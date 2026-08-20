@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter, defaultdict
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
 
 from supabase import AsyncClient
@@ -105,9 +105,7 @@ async def _rows(query: Any, label: str) -> list[Row]:
     # ``retry_statement_timeout``: the 2026-08-05 drive caught
     # /insights/targets 500ing on a single 57014 while the identical read
     # succeeded 23s later (#604) — one backoff retry absorbs that class.
-    resp = await execute_with_retry(
-        query.execute, label=label, retry_statement_timeout=True
-    )
+    resp = await execute_with_retry(query.execute, label=label, retry_statement_timeout=True)
     return cast(list[Row], resp.data or [])
 
 
@@ -530,15 +528,25 @@ async def compute_pipeline(
         if log["new_status"] in APPLIED_STATUSES and log["old_status"] not in APPLIED_STATUSES:
             week_apps[_iso_week_start(_parse_dt(log["created_at"]))] += 1
 
-    all_weeks = sorted(set(week_resumes.keys()) | set(week_apps.keys()))
-    velocity = [
-        WeeklyCount(
-            week_start=w,
-            resumes_generated=week_resumes.get(w, 0),
-            applications_submitted=week_apps.get(w, 0),
-        )
-        for w in all_weeks
-    ]
+    # Contiguous weeks from the first activity through TODAY's week — not
+    # just weeks that have data. Plotting only active weeks silently dropped
+    # trailing quiet weeks, so the chart's x-axis ended at the last burst of
+    # activity and recent silence was invisible (ux-sweep 2026-08-12 §B7:
+    # a 30d view whose axis stopped 10 days before today).
+    data_weeks = set(week_resumes.keys()) | set(week_apps.keys())
+    velocity: list[WeeklyCount] = []
+    if data_weeks:
+        week = min(data_weeks)
+        last = max(_iso_week_start(datetime.now(UTC).date()), max(data_weeks))
+        while week <= last:
+            velocity.append(
+                WeeklyCount(
+                    week_start=week,
+                    resumes_generated=week_resumes.get(week, 0),
+                    applications_submitted=week_apps.get(week, 0),
+                )
+            )
+            week += timedelta(days=7)
 
     return PipelineInsights(
         total_applications=current.total_applications,
@@ -1075,6 +1083,51 @@ async def compute_skills_cost(
                 if score is not None:
                     missing_score_sum[skill_name] += score
                     missing_score_count[skill_name] += 1
+
+    # --- Harvest union (plan-phase2-structured-harvest.md) ---
+    # Phase-2 grades now carry skills_matched / skills_missing on the scores
+    # row (denormalized there precisely for this read — one table, scoped by
+    # target, no jobs fan-out). This is the same signal the analyses
+    # scorecards feed above, at ~80x the coverage (every graded pair vs.
+    # click-gated deep dives). Rows predate-the-harvest have NULL columns and
+    # are skipped by the not-null filter. Failure degrades to analyses-only —
+    # insights are advisory.
+    if target_ids is not None:
+        try:
+
+            def _harvest_base() -> Any:
+                hq = (
+                    supabase.table("scores")
+                    .select("skills_matched, skills_missing, score, updated_at")
+                    .in_("target_id", list(target_ids))
+                    .not_.is_("skills_matched", "null")
+                )
+                if since:
+                    hq = hq.gte("updated_at", since.isoformat())
+                return hq
+
+            harvest_rows = await _rows(_harvest_base(), label="insights/skills_harvest")
+            for h in harvest_rows:
+                h_score = h.get("score")
+                score_f = float(h_score) if isinstance(h_score, (int, float)) else None
+                matched = h.get("skills_matched")
+                if isinstance(matched, list):
+                    for s in matched:
+                        if isinstance(s, str) and s:
+                            matched_counts[s] += 1
+                missing = h.get("skills_missing")
+                if isinstance(missing, list):
+                    for s in missing:
+                        if isinstance(s, str) and s:
+                            missing_counts[s] += 1
+                            if score_f is not None:
+                                missing_score_sum[s] += score_f
+                                missing_score_count[s] += 1
+        except Exception:
+            logger.warning(
+                "insights: skills-harvest union failed — serving analyses-only skills",
+                exc_info=True,
+            )
 
     # Combine and rank by total frequency
     all_skills = set(matched_counts.keys()) | set(missing_counts.keys())

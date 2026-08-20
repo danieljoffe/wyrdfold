@@ -87,9 +87,7 @@ async def test_manual_add_upsert_row_columns(async_service_client) -> None:
         targets=[],
     )
     assert posting_id, "manual-add upsert returned no row — column contract broken"
-    await (
-        async_service_client.table("jobs").delete().eq("id", posting_id).execute()
-    )
+    await async_service_client.table("jobs").delete().eq("id", posting_id).execute()
 
 
 def test_jobs_embed_columns_resolve(service_client: Client) -> None:
@@ -103,10 +101,7 @@ def test_jobs_embed_columns_resolve(service_client: Client) -> None:
     from app.routers.jobs import _JOBS_EMBED, _SCORE_ROW_COLS
 
     resp = (
-        service_client.table("scores")
-        .select(f"{_SCORE_ROW_COLS}{_JOBS_EMBED}")
-        .limit(1)
-        .execute()
+        service_client.table("scores").select(f"{_SCORE_ROW_COLS}{_JOBS_EMBED}").limit(1).execute()
     )
     assert isinstance(resp.data, list)
 

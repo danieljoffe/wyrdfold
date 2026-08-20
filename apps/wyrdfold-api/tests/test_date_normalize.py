@@ -143,3 +143,53 @@ def test_seconds_epoch_10_digits_parses() -> None:
 def test_datetime_input_normalized_to_utc_iso() -> None:
     aware = datetime(2026, 4, 1, 12, 0, tzinfo=UTC)
     assert normalize_posted_at(aware) == aware.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Implausible dates become NULL, whatever path parsed them.
+#
+# The epoch path bounded itself; the ISO path did not, so prod carries live
+# jobs "posted" on 1761-07-22 and 1781-02-02 (six rows, found 2026-08-17).
+# These are not cosmetic: the value is what the list SHOWS as Posted, what the
+# Posted sort orders by, and what the recency decay ages the score against —
+# a listing dated 1761 is permanently decayed to the floor.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "1761-07-22T09:35:00+00:00",  # real prod value (Shieldai)
+        "1781-02-02T23:51:00+00:00",  # real prod value (Loftorbital)
+        "1900-01-01",
+        "1999-12-31T23:59:59+00:00",  # just under the floor
+    ],
+)
+def test_ancient_iso_dates_are_null_not_stored(raw: str) -> None:
+    assert normalize_posted_at(raw) is None
+
+
+def test_future_dates_are_null() -> None:
+    """A listing cannot be posted in the future. A far-future value is a parse
+    artefact (a ms epoch read as seconds, say), and it would sit permanently at
+    the top of the Posted sort."""
+    future = (datetime.now(UTC) + timedelta(days=30)).isoformat()
+    assert normalize_posted_at(future) is None
+
+
+def test_mild_clock_skew_is_tolerated() -> None:
+    """Sources are sloppy about timezones; a few hours ahead is not garbage."""
+    skewed = (datetime.now(UTC) + timedelta(hours=6)).isoformat()
+    assert normalize_posted_at(skewed) is not None
+
+
+def test_a_genuinely_old_but_plausible_posting_survives() -> None:
+    """The floor is deliberately loose — long-open reqs are real, and dropping
+    a true 2016 date would be worse than keeping it."""
+    assert normalize_posted_at("2016-02-08T19:02:13+00:00") is not None
+
+
+def test_bounds_apply_to_a_datetime_passed_straight_through() -> None:
+    """The ``isinstance(raw, datetime)`` fast path skipped every other guard."""
+    assert normalize_posted_at(datetime(1761, 7, 22, tzinfo=UTC)) is None
+    assert normalize_posted_at(datetime(2026, 1, 1, tzinfo=UTC)) is not None

@@ -150,7 +150,7 @@ export default function IdentityStep({
             onClick={onSkip}
             disabled={saving}
           >
-            Skip for now
+            Skip this step
           </Button>
           <Button
             name='onboarding-identity-save'

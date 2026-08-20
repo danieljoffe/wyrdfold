@@ -41,6 +41,7 @@ const baseProps = {
   order: 'desc' as const,
   handleSort: () => undefined,
   sortIndicator: () => '',
+  nextSortAction: () => 'descending' as const,
   analysisTargetId: undefined,
   onRefetch: () => undefined,
 };
@@ -321,7 +322,7 @@ describe('JobsListTable score cell (issue #603)', () => {
         onSelectionChange={() => undefined}
       />
     );
-    expect(screen.getByLabelText('Fit score pending')).toBeInTheDocument();
+    expect(screen.getByLabelText('Match score pending')).toBeInTheDocument();
     expect(screen.queryByLabelText('Match score 61')).not.toBeInTheDocument();
   });
 });
@@ -448,5 +449,120 @@ describe('JobsListTable load-error state (issue #604)', () => {
     );
     expect(screen.getByText(/no jobs found/i)).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+});
+
+// Keyboard selection. The row is a focusable widget whose Space/Enter expands
+// it — but the handler lives on the <tr>, so a keypress originating in the
+// row's OWN checkbox bubbles up to it. Mouse users are fine (the checkbox sits
+// in a stopPropagation wrapper); keyboard users were not.
+//
+// This matters more since bulk actions shipped: a user who cannot select rows
+// cannot use them at all.
+describe('JobsListTable — keyboard selection', () => {
+  function renderRow(onSelectionChange: (ids: Set<string>) => void) {
+    render(
+      <JobsListTable
+        {...baseProps}
+        postings={[makeJob()]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={onSelectionChange}
+      />
+    );
+  }
+
+  it('selects the row when Space is pressed on its checkbox', async () => {
+    const onSelectionChange = jest.fn();
+    const user = userEvent.setup();
+    renderRow(onSelectionChange);
+
+    const box = screen.getByLabelText(/select senior frontend engineer/i);
+    box.focus();
+    await user.keyboard(' ');
+
+    expect(onSelectionChange).toHaveBeenCalled();
+    expect([...onSelectionChange.mock.calls[0][0]]).toEqual(['j-1']);
+  });
+
+  it('still expands the row when Space is pressed on the row itself', async () => {
+    const user = userEvent.setup();
+    renderRow(() => undefined);
+
+    const row = screen.getByRole('row', {
+      name: /senior frontend engineer at acme/i,
+    });
+    row.focus();
+    await user.keyboard(' ');
+
+    expect(
+      await screen.findByTestId('job-detail-panel-stub')
+    ).toBeInTheDocument();
+  });
+});
+
+describe('JobsListTable Posted column', () => {
+  // ── The Posted column (#815 follow-up) ───────────────────────────────────
+  // The column shows the PROVIDER'S date. ~4% of live listings carry none, and
+  // those used to silently render OUR catalog date under a "Posted" heading —
+  // misattributing our number to the employer.
+
+  it('shows the provider posted date, not our catalog date', () => {
+    render(
+      <JobsListTable
+        {...baseProps}
+        postings={[
+          makeJob({
+            source_posted_at: new Date(Date.now() - 3 * 86400000).toISOString(),
+            cataloged_at: new Date(Date.now() - 90 * 86400000).toISOString(),
+          }),
+        ]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    expect(screen.getByText('3d ago')).toBeInTheDocument();
+    expect(screen.queryByText('90d ago')).not.toBeInTheDocument();
+  });
+
+  it('shows an em dash when the ATS gave no posted date', () => {
+    render(
+      <JobsListTable
+        {...baseProps}
+        postings={[
+          makeJob({
+            source_posted_at: null,
+            cataloged_at: new Date(Date.now() - 2 * 86400000).toISOString(),
+          }),
+        ]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    // Other cells (salary, location) render an em dash too, so assert on the
+    // load-bearing half: our catalog date must not appear under "Posted".
+    expect(screen.getAllByText('\u2014').length).toBeGreaterThan(0);
+    expect(screen.queryByText('2d ago')).not.toBeInTheDocument();
+  });
+
+  it('sorts the Posted column by the provider date token', async () => {
+    const calls: string[] = [];
+    const user = userEvent.setup();
+    render(
+      <JobsListTable
+        {...baseProps}
+        handleSort={(col: JobsSortColumn) => calls.push(col)}
+        postings={[makeJob()]}
+        loading={false}
+        selectedIds={new Set()}
+        onSelectionChange={() => undefined}
+      />
+    );
+    await user.click(screen.getByRole('button', { name: /posted/i }));
+    // 'created_at' would sort by when WE catalogued it — a different date
+    // from the one this column renders.
+    expect(calls).toEqual(['posted_at']);
   });
 });

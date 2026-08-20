@@ -71,10 +71,7 @@ async def test_same_pod_tenants_share_the_gate(monkeypatch) -> None:
 
     tenants = ["cisco", "msd", "usfca", "zillow"]
     results = await asyncio.gather(
-        *(
-            wd.fetch_workday_jobs(f"https://{t}.wd5.myworkdayjobs.com|{t}|Careers")
-            for t in tenants
-        )
+        *(wd.fetch_workday_jobs(f"https://{t}.wd5.myworkdayjobs.com|{t}|Careers") for t in tenants)
     )
 
     assert probe.peak["wd5.myworkdayjobs.com"] <= wd._POD_CONCURRENCY

@@ -1,8 +1,9 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import Button from '@/components/kit/Button';
+import ConfirmModal from '@/components/ConfirmModal';
 import LinkButton from '@/components/kit/LinkButton';
 import { useToast } from '@/state/Toast/ToastProvider';
 import { loadJobDescription } from './loadJobDescription';
@@ -11,6 +12,14 @@ import { useTailorDocument } from './useTailorDocument';
 
 interface ResumeSectionProps {
   jobPostingId: string;
+  /** Fired when a generation this panel started lands a draft. The server
+   *  marks the job ``resume_draft`` as part of the run (tailor.py,
+   *  ``mark_job_resume_draft``); without this the host's status pill kept
+   *  showing "New" until a full reload (ux-sweep 2026-08-12 §B7). */
+  onDrafted?: () => void;
+  /** The match analysis' recommendation, when it advises skipping. Present =
+   *  confirm before spending; see ``CoverLetterSection`` for the rationale. */
+  skipReason?: string | undefined;
 }
 
 /**
@@ -28,7 +37,12 @@ interface ResumeSectionProps {
  * that run was started before this panel mounted (or in another tab), and
  * navigating away mid-generation loses nothing.
  */
-export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
+export default function ResumeSection({
+  jobPostingId,
+  onDrafted,
+  skipReason,
+}: ResumeSectionProps) {
+  const [confirmOpen, setConfirmOpen] = useState(false);
   const { toast } = useToast();
   const { record, loading, generating, error, generate } = useTailorDocument({
     jobPostingId,
@@ -69,6 +83,7 @@ export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
     });
     if (ok) {
       toast({ variant: 'success', title: 'Tailored resume drafted with AI' });
+      onDrafted?.();
     }
   }
 
@@ -108,14 +123,37 @@ export default function ResumeSection({ jobPostingId }: ResumeSectionProps) {
   }
   if (!record) {
     return (
-      <Button
-        name='generate-resume'
-        variant='primary'
-        size='sm'
-        onClick={handleGenerate}
-      >
-        Generate tailored resume
-      </Button>
+      <>
+        <Button
+          name='generate-resume'
+          variant='primary'
+          size='sm'
+          onClick={() => {
+            if (skipReason) {
+              setConfirmOpen(true);
+              return;
+            }
+            void handleGenerate();
+          }}
+        >
+          Generate tailored resume
+        </Button>
+        {confirmOpen && (
+          <ConfirmModal
+            isOpen
+            onClose={() => setConfirmOpen(false)}
+            onConfirm={() => {
+              setConfirmOpen(false);
+              void handleGenerate();
+            }}
+            title='Generate anyway?'
+            message={`The match analysis recommends skipping this one: "${skipReason}" Generating a tailored resume is billed per run.`}
+            confirmLabel='Generate anyway'
+            cancelLabel='Cancel'
+            name='resume-spend-confirm'
+          />
+        )}
+      </>
     );
   }
   return (

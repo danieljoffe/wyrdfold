@@ -1,7 +1,7 @@
 import React from 'react';
 import '@testing-library/jest-dom';
 import { render, screen } from '@testing-library/react';
-import ScoringProfileView from '../ScoringProfileView';
+import ScoringProfileView, { formatCategoryName } from '../ScoringProfileView';
 import type { JobTarget, ScoringProfile } from '../../types';
 
 // SEC-2 (#366): the shared scoring model is view-only per user. These pin
@@ -34,11 +34,27 @@ function makeTarget(scoring_profile: ScoringProfile | null): JobTarget {
   };
 }
 
+describe('formatCategoryName', () => {
+  // The prod profiles ship SCREAMING_SNAKE keys (CORE_SKILLS et al.) — the
+  // humanizer must handle multi-word enums, not just single words.
+  it('humanizes enum-style category keys', () => {
+    expect(formatCategoryName('CORE_SKILLS')).toBe('Core skills');
+    expect(formatCategoryName('NICE_TO_HAVE')).toBe('Nice to have');
+    expect(formatCategoryName('frontend')).toBe('Frontend');
+  });
+
+  it('is safe on degenerate input', () => {
+    expect(formatCategoryName('')).toBe('');
+    expect(formatCategoryName('_')).toBe('');
+  });
+});
+
 describe('ScoringProfileView', () => {
   it('renders the shared profile: categories, keywords, seniority, domain, penalties', () => {
     render(<ScoringProfileView target={makeTarget(PROFILE)} />);
 
-    expect(screen.getByText('frontend')).toBeInTheDocument();
+    // Raw category keys are humanized for display ("frontend" → "Frontend").
+    expect(screen.getByText('Frontend')).toBeInTheDocument();
     expect(screen.getByText('react')).toBeInTheDocument();
     expect(screen.getByText('typescript')).toBeInTheDocument();
     expect(screen.getByText('Level: senior')).toBeInTheDocument();

@@ -181,13 +181,19 @@ def test_null_activation_status_leaves_an_existing_row_alone(
     normalized = label.lower()
 
     first = _call(
-        service_client, user_id=uid_a, label=label, normalized=normalized,
+        service_client,
+        user_id=uid_a,
+        label=label,
+        normalized=normalized,
         activation_status="polling",
     )
     cleanup_targets.append(first["target"]["id"])
 
     second = _call(
-        service_client, user_id=uid_b, label=label, normalized=normalized,
+        service_client,
+        user_id=uid_b,
+        label=label,
+        normalized=normalized,
         activation_status=None,
     )
 

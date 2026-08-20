@@ -179,9 +179,10 @@ def _seeded() -> _FakeSupabase:
             {"id": "rj2", "user_id": "other", "jd_text": "someone else's JD"},
         ],
         "user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}],
+        # Keyed by the auth uid since R3 §2 (#557) — an ordinary user_id table.
         "notifications_sent": [
-            {"user_profile_id": _PROFILE_ID},
-            {"user_profile_id": _PROFILE_ID},
+            {"user_id": _UID},
+            {"user_id": _UID},
         ],
         # Shared catalog rows that must survive erasure.
         "scores": [{"target_id": "t1", "job_posting_id": "j1"}],
@@ -229,11 +230,21 @@ async def test_deletes_every_per_user_table_by_user_id() -> None:
         assert table in report
 
 
-async def test_notifications_deleted_by_resolved_profile_id() -> None:
+async def test_notifications_erased_by_auth_uid_with_no_profile_lookup() -> None:
+    """R3 §2 (#557): ``notifications_sent`` is keyed by the auth uid, so it
+    erases in the ordinary ``_USER_ID_TABLES`` loop and the ``user_profiles.id``
+    surrogate resolution is gone entirely.
+    """
     sb = _seeded()
     report = await account_deletion.delete_account(sb, user_id=_UID)
-    assert ("delete", "notifications_sent", {"user_profile_id": _PROFILE_ID}) in sb.log
+    assert ("delete", "notifications_sent", {"user_id": _UID}) in sb.log
+    # A count, not just a present key — proves rows actually matched the filter
+    # rather than the delete being issued against a column nothing is keyed by.
     assert report["notifications_sent"] == 2
+    assert sb.tables["notifications_sent"] == []
+    # The surrogate lookup is gone: erasure no longer SELECTs user_profiles at
+    # all (it only deletes it, in its own step).
+    assert not [e for e in sb.log if e[0] == "select" and e[1] == "user_profiles"]
 
 
 async def test_shared_catalog_is_never_deleted() -> None:
@@ -394,10 +405,21 @@ async def test_auth_user_deleted_last() -> None:
     assert sb.auth.admin.deleted == [_UID]
 
 
-async def test_no_profile_skips_notifications_but_still_deletes_auth() -> None:
-    sb = _FakeSupabase(tables={"documents": [{"user_id": _UID}]}, objects={})
+async def test_erasure_covers_notifications_without_a_profile_row() -> None:
+    """Erasure no longer depends on a ``user_profiles`` row existing.
+
+    Before R3 §2 (#557) this case asserted the ledger was *skipped* — the
+    profile surrogate could not be resolved, so the delete never ran. That was
+    safe only because the FK made such rows impossible; the dependency is now
+    gone, so the ledger is erased on its own terms.
+    """
+    sb = _FakeSupabase(
+        tables={"documents": [{"user_id": _UID}], "notifications_sent": [{"user_id": _UID}]},
+        objects={},
+    )
     report = await account_deletion.delete_account(sb, user_id=_UID)
-    assert "notifications_sent" not in report  # no profile id to resolve
+    assert report["notifications_sent"] == 1
+    assert sb.tables["notifications_sent"] == []
     assert sb.auth.admin.deleted == [_UID]
     assert report["auth_user"] == 1
 

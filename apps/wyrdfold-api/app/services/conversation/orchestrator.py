@@ -177,6 +177,7 @@ async def _add_annotation(
         source="user_edit",
     )
 
+
 PURPOSE_TURN_ONBOARDING = "conversation.onboarding"
 PURPOSE_TURN_UPDATE = "conversation.update"
 PURPOSE_PROBE = "conversation.probe"
@@ -393,8 +394,17 @@ async def handle_turn(
     new_prose_version: int | None = None
     prose_updated = False
     prose_warnings: list[str] = []
-    if parsed.prose_append and parsed.prose_append.strip():
-        append_text = parsed.prose_append.strip()
+    append_text = (parsed.prose_append or "").strip()
+    existing = current_prose.content if current_prose else ""
+    # Recap-echo guard: the grounding instructions tell the model to restate
+    # the user's earlier claims when asking follow-ups, which invites
+    # restating them into prose_append too. The contract bans it ("restating
+    # is NOT new content"), but a model that does it anyway would silently
+    # duplicate source-of-truth lines the tailor later reproduces verbatim.
+    # A block already in the doc is never an append.
+    if append_text and append_text in existing:
+        append_text = ""
+    if append_text:
         # Faithfulness guard (#47): the append becomes source-of-truth the
         # tailor later reproduces verbatim, written by the weakest model with
         # no check. Flag (don't drop) numbers/names the user never said — we
@@ -416,7 +426,6 @@ async def handle_turn(
             # from marked blocks. Content is kept (it may be real) — the
             # marker makes it confirm-or-fix instead of silently "truth".
             append_text = f"{UNVERIFIED_MARKER}\n{append_text}"
-        existing = current_prose.content if current_prose else ""
         new_content = (existing + "\n\n" + append_text).strip() if existing else append_text
         new_doc = await _prose_create_version(supabase, user_id=user_id, content=new_content)
         new_prose_version = new_doc.version

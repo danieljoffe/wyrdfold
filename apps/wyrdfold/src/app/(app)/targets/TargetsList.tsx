@@ -11,13 +11,16 @@ import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import Button from '@/components/kit/Button';
 import ConfirmModal from '@/components/ConfirmModal';
 import { extractApiError } from '@/lib/extractApiError';
+import { parseActiveLimit, type ActiveLimitDetail } from '@/lib/activeLimit';
 import { useToast } from '@/state/Toast/ToastProvider';
 import TargetCard from './TargetCard';
 import CreateTargetModal, {
+  type CreateTargetDraft,
   type ManualSubmission,
   type UrlSubmission,
 } from './CreateTargetModal';
 import PendingTargetCard from './PendingTargetCard';
+import SwapActiveTargetModal from './SwapActiveTargetModal';
 import {
   addSearchSuggestionTarget,
   addSuggestionTarget,
@@ -39,6 +42,84 @@ import { toSummary } from './types';
 interface PendingTarget {
   id: string;
   label: string;
+}
+
+/**
+ * Durable "we ran it and found nothing" panel for the two suggest actions.
+ *
+ * Both calls are LLM-backed and routinely take 20-50s, while the toast that
+ * reports a zero-result run auto-dismisses after 4s — so the user who looks
+ * away for the duration (i.e. most of them) comes back to a page identical to
+ * the one they left and cannot tell whether anything ran. The toast stays for
+ * whoever is watching; this is the trace for whoever is not.
+ *
+ * Mirrors LearningLogPanel's two-layer treatment of the same situation.
+ */
+function SuggestEmptyPanel({
+  title,
+  children,
+  onRetry,
+  retrying,
+  retryName,
+}: {
+  title: string;
+  children: React.ReactNode;
+  onRetry: () => void;
+  retrying: boolean;
+  retryName: string;
+}) {
+  return (
+    <Card padding='none'>
+      <CardContent className='flex flex-col items-start gap-2 p-4'>
+        <Heading variant='cardTitle'>{title}</Heading>
+        <Text variant='body' as='p' className='text-text-secondary'>
+          {children}
+        </Text>
+        <Button
+          name={retryName}
+          variant='outline'
+          size='sm'
+          onClick={onRetry}
+          disabled={retrying}
+          className='mt-1'
+        >
+          {retrying ? 'Checking again…' : 'Check again'}
+        </Button>
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Header for a rendered suggestions run, with the dismiss the panels lacked.
+ *
+ * A 20-50s LLM result used to sit on the page until a full reload — there was
+ * no way to put it away, so the page stayed cluttered with roles the user had
+ * already decided against.
+ */
+function SuggestionsHeader({
+  title,
+  onDismiss,
+  dismissName,
+}: {
+  title: string;
+  onDismiss: () => void;
+  dismissName: string;
+}) {
+  return (
+    <div className='flex items-center justify-between gap-3'>
+      <Text variant='caption'>{title}</Text>
+      <Button
+        name={dismissName}
+        variant='bare'
+        size='sm'
+        onClick={onDismiss}
+        className='shrink-0'
+      >
+        Dismiss
+      </Button>
+    </div>
+  );
 }
 
 interface TargetsListProps {
@@ -68,6 +149,15 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
   const [targets, setTargets] =
     useState<UserTargetWithSummary[]>(initialTargets);
   const [modalOpen, setModalOpen] = useState(false);
+  // Set only when a create fails, so the modal can re-open holding what
+  // the user typed instead of an empty form.
+  const [createDraft, setCreateDraft] = useState<CreateTargetDraft | undefined>(
+    undefined
+  );
+  // Paired with the draft: the toast that reports the failure auto-dismisses,
+  // and the from-url fetch runs 10-20s, so the reason has to survive on the
+  // re-opened modal too.
+  const [createError, setCreateError] = useState<string | undefined>(undefined);
   const { toast } = useToast();
   const router = useRouter();
 
@@ -78,6 +168,21 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
   useEffect(() => {
     setTargets(initialTargets);
   }, [initialTargets]);
+
+  // Set when an activation is refused by the active-target cap: the target
+  // the user wanted, plus the server's list of what is currently holding the
+  // cap. Drives the swap picker.
+  const [swapFor, setSwapFor] = useState<{
+    id: string;
+    label: string;
+    detail: ActiveLimitDetail;
+  } | null>(null);
+
+  const labelFor = useCallback(
+    (id: string) =>
+      targets.find(t => t.target.id === id)?.target.label ?? 'this target',
+    [targets]
+  );
 
   // Flip THIS user's `user_target.is_active` for one target in local state.
   // `isActive` on the card reads this per-user flag (see TargetCard ~14-27),
@@ -98,7 +203,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
   // nav route (7 requests for one toggle); a targeted GET of just this
   // target's user-target row settles the single card instead.
   const toggleActive = useCallback(
-    async (id: string, active: boolean) => {
+    async (id: string, active: boolean, swapOut?: string) => {
       const endpoint = active ? 'activate' : 'deactivate';
       const failTitle = active
         ? 'Failed to activate target'
@@ -108,14 +213,35 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       try {
         const res = await fetch(`/api/targets/${id}/${endpoint}`, {
           method: 'POST',
+          ...(swapOut
+            ? {
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ deactivate_target_id: swapOut }),
+              }
+            : {}),
         });
-        if (!res.ok)
+        if (!res.ok) {
+          // The cap is not a plain failure — it has a way out. Offer the
+          // picker instead of a toast the user can only read and obey.
+          const capped = active ? await parseActiveLimit(res) : null;
+          if (capped) {
+            setActive(id, false); // undo the optimistic flip; nothing changed
+            setSwapFor({ id, label: labelFor(id), detail: capped });
+            return;
+          }
           throw new Error(
             await extractApiError(
               res,
               active ? 'Activate failed' : 'Deactivate failed'
             )
           );
+        }
+        if (swapOut) {
+          // The server deactivated it as part of the swap; mirror that
+          // locally so the other card doesn't keep claiming to be active.
+          setActive(swapOut, false);
+          setSwapFor(null);
+        }
         toast({
           variant: 'success',
           title: active ? 'Target activated' : 'Target deactivated',
@@ -148,7 +274,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         });
       }
     },
-    [toast, setActive]
+    [toast, setActive, labelFor]
   );
 
   const handleActivate = useCallback(
@@ -161,9 +287,70 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     [toggleActive]
   );
 
+  // Ids with a retry request in flight — drives the button's spinner so a
+  // second click can't stack another activation on the same target.
+  const [retryingIds, setRetryingIds] = useState<Set<string>>(() => new Set());
+
+  // #649: re-running the pipeline IS the retry — any non-error transition
+  // clears `activation_error` server-side, so there is no separate "clear"
+  // call. The optimistic flip to `deriving` matters as much as the POST: it
+  // seeds the poller below, so the card recovers on screen instead of sitting
+  // on a stale error until the user reloads.
+  const handleRetry = useCallback(
+    async (id: string) => {
+      setRetryingIds(prev => new Set(prev).add(id));
+      try {
+        const res = await fetch(`/api/targets/${id}/activate`, {
+          method: 'POST',
+        });
+        if (!res.ok)
+          throw new Error(await extractApiError(res, 'Retry failed'));
+        toast({ variant: 'success', title: 'Retrying activation' });
+        setTargets(prev =>
+          prev.map(t =>
+            t.target.id === id
+              ? {
+                  ...t,
+                  target: {
+                    ...t.target,
+                    activation_status: 'deriving',
+                    activation_error: null,
+                  },
+                }
+              : t
+          )
+        );
+        setDerivingIds(prev => new Set(prev).add(id));
+      } catch (err) {
+        toast({
+          variant: 'error',
+          title: err instanceof Error ? err.message : 'Retry failed',
+        });
+      } finally {
+        setRetryingIds(prev => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
+    },
+    [toast]
+  );
+
   // The card's Delete action stashes the target id and opens the confirm
   // modal; the actual DELETE runs once the user confirms below.
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+
+  // Resolved from the list rather than stashed alongside the id, so the prompt
+  // can never name a target the row no longer describes.
+  const pendingDeleteLabel = useMemo(
+    () =>
+      pendingDeleteId === null
+        ? null
+        : (targets.find(t => t.target.id === pendingDeleteId)?.target.label ??
+          null),
+    [pendingDeleteId, targets]
+  );
 
   const handleDelete = useCallback((id: string) => {
     setPendingDeleteId(id);
@@ -219,10 +406,25 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     }
   }, []);
 
+  // Only meaningful once the user HAS targets — the zero-target empty state
+  // already tells its own story, and a pending (still-deriving) target means
+  // one is on the way, so the banner would be premature.
+  const noneActive =
+    targets.length > 0 &&
+    pendingTargets.length === 0 &&
+    targets.every(t => !t.user_target.is_active);
+
   const pollKey = useMemo(() => {
     const ids = new Set(derivingIds);
     for (const t of targets) {
-      if (t.target.activation_status === 'deriving') ids.add(t.target.id);
+      // Seed from the SAME predicate that decides when to stop (`isDeriving`).
+      // These used to disagree: the seed only looked at `activation_status ===
+      // 'deriving'` while the settle condition also treated a null fit_score as
+      // deriving. A target that finished its profile but never got a score was
+      // therefore never picked up on load — no spinner, no poll, no score, and
+      // the backend's lazy refresh skipped it too. Both halves are fixed; this
+      // is the client half.
+      if (isDeriving(t)) ids.add(t.target.id);
     }
     return [...ids].sort().join(',');
   }, [derivingIds, targets]);
@@ -296,7 +498,8 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     async (
       endpoint: '/api/targets/from-manual' | '/api/targets/from-url',
       body: object,
-      pendingLabel: string
+      pendingLabel: string,
+      draft: CreateTargetDraft
     ) => {
       const pendingId =
         typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -304,8 +507,17 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
           : `pending-${Date.now()}-${Math.random()}`;
       setPendingTargets(p => [...p, { id: pendingId, label: pendingLabel }]);
       setModalOpen(false);
+      // This attempt is not the previous attempt's failure.
+      setCreateError(undefined);
       setSuggestions([]);
       setLateralSuggestions([]);
+      // Clear the "we found nothing" panels too, not just the result arrays.
+      // Their copy ("your existing targets already cover the roles that fit
+      // your experience") is a claim about the target list, so it goes stale
+      // the moment the list changes — leaving it up would have the page argue
+      // with the card the user just created.
+      setSuggestEmpty(false);
+      setLateralEmpty(false);
 
       try {
         const result = await createOrLinkTarget(endpoint, body);
@@ -324,10 +536,19 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         // is slow or fails.
         insertEntry(toListEntry(result));
       } catch (e) {
-        toast({
-          variant: 'error',
-          title: e instanceof Error ? e.message : 'Failed to add target',
-        });
+        const message = e instanceof Error ? e.message : 'Failed to add target';
+        toast({ variant: 'error', title: message });
+        // Hand the draft back. The modal is closed optimistically above
+        // because success is the common case, but that meant a failure threw
+        // away what the user typed — and the from-url errors in particular
+        // ("we couldn't read that page") are ones you recover from by editing
+        // the URL you no longer have. A fresh object each time so a second
+        // failure re-seeds even if the field was edited in between.
+        setCreateDraft({ ...draft });
+        // ...and the same message the toast is about to drop, so it is still
+        // there when the user looks back at the modal.
+        setCreateError(message);
+        setModalOpen(true);
       } finally {
         setPendingTargets(p => p.filter(t => t.id !== pendingId));
       }
@@ -337,7 +558,11 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
 
   const handleSubmitManual = useCallback(
     (payload: ManualSubmission) => {
-      void runCreate('/api/targets/from-manual', payload, payload.label);
+      void runCreate('/api/targets/from-manual', payload, payload.label, {
+        mode: 'manual',
+        label: payload.label,
+        description: payload.description ?? '',
+      });
     },
     [runCreate]
   );
@@ -346,7 +571,10 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     (payload: UrlSubmission) => {
       // Empty pending label: the title is derived server-side from the posting,
       // so the optimistic card shows the URL-mode skeleton until it resolves.
-      void runCreate('/api/targets/from-url', payload, '');
+      void runCreate('/api/targets/from-url', payload, '', {
+        mode: 'url',
+        jdUrl: payload.jd_url,
+      });
     },
     [runCreate]
   );
@@ -402,11 +630,13 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
 
   const [suggestions, setSuggestions] = useState<MatchedSuggestion[]>([]);
   const [suggesting, setSuggesting] = useState(false);
+  const [suggestEmpty, setSuggestEmpty] = useState(false);
   const [addingSuggestion, setAddingSuggestion] = useState<string | null>(null);
 
   const handleSuggest = useCallback(async () => {
     setSuggesting(true);
     setSuggestions([]);
+    setSuggestEmpty(false);
     try {
       const res = await fetch('/api/targets/suggest', { method: 'POST' });
       if (!res.ok)
@@ -414,6 +644,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       const data = (await res.json()) as MatchedSuggestions;
       setSuggestions(data.matches);
       if (data.matches.length === 0) {
+        setSuggestEmpty(true);
         toast({
           variant: 'info',
           title: 'No new suggestions',
@@ -464,11 +695,13 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
     LateralSuggestion[]
   >([]);
   const [suggestingLateral, setSuggestingLateral] = useState(false);
+  const [lateralEmpty, setLateralEmpty] = useState(false);
   const [addingLateral, setAddingLateral] = useState<string | null>(null);
 
   const handleSuggestLateral = useCallback(async () => {
     setSuggestingLateral(true);
     setLateralSuggestions([]);
+    setLateralEmpty(false);
     try {
       const res = await fetch('/api/targets/suggest-lateral', {
         method: 'POST',
@@ -478,6 +711,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
       const data = (await res.json()) as LateralSuggestions;
       setLateralSuggestions(data.suggestions);
       if (data.suggestions.length === 0) {
+        setLateralEmpty(true);
         toast({
           variant: 'info',
           title: 'No lateral roles found',
@@ -542,10 +776,14 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                 name='target-create-empty'
                 variant='primary'
                 size='sm'
-                onClick={() => setModalOpen(true)}
+                onClick={() => {
+                  setCreateDraft(undefined);
+                  setCreateError(undefined);
+                  setModalOpen(true);
+                }}
               >
                 <Plus className='size-4' aria-hidden />
-                <span>Create Target</span>
+                <span>Create target</span>
               </Button>
               <Button
                 name='target-suggest-empty'
@@ -553,15 +791,48 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                 size='sm'
                 onClick={handleSuggest}
                 disabled={suggesting}
+                aria-busy={suggesting}
               >
-                <Sparkles className='size-4' aria-hidden />
-                <span>Suggest from Experience</span>
+                {suggesting ? (
+                  <>
+                    <Spinner size='sm' aria-label='Suggesting' />
+                    <span>Suggesting...</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className='size-4' aria-hidden />
+                    <span>Suggest from experience</span>
+                  </>
+                )}
               </Button>
             </div>
           </CardContent>
         </Card>
       ) : (
         <>
+          {/* Home ("Activate a target so we can match incoming jobs") and
+              /jobs ("No active targets. Activate a target to start seeing
+              matched jobs") both diagnose this and send the user HERE — and
+              this page then said nothing. Every card carried a small grey
+              "Inactive" chip and the word "Activate" appeared nowhere,
+              because it lives one level down in a per-card menu. */}
+          {noneActive && (
+            <Card padding='none'>
+              <CardContent className='flex flex-col items-start gap-1.5 p-4'>
+                <Heading variant='cardTitle'>
+                  No targets are active — nothing is being matched
+                </Heading>
+                <Text variant='body' as='p' className='text-text-secondary'>
+                  Jobs are only scored against active targets. Open the{' '}
+                  <span aria-hidden>⋮</span>
+                  <span className='sr-only'>actions</span> menu on whichever
+                  target you want to pursue and choose <strong>Activate</strong>
+                  .
+                </Text>
+              </CardContent>
+            </Card>
+          )}
+
           <div className='grid gap-4 sm:grid-cols-2 lg:grid-cols-3'>
             {pendingTargets.map(p => (
               <PendingTargetCard key={p.id} label={p.label} />
@@ -574,6 +845,8 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                 fitScore={user_target.fit_score}
                 fitScoreReasoning={user_target.fit_score_reasoning}
                 onActivate={handleActivate}
+                onRetry={id => void handleRetry(id)}
+                retrying={retryingIds.has(target.id)}
                 onDeactivate={handleDeactivate}
                 onDelete={handleDelete}
                 onViewJobs={handleViewJobs}
@@ -586,10 +859,14 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
               name='target-create'
               variant='primary'
               size='sm'
-              onClick={() => setModalOpen(true)}
+              onClick={() => {
+                setCreateDraft(undefined);
+                setCreateError(undefined);
+                setModalOpen(true);
+              }}
             >
               <Plus className='size-4' aria-hidden />
-              <span>Add Target</span>
+              <span>Add target</span>
             </Button>
             <Button
               name='target-suggest'
@@ -597,6 +874,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
               size='sm'
               onClick={handleSuggest}
               disabled={suggesting}
+              aria-busy={suggesting}
             >
               {suggesting ? (
                 <>
@@ -606,7 +884,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
               ) : (
                 <>
                   <Sparkles className='size-4' aria-hidden />
-                  <span>Suggest from Experience</span>
+                  <span>Suggest from experience</span>
                 </>
               )}
             </Button>
@@ -616,6 +894,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
               size='sm'
               onClick={handleSuggestLateral}
               disabled={suggestingLateral}
+              aria-busy={suggestingLateral}
             >
               {suggestingLateral ? (
                 <>
@@ -633,9 +912,26 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         </>
       )}
 
+      {suggestEmpty && suggestions.length === 0 && (
+        <SuggestEmptyPanel
+          title='No new suggestions'
+          onRetry={handleSuggest}
+          retrying={suggesting}
+          retryName='target-suggest-retry'
+        >
+          Your existing targets already cover the roles that fit your
+          experience. Update your profile with new skills or experience, then
+          check again.
+        </SuggestEmptyPanel>
+      )}
+
       {suggestions.length > 0 && (
         <div className='flex flex-col gap-3'>
-          <Text variant='caption'>Suggested targets from your experience</Text>
+          <SuggestionsHeader
+            title='Suggested targets from your experience'
+            onDismiss={() => setSuggestions([])}
+            dismissName='target-suggest-dismiss'
+          />
           <div className='grid gap-3 sm:grid-cols-2 lg:grid-cols-3'>
             {suggestions.map(match => (
               <Card key={match.suggestion.label} padding='none'>
@@ -672,7 +968,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                   >
                     {addingSuggestion === match.suggestion.label
                       ? 'Adding...'
-                      : 'Add Target'}
+                      : 'Add target'}
                   </Button>
                 </CardContent>
               </Card>
@@ -681,11 +977,25 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         </div>
       )}
 
+      {lateralEmpty && lateralSuggestions.length === 0 && (
+        <SuggestEmptyPanel
+          title='No lateral roles found'
+          onRetry={handleSuggestLateral}
+          retrying={suggestingLateral}
+          retryName='target-suggest-lateral-retry'
+        >
+          We could not find adjacent roles to branch into from your current
+          targets. Add a target or two first, then check again.
+        </SuggestEmptyPanel>
+      )}
+
       {lateralSuggestions.length > 0 && (
         <div className='flex flex-col gap-3'>
-          <Text variant='caption'>
-            Lateral roles to branch into, based on your current targets
-          </Text>
+          <SuggestionsHeader
+            title='Lateral roles to branch into, based on your current targets'
+            onDismiss={() => setLateralSuggestions([])}
+            dismissName='target-suggest-lateral-dismiss'
+          />
           <div className='grid gap-3 sm:grid-cols-2 lg:grid-cols-3'>
             {lateralSuggestions.map(suggestion => (
               <Card key={suggestion.label} padding='none'>
@@ -717,7 +1027,7 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
                   >
                     {addingLateral === suggestion.label
                       ? 'Adding...'
-                      : 'Add Target'}
+                      : 'Add target'}
                   </Button>
                 </CardContent>
               </Card>
@@ -726,20 +1036,46 @@ export default function TargetsList({ initialTargets }: TargetsListProps) {
         </div>
       )}
 
+      <SwapActiveTargetModal
+        detail={swapFor?.detail ?? null}
+        incomingLabel={swapFor?.label ?? ''}
+        onClose={() => setSwapFor(null)}
+        onSwap={async deactivateId => {
+          if (swapFor) await toggleActive(swapFor.id, true, deactivateId);
+        }}
+      />
+
       <CreateTargetModal
         isOpen={modalOpen}
-        onClose={() => setModalOpen(false)}
+        onClose={() => {
+          setCreateDraft(undefined);
+          setCreateError(undefined);
+          setModalOpen(false);
+        }}
         onSubmitManual={handleSubmitManual}
         onSubmitUrl={handleSubmitUrl}
         onFollow={handleFollowSearchResult}
         onCreateSuggestion={handleCreateSearchSuggestion}
+        draft={createDraft}
+        error={createError}
       />
 
+      {/* The dialog names the target. It used to say only "Delete target?",
+          which is unverifiable on an account holding several near-identical
+          labels ("Senior Full Stack Engineer" / "Senior Full-Stack Engineer" /
+          "Staff Full-Stack Engineer" / "Senior Frontend Engineer" / "Senior
+          Frontend Engineer – Web Performance"). Opening the wrong card's kebab
+          was unrecoverable and undetectable, and the action is irreversible by
+          design — which is exactly why the name has to be in the prompt. */}
       <ConfirmModal
         isOpen={pendingDeleteId !== null}
         onClose={() => setPendingDeleteId(null)}
         onConfirm={confirmDelete}
-        title='Delete target?'
+        title={
+          pendingDeleteLabel
+            ? `Delete “${pendingDeleteLabel}”?`
+            : 'Delete target?'
+        }
         message='Saved jobs scored against this target lose their target context. This cannot be undone.'
         confirmLabel='Delete'
         destructive

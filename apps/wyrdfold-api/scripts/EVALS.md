@@ -43,7 +43,7 @@ To reproduce locally (PII-free):
 
 ```bash
 cd apps/wyrdfold-api
-export OPEN_ROUTER_API_KEY=sk-or-...
+export OPENROUTER_API_KEY=sk-or-...
 uv run python scripts/gen_sample_eval_set.py
 uv run python scripts/eval_phase1_triage.py
 uv run python scripts/eval_derive_target.py

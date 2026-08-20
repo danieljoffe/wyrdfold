@@ -398,3 +398,35 @@ def _retry_after_seconds(resp: httpx.Response) -> float | None:
         return max(0.0, float(raw))
     except ValueError:
         return None
+
+
+def json_or_none(resp: httpx.Response, *, source: str) -> Any | None:
+    """Decode a JSON body, or ``None`` when the response wasn't JSON at all.
+
+    Every ATS fetcher called ``resp.json()`` bare on a 200. That is fine until a
+    board answers 200 with something that isn't JSON — an HTML interstitial, a
+    WAF challenge, a maintenance page, an empty body — and then the poll dies
+    with ``JSONDecodeError: Expecting value: line 1 column 1 (char 0)`` raised
+    six frames deep inside httpx. Prod logged that repeatedly against Workday
+    boards; it reads as a code bug in the traceback when it is really an
+    upstream serving HTML.
+
+    Returning ``None`` lets each fetcher treat it exactly like the non-200 case
+    it already handles: warn, and yield no jobs. Yielding NOTHING (rather than a
+    partial harvest) is the load-bearing part — the poller's stale-archive pass
+    skips a source that returns zero rows while active rows exist, so a failed
+    fetch can't archive live listings. A partial result would sail straight
+    past that guard.
+    """
+    try:
+        return resp.json()
+    except ValueError:  # json.JSONDecodeError subclasses ValueError
+        body = resp.text[:120].replace("\n", " ")
+        logger.warning(
+            "%s returned %d with a non-JSON body (content-type=%r): %r",
+            source,
+            resp.status_code,
+            resp.headers.get("content-type"),
+            body,
+        )
+        return None

@@ -38,7 +38,11 @@ DEFAULT_PURPOSE = "target.derive_profile"
 # Bump when SYSTEM_PROMPT below materially changes. See module docstring.
 # v2: prepended the prompt-injection directive + fenced the JD in the user
 # message (scraped JD feeds the SHARED target profile). Invalidates v1 cache.
-PROMPT_VERSION = "v3"  # v3: de-bias — ignore company-specific noise (#5 refinement)
+# v4: seniority signals must be evidence of LEVEL (not duties/perks), domain
+# signals are the industry (not its technologies), and no term may appear in
+# both a skills category and domain. Measured by
+# scripts/eval_derive_profile_from_jd.py — see that module for the baseline.
+PROMPT_VERSION = "v4"
 
 _CACHE_TABLE = "target_derive_jd_cache"
 
@@ -115,8 +119,27 @@ Rules for scoring_profile:
 - "nice_to_have": bonus skills mentioned in passing. Weight each keyword 1.
 - Seniority level: one of "junior", "mid", "senior", "staff", "principal", \
 "director".
-- Domain signals: industry vertical or business context (e.g., "fintech", \
-"b2b-saas", "healthcare").
+- Seniority signals: EVIDENCE OF LEVEL only. Valid: years-of-experience \
+phrases ("5+ years"), and scope / leadership / autonomy markers ("leads a \
+team", "mentors engineers", "sets technical direction", "independent \
+decision-making", "accountable across three teams"). NOT valid: duties, \
+responsibilities, technologies, or perks — "design", "ship", "own services", \
+"debug incidents", "no on-call rotation" describe the job or the workplace, \
+not how senior it is. If the JD gives no evidence of level, return an empty \
+list rather than harvesting verbs from the responsibilities section.
+- Domain signals: the INDUSTRY or business context only (e.g., "fintech", \
+"healthcare", "games", "b2b-saas") — NOT the technologies, standards, \
+protocols or regulations used in that industry. "PCI-DSS", "HL7", "FHIR", \
+"Unreal Engine" and "FedRAMP" are skills; "payments", "healthcare" and \
+"games" are the domain.
+- Every term belongs to exactly ONE section — but it must still appear in \
+that one. Never emit the same term in both a skills category and domain \
+signals (the two feed different scoring axes, so a duplicate is counted \
+twice against the same job), and never resolve that by dropping the term \
+altogether. When a term could plausibly be either, KEEP IT AS A SKILL and \
+leave it out of domain: "PCI-DSS", "ACH", "SEPA", "HL7" and "FedRAMP" stay \
+in a skills category; only the bare industry words ("payments", \
+"healthcare", "public sector") go in domain.
 - Negative keywords: terms that indicate the JD is NOT for this persona \
 (e.g., role is too junior, wrong tech stack entirely).
 - Use canonical skill names (React not reactjs, TypeScript not TS, Node.js \
@@ -209,11 +232,13 @@ async def _get_cached(supabase: Client | AsyncClient, key: str) -> DerivedTarget
             )
         else:
             resp = await asyncio.to_thread(
-                lambda: supabase.table(_CACHE_TABLE)
-                .select("derived_payload")
-                .eq("jd_hash", key)
-                .limit(1)
-                .execute()
+                lambda: (
+                    supabase.table(_CACHE_TABLE)
+                    .select("derived_payload")
+                    .eq("jd_hash", key)
+                    .limit(1)
+                    .execute()
+                )
             )
     except Exception:
         # Cache layer is best-effort — a Supabase outage must not break
@@ -240,9 +265,10 @@ async def _record_cache_hit(supabase: Client | AsyncClient, key: str) -> None:
             # fetch_one, not .single(): the outer try/except made the raise
             # harmless, but it still turned every cache-row miss into a thrown
             # (and swallowed) exception rather than a plain empty read.
-            row = await fetch_one(
-                supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key)
-            ) or {}
+            row = (
+                await fetch_one(supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key))
+                or {}
+            )
             next_count = int(row.get("hit_count", 0)) + 1
             await (
                 supabase.table(_CACHE_TABLE)
@@ -256,10 +282,14 @@ async def _record_cache_hit(supabase: Client | AsyncClient, key: str) -> None:
                 .execute()
             )
         else:
+
             def _bump() -> None:
-                row = fetch_one_sync(
-                    supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key)
-                ) or {}
+                row = (
+                    fetch_one_sync(
+                        supabase.table(_CACHE_TABLE).select("hit_count").eq("jd_hash", key)
+                    )
+                    or {}
+                )
                 next_count = int(row.get("hit_count", 0)) + 1
                 supabase.table(_CACHE_TABLE).update(
                     {
@@ -296,9 +326,9 @@ async def _persist_cache(
             await supabase.table(_CACHE_TABLE).upsert(payload, on_conflict="jd_hash").execute()
         else:
             await asyncio.to_thread(
-                lambda: supabase.table(_CACHE_TABLE)
-                .upsert(payload, on_conflict="jd_hash")
-                .execute()
+                lambda: (
+                    supabase.table(_CACHE_TABLE).upsert(payload, on_conflict="jd_hash").execute()
+                )
             )
     except Exception:
         logger.warning("derive-jd cache write failed", exc_info=True)

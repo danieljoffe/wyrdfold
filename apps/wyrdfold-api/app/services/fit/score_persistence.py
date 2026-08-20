@@ -122,6 +122,7 @@ async def score_with_phase2_and_persist(
             job_title=title,
             jd_text=jd_text,
             extract_logistics=settings.logistics_extraction_enabled,
+            extract_skills=settings.skills_harvest_enabled,
         )
     except Exception:
         logger.exception(
@@ -188,6 +189,22 @@ async def score_with_phase2_and_persist(
         # rather than blowing away historical logistics data.
         if fit.logistics is not None:
             update_payload["logistics_filters"] = fit.logistics.model_dump()
+        # Skills harvest (same omit-when-None contract as logistics). These
+        # are PAIR-level facts feeding the insights aggregation, denormalized
+        # here so it reads ONE table instead of fanning out to jobs (#60-perf).
+        #
+        # The harvest deliberately does NOT write ``jobs.skills_required`` any
+        # more: that column is the SEARCH FACET, and it has exactly one writer
+        # — the skill dictionary (``qualification.skill_dictionary``). Two
+        # writers meant last-write-wins between a canonical vocabulary and the
+        # model's free-form one (which fragmented into 1,757 values, 68%
+        # singletons), so a job's findability would depend on whether it was
+        # graded or re-tagged most recently. The facet stays canonical by
+        # having a single owner; the harvest keeps its pair-level depth here.
+        if fit.skills is not None:
+            update_payload["skills_required"] = fit.skills.skills_required
+            update_payload["skills_matched"] = fit.skills.skills_matched
+            update_payload["skills_missing"] = fit.skills.skills_missing
         # Persist via the async client (#57) or the sync thread (#107) —
         # see ``_apply_scores_update``. Either way the write never stalls the
         # event loop the Phase-2 fan-out runs on.

@@ -8,7 +8,7 @@ Usage:
     cd apps/wyrdfold-api
     zsh -c 'source ~/.zshrc && uv run python scripts/openrouter_smoke.py'
 
-Or, if your env already has OPEN_ROUTER_API_KEY:
+Or, if your env already has OPENROUTER_API_KEY:
     uv run python scripts/openrouter_smoke.py
 """
 
@@ -33,7 +33,7 @@ _TINY_USER = "Confirm you can respond with the schema above."
 
 async def main() -> int:
     api_key = get_api_key()
-    print(f"OPEN_ROUTER_API_KEY loaded ({api_key[:14]}…).\n")
+    print(f"OPENROUTER_API_KEY loaded ({api_key[:14]}…).\n")
 
     failures: list[str] = []
     total_cost = 0.0

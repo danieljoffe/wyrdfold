@@ -23,6 +23,7 @@ import type {
 } from '@/app/(app)/targets/types';
 import { completeOnboarding } from './completeOnboarding';
 import type { JobData } from './JobUrlInput';
+import { useStagedMessage } from './useStagedMessage';
 
 /**
  * Path A's promised payoff: after the from-posting target lands, draft
@@ -34,17 +35,20 @@ import type { JobData } from './JobUrlInput';
  * Any failure — no JD, gap gate, LLM budget, network — returns false and
  * the caller falls back to the normal completion flow: the target is
  * already created, so the user lost nothing but the shortcut.
+ *
+ * The JD is threaded through from the add-job step's manual-add response
+ * rather than re-fetched: ``GET /api/jobs/{id}`` gates on a ``scores``
+ * row existing for one of the caller's targets, and the from-posting
+ * target only gets scores once its background activation runs — so the
+ * fetch 404'd on every fresh onboarding and the payoff never fired.
  */
-async function draftPathAResume(postingId: string): Promise<boolean> {
+async function draftPathAResume(
+  postingId: string,
+  descriptionHtml: string | null
+): Promise<boolean> {
+  const jd = (descriptionHtml ?? '').trim();
+  if (!jd) return false;
   try {
-    const detailRes = await fetch(`/api/jobs/${postingId}`);
-    if (!detailRes.ok) return false;
-    const detail = (await detailRes.json()) as {
-      description_html: string | null;
-    };
-    const jd = (detail.description_html ?? '').trim();
-    if (!jd) return false;
-
     const res = await fetch('/api/jobs/tailor/resume', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -61,19 +65,80 @@ async function draftPathAResume(postingId: string): Promise<boolean> {
   }
 }
 
+const ANALYZE_STAGES = [
+  'Analyzing your experience...',
+  'Matching roles to your background — a few more seconds...',
+] as const;
+
+// Per-tab cache of the last suggestion set (sweep 2026-08-14 A3). The
+// suggest call is a fresh LLM pass — non-deterministic and billed — so a
+// mid-step refresh used to reroll the options: sets shrank or changed
+// entirely, and the user paid another ~20 s wait for the privilege.
+// sessionStorage survives exactly the reload case and dies with the tab;
+// the TTL bounds staleness across a same-tab redo-onboarding run.
+const SUGGESTIONS_CACHE_KEY = 'wyrdfold.onboarding.suggestions';
+const SUGGESTIONS_CACHE_TTL_MS = 30 * 60 * 1000;
+
+interface CachedSuggestions {
+  cachedAt: number;
+  matches: MatchedSuggestion[];
+}
+
+function readSuggestionsCache(): MatchedSuggestion[] | null {
+  try {
+    const raw = sessionStorage.getItem(SUGGESTIONS_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as CachedSuggestions;
+    if (!Array.isArray(parsed.matches) || parsed.matches.length === 0) {
+      return null;
+    }
+    if (Date.now() - parsed.cachedAt > SUGGESTIONS_CACHE_TTL_MS) return null;
+    return parsed.matches;
+  } catch {
+    return null; // corrupt / unavailable storage — treat as no cache
+  }
+}
+
+function writeSuggestionsCache(matches: MatchedSuggestion[]): void {
+  try {
+    sessionStorage.setItem(
+      SUGGESTIONS_CACHE_KEY,
+      JSON.stringify({ cachedAt: Date.now(), matches })
+    );
+  } catch {
+    // Quota / unavailable storage — the cache is best-effort.
+  }
+}
+
+function clearSuggestionsCache(): void {
+  try {
+    sessionStorage.removeItem(SUGGESTIONS_CACHE_KEY);
+  } catch {
+    // Nothing to do — absence is the goal.
+  }
+}
+
 interface TargetSuggestionsProps {
   onComplete: () => void;
   onSkip: () => void;
+  /** Reports how many targets this step actually created/linked, so the
+   *  completion screen can branch its copy on it — a zero-target finish
+   *  must not claim "you're all set" (sweep 2026-08-14 P2). */
+  onTargetsCreated?: (count: number) => void;
   jobData?: JobData | null;
 }
 
 export default function TargetSuggestions({
   onComplete,
   onSkip,
+  onTargetsCreated,
   jobData,
 }: TargetSuggestionsProps) {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
+  // The suggest call runs a full LLM pass over the master doc (~20s
+  // observed); stage the copy so the wait doesn't read as a hang.
+  const analyzeStage = useStagedMessage(ANALYZE_STAGES, loading);
   const [error, setError] = useState<string | null>(null);
   const [createdLabel, setCreatedLabel] = useState<string | null>(null);
   const [draftingResume, setDraftingResume] = useState(false);
@@ -81,6 +146,9 @@ export default function TargetSuggestions({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [creating, setCreating] = useState(false);
   const [createdCount, setCreatedCount] = useState(0);
+  // Bumped by "Refresh suggestions" — a deliberate reroll that bypasses
+  // (and replaces) the per-tab cache.
+  const [refreshNonce, setRefreshNonce] = useState(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -93,6 +161,7 @@ export default function TargetSuggestions({
   useEffect(() => {
     if (!jobData) return;
     const postingId = jobData.postingId;
+    const descriptionHtml = jobData.descriptionHtml;
     let cancelled = false;
 
     async function createFromPosting() {
@@ -114,6 +183,10 @@ export default function TargetSuggestions({
         const data = (await res.json()) as { id: string; label: string };
         if (!cancelled) {
           setCreatedLabel(data.label);
+          // The from-posting target exists regardless of whether the
+          // resume shortcut below fires — if we fall back to the
+          // completion screen, it should know one target was created.
+          onTargetsCreated?.(1);
           // Kick off the derive → poll → score pipeline so the new
           // target actually has matched jobs by the time the user
           // lands on /dashboard. Path B (suggest) does this after
@@ -124,7 +197,7 @@ export default function TargetSuggestions({
           // this posting and finish on its review page. Fallback on any
           // failure is the pre-existing flow (completion screen).
           setDraftingResume(true);
-          const drafted = await draftPathAResume(postingId);
+          const drafted = await draftPathAResume(postingId, descriptionHtml);
           if (cancelled) return;
           if (drafted) {
             router.push(`/jobs/${postingId}/resume`);
@@ -156,12 +229,25 @@ export default function TargetSuggestions({
     return () => {
       cancelled = true;
     };
-  }, [jobData, onComplete, router]);
+  }, [jobData, onComplete, onTargetsCreated, router]);
 
-  // Paths B/C: fetch suggestions from LLM
+  // Paths B/C: fetch suggestions from LLM (or serve the per-tab cache)
   useEffect(() => {
     if (jobData) return;
     let cancelled = false;
+
+    // A plain (re)mount — most importantly a page refresh mid-step —
+    // reuses the cached set instead of rerolling it. ``refreshNonce > 0``
+    // is a deliberate reroll via "Refresh suggestions" and bypasses.
+    if (refreshNonce === 0) {
+      const cached = readSuggestionsCache();
+      if (cached) {
+        setSuggestions(cached);
+        setSelected(new Set(cached.map(m => m.suggestion.label)));
+        setLoading(false);
+        return;
+      }
+    }
 
     async function fetchSuggestions() {
       try {
@@ -175,6 +261,7 @@ export default function TargetSuggestions({
           setSuggestions(data.matches);
           // Pre-select all suggestions
           setSelected(new Set(data.matches.map(m => m.suggestion.label)));
+          writeSuggestionsCache(data.matches);
         }
       } catch (err) {
         if (!cancelled) {
@@ -199,7 +286,7 @@ export default function TargetSuggestions({
     return () => {
       cancelled = true;
     };
-  }, [jobData]);
+  }, [jobData, refreshNonce]);
 
   const toggleSelection = useCallback((label: string) => {
     setSelected(prev => {
@@ -213,14 +300,32 @@ export default function TargetSuggestions({
     });
   }, []);
 
+  const handleRefreshSuggestions = useCallback(() => {
+    // Deliberate reroll: drop the cached set and re-run the (billed)
+    // suggest pass. The nonce bump re-fires the fetch effect above.
+    clearSuggestionsCache();
+    setError(null);
+    setSuggestions([]);
+    setSelected(new Set());
+    setLoading(true);
+    setRefreshNonce(n => n + 1);
+  }, []);
+
   const handleCreateSelected = useCallback(async () => {
+    // Either exit consumes the offer — a later wizard run should get a
+    // fresh set, not this tab's leftovers.
+    clearSuggestionsCache();
     if (selected.size === 0) {
       onComplete();
       return;
     }
 
     setCreating(true);
+    // Clear any banner from an earlier step/attempt so an error can never
+    // outlive the action that caused it (#857).
+    setError(null);
     let created = 0;
+    const failures: string[] = [];
 
     for (const match of suggestions) {
       if (!selected.has(match.suggestion.label)) continue;
@@ -231,9 +336,14 @@ export default function TargetSuggestions({
           // Bare create, NOT from-manual: these suggestions already went
           // through LLM matching in ``/targets/suggest`` — re-running the
           // create-or-link endpoint would repeat that call per target.
+          // Label only — the suggestion's description is résumé-informed
+          // ("…given your work at <employer>") and `targets` is the SHARED
+          // catalog, readable by every co-follower and outliving the author's
+          // account (#868). Activation fills `description` with the
+          // role-generic form derived from the label alone. The rationale
+          // still shows on the card above; it just stops being persisted.
           const createdTarget = await createBareTarget({
             label: match.suggestion.label,
-            description: match.suggestion.description,
           });
           targetId = createdTarget.id;
         } else {
@@ -248,15 +358,41 @@ export default function TargetSuggestions({
         // because the wizard only ran create+link, so no jobs got polled
         // until the user manually clicked Activate on /targets.
         activateTargetInBackground(targetId);
-      } catch {
-        // Continue creating remaining targets
+      } catch (err) {
+        // Keep going so one refusal doesn't strand the rest — but do NOT
+        // discard the reason. Both helpers already throw the API's own
+        // message via ``extractApiError``, and the two that actually happen
+        // here are actionable: a 409 for the active-target cap ("you're on
+        // Starter, which allows 2") and a 402 for an exhausted or expired
+        // trial. Swallowing them is what let the wizard advance to "You're
+        // all set!" after refusing the user's request (#857, #864).
+        failures.push(err instanceof Error ? err.message.trim() : '');
       }
     }
 
     setCreatedCount(created);
+    onTargetsCreated?.(created);
     setCreating(false);
+
+    if (failures.length > 0) {
+      const reason = failures.find(Boolean) ?? '';
+      if (created === 0) {
+        // Nothing was created — do NOT advance. The completion screen would
+        // read as "you chose not to add a target" when in fact we refused.
+        setError(
+          reason || 'We couldn’t create your targets. Please try again.'
+        );
+        return;
+      }
+      // Partial success: say plainly what landed and what didn't, then let
+      // the wizard finish — the targets that were created are real.
+      setError(
+        `Created ${created} of ${selected.size} targets.${reason ? ` ${reason}` : ''}`
+      );
+    }
+
     timerRef.current = setTimeout(onComplete, 1500);
-  }, [selected, suggestions, onComplete]);
+  }, [selected, suggestions, onComplete, onTargetsCreated]);
 
   // Path A: auto-creation in progress or completed
   if (jobData) {
@@ -308,7 +444,7 @@ export default function TargetSuggestions({
       <div className='flex flex-col items-center gap-4 py-12'>
         <Spinner size='lg' aria-label='Loading suggestions' />
         <Text variant='body' className='text-text-secondary'>
-          Analyzing your experience...
+          {analyzeStage}
         </Text>
       </div>
     );
@@ -443,15 +579,27 @@ export default function TargetSuggestions({
         {error && <Alert variant='error'>{error}</Alert>}
 
         <div className='flex items-center justify-between'>
-          <Button
-            name='onboarding-skip-targets'
-            variant='bare'
-            className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
-            size='sm'
-            onClick={onSkip}
-          >
-            Skip for now
-          </Button>
+          <div className='flex items-center gap-2'>
+            <Button
+              name='onboarding-skip-targets'
+              variant='bare'
+              className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
+              size='sm'
+              onClick={onSkip}
+            >
+              Skip this step
+            </Button>
+            <Button
+              name='onboarding-refresh-suggestions'
+              variant='bare'
+              className='text-text-tertiary hover:bg-surface-elevated hover:text-text-primary'
+              size='sm'
+              onClick={handleRefreshSuggestions}
+              disabled={creating}
+            >
+              Refresh suggestions
+            </Button>
+          </div>
           <Button
             name='onboarding-create-targets'
             variant='primary'
@@ -529,7 +677,7 @@ export default function TargetSuggestions({
           size='sm'
           onClick={onSkip}
         >
-          Skip for now
+          Skip this step
         </Button>
       </div>
     </div>

@@ -14,19 +14,23 @@ import LinkButton from '@/components/kit/LinkButton';
 import ConfirmModal from '@/components/ConfirmModal';
 import ScoreBadge from '@/components/ScoreBadge';
 import { LocalDate } from '@/components/LocalFormat';
+import { formatCompanyName } from '@/lib/formatCompanyName';
 import { cn } from '@/lib/cn';
+import { displayTitle } from '@/lib/displayTitle';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import CoverLetterSection from './CoverLetterSection';
-import { useJobDelete } from './useJobDelete';
+import { useJobRemove } from './useJobRemove';
 import JobFeedbackSection from './JobFeedbackSection';
 import LogisticsChips from './LogisticsChips';
 import ResumeSection from './ResumeSection';
 import StatusIndicator from './StatusIndicator';
 import {
   formatStatus,
+  isSkipRecommendation,
   JOB_STATUSES,
   STATUS_DOT_CLASS,
+  freshnessAnchorAt,
   type AnalysisStatus,
   type JobAnalysis,
   type JobPosting,
@@ -77,12 +81,12 @@ function formatFactor(key: string): string {
   return SCORE_FACTOR_LABEL[key] ?? key.replace(/_/g, ' ');
 }
 
-/** Fixed render order — the four fit axes whose average IS the score (#609). */
+/** Fixed render order — the four axes whose average IS the match score (#609). */
 const FIT_AXES: ReadonlyArray<[key: string, label: string]> = [
-  ['title_fit', 'Title fit'],
-  ['skills_fit', 'Skills fit'],
-  ['seniority_fit', 'Seniority fit'],
-  ['domain_fit', 'Domain fit'],
+  ['title_fit', 'Title match'],
+  ['skills_fit', 'Skills match'],
+  ['seniority_fit', 'Seniority match'],
+  ['domain_fit', 'Domain match'],
 ];
 
 /**
@@ -94,7 +98,7 @@ const FIT_AXES: ReadonlyArray<[key: string, label: string]> = [
 function FitAxisList({ axes }: { axes: Record<string, number> }) {
   const known = FIT_AXES.filter(([key]) => typeof axes[key] === 'number');
   if (known.length === 0) {
-    return <Text variant='meta'>No fit axes recorded for this grade</Text>;
+    return <Text variant='meta'>No match axes recorded for this grade</Text>;
   }
   return (
     <ul className='flex flex-col gap-2'>
@@ -123,51 +127,137 @@ function FitAxisList({ axes }: { axes: Record<string, number> }) {
 
 function ScoreBreakdownList({
   breakdown,
+  rawScore,
+  displayedScore,
+  postedAtIso,
 }: {
   breakdown: Record<string, number>;
+  /** Undecayed fit. Absent on responses predating #665's projection. */
+  rawScore: number | null | undefined;
+  /** What the card actually shows — fit × freshness. */
+  displayedScore: number;
+  /** The date the SERVER decayed this score against — the provider's date
+   * when known, else our catalog date. Deliberately not the (nullable)
+   * Posted column value: the age shown here has to explain the number on the
+   * card, and the server always has an anchor even when the ATS gave none. */
+  postedAtIso: string;
 }) {
-  const entries = Object.entries(breakdown).filter(([, v]) => v !== 0);
+  // #650: the old list rendered RAW keyword points and hid zeros, so "+80"
+  // and "+4" sat under a headline of 60 with no stated relationship. Two
+  // different unit changes separate those numbers:
+  //   components (raw points) → fit% (÷ this target's max) → × freshness
+  // Show the whole chain so the panel reconciles to the number on the card.
+  const entries = Object.entries(breakdown);
   if (entries.length === 0) {
     return <Text variant='meta'>No factors contributed to this score</Text>;
   }
-  const max = Math.max(...entries.map(([, v]) => Math.abs(v)));
+
+  const rawTotal = entries.reduce((sum, [, v]) => sum + v, 0);
+  // Apportion the fit score across components by their share of the raw
+  // total. Derived from the two numbers we already have rather than
+  // re-deriving the normalizer client-side — the server owns that formula.
+  const canApportion =
+    typeof rawScore === 'number' && rawScore > 0 && rawTotal > 0;
+  const shareOf = (value: number) =>
+    canApportion ? (value / rawTotal) * rawScore : value;
+
+  // The freshness multiplier is OBSERVABLE (displayed ÷ fit), so the decay
+  // formula is never duplicated here — if the server changes it, this follows.
+  const freshness =
+    typeof rawScore === 'number' && rawScore > 0
+      ? displayedScore / rawScore
+      : 1;
+  const ageDays = Math.max(
+    0,
+    Math.round((Date.now() - new Date(postedAtIso).getTime()) / 86_400_000)
+  );
+
+  // Bars are a share of the FIT total, not of the largest entry — the old
+  // max-of-present scale made the biggest component full-width by definition,
+  // implying a denominator that did not exist.
+  const barBase = canApportion
+    ? rawScore
+    : Math.max(...entries.map(([, v]) => Math.abs(v)));
+
   return (
-    <ul className='flex flex-col gap-2'>
-      {entries.map(([key, value]) => {
-        const pct = max === 0 ? 0 : (Math.abs(value) / max) * 100;
-        const positive = value > 0;
-        const display = Number.isInteger(value)
-          ? value
-          : Number(value.toFixed(1));
-        return (
-          <li key={key} className='flex flex-col gap-1'>
-            <div className='flex items-baseline justify-between gap-3'>
-              <span className='text-sm text-text-primary'>
-                {formatFactor(key)}
-              </span>
-              <span
-                className={cn(
-                  'text-xs font-medium tabular-nums shrink-0',
-                  positive ? 'text-success' : 'text-error'
-                )}
-              >
-                {positive ? '+' : ''}
-                {display}
-              </span>
-            </div>
-            <div className='h-1.5 w-full overflow-hidden rounded-full bg-surface-elevated'>
-              <div
-                className={cn(
-                  'h-full rounded-full',
-                  positive ? 'bg-success' : 'bg-error/70'
-                )}
-                style={{ width: `${pct}%` }}
-              />
-            </div>
-          </li>
-        );
-      })}
-    </ul>
+    <div className='flex flex-col gap-2'>
+      <ul className='flex flex-col gap-2'>
+        {entries.map(([key, value]) => {
+          const shown = shareOf(value);
+          const pct =
+            barBase === 0
+              ? 0
+              : Math.min(100, (Math.abs(shown) / barBase) * 100);
+          const positive = shown > 0;
+          const display = Number.isInteger(shown)
+            ? shown
+            : Number(shown.toFixed(1));
+          return (
+            <li key={key} className='flex flex-col gap-1'>
+              <div className='flex items-baseline justify-between gap-3'>
+                <span
+                  className={cn(
+                    'text-sm',
+                    // A zero component is the most actionable signal on the
+                    // card ("domain skills scored nothing") — it is shown, but
+                    // muted so it does not compete with what did contribute.
+                    shown === 0 ? 'text-text-tertiary' : 'text-text-primary'
+                  )}
+                >
+                  {formatFactor(key)}
+                </span>
+                <span
+                  className={cn(
+                    'shrink-0 text-xs font-medium tabular-nums',
+                    shown === 0
+                      ? 'text-text-tertiary'
+                      : positive
+                        ? 'text-text-secondary'
+                        : 'text-error'
+                  )}
+                >
+                  {display}
+                </span>
+              </div>
+              <div className='h-1.5 w-full rounded bg-surface-tertiary'>
+                <div
+                  className={cn(
+                    'h-1.5 rounded',
+                    positive ? 'bg-brand-500' : 'bg-error'
+                  )}
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+
+      {canApportion && (
+        <dl className='flex flex-col gap-1 border-t border-border pt-2 text-xs'>
+          <div className='flex items-baseline justify-between gap-3'>
+            <dt className='text-text-secondary'>Match against this target</dt>
+            <dd className='tabular-nums font-medium text-text-primary'>
+              {rawScore}
+            </dd>
+          </div>
+          <div className='flex items-baseline justify-between gap-3'>
+            <dt className='text-text-tertiary'>
+              Freshness{ageDays > 0 ? ` (posted ${ageDays}d ago)` : ''}
+            </dt>
+            <dd className='tabular-nums text-text-tertiary'>
+              ×{freshness.toFixed(2)}
+            </dd>
+          </div>
+          <div className='flex items-baseline justify-between gap-3 border-t border-border pt-1'>
+            <dt className='text-text-secondary'>Score shown</dt>
+            <dd className='tabular-nums font-medium text-text-primary'>
+              {displayedScore}
+            </dd>
+          </div>
+        </dl>
+      )}
+    </div>
   );
 }
 
@@ -183,9 +273,19 @@ export default function JobDetailPanel({
 }: JobDetailPanelProps) {
   const [status, setStatus] = useState(posting.status);
   const [updating, setUpdating] = useState(false);
-  const { deleteJob, deleting } = useJobDelete();
+  const { removeJob, removing: deleting } = useJobRemove();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [analysis, setAnalysis] = useState<JobAnalysis | null>(null);
+  // Only set when the analysis has actually run AND advises skipping. The
+  // tailor buttons use it to confirm before a billed generation — an
+  // un-analyzed job stays frictionless.
+  const skipReason = isSkipRecommendation(analysis?.recommendation)
+    ? analysis?.recommendation
+    : undefined;
+  // Whether the spend-free open probe (#634) has resolved. Gates the
+  // "Analyze fit" button so it doesn't flash on jobs whose cached
+  // scorecard is about to render.
+  const [cacheChecked, setCacheChecked] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzingStartedAt, setAnalyzingStartedAt] = useState<number | null>(
     null
@@ -277,153 +377,221 @@ export default function JobDetailPanel({
     return () => window.clearInterval(id);
   }, [analyzing, analyzingStartedAt]);
 
-  const runAnalysis = useCallback(async () => {
-    if (!targetId) return;
-    // Supersede any prior loop and mark this one active.
-    const token = {};
-    activeRunRef.current = token;
-    const alive = () => activeRunRef.current === token;
+  const runAnalysis = useCallback(
+    async (kick = true) => {
+      if (!targetId) return;
+      // Supersede any prior loop and mark this one active.
+      const token = {};
+      activeRunRef.current = token;
+      const alive = () => activeRunRef.current === token;
 
-    const url = `/api/jobs/analysis/${posting.id}?target_id=${encodeURIComponent(targetId)}`;
+      const url = `/api/jobs/analysis/${posting.id}?target_id=${encodeURIComponent(targetId)}`;
 
-    // A finished analysis record → render it + tell the parent to refetch.
-    // The backend blended the LLM score into the per-target ``scores`` row and
-    // flipped ``scoring_status`` to ``complete``, so the stale ``posting`` prop
-    // (keyword-only score) needs a re-GET to refresh the badge + breakdown.
-    const applyRecord = (record: JobAnalysis) => {
-      setAnalysis(record);
-      onAnalysisComplete?.();
-    };
+      // A finished analysis record → render it + tell the parent to refetch.
+      // The backend blended the LLM score into the per-target ``scores`` row and
+      // flipped ``scoring_status`` to ``complete``, so the stale ``posting`` prop
+      // (keyword-only score) needs a re-GET to refresh the badge + breakdown.
+      const applyRecord = (record: JobAnalysis) => {
+        setAnalysis(record);
+        onAnalysisComplete?.();
+      };
 
-    setAnalyzing(true);
-    setAnalyzingStartedAt(Date.now());
-    setAnalysisError(null);
-    setNeedsProfile(false);
-    try {
-      // Kick off (or fetch a cached) analysis. Non-blocking (#459): a cache
-      // miss returns 202 ``{status:"running"}`` and the LLM runs server-side in
-      // a detached task, so this POST returns in well under a second.
-      const res = await fetch(url, { method: 'POST' });
-      if (!alive()) return;
-      if (!res.ok) {
-        // ``no description`` (422) is a data gap, not a transient failure;
-        // everything else routes through extractApiError (which understands
-        // the structured ``llm_budget_exceeded`` 429).
-        const message = await extractApiError(res, 'Analysis failed');
-        if (alive()) {
-          setAnalysisError(
-            res.status === 422 && /no description/i.test(message)
-              ? 'Analysis skipped — this job posting has no description text.'
-              : message
-          );
-        }
-        return;
-      }
-
-      const kicked = (await res.json()) as
-        JobAnalysis | AnalysisStatus | { code?: string };
-      if (!alive()) return;
-
-      // ``no_profile`` is a setup state, not a failure — render the CTA (below)
-      // rather than a red error + doomed retry. (#105)
-      if ((kicked as { code?: string }).code === 'no_profile') {
-        setNeedsProfile(true);
-        return;
-      }
-      // Cache hit: the record came straight back — no polling needed.
-      if ('id' in kicked) {
-        applyRecord(kicked as JobAnalysis);
-        return;
-      }
-      // A run was already failed server-side (rare on a kick) — surface it.
-      if ((kicked as AnalysisStatus).status === 'error') {
-        setAnalysisError(
-          (kicked as AnalysisStatus).message ?? 'Analysis failed. Please retry.'
+      setAnalyzing(true);
+      setAnalyzingStartedAt(Date.now());
+      setAnalysisError(null);
+      setNeedsProfile(false);
+      try {
+        // ``kick`` (the default) is explicit user intent: POST kicks off (or
+        // fetches a cached) analysis. Non-blocking (#459): a cache miss returns
+        // 202 ``{status:"running"}`` and the LLM runs server-side in a detached
+        // task, so this POST returns in well under a second. ``kick=false`` is
+        // the spend-free open probe (#634) attaching to a run that is ALREADY
+        // in flight — a GET, so opening a panel can never buy an LLM call.
+        const res = await fetch(
+          url,
+          kick ? { method: 'POST' } : { method: 'GET' }
         );
-        return;
-      }
-
-      // Otherwise it's ``running``: poll GET until the analysis lands. The work
-      // continues + persists on the server regardless of this loop, so if the
-      // user navigates away (``alive()`` → false) nothing is lost — reopening
-      // the job hits the cache.
-      let reKicked = false;
-      for (let attempt = 0; attempt < ANALYSIS_MAX_POLLS; attempt += 1) {
-        await delay(ANALYSIS_POLL_INTERVAL_MS);
         if (!alive()) return;
-
-        const poll = await fetch(url, { method: 'GET' });
-        if (!alive()) return;
-        if (!poll.ok) {
-          setAnalysisError(await extractApiError(poll, 'Analysis failed'));
+        if (!res.ok) {
+          // ``no description`` (422) is a data gap, not a transient failure;
+          // everything else routes through extractApiError (which understands
+          // the structured ``llm_budget_exceeded`` 429).
+          const message = await extractApiError(res, 'Analysis failed');
+          if (alive()) {
+            setAnalysisError(
+              res.status === 422 && /no description/i.test(message)
+                ? 'Analysis skipped — this job posting has no description text.'
+                : message
+            );
+          }
           return;
         }
-        const data = (await poll.json()) as
+
+        const kicked = (await res.json()) as
           JobAnalysis | AnalysisStatus | { code?: string };
         if (!alive()) return;
 
+        // ``no_profile`` is a setup state, not a failure — render the CTA (below)
+        // rather than a red error + doomed retry. (#105)
+        if ((kicked as { code?: string }).code === 'no_profile') {
+          setNeedsProfile(true);
+          return;
+        }
+        // Cache hit: the record came straight back — no polling needed.
+        if ('id' in kicked) {
+          applyRecord(kicked as JobAnalysis);
+          return;
+        }
+        // A run was already failed server-side (rare on a kick) — surface it.
+        if ((kicked as AnalysisStatus).status === 'error') {
+          setAnalysisError(
+            (kicked as AnalysisStatus).message ??
+              'Analysis failed. Please retry.'
+          );
+          return;
+        }
+
+        // Otherwise it's ``running``: poll GET until the analysis lands. The work
+        // continues + persists on the server regardless of this loop, so if the
+        // user navigates away (``alive()`` → false) nothing is lost — reopening
+        // the job hits the cache.
+        //
+        // Attach mode (kick=false) starts with its re-kick already spent: if the
+        // watched run dies server-side, the panel hands back to the explicit
+        // retry button rather than paying for a run the user never asked for.
+        let reKicked = !kick;
+        for (let attempt = 0; attempt < ANALYSIS_MAX_POLLS; attempt += 1) {
+          await delay(ANALYSIS_POLL_INTERVAL_MS);
+          if (!alive()) return;
+
+          const poll = await fetch(url, { method: 'GET' });
+          if (!alive()) return;
+          if (!poll.ok) {
+            setAnalysisError(await extractApiError(poll, 'Analysis failed'));
+            return;
+          }
+          const data = (await poll.json()) as
+            JobAnalysis | AnalysisStatus | { code?: string };
+          if (!alive()) return;
+
+          if ((data as { code?: string }).code === 'no_profile') {
+            setNeedsProfile(true);
+            return;
+          }
+          if ('id' in data) {
+            applyRecord(data as JobAnalysis);
+            return;
+          }
+          const status = (data as AnalysisStatus).status;
+          if (status === 'error') {
+            setAnalysisError(
+              (data as AnalysisStatus).message ??
+                'Analysis failed. Please retry.'
+            );
+            return;
+          }
+          if (status === 'idle') {
+            // The server dropped the run (e.g. a deploy restarted the API
+            // mid-analysis). Re-kick once; if it happens again, hand back to a
+            // manual retry rather than looping forever.
+            if (reKicked) {
+              setAnalysisError('Analysis was interrupted. Please retry.');
+              return;
+            }
+            reKicked = true;
+            await fetch(url, { method: 'POST' });
+            continue;
+          }
+          // ``running`` → keep polling.
+        }
+        // Ran out of poll attempts without a result.
+        if (alive()) {
+          setAnalysisError(
+            'Analysis is taking longer than expected. Please retry.'
+          );
+        }
+      } catch {
+        if (alive()) setAnalysisError('Network error running analysis.');
+      } finally {
+        if (alive()) {
+          setAnalyzing(false);
+          setAnalyzingStartedAt(null);
+        }
+      }
+    },
+    [posting.id, targetId, onAnalysisComplete]
+  );
+
+  // Keep the latest runAnalysis reachable from the probe effect below without
+  // widening that effect's deps: runAnalysis's identity churns with the
+  // parent's ``onAnalysisComplete`` callback, and a probe keyed on it would
+  // reset + re-GET on every parent render instead of once per (job, target).
+  const runAnalysisRef = useRef(runAnalysis);
+  useEffect(() => {
+    runAnalysisRef.current = runAnalysis;
+  });
+
+  // Spend-free open (#634): opening the panel only READS. A cached record
+  // renders instantly; a run already in flight (kicked earlier, possibly from
+  // another surface) is attached to; a cache miss leaves the explicit
+  // "Analyze fit" button. The auto-kick this replaces bought a ~$0.04 LLM run
+  // plus a ~30s wait on every first open of a (job, target, version) with no
+  // user intent — browsing must cost nothing until the user asks.
+  useEffect(() => {
+    if (!targetId) return;
+    // New (job, target) identity — clear the previous one's states.
+    setAnalysis(null);
+    setAnalysisError(null);
+    setNeedsProfile(false);
+    setCacheChecked(false);
+    const token = {};
+    activeRunRef.current = token;
+    const alive = () => activeRunRef.current === token;
+    const url = `/api/jobs/analysis/${posting.id}?target_id=${encodeURIComponent(targetId)}`;
+    void (async () => {
+      try {
+        const res = await fetch(url, { method: 'GET' });
+        // A failed read-only probe just leaves the button — opening the
+        // panel must never surface an error the user didn't cause.
+        if (!alive() || !res.ok) return;
+        const data = (await res.json()) as
+          JobAnalysis | AnalysisStatus | { code?: string };
+        if (!alive()) return;
         if ((data as { code?: string }).code === 'no_profile') {
           setNeedsProfile(true);
           return;
         }
         if ('id' in data) {
-          applyRecord(data as JobAnalysis);
+          // Cached record: render WITHOUT onAnalysisComplete — the score
+          // blend happened on the run that produced it, so refetching the
+          // posting on every open would be a wasted round-trip.
+          setAnalysis(data as JobAnalysis);
           return;
         }
         const status = (data as AnalysisStatus).status;
+        if (status === 'running') {
+          // Already paid for and in flight — attach; never POST from here.
+          setCacheChecked(true);
+          void runAnalysisRef.current(false);
+          return;
+        }
         if (status === 'error') {
+          // A prior run failed server-side: surface it with the retry button.
           setAnalysisError(
             (data as AnalysisStatus).message ?? 'Analysis failed. Please retry.'
           );
-          return;
         }
-        if (status === 'idle') {
-          // The server dropped the run (e.g. a deploy restarted the API
-          // mid-analysis). Re-kick once; if it happens again, hand back to a
-          // manual retry rather than looping forever.
-          if (reKicked) {
-            setAnalysisError('Analysis was interrupted. Please retry.');
-            return;
-          }
-          reKicked = true;
-          await fetch(url, { method: 'POST' });
-          continue;
-        }
-        // ``running`` → keep polling.
+        // ``idle`` → nothing cached, nothing running: the Analyze button.
+      } catch {
+        // Network error on the read-only probe → the button.
+      } finally {
+        if (alive()) setCacheChecked(true);
       }
-      // Ran out of poll attempts without a result.
-      if (alive()) {
-        setAnalysisError(
-          'Analysis is taking longer than expected. Please retry.'
-        );
-      }
-    } catch {
-      if (alive()) setAnalysisError('Network error running analysis.');
-    } finally {
-      if (alive()) {
-        setAnalyzing(false);
-        setAnalyzingStartedAt(null);
-      }
-    }
-  }, [posting.id, targetId, onAnalysisComplete]);
-
-  // Auto-trigger analysis on first open when a target is selected.
-  // Cache hit returns instantly; cache miss runs the LLM exactly once
-  // per (job, target, optimized version).
-  useEffect(() => {
-    if (
-      targetId &&
-      !analysis &&
-      !analyzing &&
-      !analysisError &&
-      !needsProfile
-    ) {
-      runAnalysis();
-    }
-  }, [targetId, analysis, analyzing, analysisError, needsProfile, runAnalysis]);
+    })();
+  }, [posting.id, targetId]);
 
   async function handleDelete() {
-    if (await deleteJob(posting.id)) {
+    if (await removeJob(posting.id, targetId)) {
       setConfirmDeleteOpen(false);
       onDelete?.();
     }
@@ -551,11 +719,25 @@ export default function JobDetailPanel({
             keep all their generate/review/view state internally. */}
         {targetId && (
           <>
-            <ResumeSection jobPostingId={posting.id} />
+            <ResumeSection
+              jobPostingId={posting.id}
+              skipReason={skipReason}
+              onDrafted={() => {
+                // Mirror the server's mark_job_resume_draft so the pill
+                // doesn't show "New" until a reload (§B7). Forward-only:
+                // never demote a job the user already advanced.
+                if (status === 'new' || status === 'saved') {
+                  setStatus('resume_draft');
+                  onStatusChange?.('resume_draft');
+                  fetchHistory();
+                }
+              }}
+            />
             <CoverLetterSection
               jobPostingId={posting.id}
-              companyName={posting.company_name}
-              roleTitle={posting.title}
+              companyName={formatCompanyName(posting.company_name)}
+              roleTitle={displayTitle(posting)}
+              skipReason={skipReason}
             />
           </>
         )}
@@ -596,7 +778,7 @@ export default function JobDetailPanel({
             }
             items={[
               {
-                label: deleting ? 'Deleting…' : 'Delete',
+                label: deleting ? 'Removing…' : 'Remove',
                 danger: true,
                 disabled: deleting,
                 onClick: () => setConfirmDeleteOpen(true),
@@ -616,12 +798,12 @@ export default function JobDetailPanel({
         isOpen={confirmDeleteOpen}
         onClose={() => setConfirmDeleteOpen(false)}
         onConfirm={handleDelete}
-        title='Delete posting?'
-        message={`Delete "${posting.title}" from ${posting.company_name}? This can't be undone.`}
-        confirmLabel='Delete'
+        title='Remove posting?'
+        message={`Remove "${displayTitle(posting)}" from ${posting.company_name}? It will stop appearing in this target. You can undo this.`}
+        confirmLabel='Remove'
         destructive
         loading={deleting}
-        loadingLabel='Deleting…'
+        loadingLabel='Removing…'
       />
 
       {/* Two-column main body: Score Breakdown on the left, LLM Analysis on
@@ -636,14 +818,19 @@ export default function JobDetailPanel({
             keyword components can never explain an axis-blend number. */}
         <div>
           <Text variant='caption' className='mb-2'>
-            Score Breakdown
+            Score breakdown
           </Text>
           {axes && Object.keys(axes).length > 0 ? (
             <FitAxisList axes={axes} />
           ) : axesPending ? (
             <Skeleton variant='text' lines={3} />
           ) : breakdown ? (
-            <ScoreBreakdownList breakdown={breakdown} />
+            <ScoreBreakdownList
+              breakdown={breakdown}
+              rawScore={posting.raw_score}
+              displayedScore={posting.score}
+              postedAtIso={freshnessAnchorAt(posting)}
+            />
           ) : (
             <Skeleton variant='text' lines={3} />
           )}
@@ -656,14 +843,14 @@ export default function JobDetailPanel({
         {targetId && (
           <div>
             <div className='mb-1 flex items-center gap-2'>
-              <Text variant='caption'>LLM Analysis</Text>
+              <Text variant='caption'>Match analysis</Text>
               {analyzing && (
                 <span
                   className='inline-flex items-center gap-1.5'
                   role='status'
                   aria-live='polite'
                 >
-                  <Spinner size='sm' aria-label='Running LLM analysis' />
+                  <Spinner size='sm' aria-label='Running match analysis' />
                   <Text variant='meta'>Running… {analyzingElapsedS}s</Text>
                 </span>
               )}
@@ -740,20 +927,30 @@ export default function JobDetailPanel({
                   Set up your profile →
                 </Link>
               </div>
+            ) : !cacheChecked ? (
+              // The sub-second cache probe is still in flight — don't flash
+              // the Analyze button at a job whose cached scorecard is about
+              // to render.
+              <div className='h-4 w-3/4 rounded-xs bg-surface-elevated animate-pulse motion-reduce:animate-none' />
             ) : (
-              <div>
-                {analysisError && (
-                  <Text variant='error' className='mb-2'>
-                    {analysisError}
+              // Spend-free open (#634): nothing cached — analysis runs only
+              // on this explicit click, never as a side effect of browsing.
+              <div className='space-y-2'>
+                {analysisError ? (
+                  <Text variant='error'>{analysisError}</Text>
+                ) : (
+                  <Text variant='body' className='text-text-secondary'>
+                    See how you match this job on skills, seniority and domain,
+                    graded against your experience profile.
                   </Text>
                 )}
                 <Button
                   name='analyze-job'
                   variant='secondary'
                   size='sm'
-                  onClick={runAnalysis}
+                  onClick={() => void runAnalysis()}
                 >
-                  Retry analysis
+                  {analysisError ? 'Retry analysis' : 'Analyze match'}
                 </Button>
               </div>
             )}

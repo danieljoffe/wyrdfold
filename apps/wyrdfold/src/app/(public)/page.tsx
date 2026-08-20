@@ -14,6 +14,7 @@ import { Text } from '@danieljoffe/shared-ui/Text';
 import LinkButton from '@/components/kit/LinkButton';
 import WaitlistForm from './WaitlistForm';
 import { deploymentMode } from '@/lib/deployment';
+import { readSignupMode } from '@/lib/api/signupMode';
 
 const HERO_SUBTITLE =
   'Job hunting has become a second job — endless boards, postings you miss, your resume rewritten for the 40th time. WyrdFold runs the search for you: relevant roles and ready-to-send, tailored applications, delivered while you get on with your life.';
@@ -104,33 +105,13 @@ const STEPS: Step[] = [
   },
 ];
 
-// Phase 3 slice 5: whether public signup is open (the operator switch,
-// read through the backend's fail-safe probe). Every degraded state —
-// missing env, backend down, junk payload — is 'closed', so the homepage
-// can never advertise signup the perimeter would refuse. Short revalidate:
-// perimeter flips are rare and a minute of staleness is fine.
-async function signupMode(): Promise<'open' | 'closed'> {
-  const baseUrl = process.env['WYRDFOLD_API_URL'];
-  if (!baseUrl) return 'closed';
-  try {
-    const res = await fetch(`${baseUrl}/signup-mode`, {
-      next: { revalidate: 60 },
-    });
-    if (!res.ok) return 'closed';
-    const data = (await res.json()) as { mode?: string };
-    return data.mode === 'open' ? 'open' : 'closed';
-  } catch {
-    return 'closed';
-  }
-}
-
 export default async function WyrdfoldLandingPage() {
   // Phase 2 (deployment modes): self_host drops the waitlist funnel for a
   // direct sign-in CTA — a self-hosted instance has no waitlist. saas keeps
   // the hosted funnel. Phase 3 slice 5 adds the third state: open-saas
   // swaps the waitlist for a sign-up CTA once the operator flips signup.
   const mode = deploymentMode();
-  const signupOpen = mode === 'saas' && (await signupMode()) === 'open';
+  const signupOpen = mode === 'saas' && (await readSignupMode()) === 'open';
   return (
     <div className='mx-auto w-full max-w-6xl px-4 md:px-6'>
       {/*

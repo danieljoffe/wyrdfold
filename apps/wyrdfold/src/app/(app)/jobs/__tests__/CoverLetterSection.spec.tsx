@@ -186,4 +186,91 @@ describe('CoverLetterSection', () => {
       );
     });
   });
+
+  /**
+   * The skip-confirm click IS the user's "I know it's a reach, write it
+   * anyway" — the API's ``allow_stretch`` exists precisely so the model does
+   * not decline on their behalf and bill them for the refusal. The flag was
+   * added API-side first and would have shipped inert: nothing in the FE sent
+   * it, and no test could tell.
+   */
+  function mockGenerateFlow(captured: { body?: Record<string, unknown> }) {
+    let n = 0;
+    global.fetch = jest
+      .fn()
+      .mockImplementation((url: string, init?: RequestInit) => {
+        n += 1;
+        if (n === 1) {
+          // Initial poll — no existing record.
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({ record: null, status: 'idle' }),
+          });
+        }
+        if (String(url).includes('/api/jobs/j-1') && !init?.method) {
+          // loadJobDescription
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({ description_html: 'Senior UX Designer JD' }),
+          });
+        }
+        captured.body = JSON.parse(String(init?.body ?? '{}'));
+        return Promise.resolve({
+          ok: true,
+          status: 202,
+          json: async () => ({}),
+        });
+      }) as unknown as typeof fetch;
+  }
+
+  it('sends allow_stretch when the user confirms past the skip warning', async () => {
+    const captured: { body?: Record<string, unknown> } = {};
+    mockGenerateFlow(captured);
+
+    const user = userEvent.setup();
+    render(
+      <CoverLetterSection
+        jobPostingId='j-1'
+        companyName='Acme'
+        roleTitle='Senior UX Designer'
+        skipReason='Skip — no product design experience.'
+      />
+    );
+
+    await user.click(
+      await screen.findByRole('button', { name: /generate cover letter/i })
+    );
+    // The warning gates the spend; confirming is the explicit override.
+    await user.click(
+      await screen.findByRole('button', { name: /^generate anyway$/i })
+    );
+
+    await waitFor(() => expect(captured.body).toBeDefined());
+    expect(captured.body).toMatchObject({ allow_stretch: true });
+  });
+
+  it('omits allow_stretch when the job carries no skip recommendation', async () => {
+    const captured: { body?: Record<string, unknown> } = {};
+    mockGenerateFlow(captured);
+
+    const user = userEvent.setup();
+    render(
+      <CoverLetterSection
+        jobPostingId='j-1'
+        companyName='Acme'
+        roleTitle='SWE'
+      />
+    );
+
+    await user.click(
+      await screen.findByRole('button', { name: /generate cover letter/i })
+    );
+
+    await waitFor(() => expect(captured.body).toBeDefined());
+    // A good-fit job must keep the default prompt — the stretch block is an
+    // opt-in, not a global loosening of the refusal behaviour.
+    expect(captured.body).not.toHaveProperty('allow_stretch');
+  });
 });

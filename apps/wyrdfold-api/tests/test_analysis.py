@@ -166,7 +166,9 @@ def _make_supabase_mock(
     )
     # select chain (get_cached uses .eq * 3 → .order → .limit → .is_/.eq → .execute)
     cached_chain = supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value
-    cached_chain.is_.return_value.execute = AsyncMock(return_value=MagicMock(data=select_data or []))
+    cached_chain.is_.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=select_data or [])
+    )
     cached_chain.eq.return_value.execute = AsyncMock(return_value=MagicMock(data=select_data or []))
     return supabase
 
@@ -435,7 +437,9 @@ async def test_router_cache_hit_skips_llm(
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
+    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[
+        get_async_service_supabase
+    ]
 
     try:
         tc = TestClient(app)
@@ -479,7 +483,7 @@ def _analysis_client(
     app.dependency_overrides[get_async_supabase_for_caller] = (
         (lambda: caller) if caller is not None else (lambda: supabase)
     )
-    app.dependency_overrides[get_llm_client] = lambda: (llm if llm is not None else MockLLMClient())
+    app.dependency_overrides[get_llm_client] = lambda: llm if llm is not None else MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     app.dependency_overrides[get_current_user_id_optional] = lambda: user_id
     try:
@@ -510,8 +514,10 @@ def _job_supabase(description_html: str = "We want a React engineer.") -> MagicM
     supabase = MagicMock()
     # #57 slice 3: the jobs read + scores read + blend RPC are awaited on the
     # async client → every .execute must be an AsyncMock.
-    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
-        return_value=MagicMock(data=[{"id": "job-1", "description_html": description_html}])
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(
+            return_value=MagicMock(data=[{"id": "job-1", "description_html": description_html}])
+        )
     )
     # _apply_llm_blend's keyword-score read (.select.eq.eq.limit.execute).
     supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
@@ -820,9 +826,7 @@ def test_check_daily_count_counts_in_flight_runs() -> None:
     ) = 2
 
     # 2 persisted + 0 in-flight < limit 3 → allowed.
-    budget.check_daily_count(
-        supabase, user_id="u", purpose=DEFAULT_PURPOSE, limit=3, in_flight=0
-    )
+    budget.check_daily_count(supabase, user_id="u", purpose=DEFAULT_PURPOSE, limit=3, in_flight=0)
     # 2 persisted + 1 in-flight == limit 3 → 429.
     with pytest.raises(HTTPException) as ei:
         budget.check_daily_count(
@@ -847,7 +851,9 @@ async def test_router_missing_optimized_doc_returns_404(
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
+    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[
+        get_async_service_supabase
+    ]
 
     try:
         tc = TestClient(app)
@@ -876,8 +882,8 @@ async def test_router_empty_description_returns_422(
     monkeypatch.setattr(analysis_router, "_target_get", AsyncMock(return_value=_job_target()))
 
     supabase = MagicMock()
-    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
-        return_value=MagicMock(data=[{"id": "job-1", "description_html": ""}])
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=MagicMock(data=[{"id": "job-1", "description_html": ""}]))
     )
 
     from fastapi.testclient import TestClient
@@ -890,7 +896,9 @@ async def test_router_empty_description_returns_422(
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
+    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[
+        get_async_service_supabase
+    ]
 
     try:
         tc = TestClient(app)
@@ -911,8 +919,8 @@ async def test_router_missing_job_posting_returns_404(
     monkeypatch.setattr(analysis_router, "_target_get", AsyncMock(return_value=_job_target()))
 
     supabase = MagicMock()
-    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = AsyncMock(
-        return_value=MagicMock(data=[])
+    supabase.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=MagicMock(data=[]))
     )
 
     from fastapi.testclient import TestClient
@@ -925,7 +933,9 @@ async def test_router_missing_job_posting_returns_404(
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
+    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[
+        get_async_service_supabase
+    ]
 
     try:
         tc = TestClient(app)
@@ -956,7 +966,9 @@ async def test_router_missing_target_returns_404(
     app.dependency_overrides[get_current_user_id_optional] = lambda: None
     # api-key caller (user_id None): dual-auth resolves the caller client
     # to the same service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[get_async_service_supabase]
+    app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[
+        get_async_service_supabase
+    ]
 
     try:
         tc = TestClient(app)

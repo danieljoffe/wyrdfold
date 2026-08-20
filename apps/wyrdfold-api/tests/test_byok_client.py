@@ -279,3 +279,35 @@ class _FakeSupabase:
     def table(self, name: str) -> _FakeQuery:
         assert name == keys.store.TABLE  # type: ignore[attr-defined]
         return _FakeQuery(self.rows)
+
+
+async def test_get_llm_client_translates_expired_trial_to_a_different_402(
+    monkeypatch: pytest.MonkeyPatch, openrouter_mode: None
+) -> None:
+    """Both refusals are 402, but they must not say the same thing (#841).
+
+    An expired trial user has no OpenRouter key and no reason to get one —
+    telling them to add one is the dead end the trial exists to remove. The
+    message must point at subscribing instead.
+    """
+    from app.services.llm import TrialExpiredError
+
+    async def _raise_expired(*a: object, **k: object) -> None:
+        raise TrialExpiredError()
+
+    async def _sub(*a: object, **k: object) -> str:
+        return "user-1"
+
+    monkeypatch.setattr("app.services.llm.get_client_async", _raise_expired)
+    monkeypatch.setattr(dependencies, "_try_decode_jwt_sub_async", _sub)
+    monkeypatch.setattr("app.supabase_pool.get_async_supabase", lambda: object())
+
+    with pytest.raises(HTTPException) as exc:
+        await dependencies.get_llm_client(SimpleNamespace(), settings)
+
+    assert exc.value.status_code == 402
+    detail = exc.value.detail.lower()
+    assert "trial" in detail and "subscribe" in detail
+    # The precise failure this guards against: falling through to the BYOK
+    # branch and telling a trial user to go and buy an API key.
+    assert "openrouter" not in detail

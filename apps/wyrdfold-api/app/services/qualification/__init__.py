@@ -24,6 +24,15 @@ from app.services.qualification.heuristics import (
     positively_us_location,
     qualification_hash,
 )
+from app.services.qualification.skill_dictionary import (
+    MAX_SKILLS_PER_JOB,
+    SKILL_DICTIONARY,
+    VOCABULARY,
+    unknown_terms,
+)
+from app.services.qualification.skill_dictionary import (
+    extract_skills as extract_dictionary_skills,
+)
 from app.services.qualification.tagger import (
     QUALIFICATION_MODEL,
     QUALIFICATION_PURPOSE,
@@ -35,15 +44,20 @@ from app.services.qualification.tagger import (
 )
 
 __all__ = [
+    "MAX_SKILLS_PER_JOB",
     "QUALIFICATION_MODEL",
     "QUALIFICATION_PURPOSE",
+    "SKILL_DICTIONARY",
+    "VOCABULARY",
     "EmploymentType",
     "QualificationTags",
     "RoleFamily",
     "Seniority",
     "clean_description",
+    "extract_dictionary_skills",
     "is_us_location",
     "positively_us_location",
     "qualification_hash",
     "tag_job",
+    "unknown_terms",
 ]

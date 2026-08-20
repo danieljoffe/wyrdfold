@@ -74,6 +74,7 @@ def test_start_scheduler_returns_none_when_all_disabled() -> None:
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         result = start_scheduler_if_enabled()
     assert result is None
 
@@ -89,6 +90,7 @@ async def test_start_scheduler_registers_only_poll_when_only_poll_enabled() -> N
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -111,6 +113,7 @@ async def test_start_scheduler_registers_only_url_health_when_only_url_health_en
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -134,6 +137,7 @@ async def test_start_scheduler_registers_both_jobs_when_both_enabled() -> None:
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -150,6 +154,98 @@ async def test_start_scheduler_registers_both_jobs_when_both_enabled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_scheduler_registers_only_activation_sweep_when_only_it_enabled() -> None:
+    """The sweep is opt-in (#557 §3): off by default, and when it IS on it must
+    actually land as a job — otherwise the flag is decoration."""
+    with patch("app.scheduler.settings") as mock_settings:
+        mock_settings.poll_scheduler_enabled = False
+        mock_settings.url_health_check_enabled = False
+        mock_settings.retention_purge_enabled = False
+        mock_settings.discovery_scheduler_enabled = False
+        mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = True
+        mock_settings.activation_sweep_tick_hours = 6
+        mock_settings.activation_stale_after_hours = 6
+        scheduler = start_scheduler_if_enabled()
+
+    assert scheduler is not None
+    try:
+        assert scheduler.running is True
+        # The catch-up anchor is NOT optional: IntervalTrigger counts from
+        # process start, so without it a near-daily deploy cadence can starve a
+        # 6h tick indefinitely (#244 — discovery ran once in six days).
+        assert {j.id for j in scheduler.get_jobs()} == {
+            "activation_sweep",
+            "activation_sweep_catchup",
+        }
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
+async def test_every_ledger_stamped_interval_job_has_a_catch_up_anchor() -> None:
+    """Generalizes the bug this file keeps re-learning.
+
+    A job whose tick is measured in HOURS and whose cadence is persisted in
+    ``scheduler_runs`` must also register a ``<id>_catchup`` one-shot, or a
+    deploy that lands inside the interval silently resets the countdown. This
+    shipped wrong for ``activation_sweep`` (2026-08-11) exactly as it had for
+    ``discovery_run`` before it — so assert the property, not each instance.
+
+    ``poll_due_sources`` is deliberately exempt: it ticks in MINUTES, so a
+    deploy cannot starve it.
+    """
+    with patch("app.scheduler.settings") as mock_settings:
+        mock_settings.poll_scheduler_enabled = True
+        mock_settings.poll_tick_minutes = 30
+        mock_settings.url_health_check_enabled = True
+        mock_settings.url_health_tick_hours = 12
+        mock_settings.retention_purge_enabled = True
+        mock_settings.retention_purge_tick_hours = 24
+        mock_settings.discovery_scheduler_enabled = True
+        mock_settings.discovery_tick_hours = 24
+        mock_settings.recency_refresh_enabled = True
+        mock_settings.recency_refresh_tick_hours = 24
+        mock_settings.activation_sweep_enabled = True
+        mock_settings.activation_sweep_tick_hours = 6
+        mock_settings.activation_stale_after_hours = 6
+        scheduler = start_scheduler_if_enabled()
+
+    # Anchor id per hour-scale job. NOT an exemption list — a job absent from
+    # here fails below, so adding one forces a deliberate answer to "what
+    # re-anchors this after a deploy?". (`discovery_run` predates the shared
+    # `_anchor_job_from_ledger` and keeps its own bespoke anchor, hence the
+    # non-uniform name.)
+    expected_anchor = {
+        "url_health_check": "url_health_check_catchup",
+        "retention_purge": "retention_purge_catchup",
+        "recency_refresh": "recency_refresh_catchup",
+        "discovery_run": "discovery_catchup",
+        "activation_sweep": "activation_sweep_catchup",
+    }
+
+    assert scheduler is not None
+    try:
+        ids = {j.id for j in scheduler.get_jobs()}
+        # `poll_due_sources` ticks in MINUTES — a deploy cannot starve it.
+        hourly = {i for i in ids if i != "poll_due_sources" and not i.endswith("_catchup")}
+        # Sanity: if this found nothing the assertions below would pass vacuously.
+        assert len(hourly) >= 5, hourly
+
+        undeclared = sorted(hourly - expected_anchor.keys())
+        assert not undeclared, (
+            "hour-scale scheduled job(s) with no declared catch-up anchor. "
+            "IntervalTrigger counts from PROCESS START and this app deploys "
+            "near-daily, so an un-anchored tick can go indefinitely without "
+            f"firing (#244): {undeclared}"
+        )
+        unregistered = sorted(job_id for job_id in hourly if expected_anchor[job_id] not in ids)
+        assert not unregistered, f"declared catch-up anchor(s) never registered: {unregistered}"
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+@pytest.mark.asyncio
 async def test_start_scheduler_registers_only_retention_when_only_retention_enabled() -> None:
     """Retention-only operation — verify only the retention_purge job lands."""
     with patch("app.scheduler.settings") as mock_settings:
@@ -159,6 +255,7 @@ async def test_start_scheduler_registers_only_retention_when_only_retention_enab
         mock_settings.retention_purge_tick_hours = 24
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -183,6 +280,7 @@ async def test_start_scheduler_registers_three_when_poll_health_retention_enable
         mock_settings.retention_purge_tick_hours = 24
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -211,6 +309,7 @@ async def test_start_scheduler_registers_only_discovery_when_only_discovery_enab
         mock_settings.discovery_scheduler_enabled = True
         mock_settings.discovery_tick_hours = 24
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -236,6 +335,7 @@ async def test_discovery_scheduler_off_by_default_does_not_register() -> None:
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
+        mock_settings.activation_sweep_enabled = False
         scheduler = start_scheduler_if_enabled()
     # No flags on → no scheduler at all, so no discovery_run job.
     assert scheduler is None
@@ -254,6 +354,7 @@ async def test_start_scheduler_registers_all_five_when_all_enabled() -> None:
         mock_settings.discovery_scheduler_enabled = True
         mock_settings.discovery_tick_hours = 24
         mock_settings.recency_refresh_enabled = True
+        mock_settings.activation_sweep_enabled = False
         mock_settings.recency_refresh_tick_hours = 12
         scheduler = start_scheduler_if_enabled()
 
@@ -285,6 +386,7 @@ async def test_start_scheduler_registers_only_recency_when_only_recency_enabled(
         mock_settings.retention_purge_enabled = False
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = True
+        mock_settings.activation_sweep_enabled = False
         mock_settings.recency_refresh_tick_hours = 12
         scheduler = start_scheduler_if_enabled()
 
@@ -311,13 +413,13 @@ async def test_run_scheduled_retention_purge_invokes_service_with_windows() -> N
     ):
         mock_settings.llm_costs_retention_days = 365
         mock_settings.notifications_sent_retention_days = 180
-        mock_settings.prescan_shadow_retention_days = 30
         mock_settings.search_events_retention_days = 90
+        mock_settings.phase1_rejections_retention_days = 90
         mock_purge.return_value = {
             "llm_costs": 0,
             "notifications_sent": 0,
-            "prescan_shadow": 0,
             "search_events": 0,
+            "phase1_rejections": 0,
         }
         await _run_scheduled_retention_purge()
 
@@ -325,8 +427,8 @@ async def test_run_scheduled_retention_purge_invokes_service_with_windows() -> N
         fake_client,
         llm_costs_days=365,
         notifications_sent_days=180,
-        prescan_shadow_days=30,
         search_events_days=90,
+        phase1_rejections_days=90,
     )
 
 

@@ -123,12 +123,21 @@ class TestManualJobEndpoint:
         assert result.extraction_tier == "jsonld"
         assert result.extracted["title"] == "Senior Engineer"
         assert result.needs_manual_fields is False
+        # The JD body rides the response so the onboarding path-A tailor
+        # kick doesn't need GET /jobs/{id} (which 404s pre-scoring).
+        assert result.description_html is not None
+        assert "Build things" in result.description_html
 
         # Verify upsert was called with correct source_id (last upsert = jobs row)
         upsert_call = mock_supabase.table.return_value.upsert.call_args
         row = upsert_call[0][0]
         assert row["source_id"] == MANUAL_SOURCE_ID
         assert row["title"] == "Senior Engineer"
+        # The display column is WRITTEN at ingest (None here — this raw title
+        # needs no repair; the key is that the column is in the payload, so a
+        # junk title would get its cleaned form persisted).
+        assert "title_display" in row
+        assert row["title_display"] is None
         assert row["company_name"] == "Acme Corp"
         # R2 dropped the vestigial global jobs.score/score_breakdown; writing
         # them PGRST204s the whole upsert (prod, 2026-08-06). This test used
@@ -169,9 +178,7 @@ class TestManualJobEndpoint:
             captured["score_client"] = client
             return None
 
-        monkeypatch.setattr(
-            job_ingest, "score_and_upsert_async", AsyncMock(side_effect=fake_score)
-        )
+        monkeypatch.setattr(job_ingest, "score_and_upsert_async", AsyncMock(side_effect=fake_score))
 
         mock_service = _async_service_client(posting_id="posting-uuid-r2")
 
@@ -226,9 +233,7 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="not-a-url")
         with pytest.raises(HTTPException) as exc_info:
-            await add_manual_job(
-                request=MagicMock(), body=body, user_id=None, supabase=MagicMock()
-            )
+            await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=MagicMock())
         assert exc_info.value.status_code == 400
         assert "Malformed" in exc_info.value.detail
 
@@ -241,9 +246,7 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="https://www.ziprecruiter.com/jobs/123")
         with pytest.raises(HTTPException) as exc_info:
-            await add_manual_job(
-                request=MagicMock(), body=body, user_id=None, supabase=MagicMock()
-            )
+            await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=MagicMock())
         assert exc_info.value.status_code == 400
         assert "Banned" in exc_info.value.detail
 
@@ -285,6 +288,9 @@ class TestManualJobEndpoint:
 
         assert result.success is True
         assert result.posting_id == "posting-uuid-3"
+        # No JD was extractable from the opaque page — the field must be
+        # None (not ""), so FE callers can gate the tailor kick on it.
+        assert result.description_html is None
 
     @pytest.mark.asyncio
     async def test_dedup_same_url(self, monkeypatch):
@@ -302,9 +308,7 @@ class TestManualJobEndpoint:
         from app.routers.jobs import add_manual_job
 
         body = ManualJobRequest(url=url)
-        await add_manual_job(
-            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
-        )
+        await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=mock_supabase)
 
         upsert_call = mock_supabase.table.return_value.upsert.call_args
         row = upsert_call[0][0]

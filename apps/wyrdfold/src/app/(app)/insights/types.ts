@@ -96,3 +96,24 @@ export interface SkillsCostInsights {
   total_cost: number;
   avg_cost_per_resume: number | null;
 }
+
+export interface NearMissTitle {
+  title: string;
+  confidence: number;
+  last_judged_at: string;
+}
+
+export interface TargetNearMisses {
+  target_id: string;
+  label: string;
+  titles: NearMissTitle[];
+}
+
+/** Low-confidence Phase-1 rejections per target — roles adjacent to a
+ *  target that the triage gate excluded without being sure. Mined for
+ *  free from the persistent rejection store (#703). */
+export interface NearMissInsights {
+  targets: TargetNearMisses[];
+  confidence_ceiling: number;
+  window_days: number;
+}

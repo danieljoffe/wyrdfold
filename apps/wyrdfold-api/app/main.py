@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -60,7 +61,7 @@ _log = logging.getLogger("app")
 
 # Wire JSON logging before Sentry init so any boot-time errors land in
 # the configured format. No-op when LOG_FORMAT=text (the default).
-init_logging(settings.log_format)
+init_logging(settings.log_format, settings.log_level)
 init_sentry()
 
 
@@ -404,6 +405,29 @@ async def _llm_service_error_handler(request: Request, exc: LLMServiceError) -> 
     )
 
 
+def _is_upstream_block(exc: APIError) -> bool:
+    """True when the response never reached PostgREST at all.
+
+    A real PostgREST error always carries a SQLSTATE-ish ``code`` parsed out of
+    a JSON body. This pair — HTTP ``403`` *plus* "JSON could not be generated" —
+    is the client telling us the body wasn't JSON, which for this stack means an
+    edge/WAF block page rather than the database. Both halves are required: a
+    genuine RLS denial is also 403, but it arrives as JSON with code ``42501``
+    and must keep its existing handling.
+    """
+    return str(exc.code) == "403" and exc.message == "JSON could not be generated"
+
+
+def _cf_ray_id(exc: APIError) -> str | None:
+    """The Cloudflare Ray ID from a block page, for correlating in their logs.
+
+    Deliberately narrow: ``exc.details`` holds the whole HTML page, which also
+    contains the CALLER'S IP ADDRESS. Never log or return the page itself.
+    """
+    match = re.search(r"Ray ID:[^<]*<strong[^>]*>([0-9a-f]+)", str(exc.details or ""))
+    return match.group(1) if match else None
+
+
 @app.exception_handler(APIError)
 async def _postgrest_error_handler(request: Request, exc: APIError) -> JSONResponse:
     """Map a PostgREST ``22P02`` (invalid text representation) to a clean 404.
@@ -457,6 +481,28 @@ async def _postgrest_error_handler(request: Request, exc: APIError) -> JSONRespo
             status_code=503,
             content={"detail": "Temporarily overloaded — please retry."},
             headers={"Retry-After": "5"},
+        )
+    if _is_upstream_block(exc):
+        # Supabase sits behind Cloudflare, whose WAF rejects request values that
+        # look like an attack — a user typing ``' OR 1=1 --`` into the company
+        # or title filter is enough. The block page is HTML, so the client
+        # raises "JSON could not be generated" and the request became a 500:
+        # a *server* error for a value the perimeter deliberately refused, and
+        # a red toast where the UI could have said "try different text".
+        #
+        # 400, not 5xx: nothing is wrong with the service, and the caller can
+        # fix it by rephrasing. Retrying is useless, so this must not look
+        # retryable. NOTE the block page embeds the caller's IP and a Ray ID —
+        # only the Ray ID is logged, and the body says nothing at all.
+        _log.warning(
+            "upstream WAF blocked a request value -> 400 on %s %s (cf-ray=%s)",
+            request.method,
+            request.url.path,
+            _cf_ray_id(exc) or "unknown",
+        )
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "That filter value was rejected. Please rephrase it."},
         )
     # Not a malformed-input error — hand off to the generic 500 handler, which
     # logs the traceback and applies the fail-closed body posture.
@@ -528,6 +574,31 @@ async def health() -> dict[str, str]:
     process is up. This is what the Railway healthcheck and the Docker
     HEALTHCHECK target, deliberately — see ``/ready`` below for why."""
     return {"status": "ok"}
+
+
+@app.get("/version")
+async def version() -> dict[str, str | None]:
+    """Which build is actually serving traffic.
+
+    Exists because a release could not be verified. The usual discriminator is
+    a schema diff in ``/openapi.json``, but a BEHAVIOURAL release changes no
+    schema — and with Railway auth expired and no deploy id in any response
+    header, there was no way to tell the new build from the old one. Release
+    #794 shipped with its API cutover unverified for exactly this reason.
+
+    Unauthenticated and dependency-free, like ``/health``: a probe that needs a
+    token is useless in the moment you actually reach for it. It exposes only a
+    commit SHA and a build timestamp — no config, no secrets.
+
+    ``RAILWAY_GIT_COMMIT_SHA`` is injected by Railway; ``BUILD_SHA`` is the
+    portable override for any other host (and for a local Docker run). Both
+    absent → ``null``, which is itself the honest answer rather than a lie.
+    """
+    return {
+        "commit": os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("BUILD_SHA"),
+        "built_at": os.getenv("BUILD_TIME"),
+        "environment": os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("APP_ENV"),
+    }
 
 
 # How long the readiness DB ping may take before we call the dependency

@@ -120,7 +120,13 @@ jobs:
       # are fixed via overrides in pnpm-workspace.yaml.
       - name: Audit dependencies (OSV)
         run: |
-          curl -sSL -o /tmp/osv-scanner \
+          set -euo pipefail
+          # -f so an HTTP error page is never written to the file and then
+          # chmod +x'd; --retry-all-errors because plain --retry only covers
+          # timeouts and 408/429/5xx, not the connection resets GitHub's
+          # release CDN actually throws (see the Supabase CLI step).
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 180 \
+            -o /tmp/osv-scanner \
             https://github.com/google/osv-scanner/releases/download/v2.4.0/osv-scanner_linux_amd64
           chmod +x /tmp/osv-scanner
           # --config: osv-scanner.toml carries the (rare) suppressions for
@@ -162,8 +168,54 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Install Playwright chromium
-        run: pnpm exec playwright install chromium --with-deps
+      # The Chromium download is the flakiest step in CI: it stalled twice in
+      # one day (27 min and 12 min, both on release PRs, both cleared by a
+      # re-run). Cache it so the common case never touches the network — see
+      # #883.
+      #
+      # Keyed on the resolved Playwright VERSION, not the lockfile hash, so an
+      # unrelated dependency bump still hits the cache.
+      - name: Resolve Playwright version
+        id: playwright-version
+        run: |
+          echo "version=$(pnpm exec playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.playwright-version.outputs.version }}
+
+      # Split from --with-deps deliberately: the OS packages below land via apt
+      # and are NOT inside the cached path, so they must run every time. Only
+      # the browser bundle is cacheable.
+      #
+      # timeout-minutes bounds the stall. Caching lowers how OFTEN the download
+      # happens; it cannot remove it (a version bump still misses). Without a
+      # step timeout a stall eats the job's full 30 minutes and, because it
+      # HANGS rather than errors, nothing retries it — someone has to notice.
+      #
+      # The two budgets are deliberately very different, measured rather than
+      # guessed (first run of this change):
+      #   browser download, cold  ->  12s   (so the 27- and 12-minute stalls
+      #                                     seen on releases were pathological,
+      #                                     not "slow" — 5 min is ~25x headroom)
+      #   install-deps (apt)      -> 312s   on a run where the azure mirror was
+      #                                     unreachable and it fell back to
+      #                                     archive.ubuntu.com
+      #
+      # apt is NOT the flaky step this issue is about; bounding it tightly buys
+      # nothing and fails good builds on a bad-mirror day. 15 min is ~3x the
+      # slow observation while still catching a true hang before the job cap.
+      - name: Install Playwright chromium (browser)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 5
+        run: pnpm exec playwright install chromium
+
+      - name: Install Playwright OS dependencies
+        timeout-minutes: 15
+        run: pnpm exec playwright install-deps chromium
 
       # ---- Zero-secret authed tier -------------------------------------
       # The authed Playwright projects need a real auth backend + the API.
@@ -173,7 +225,7 @@ jobs:
       # public dev defaults, the test user is created per-run, and the
       # whole stack dies with the runner.
       - name: Install uv (for the wyrdfold-api server)
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -185,13 +237,22 @@ jobs:
       # Same hardened fetch as the rls-integration job: step timeout +
       # curl retries/timeouts so a slow mirror can't hang the job, and a
       # pinned sha256 so a tampered download fails loudly.
+      #
+      # --retry-all-errors is load-bearing, not belt-and-braces: curl's plain
+      # --retry only treats "a timeout, an FTP 4xx response code or an HTTP
+      # 408, 429, 500, 502, 503 or 504" as retryable. This download really
+      # fails with `curl: (35) Recv failure: Connection reset by peer`, which
+      # is NOT in that set — so --retry 3 alone retried zero times and the job
+      # went red on a pure network blip (run 31460681334). Safe with -o: curl
+      # discards a failed partial transfer written to an output file before
+      # retrying, and the sha256 check below would catch any corruption anyway.
       - name: Install Supabase CLI
         timeout-minutes: 5
         run: |
           set -euo pipefail
           SUPABASE_CLI_VERSION=2.104.0
           SUPABASE_CLI_SHA256=bfca4efe4aa88c65b29a59187f12b711b80fd119bc38464423795a4bf41b0e15
-          curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 \
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 180 \
             -o /tmp/supabase.deb \
             "https://github.com/supabase/cli/releases/download/v${SUPABASE_CLI_VERSION}/supabase_${SUPABASE_CLI_VERSION}_linux_amd64.deb"
           echo "${SUPABASE_CLI_SHA256}  /tmp/supabase.deb" | sha256sum -c -
@@ -348,7 +409,7 @@ jobs:
           python-version: '3.14'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -392,7 +453,7 @@ jobs:
           set -euo pipefail
           PANDOC_VERSION=3.1.3
           PANDOC_SHA256=caa7e0410f9e2cb1da2eb8db13cc97b5548fe455985e2c944e3929d22f99bcdc
-          if curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 \
+          if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 120 \
                -o /tmp/pandoc.deb \
                "https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-1-amd64.deb"; then
             echo "${PANDOC_SHA256}  /tmp/pandoc.deb" | sha256sum -c -
@@ -435,7 +496,7 @@ jobs:
           python-version: '3.14'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -459,7 +520,7 @@ jobs:
           set -euo pipefail
           SUPABASE_CLI_VERSION=2.104.0
           SUPABASE_CLI_SHA256=bfca4efe4aa88c65b29a59187f12b711b80fd119bc38464423795a4bf41b0e15
-          curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 \
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 180 \
             -o /tmp/supabase.deb \
             "https://github.com/supabase/cli/releases/download/v${SUPABASE_CLI_VERSION}/supabase_${SUPABASE_CLI_VERSION}_linux_amd64.deb"
           echo "${SUPABASE_CLI_SHA256}  /tmp/supabase.deb" | sha256sum -c -

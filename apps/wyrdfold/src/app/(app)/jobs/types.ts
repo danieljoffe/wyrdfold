@@ -25,7 +25,9 @@ export const STATUS_DOT_CLASS: Record<JobStatus, string> = {
 };
 
 export function formatStatus(status: string): string {
-  return status.replace(/_/g, ' ');
+  // Title-cased so dropdown options match the status pill, which was the only
+  // surface capitalizing (via CSS) — "resume_draft" → "Resume Draft".
+  return status.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
 export type ScoringStatus = 'stage1' | 'stage2' | 'complete';
@@ -54,6 +56,12 @@ export interface JobPosting {
   external_id: string;
   source_id: string;
   title: string;
+  /**
+   * Cleaned display form of `title` (server-side, deterministic), null when
+   * the raw title is already presentable. Render via `displayTitle()` — the
+   * RPC-backed list paths don't serve it yet (stage 2), so it is optional.
+   */
+  title_display?: string | null;
   company_name: string;
   location: string | null;
   /**
@@ -66,6 +74,14 @@ export interface JobPosting {
   location_remote?: boolean | null;
   absolute_url: string | null;
   score: number;
+  /**
+   * The UNDECAYED fit score. `score` is what the list shows and floors on —
+   * fit × freshness since #665 — so for anything past the 7-day grace the two
+   * differ. The detail panel needs both to show an honest chain from the
+   * keyword components down to the number on the card (#650).
+   * Optional: responses predating #665's projection omit it.
+   */
+  raw_score?: number | null;
   score_breakdown: Record<string, number> | null;
   /**
    * The fit grade's four axes (title/skills/seniority/domain, 0–100) for
@@ -135,9 +151,16 @@ export interface JobsFilterState {
   country: string; // '' | ISO country code
 }
 
-/** Wire sort tokens. 'created_at' is kept for URL/param stability and sorts
- * the renamed cataloged_at column server-side (R2). */
-export type JobsSortColumn = 'score' | 'created_at' | 'company_name' | 'title';
+/** Wire sort tokens.
+ *
+ * 'posted_at' sorts the PROVIDER'S date (``source_posted_at``) — what the
+ * Posted column shows — with the listings that carry none sorted last.
+ *
+ * 'created_at' is kept for URL/param stability and sorts the renamed
+ * cataloged_at column server-side (R2): when WE catalogued the listing, which
+ * is a different question and no longer what the Posted column asks. */
+export type JobsSortColumn =
+  'score' | 'posted_at' | 'created_at' | 'company_name' | 'title';
 
 interface SkillMatch {
   name: string;
@@ -255,6 +278,16 @@ export interface TailoredResumeRecord {
   approved_at: string | null;
   source_resume_id: string | null;
   /**
+   * Whether this document was generated under the user's stretch opt-in — the
+   * "Generate anyway" confirm on a Skip-verdict job (#780/#785). Re-generate
+   * on the review page reuses it, because that route has no target in scope
+   * and the Skip verdict it would need is per-(job, target).
+   *
+   * Optional on the type so a stale cached response still parses; the API
+   * always sends it and it is `false` for every resume.
+   */
+  allow_stretch?: boolean;
+  /**
    * ATS lint state (#656). `null` = never linted (rows predating the column);
    * `[]` = linted with nothing to report; a list with any
    * `severity: 'error'` entry = **flagged draft**,
@@ -344,8 +377,27 @@ export interface ResumeVersion {
   id: string;
   resume_id: string;
   payload: TailoredResumePayload;
+  /**
+   * The snapshot's markdown — what a restore actually writes back. Null only
+   * for rows snapshotted before this column was populated.
+   *
+   * Declared here rather than cast at each use site: the API omitted this
+   * field entirely (its Pydantic model had no `payload_md` and
+   * `extra: "ignore"` dropped the column), so every version failed restore.
+   * Typing it means the next serialization gap fails the build instead of
+   * silently degrading to "cannot restore".
+   */
+  payload_md: string | null;
   source: ResumeVersionSource;
   created_at: string;
+}
+
+/**
+ * Can this snapshot actually be restored? Restore writes `payload_md` into the
+ * editor, so a version without it is listable but not loadable.
+ */
+export function hasRestorableMarkdown(version: ResumeVersion): boolean {
+  return Boolean(version.payload_md);
 }
 
 export interface ResumeVersionsResponse {
@@ -353,11 +405,53 @@ export interface ResumeVersionsResponse {
   cap: number;
 }
 
-/** The date a card shows as "Posted": the provider's own date when known,
- * else when we cataloged the listing (R2 two-timestamp model). */
+/** The date a card shows as "Posted" — the PROVIDER'S own date, or null.
+ *
+ * Null when the ATS gave us none (~4% of live listings). It stays null rather
+ * than falling back to our catalog date: "Posted" is a claim about the
+ * employer's board, and quietly substituting the day WE happened to find the
+ * listing misattributes our number to them. Callers render null as an em dash
+ * (``timeAgo`` already does), and the Posted sort puts those rows last.
+ *
+ * For the freshness the SCORE was decayed against, use
+ * {@link freshnessAnchorAt} — the two are different questions and the server
+ * answers them differently. */
 export function postedAt(job: {
+  source_posted_at: string | null;
+}): string | null {
+  return job.source_posted_at;
+}
+
+/** The date the server's recency decay ages a score against: the provider's
+ * date when known, else when we cataloged the listing (R2 two-timestamp
+ * model). Mirrors ``source_posted_at or cataloged_at`` in the API's
+ * ``_display_sort_value`` / ``recency.py`` — keep the two in step, or the
+ * panel's "aged N days" stops explaining the number on the card. */
+export function freshnessAnchorAt(job: {
   source_posted_at: string | null;
   cataloged_at: string;
 }): string {
   return job.source_posted_at ?? job.cataloged_at;
+}
+
+/**
+ * Does the match analysis recommend skipping this job?
+ *
+ * The analysis opens with its verdict ("Skip: this is a Senior UX Designer
+ * role requiring…"), so the leading word carries the recommendation. Used to
+ * warn before a paid generation: a "Skip" job is exactly where the model may
+ * decline to apply on the user's behalf, and being charged for a refusal with
+ * no warning is the worst version of that.
+ *
+ * Deliberately conservative — only an explicit leading Skip/Pass/Avoid counts.
+ * A false positive adds friction to a good match, which is worse than missing
+ * a marginal one.
+ */
+export function isSkipRecommendation(
+  recommendation: string | null | undefined
+): boolean {
+  if (!recommendation) return false;
+  return /^\s*(skip|pass|avoid|do not apply|don't apply)\b/i.test(
+    recommendation
+  );
 }

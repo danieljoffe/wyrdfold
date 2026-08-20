@@ -35,6 +35,7 @@ from app.models.experience import OptimizedDoc
 from app.models.learning import ProfilePatch
 from app.models.schemas import PollResult
 from app.models.targets import (
+    ActivateTargetRequest,
     AxisWeights,
     ContributionVoteResult,
     CreateOrLinkResult,
@@ -84,6 +85,7 @@ from app.services.source_discovery import (
 )
 from app.services.target_scoring import bulk_title_score_for_target
 from app.services.targets import crud, fit_refresh, from_input, votes
+from app.services.targets.activation import ActivationError
 from app.services.targets.derive_profile import DEFAULT_PURPOSE, derive_profile_from_jd
 from app.services.targets.derive_profile_from_label import (
     DEFAULT_PURPOSE as DERIVE_LABEL_PURPOSE,
@@ -291,8 +293,7 @@ async def _active_targets(supabase: AsyncClient) -> list[JobTarget]:
         .execute()
     )
     member_ids = {
-        cast(str, r["target_id"])
-        for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
+        cast(str, r["target_id"]) for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
     }
     rows = cast(list[dict[str, Any]], floor_resp.data or [])
     seen = {cast(str, r["id"]) for r in rows}
@@ -547,36 +548,31 @@ async def _create_target_async(supabase: AsyncClient, payload: TargetCreate) -> 
 async def _update_target_async(
     supabase: AsyncClient, target_id: str, payload: TargetUpdate
 ) -> JobTarget | None:
-    """Async inline of ``crud.update`` — same partial field mapping."""
-    updates: dict[str, Any] = {"updated_at": datetime.now(UTC).isoformat()}
-    if payload.label is not None:
-        updates["label"] = payload.label
-        updates["normalized_label"] = crud.normalize_label(payload.label)
-    if payload.description is not None:
-        updates["description"] = payload.description
-    if payload.scoring_profile is not None:
-        updates["scoring_profile"] = payload.scoring_profile.model_dump()
-    if payload.search_keywords is not None:
-        updates["search_keywords"] = payload.search_keywords
-    if payload.activation_status is not None:
-        updates["activation_status"] = payload.activation_status
-    if payload.app_active is not None:
-        updates["app_active"] = payload.app_active
-    if payload.profile_version is not None:
-        updates["profile_version"] = payload.profile_version
-    if payload.example_promising_titles is not None:
-        updates["example_promising_titles"] = payload.example_promising_titles
-    if payload.example_unpromising_titles is not None:
-        updates["example_unpromising_titles"] = payload.example_unpromising_titles
-    if payload.seniority_hint is not None:
-        updates["seniority_hint"] = payload.seniority_hint
-    if payload.domain_hints is not None:
-        updates["domain_hints"] = payload.domain_hints
-    if payload.role_family is not None:
-        updates["role_family"] = payload.role_family
+    """Async inline of ``crud.update`` — shares its field mapping verbatim."""
+    updates = crud.build_update_fields(payload)
     resp = await supabase.table(crud.TARGETS_TABLE).update(updates).eq("id", target_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return crud._parse_target(rows[0]) if rows else None
+
+
+async def _set_link_active(
+    supabase: AsyncClient, *, user_id: str, target_id: str, active: bool
+) -> None:
+    """Flip one link's ``is_active`` directly, with no cap check.
+
+    Used by the activate-with-swap path. Bypassing the cap is correct for
+    both of its uses: deactivating always lowers the count, and the rollback
+    only restores a link that was active moments earlier — re-checking the
+    cap there could refuse to undo our own change and strand the user with
+    nothing active.
+    """
+    await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .update({"is_active": active, "updated_at": datetime.now(UTC).isoformat()})
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
 
 
 async def _set_user_target_inactive_async(
@@ -706,9 +702,7 @@ async def _set_notification_thresholds_async(
     if current is None:
         return None
     updates: dict[str, Any] = {
-        col: thresholds[col]
-        for col in crud._NOTIFICATION_THRESHOLD_COLUMNS
-        if col in thresholds
+        col: thresholds[col] for col in crud._NOTIFICATION_THRESHOLD_COLUMNS if col in thresholds
     }
     if not updates:
         return current
@@ -798,6 +792,158 @@ async def _effective_active_target_cap_async(supabase: AsyncClient, user_id: str
     return crud.MAX_ACTIVE_TARGETS_PER_USER
 
 
+async def _raise_if_active_limit_async(
+    supabase: AsyncClient, user_id: str, target_id: str
+) -> None:
+    """Raise ``ActiveTargetLimitError`` if activating this link exceeds the cap.
+
+    Extracted so it can be called BEFORE expensive work as well as at the
+    write (#865). ``link_target`` used to derive — and CHARGE the user for —
+    an LLM fit score, and only then attempt the write that rejects on the
+    cap: the score was discarded and the user paid for a target they never
+    received. Same shape as #845, on the interactive side.
+
+    Keeps the write-time call too. This one is advisory: two concurrent
+    links can both pass it and only the upsert serializes, so the guard at
+    the write is what actually enforces. This exists to avoid paying for
+    work that guard will reject, not to replace it.
+
+    Re-activating a link that is ALREADY active is exempt — it changes no
+    count, so an idempotent refresh stays free.
+    """
+    existing_resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .select("is_active")
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .limit(1)
+        .execute()
+    )
+    existing = cast(list[dict[str, Any]], existing_resp.data or [])
+    if existing and existing[0].get("is_active"):
+        return
+    current = await _count_active_for_user_async(supabase, user_id)
+    cap = await _effective_active_target_cap_async(supabase, user_id)
+    if current >= cap:
+        raise crud.ActiveTargetLimitError(current, cap)
+
+
+async def _active_target_choices(supabase: AsyncClient, user_id: str) -> list[dict[str, str]]:
+    """``[{id, label}]`` for the user's currently-active targets.
+
+    Only read on the 409 path, so it costs nothing on the happy path. It is
+    carried in the error body rather than left for the client to work out
+    because not every caller HAS the list: ``/targets`` holds all the user's
+    targets in state, but the detail page knows only the one it is showing,
+    and would otherwise need a second round-trip to name the alternatives.
+    """
+    resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .select("target_id, targets(label)")
+        .eq("user_id", user_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    out: list[dict[str, str]] = []
+    for r in rows:
+        tid = r.get("target_id")
+        if not tid:
+            continue
+        joined = r.get("targets")
+        # PostgREST returns an embedded to-one as an object, but older
+        # rows/queries can surface a single-element list — accept both rather
+        # than dropping the label and rendering an unnamed radio button.
+        if isinstance(joined, list):
+            joined = joined[0] if joined else None
+        label = (joined or {}).get("label") if isinstance(joined, dict) else None
+        out.append({"id": str(tid), "label": str(label or "Untitled target")})
+    return sorted(out, key=lambda t: t["label"].lower())
+
+
+async def _activate_link_with_optional_swap(
+    supabase: AsyncClient, *, user_id: str, target_id: str, swap_out: str | None
+) -> None:
+    """Activate ``target_id``, optionally freeing a slot first.
+
+    ``swap_out`` makes this a SWAP. Ordering is forced: the cap check counts
+    active links, so the deactivation must land before the activation. Doing
+    both here rather than as two client calls keeps the window where the user
+    has NEITHER target active server-side and short, instead of spanning a
+    network round-trip they could navigate away from.
+
+    Any failure after the deactivation rolls it back. Without that, a failed
+    swap leaves the user with fewer active targets than they started with —
+    strictly worse than the refusal they were trying to get past.
+
+    Raises ``HTTPException`` (400 for an invalid swap, 409 for the cap).
+    """
+    if swap_out:
+        if swap_out == target_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot deactivate the target being activated.",
+            )
+        # Only a target the user currently has ACTIVE may be swapped out.
+        # Otherwise this endpoint doubles as "deactivate any target by id" as
+        # a side effect of activating an unrelated one.
+        active_now = await _active_target_choices(supabase, user_id)
+        if swap_out not in {t["id"] for t in active_now}:
+            raise HTTPException(
+                status_code=400,
+                detail="That target is not currently active.",
+            )
+        await _set_link_active(supabase, user_id=user_id, target_id=swap_out, active=False)
+
+    try:
+        await _link_user_to_target_async(
+            supabase, user_id=user_id, target_id=target_id, is_active=True
+        )
+    except crud.ActiveTargetLimitError as e:
+        if swap_out:
+            await _set_link_active(supabase, user_id=user_id, target_id=swap_out, active=True)
+        # 409 Conflict — well-formed, but conflicts with current state.
+        # ``error`` lets the frontend switch on this case specifically,
+        # ``message`` is what it shows when it doesn't, and
+        # ``active_targets`` is what its swap picker lists.
+        raise _active_limit_error(e, await _active_target_choices(supabase, user_id)) from e
+    except Exception:
+        if swap_out:
+            await _set_link_active(supabase, user_id=user_id, target_id=swap_out, active=True)
+        raise
+
+
+def _active_limit_error(
+    e: crud.ActiveTargetLimitError,
+    active_targets: list[dict[str, str]] | None = None,
+) -> HTTPException:
+    """The one 409 shape for the active-target cap.
+
+    Raised from three places (activate, link/follow, add-from-posting) that
+    each carried a byte-identical copy of this dict. ``message`` is the string
+    the user actually reads — the frontend surfaces it verbatim rather than
+    composing its own — so it is worth having exactly one of.
+
+    ``active_targets`` names what is currently holding the cap so the client
+    can offer a pick-one-to-deactivate swap instead of a dead end. Optional:
+    a caller that cannot cheaply resolve it still gets the message.
+    """
+    noun = "target" if e.current_count == 1 else "targets"
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "ACTIVE_LIMIT",
+            "limit": e.limit,
+            "active_count": e.current_count,
+            "active_targets": active_targets or [],
+            "message": (
+                f"You already have {e.current_count} active {noun} "
+                f"(limit {e.limit}) — deactivate one first."
+            ),
+        },
+    )
+
+
 async def _link_user_to_target_async(
     supabase: AsyncClient,
     *,
@@ -816,21 +962,7 @@ async def _link_user_to_target_async(
     columns follow crud's conditional shape (written only when non-None) so the
     link route can stamp a freshly-derived score + its E2 version marker."""
     if is_active:
-        existing_resp = await (
-            supabase.table(crud.USER_TARGETS_TABLE)
-            .select("is_active")
-            .eq("user_id", user_id)
-            .eq("target_id", target_id)
-            .limit(1)
-            .execute()
-        )
-        existing = cast(list[dict[str, Any]], existing_resp.data or [])
-        already_active = bool(existing and existing[0].get("is_active"))
-        if not already_active:
-            current = await _count_active_for_user_async(supabase, user_id)
-            cap = await _effective_active_target_cap_async(supabase, user_id)
-            if current >= cap:
-                raise crud.ActiveTargetLimitError(current, cap)
+        await _raise_if_active_limit_async(supabase, user_id, target_id)
 
     row: dict[str, Any] = {
         "user_id": user_id,
@@ -894,7 +1026,12 @@ async def _activate_pipeline(
             if doc is None:
                 logger.warning("No OptimizedDoc for target %s — skipping derive", target_id)
                 await _update_target_async(
-                    supabase, target_id, TargetUpdate(activation_status="error")
+                    supabase,
+                    target_id,
+                    TargetUpdate(
+                        activation_status="error",
+                        activation_error=ActivationError.NO_EXPERIENCE_PROFILE,
+                    ),
                 )
                 return
 
@@ -928,9 +1065,7 @@ async def _activate_pipeline(
             target = updated
 
         # Step 2: poll jobs using the target's search keywords
-        await _update_target_async(
-            supabase, target_id, TargetUpdate(activation_status="polling")
-        )
+        await _update_target_async(supabase, target_id, TargetUpdate(activation_status="polling"))
         poll_result = await poll_sources_for_target(supabase, target)
         logger.info(
             "Activation pipeline for target %s: %d sources, %d new jobs",
@@ -954,13 +1089,16 @@ async def _activate_pipeline(
             retro_scored,
         )
 
-        await _update_target_async(
-            supabase, target_id, TargetUpdate(activation_status="ready")
-        )
+        await _update_target_async(supabase, target_id, TargetUpdate(activation_status="ready"))
     except Exception:
         logger.exception("Activation pipeline failed for target %s", target_id)
         await _update_target_async(
-            supabase, target_id, TargetUpdate(activation_status="error")
+            supabase,
+            target_id,
+            TargetUpdate(
+                activation_status="error",
+                activation_error=ActivationError.PIPELINE_FAILED,
+            ),
         )
 
 
@@ -1102,7 +1240,18 @@ async def create_target_from_url(
         )
     final_url = vr.final_url
 
-    extraction = await _fetch_jd_from_url(final_url)
+    extraction = await _fetch_jd_from_url(
+        final_url,
+        # The generic hint ("paste the JD directly") is true for reference JDs
+        # but NOT here: there is no JD-text field in the create flow, and the
+        # Reference JDs tab it lives on belongs to a target that does not exist
+        # yet. Advising an impossible action is worse than no advice.
+        recovery_hint=(
+            "The page may need a login or render its text with JavaScript. "
+            "Check the link opens publicly, or create the target manually and "
+            "add this posting from its Reference JDs tab."
+        ),
+    )
 
     return await from_input.from_url(
         supabase,
@@ -1423,6 +1572,7 @@ async def update_target(
 )
 async def activate_target(
     target_id: str,
+    body: ActivateTargetRequest | None = None,
     supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
@@ -1431,30 +1581,12 @@ async def activate_target(
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    try:
-        await _link_user_to_target_async(
-            supabase,
-            user_id=user_id,
-            target_id=target_id,
-            is_active=True,
-        )
-    except crud.ActiveTargetLimitError as e:
-        # 409 Conflict — the request was well-formed but conflicts with
-        # current state (the user is already at the active-target cap).
-        # Frontend reads ``error`` to switch on this case specifically and
-        # offers a deactivate picker rather than a generic toast.
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "ACTIVE_LIMIT",
-                "limit": e.limit,
-                "active_count": e.current_count,
-                "message": (
-                    f"You already have {e.current_count} active targets "
-                    f"(limit {e.limit}) — deactivate one first."
-                ),
-            },
-        ) from e
+    await _activate_link_with_optional_swap(
+        supabase,
+        user_id=user_id,
+        target_id=target_id,
+        swap_out=(body.deactivate_target_id if body else None) or None,
+    )
     refreshed = await _target_get(supabase, target_id) or target
 
     spawn_detached(
@@ -1751,6 +1883,17 @@ async def link_target(
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
+    # Cap FIRST, before the fit score below bills the user (#865). The write
+    # at the bottom raises the same error, but by then the LLM call has
+    # happened and been charged — for a link we are about to refuse. The
+    # failure fires exactly when someone is trying to add MORE targets, so
+    # without this a user bouncing off the cap burns quota with nothing to
+    # show for it. Both guards stay; see `_raise_if_active_limit_async`.
+    try:
+        await _raise_if_active_limit_async(supabase, user_id, target_id)
+    except crud.ActiveTargetLimitError as e:
+        raise _active_limit_error(e, await _active_target_choices(supabase, user_id)) from e
+
     # Derive fit score if we have an experience profile
     fit_score: int | None = None
     fit_reasoning: str | None = None
@@ -1784,18 +1927,7 @@ async def link_target(
             fit_score_prose_doc_id=prose_doc_id,
         )
     except crud.ActiveTargetLimitError as e:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "ACTIVE_LIMIT",
-                "limit": e.limit,
-                "active_count": e.current_count,
-                "message": (
-                    f"You already have {e.current_count} active targets "
-                    f"(limit {e.limit}) — deactivate one first."
-                ),
-            },
-        ) from e
+        raise _active_limit_error(e, await _active_target_choices(supabase, user_id)) from e
 
 
 @router.post(
@@ -2007,18 +2139,7 @@ async def create_target_from_posting(
                 is_active=True,
             )
         except crud.ActiveTargetLimitError as e:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "ACTIVE_LIMIT",
-                    "limit": e.limit,
-                    "active_count": e.current_count,
-                    "message": (
-                        f"You already have {e.current_count} active targets "
-                        f"(limit {e.limit}) — deactivate one first."
-                    ),
-                },
-            ) from e
+            raise _active_limit_error(e, await _active_target_choices(supabase, user_id)) from e
         # Re-read the target row so the response reflects any writes the
         # linking flow made.
         refreshed = await _target_get(supabase, target.id)
@@ -2030,7 +2151,9 @@ async def create_target_from_posting(
 # ---- Reference JDs ---------------------------------------------------------
 
 
-async def _fetch_jd_from_url(url: str) -> ExtractionResult:
+async def _fetch_jd_from_url(
+    url: str, *, recovery_hint: str = "Try pasting the JD text directly."
+) -> ExtractionResult:
     """Fetch a JD page and run the extraction cascade (JSON-LD → meta → Firecrawl).
 
     Returns ``(title, jd_text)``. The title comes from the same extraction
@@ -2109,10 +2232,7 @@ async def _fetch_jd_from_url(url: str) -> ExtractionResult:
     if len(jd_text) < 50:
         raise HTTPException(
             status_code=422,
-            detail=(
-                "Could not extract a job description from that URL. "
-                "Try pasting the JD text directly."
-            ),
+            detail=("Could not extract a job description from that URL. " + recovery_hint),
         )
     # Return the whole extraction (title + company + location + description +
     # salary) so the from-url flow can materialize a full job, not just derive

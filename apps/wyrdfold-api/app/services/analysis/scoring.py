@@ -32,4 +32,3 @@ def scorecard_to_numeric(scorecard: Scorecard) -> float:
     score += domain_map.get(scorecard.domain_fit, 0)
 
     return max(0, min(100, score))
-

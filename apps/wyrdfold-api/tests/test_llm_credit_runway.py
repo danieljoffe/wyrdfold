@@ -19,7 +19,8 @@ import pytest
 
 from app.config import settings
 from app.services.ingestion_health import (
-    _openrouter_remaining_usd,
+    OpenRouterBudget,
+    _openrouter_budget,
     check_ingestion_health,
 )
 
@@ -40,14 +41,22 @@ def credit_check_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "llm_credit_min_remaining_usd", 2.0)
 
 
-def _patch_probe(monkeypatch: pytest.MonkeyPatch, *, remaining: float | None) -> list[int]:
+def _patch_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    remaining: float | None,
+    usage_weekly: float | None = None,
+) -> list[int]:
+    """Patch the budget probe. ``remaining`` lands on the ACCOUNT limit so the
+    existing cases keep their meaning; ``usage_weekly`` opts a case into
+    OpenRouter's own trailing rate (None → the ledger fallback)."""
     calls: list[int] = []
 
-    async def fake_probe(client: Any = None) -> float | None:
+    async def fake_probe(client: Any = None) -> OpenRouterBudget:
         calls.append(1)
-        return remaining
+        return OpenRouterBudget(account_remaining=remaining, usage_weekly=usage_weekly)
 
-    monkeypatch.setattr("app.services.ingestion_health._openrouter_remaining_usd", fake_probe)
+    monkeypatch.setattr("app.services.ingestion_health._openrouter_budget", fake_probe)
     return calls
 
 
@@ -127,7 +136,7 @@ class TestCreditRunwayCheck:
         async def boom(client: Any = None) -> float | None:
             raise httpx.ConnectError("dns down")
 
-        monkeypatch.setattr("app.services.ingestion_health._openrouter_remaining_usd", boom)
+        monkeypatch.setattr("app.services.ingestion_health._openrouter_budget", boom)
         spend_calls = _patch_week_spend(monkeypatch, 35.0)
 
         report = await check_ingestion_health(object(), now=_NOW)  # must not raise
@@ -200,11 +209,22 @@ def _mock_client(routes: dict[str, dict[str, Any]]) -> httpx.AsyncClient:
 
 class TestOpenrouterRemainingParse:
     @pytest.mark.asyncio
-    async def test_key_limit_remaining_wins(self) -> None:
+    async def test_key_cap_binds_when_tighter_than_the_account(self) -> None:
+        """The 2026-08-12 incident in miniature: the key's own cap runs out
+        while the account is still funded. `remaining` must follow the tighter
+        limit, and `binding_limit` must name it — they fail identically (403)
+        but have opposite remedies."""
         client = _mock_client(
-            {"/api/v1/key": {"data": {"limit": 20, "usage": 7.5, "limit_remaining": 12.5}}}
+            {
+                "/api/v1/key": {"data": {"limit": 20, "usage": 7.5, "limit_remaining": 12.5}},
+                "/api/v1/credits": {"data": {"total_credits": 100.0, "total_usage": 20.0}},
+            }
         )
-        assert await _openrouter_remaining_usd(client) == 12.5
+        budget = await _openrouter_budget(client)
+        assert budget.remaining == 12.5
+        assert budget.binding_limit == "key"
+        assert "raise it" in budget.remedy()
+        assert "settings/credits" not in budget.remedy()
 
     @pytest.mark.asyncio
     async def test_unlimited_key_falls_back_to_account_credits(self) -> None:
@@ -214,7 +234,10 @@ class TestOpenrouterRemainingParse:
                 "/api/v1/credits": {"data": {"total_credits": 100.0, "total_usage": 97.25}},
             }
         )
-        assert await _openrouter_remaining_usd(client) == pytest.approx(2.75)
+        budget = await _openrouter_budget(client)
+        assert budget.remaining == pytest.approx(2.75)
+        assert budget.binding_limit == "account"
+        assert "top up" in budget.remedy()
 
     @pytest.mark.asyncio
     async def test_missing_credit_fields_returns_none(self) -> None:
@@ -224,7 +247,9 @@ class TestOpenrouterRemainingParse:
                 "/api/v1/credits": {"data": {}},
             }
         )
-        assert await _openrouter_remaining_usd(client) is None
+        budget = await _openrouter_budget(client)
+        assert budget.remaining is None
+        assert budget.binding_limit is None
 
     @pytest.mark.asyncio
     async def test_http_error_raises_to_caller(self) -> None:
@@ -235,4 +260,258 @@ class TestOpenrouterRemainingParse:
 
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         with pytest.raises(httpx.HTTPStatusError):
-            await _openrouter_remaining_usd(client)
+            await _openrouter_budget(client)
+
+
+class TestResettingKeyCapRule:
+    """2026-08-13 incident. A $10/day KEY cap exhausted mid-afternoon; the
+    runway rule alarmed only at $0.00 — after grading was already dead —
+    because "days of runway" against a window that refills daily is
+    structurally below the threshold (cap ÷ trailing rate). Worse, the tick
+    AFTER the operator raised the cap to $15 alarmed again ($4.19 left,
+    "~0.8 day(s)"), a false positive that trains the operator to ignore the
+    alarm. A resetting cap gets a fraction-consumed rule instead and stays
+    out of the runway math.
+    """
+
+    @staticmethod
+    def _probe(monkeypatch: pytest.MonkeyPatch, budget: OpenRouterBudget) -> None:
+        async def fake_probe(client: Any = None) -> OpenRouterBudget:
+            return budget
+
+        monkeypatch.setattr("app.services.ingestion_health._openrouter_budget", fake_probe)
+
+    @pytest.mark.asyncio
+    async def test_healthy_daily_cap_after_a_raise_stays_quiet(
+        self, monkeypatch: pytest.MonkeyPatch, credit_check_only: None
+    ) -> None:
+        """The exact false alarm observed at 2026-08-13T21:08Z: cap just
+        raised to $15, $4.19 left today, account funded — must NOT page."""
+        self._probe(
+            monkeypatch,
+            OpenRouterBudget(
+                key_remaining=4.19,
+                key_limit=15.0,
+                key_limit_reset="daily",
+                account_remaining=95.89,
+                usage_weekly=36.4,
+            ),
+        )
+
+        report = await check_ingestion_health(object(), now=_NOW)
+
+        assert report.alerts == []
+        assert report.low_credit is False
+        # Runway is computed on the non-recovering balance only.
+        assert report.credit_runway_days == pytest.approx(95.89 / (36.4 / 7.0))
+
+    @pytest.mark.asyncio
+    async def test_approach_warns_before_the_cap_exhausts(
+        self, monkeypatch: pytest.MonkeyPatch, credit_check_only: None
+    ) -> None:
+        """The missing early warning: 83% of the cap consumed must page
+        (warning) while there is still budget to act on."""
+        self._probe(
+            monkeypatch,
+            OpenRouterBudget(
+                key_remaining=2.50,
+                key_limit=15.0,
+                key_limit_reset="daily",
+                account_remaining=95.0,
+                usage_weekly=36.4,
+            ),
+        )
+
+        report = await check_ingestion_health(object(), now=_NOW)
+
+        assert report.low_credit is True
+        assert len(report.alerts) == 1
+        alert = report.alerts[0]
+        assert "key cap nearly consumed" in alert
+        assert "83%" in alert
+        assert "resets daily" in alert
+        assert "$2.50 left" in alert
+        assert "openrouter.ai/settings/keys" in alert
+        # It names the approaching cap, not the (healthy) account.
+        assert "top up" not in alert
+
+    @pytest.mark.asyncio
+    async def test_fraction_rule_disabled_by_zero_threshold(
+        self, monkeypatch: pytest.MonkeyPatch, credit_check_only: None
+    ) -> None:
+        monkeypatch.setattr(settings, "llm_credit_key_cap_alert_fraction", 0.0)
+        self._probe(
+            monkeypatch,
+            OpenRouterBudget(
+                key_remaining=2.50,
+                key_limit=15.0,
+                key_limit_reset="daily",
+                account_remaining=95.0,
+                usage_weekly=36.4,
+            ),
+        )
+
+        report = await check_ingestion_health(object(), now=_NOW)
+
+        assert report.alerts == []
+
+    @pytest.mark.asyncio
+    async def test_non_resetting_key_cap_keeps_the_runway_rule(
+        self, monkeypatch: pytest.MonkeyPatch, credit_check_only: None
+    ) -> None:
+        """No reset schedule → the cap does NOT self-heal, so it belongs to
+        the runway/floor rules exactly as before."""
+        self._probe(
+            monkeypatch,
+            OpenRouterBudget(
+                key_remaining=9.0,
+                key_limit=100.0,
+                key_limit_reset=None,
+                account_remaining=95.0,
+                usage_weekly=70.0,  # $10/day → 0.9-day runway on the key
+            ),
+        )
+
+        report = await check_ingestion_health(object(), now=_NOW)
+
+        assert report.low_credit is True
+        assert report.credit_runway_days == pytest.approx(0.9)
+        assert "raise it" in report.alerts[0]
+
+    @pytest.mark.asyncio
+    async def test_exhausted_resetting_cap_still_pages_error(
+        self, monkeypatch: pytest.MonkeyPatch, credit_check_only: None
+    ) -> None:
+        """Exhaustion itself must stay loud (error level), with the key
+        remedy — this is the 20:33Z page, now correctly categorized."""
+        self._probe(
+            monkeypatch,
+            OpenRouterBudget(
+                key_remaining=0.0,
+                key_limit=15.0,
+                key_limit_reset="daily",
+                account_remaining=96.69,
+                usage_weekly=36.4,
+            ),
+        )
+
+        report = await check_ingestion_health(object(), now=_NOW)
+
+        assert report.low_credit is True
+        alert = report.alerts[0]
+        assert "key cap exhausted" in alert
+        assert "topping up credits will NOT clear this" in alert
+        # The funded account must not trip a second (runway) alert.
+        assert len(report.alerts) == 1
+
+
+class TestBudgetTruthSource:
+    """2026-08-12 incident. The alarm mixed two sources: `remaining` from
+    OpenRouter, `daily_rate` from our own `llm_costs`. The ledger records only
+    calls that COMPLETE — a generation billed and then failed downstream is
+    spend we never wrote down — so on the day it read $3.01 against
+    OpenRouter's $10.00 and every runway estimate ran long.
+    """
+
+    @pytest.mark.asyncio
+    async def test_trailing_rate_comes_from_openrouter_not_our_ledger(
+        self, monkeypatch: pytest.MonkeyPatch, credit_check_only: None
+    ) -> None:
+        # OpenRouter: $70/wk → $10/day. Ledger: $7/wk → $1/day. With $9 left
+        # the honest runway is 0.9 days (alarm); the ledger's says 9 (quiet).
+        _patch_probe(monkeypatch, remaining=9.0, usage_weekly=70.0)
+        ledger_calls = _patch_week_spend(monkeypatch, 7.0)
+
+        report = await check_ingestion_health(object(), now=_NOW)
+
+        assert report.low_credit is True
+        assert report.credit_runway_days == pytest.approx(0.9)
+        # The ledger must not even be consulted — reading it at all is what
+        # let the two sources disagree.
+        assert ledger_calls == []
+        assert "per OpenRouter" in report.alerts[0]
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_ledger_only_when_openrouter_withholds_usage(
+        self, monkeypatch: pytest.MonkeyPatch, credit_check_only: None
+    ) -> None:
+        """A stale estimate beats no alarm: if OpenRouter omits usage_weekly we
+        still want a runway number rather than silence."""
+        _patch_probe(monkeypatch, remaining=1.0, usage_weekly=None)
+        ledger_calls = _patch_week_spend(monkeypatch, 7.0)
+
+        report = await check_ingestion_health(object(), now=_NOW)
+
+        assert ledger_calls == [1]
+        assert report.low_credit is True
+
+    @pytest.mark.asyncio
+    async def test_alert_names_the_key_cap_and_does_not_say_top_up(
+        self, monkeypatch: pytest.MonkeyPatch, credit_check_only: None
+    ) -> None:
+        """The actual failure on 2026-08-12: a $10/day KEY cap was exhausted
+        while the ACCOUNT still held $6.69, and the alarm said "top up credits"
+        — which would not have cleared it. The remedy must match the limit."""
+
+        async def fake_probe(client: Any = None) -> OpenRouterBudget:
+            return OpenRouterBudget(
+                key_remaining=0.0,
+                key_limit=10.0,
+                key_limit_reset="daily",
+                account_remaining=6.69,
+                usage_weekly=25.59,
+            )
+
+        monkeypatch.setattr("app.services.ingestion_health._openrouter_budget", fake_probe)
+
+        report = await check_ingestion_health(object(), now=_NOW)
+
+        alert = report.alerts[0]
+        assert report.low_credit is True
+        assert "key" in alert and "resets daily" in alert
+        assert "$10.00 cap" in alert
+        # The other limit is reported for context but NOT prescribed as the fix.
+        assert "account $6.69" in alert
+        assert "topping up credits will NOT clear this" in alert
+
+    @pytest.mark.asyncio
+    async def test_alert_says_top_up_when_the_account_is_the_binding_limit(
+        self, monkeypatch: pytest.MonkeyPatch, credit_check_only: None
+    ) -> None:
+        """The mirror case — the remedy has to flip with the limit, or naming
+        it is theatre."""
+
+        async def fake_probe(client: Any = None) -> OpenRouterBudget:
+            return OpenRouterBudget(
+                key_remaining=50.0,
+                key_limit=100.0,
+                key_limit_reset="daily",
+                account_remaining=1.0,
+                usage_weekly=70.0,
+            )
+
+        monkeypatch.setattr("app.services.ingestion_health._openrouter_budget", fake_probe)
+
+        report = await check_ingestion_health(object(), now=_NOW)
+
+        alert = report.alerts[0]
+        assert "account" in alert
+        assert "settings/credits" in alert
+        assert "NOT clear this" not in alert
+
+    @pytest.mark.asyncio
+    async def test_one_endpoint_down_degrades_but_both_down_is_loud(self) -> None:
+        """Partial data still beats blindness; total blindness must NOT read as
+        'no limit breached'."""
+        partial = _mock_client(
+            {"/api/v1/key": {"data": {"limit_remaining": 5.0, "usage_weekly": 14.0}}}
+        )
+        budget = await _openrouter_budget(partial)
+        assert budget.remaining == 5.0
+        assert budget.daily_rate == pytest.approx(2.0)
+
+        def dead(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, content="{}")
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await _openrouter_budget(httpx.AsyncClient(transport=httpx.MockTransport(dead)))

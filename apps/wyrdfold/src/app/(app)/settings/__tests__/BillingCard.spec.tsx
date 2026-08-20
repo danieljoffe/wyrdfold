@@ -6,6 +6,15 @@ import BillingCard from '../BillingCard';
 
 const mockToast = jest.fn();
 const mockNavigateTo = jest.fn();
+const mockReplace = jest.fn();
+// Mutable so a test can simulate returning from Stripe (?billing=success).
+let searchParamsValue = new URLSearchParams();
+
+jest.mock('next/navigation', () => ({
+  useSearchParams: () => searchParamsValue,
+  usePathname: () => '/settings',
+  useRouter: () => ({ replace: mockReplace, prefetch: jest.fn() }),
+}));
 
 jest.mock('@/state/Toast/ToastProvider', () => ({
   useToast: () => ({ toast: mockToast }),
@@ -43,11 +52,83 @@ describe('BillingCard', () => {
   beforeEach(() => {
     mockToast.mockClear();
     mockNavigateTo.mockClear();
+    mockReplace.mockClear();
+    searchParamsValue = new URLSearchParams();
     global.fetch = jest.fn() as jest.Mock;
   });
 
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it('confirms the payment on return from Stripe, then strips the param', async () => {
+    // #863: Stripe returns to /settings?billing=success and nothing read it,
+    // so the highest-anxiety moment in the product answered "did that work?"
+    // with an unrelated settings form.
+    searchParamsValue = new URLSearchParams('billing=success');
+    (global.fetch as jest.Mock).mockResolvedValue(
+      jsonOk(account({ plan: 'starter', has_billing_account: true }))
+    );
+
+    render(<BillingCard />);
+
+    await waitFor(() =>
+      expect(mockToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          variant: 'success',
+          title: expect.stringMatching(/subscription active/i),
+        })
+      )
+    );
+    // Stripped, so a refresh doesn't replay the confirmation.
+    await waitFor(() =>
+      expect(mockReplace).toHaveBeenCalledWith('/settings', { scroll: false })
+    );
+  });
+
+  it('says no charge was made when checkout is cancelled', async () => {
+    searchParamsValue = new URLSearchParams('billing=cancelled');
+    (global.fetch as jest.Mock).mockResolvedValue(jsonOk(account()));
+
+    render(<BillingCard />);
+
+    await waitFor(() =>
+      expect(mockToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          description: expect.stringMatching(/no charge was made/i),
+        })
+      )
+    );
+  });
+
+  it('waits for the webhook rather than showing a stale plan as final', async () => {
+    // The plan flip rides the WEBHOOK, not the redirect, so the two race.
+    // Landing first used to show "Free" beside a success message, which
+    // reads as a failed payment and invites paying twice.
+    searchParamsValue = new URLSearchParams('billing=success');
+    (global.fetch as jest.Mock)
+      .mockResolvedValueOnce(jsonOk(account({ plan: 'trial' })))
+      .mockResolvedValue(
+        jsonOk(account({ plan: 'starter', has_billing_account: true }))
+      );
+
+    render(<BillingCard />);
+
+    // It must land on the settled plan, not the stale one it first saw.
+    expect(
+      await screen.findByText(/Starter/, {}, { timeout: 4000 })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /manage subscription/i })
+    ).toBeInTheDocument();
+  });
+
+  it('says nothing when there is no billing param', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(jsonOk(account()));
+    render(<BillingCard />);
+    await screen.findByText(/Free \(bring your own key\)/);
+    expect(mockToast).not.toHaveBeenCalled();
+    expect(mockReplace).not.toHaveBeenCalled();
   });
 
   it('renders nothing when billing is not offered (self-host 404)', async () => {
@@ -56,6 +137,24 @@ describe('BillingCard', () => {
     );
     const { container } = render(<BillingCard />);
     await waitFor(() => expect(container).toBeEmptyDOMElement());
+  });
+
+  it('tells a trial user to subscribe, never to add an API key', async () => {
+    // A trial runs on HOSTED keys. Showing it the free-plan copy ("add one
+    // above") points at a field that is disabled when BYOK is unavailable —
+    // the dead end #841 exists to remove.
+    (global.fetch as jest.Mock).mockResolvedValueOnce(
+      jsonOk(account({ plan: 'trial' }))
+    );
+    render(<BillingCard />);
+
+    expect(await screen.findByText(/Free trial/)).toBeInTheDocument();
+    expect(screen.getByText(/Subscribe before it ends/)).toBeInTheDocument();
+    expect(screen.queryByText(/add one above/)).not.toBeInTheDocument();
+    // Still convertible: the upgrade path must remain on screen.
+    expect(
+      screen.getByRole('button', { name: /Get Starter/ })
+    ).toBeInTheDocument();
   });
 
   it('shows upgrade buttons for a free-plan user without a billing account', async () => {

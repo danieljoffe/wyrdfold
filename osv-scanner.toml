@@ -34,3 +34,23 @@ dev-only transitive via less@4 (vite peer), no Less in this repo.
 
 Re-check 2026-09-07.
 """
+
+[[IgnoredVulns]]
+id = "GHSA-jmr9-qjv8-65gv"
+ignoreUntil = 2026-09-09
+reason = """
+extract-zip unvalidated symlink path traversal (published 2026-08-12; started
+failing every PR's OSV audit that day, unrelated to the PRs themselves).
+
+NO FIXED VERSION EXISTS. OSV's affected range is {introduced: 0,
+last_affected: 2.0.1} and 2.0.1 is the LATEST published release — no patch on
+any line, so a pnpm override cannot clear this.
+
+Unreachable here: extract-zip arrives only via @lhci/cli -> puppeteer-core ->
+@puppeteer/browsers, all devDependencies (the Lighthouse CI toolchain). Its
+only job there is unpacking browser archives downloaded from the vendor's own
+CDN during CI browser install; nothing feeds it attacker-controlled zips, and
+it never enters a production bundle.
+
+Re-check 2026-09-09: drop this the moment a patched release lands.
+"""

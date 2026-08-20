@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import LegalDocument, { type LegalSection } from '../_components/LegalDocument';
+import { LEGAL_ENTITY_NAME } from '@/lib/legalEntity';
 
 const LEGAL_EMAIL = 'legal@wyrdfold.com';
 
@@ -17,7 +18,7 @@ const SECTIONS: LegalSection[] = [
     body: (
       <p>
         These Terms of Service (“Terms”) govern your use of WyrdFold, operated
-        by [Legal Entity Name] (“we”, “us”). Please read these Terms together
+        by {LEGAL_ENTITY_NAME} (“we”, “us”). Please read these Terms together
         with our{' '}
         <Link className='underline underline-offset-2' href='/privacy'>
           Privacy Policy
@@ -144,7 +145,9 @@ const SECTIONS: LegalSection[] = [
           </b>{' '}
           WyrdFold does <b>not</b> guarantee employment, interviews, responses,
           or the accuracy, quality, or suitability of any match or generated
-          content.
+          content. We do not guarantee that you will secure an interview or a
+          job. We are not responsible for any hiring decisions made by
+          third-party employers.
         </p>
       </>
     ),
@@ -153,27 +156,35 @@ const SECTIONS: LegalSection[] = [
     heading: 'Subscriptions and billing',
     body: (
       <p>
-        WyrdFold offers a free tier and paid subscription plans. Paid plans are
-        billed in advance on a recurring basis until cancelled. Billing is
-        handled by Stripe under its own terms and privacy practices. You can
-        cancel at any time from your account; cancellation takes effect at the
-        end of the current billing period. Fees are non-refundable except where
-        required by law. Prices and taxes are as shown at purchase and may
-        change on notice.
+        WyrdFold requires a paid subscription to access its AI-powered features.
+        There is no free tier or trial period. All subscriptions are billed in
+        advance on a recurring basis until cancelled. Billing is handled by
+        Stripe under its own terms and privacy practices. You can cancel at any
+        time from your account settings; cancellation takes effect at the end of
+        the current billing period. Fees are non-refundable except where
+        required by applicable law. Prices and taxes are as shown at purchase
+        and may change upon 30 days&rsquo; notice.
       </p>
     ),
   },
   {
     heading: 'Bring-your-own-key (BYOK)',
     body: (
-      <p>
-        If you supply your own AI provider API key, you authorize us to send
-        requests to that provider using it on your behalf. You are responsible
-        for all usage and costs incurred on that key and for complying with that
-        provider’s terms. If the key is removed, revoked, or becomes invalid, AI
-        features may stop working. We store the key only to make requests on
-        your behalf and use it for no other purpose.
-      </p>
+      <>
+        <p>
+          If you self-host WyrdFold, you may supply your own AI provider API
+          key. In that configuration we do not process, view, or store your
+          data; it is sent directly from your self-hosted instance to the AI
+          provider. You are responsible for all usage and costs incurred on that
+          key and for complying with that provider&rsquo;s terms.
+        </p>
+        <p>
+          We are developing BYOK support for our hosted service. When released,
+          the same direct-processing model will apply, and your key will be
+          stored only to make requests on your behalf and used for no other
+          purpose.
+        </p>
+      </>
     ),
   },
   {
@@ -184,6 +195,21 @@ const SECTIONS: LegalSection[] = [
         by law. These Terms grant you a personal, non-transferable right to use
         the service; they do not transfer any of our intellectual property to
         you.
+      </p>
+    ),
+  },
+  {
+    heading: 'Open-source license',
+    body: (
+      <p>
+        The source code for WyrdFold is made available under the Functional
+        Source License v1.1 (FSL-1.1-ALv2). These Terms of Service apply
+        exclusively to the hosted cloud service provided by us. Self-hosting the
+        source code is permitted under the FSL, but any use of a self-hosted
+        instance to operate a commercial service that competes with our hosted
+        offering is a violation of the FSL and is not authorized under these
+        Terms. For clarity, the FSL governs your rights to the source code;
+        these Terms govern your rights to use our hosted service.
       </p>
     ),
   },
@@ -308,9 +334,13 @@ const SECTIONS: LegalSection[] = [
     heading: 'Governing law',
     body: (
       <p>
-        These Terms are governed by the laws of [Jurisdiction], without regard
-        to its conflict-of-laws rules, and any disputes will be resolved in the
-        courts of [Jurisdiction].
+        These Terms are governed by the laws of the State of California, without
+        regard to its conflict-of-laws rules, and any disputes will be resolved
+        exclusively in the state or federal courts located in California. If you
+        reside in the European Union or the United Kingdom, this choice of law
+        does not deprive you of the mandatory consumer protections afforded to
+        you under the laws of your country of residence, and you may bring a
+        claim in your local courts where such protections apply.
       </p>
     ),
   },

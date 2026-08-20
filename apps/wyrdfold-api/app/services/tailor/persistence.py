@@ -179,6 +179,7 @@ async def persist_cover_letter(
     llm_result: LLMResult,
     storage_path: str | None,
     lint_violations: list[dict[str, Any]] | None = None,
+    allow_stretch: bool = False,
 ) -> TailoredResumeRecord:
     """Insert one documents row for a cover letter.
 
@@ -187,6 +188,11 @@ async def persist_cover_letter(
 
     ``lint_violations`` carries the same three-state ATS lint contract as
     ``persist`` — see there.
+
+    ``allow_stretch`` records whether the user opted past a Skip verdict for
+    THIS letter (#785). It is stored rather than re-derived because the review
+    page's re-generate has no target in scope, and the verdict it would need is
+    per-(job, target).
     """
     row: dict[str, Any] = {
         "user_id": user_id,
@@ -206,6 +212,7 @@ async def persist_cover_letter(
         "cost_usd": llm_result.cost_usd,
         "latency_ms": llm_result.latency_ms,
         "lint_violations": lint_violations,
+        "allow_stretch": allow_stretch,
     }
     return await insert_row(supabase, row, payload_md=payload_md)
 
@@ -269,11 +276,19 @@ async def update_payload(
     version_source: versions.VersionSource = "user_edit",
     *,
     user_id: str | None,
+    payload_md: str | None = None,
 ) -> TailoredResumeRecord:
     """Update the payload JSONB and set updated_at. Optionally update storage_path.
 
     Records a version snapshot before the update lands so history is captured
     even if the live update fails between snapshot and commit (F3-H).
+
+    Pass ``payload_md`` so the snapshot is restorable. A version row without
+    markdown can be listed but never loaded — the review page restores from
+    ``payload_md``, and refuses rows that lack it. Every other writer
+    (``insert_row``, ``versions.checkpoint``) already supplies it; this one is
+    currently uncalled in app code, so the omission was latent rather than
+    live, but it's the same trap for whoever wires it up next.
 
     Defense-in-depth (post-#714): scopes the update by ``user_id`` in
     addition to ``id`` so a future caller that bypasses the route's
@@ -286,6 +301,7 @@ async def update_payload(
         resume_id=resume_id,
         payload=payload_dict,
         source=version_source,
+        payload_md=payload_md,
     )
     updates: dict[str, Any] = {
         "payload": payload_dict,
@@ -444,15 +460,19 @@ async def mark_job_resume_draft(
     ``upsert_user_job`` twin kept for the not-yet-converted routers (#57 slice 3).
     """
     if user_id is not None:
-        await supabase.table("user_jobs").upsert(
-            {
-                "user_id": user_id,
-                "job_posting_id": job_posting_id,
-                "status": "resume_draft",
-                "updated_at": datetime.now(UTC).isoformat(),
-            },
-            on_conflict="user_id,job_posting_id",
-        ).execute()
+        await (
+            supabase.table("user_jobs")
+            .upsert(
+                {
+                    "user_id": user_id,
+                    "job_posting_id": job_posting_id,
+                    "status": "resume_draft",
+                    "updated_at": datetime.now(UTC).isoformat(),
+                },
+                on_conflict="user_id,job_posting_id",
+            )
+            .execute()
+        )
 
 
 async def approve(

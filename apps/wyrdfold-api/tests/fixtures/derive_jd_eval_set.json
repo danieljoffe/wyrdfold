@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "Synthetic JDs for scripts/eval_derive_profile_from_jd.py. AUTHORED, not scraped:",
+    "the prod snapshot fixture (tests/fixtures/eval_set.json) is real JD text, so it is",
+    "PII and gitignored, which makes it unrunnable by anyone else and unusable as a",
+    "committed baseline. These are written to stress the two defect classes observed on",
+    "prod 2026-08-15 (docs/ux-resweep-targets-2026-08-14.md C2) while staying",
+    "representative of real postings.",
+    "",
+    "Cases 1-5 are ADVERSARIAL for section disjointness: each names domain-defining",
+    "technologies (payment rails, HIPAA, Unreal) that are simultaneously plausible as",
+    "skills AND as domain signals, which is exactly what made the extractor emit them",
+    "twice. Case 6 is adversarial for seniority signals: dense in generic responsibility",
+    "verbs (design, ship, own, build) with NO real seniority evidence. Cases 7-8 are",
+    "CONTROLS - clean separation and explicit years-of-experience - so a prompt change",
+    "that simply empties these sections is caught rather than scored as an improvement."
+  ],
+  "cases": [
+    {
+      "id": "fintech-payments",
+      "note": "The exact shape that produced the prod defect: ACH/SEPA/PCI-DSS landed in both a skills category and domain signals.",
+      "jd_text": "Senior Full Stack Engineer (Fintech). We are a Series B payments company building settlement infrastructure. You will own services written in Rust and TypeScript, design GraphQL APIs consumed by our React front end, and manage infrastructure as code with Terraform on AWS. Responsibilities: design and ship event-driven microservices; own Postgres schema design and query performance; build GraphQL federation across four teams; instrument services with OpenTelemetry. Requirements: 6+ years building production backend systems, deep Rust or Go experience, strong SQL, experience with PCI-DSS compliance and payment rails such as ACH and SEPA. Nice to have: Kafka, ClickHouse, formal verification."
+    },
+    {
+      "id": "healthtech-hipaa",
+      "note": "HIPAA is both a compliance skill and a healthcare domain marker.",
+      "jd_text": "Staff Backend Engineer, Clinical Data. Join a healthtech company modernising how hospitals exchange patient records. You will build HL7 and FHIR ingestion pipelines in Python, model clinical data in Postgres, and run services on Kubernetes. Requirements: 8+ years in backend engineering, strong Python, demonstrated experience handling PHI under HIPAA, and comfort with HL7 v2 and FHIR R4 interchange formats. You will lead the data-modelling workstream and mentor two engineers. Preferred: experience with Epic or Cerner integrations, dbt, and Airflow. This role sits with our interoperability team and reports to the Director of Engineering."
+    },
+    {
+      "id": "gamedev-unreal",
+      "note": "Unreal/C++ are skills; games is the domain. Easy to conflate.",
+      "jd_text": "Senior Gameplay Engineer. We are an independent games studio shipping a third-person action title on console and PC. You will implement gameplay systems in Unreal Engine 5 using C++ and Blueprints, profile and optimise frame time on console hardware, and collaborate daily with designers and animators. Requirements: 5+ years shipping gameplay code, expert C++, deep Unreal Engine experience, and at least one shipped console title. Nice to have: networking and rollback netcode, Houdini, technical animation. You will own the combat system end to end and set its technical direction."
+    },
+    {
+      "id": "ecommerce-shopify",
+      "note": "Shopify/Stripe are skills; e-commerce/retail is the domain.",
+      "jd_text": "Senior Frontend Engineer, Storefront. A direct-to-consumer retail brand is rebuilding its storefront for speed. You will work in Next.js and TypeScript, integrate Shopify's Storefront API and Stripe checkout, and drive Core Web Vitals improvements across the funnel. Requirements: 5+ years frontend engineering, expert React and TypeScript, measurable performance work, and strong CSS. You will partner with design and own the checkout experience. Preferred: experience with headless commerce, edge rendering, and A/B testing frameworks."
+    },
+    {
+      "id": "govtech-fedramp",
+      "note": "FedRAMP/FISMA are compliance skills; public sector is the domain.",
+      "jd_text": "Principal Platform Engineer, Public Sector. We deliver cloud infrastructure to federal agencies. You will design multi-tenant AWS GovCloud environments, automate compliance evidence collection, and shepherd systems through FedRAMP authorisation. Requirements: 10+ years infrastructure engineering, deep AWS, Terraform, and hands-on experience achieving FedRAMP Moderate or FISMA compliance. You will set platform strategy across three teams and act as the primary technical authority in agency reviews. Preferred: Kubernetes, Open Policy Agent, and prior work with an authorising official."
+    },
+    {
+      "id": "logistics-embedded",
+      "note": "Domain (logistics/warehouse robotics) plus low-level skills.",
+      "jd_text": "Embedded Software Engineer, Warehouse Robotics. Our autonomous mobile robots move inventory in fulfilment centres. You will write firmware in C and Rust for motor control and sensor fusion, work with ROS 2, and debug on real hardware alongside mechanical engineers. Requirements: 4+ years embedded development, strong C, real-time systems experience, and comfort with oscilloscopes and CAN bus. Preferred: ROS 2, SLAM, functional safety standards. You will own the motion-control stack and mentor a junior firmware engineer."
+    },
+    {
+      "id": "verb-dense-no-seniority",
+      "note": "ADVERSARIAL for seniority signals: dense in generic responsibility verbs, deliberately no years-of-experience or scope markers. A clean extractor should emit FEW or NO seniority signals here rather than harvesting the verbs.",
+      "jd_text": "Software Engineer. You will design, build, test, ship, and operate services that power our product. Day to day you will write code, review pull requests, own features from spec to production, debug incidents, improve tooling, and document what you build. Our stack is Python, Postgres, and React on AWS. We care about clear writing, small pull requests, and moving quickly without breaking the things that matter. There is no on-call rotation. We work asynchronously and value people who take initiative and communicate well."
+    },
+    {
+      "id": "control-clean-separation",
+      "note": "CONTROL: unambiguous split between skills and an industry-neutral context, with explicit seniority evidence. A prompt change must not degrade or empty this one.",
+      "jd_text": "Senior Backend Engineer. You will build and maintain HTTP APIs in Go, model data in Postgres, and deploy on Kubernetes. Requirements: 7+ years of professional backend experience, strong Go, solid SQL, and experience operating services in production. You will lead technical design reviews, mentor mid-level engineers, and make independent architectural decisions with limited oversight. Preferred: gRPC, Redis, and experience with distributed tracing. We are a horizontal developer-tools company; the work is not tied to any particular industry vertical."
+    }
+  ]
+}

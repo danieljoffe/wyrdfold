@@ -59,9 +59,7 @@ _USER = "user-1"
 _JOB = "job-1"
 _CONTACT = ContactInfo(name="Daniel Joffe", email="d@example.com")
 
-_RESUME = TailoredResume(
-    summary="Senior FE.", contact=_CONTACT, experience=[], skills=["React"]
-)
+_RESUME = TailoredResume(summary="Senior FE.", contact=_CONTACT, experience=[], skills=["React"])
 _LETTER = TailoredCoverLetter(
     contact=_CONTACT,
     recipient_company="Acme",
@@ -123,6 +121,7 @@ def _record(
     lint_violations: list[LintViolation] | None = None,
     payload_md: str | None = _CLEAN_MD,
     approved_at: datetime | None = None,
+    created_at: datetime | None = None,
 ) -> TailoredResumeRecord:
     return TailoredResumeRecord(
         id=record_id,
@@ -141,7 +140,7 @@ def _record(
         output_tokens=50,
         cost_usd=0.001,
         latency_ms=50,
-        created_at=_NOW,
+        created_at=created_at if created_at is not None else _NOW,
         approved_at=approved_at,
         lint_violations=lint_violations,
     )
@@ -198,9 +197,7 @@ def _posting_exists_by_default(request: pytest.FixtureRequest) -> Iterator[None]
     if request.node.get_closest_marker("real_posting_exists"):
         yield
         return
-    with patch(
-        "app.routers.tailor._posting_exists", new_callable=AsyncMock, return_value=True
-    ):
+    with patch("app.routers.tailor._posting_exists", new_callable=AsyncMock, return_value=True):
         yield
 
 
@@ -229,13 +226,9 @@ def _pipeline(result: Any, *, cover_letter: bool = False) -> Iterator[AsyncMock]
             return_value=_optimized_doc(),
         ),
         patch("app.routers.tailor._preferences_get", new_callable=AsyncMock, return_value=None),
-        patch(
-            "app.routers.tailor.resolve_contact", new_callable=AsyncMock, return_value=_CONTACT
-        ),
+        patch("app.routers.tailor.resolve_contact", new_callable=AsyncMock, return_value=_CONTACT),
         patch(f"app.routers.tailor.{target}", run),
-        patch(
-            "app.services.tailor.persistence.mark_job_resume_draft", new_callable=AsyncMock
-        ),
+        patch("app.services.tailor.persistence.mark_job_resume_draft", new_callable=AsyncMock),
     ):
         yield run
 
@@ -276,9 +269,7 @@ async def test_detached_resume_task_runs_pipeline_and_clears_the_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured = _capture_spawned(monkeypatch)
-    key = run_registry.key_for(
-        user_id=_USER, document_type="resume", job_posting_id=_JOB
-    )
+    key = run_registry.key_for(user_id=_USER, document_type="resume", job_posting_id=_JOB)
     try:
         with _pipeline(_success()) as run, _client() as tc:
             tc.post("/tailor/resume", json=_resume_body())
@@ -300,9 +291,7 @@ async def test_detached_resume_task_marks_error_when_the_pipeline_raises(
     a key that will never produce a row until it gives up — the exact failure
     the 202 pattern is supposed to make visible."""
     captured = _capture_spawned(monkeypatch)
-    key = run_registry.key_for(
-        user_id=_USER, document_type="resume", job_posting_id=_JOB
-    )
+    key = run_registry.key_for(user_id=_USER, document_type="resume", job_posting_id=_JOB)
     try:
         with _pipeline(_success()) as run, _client() as tc:
             run.side_effect = RuntimeError("LLM exploded")
@@ -382,9 +371,7 @@ def test_concurrency_cap_429s_a_fan_out_across_postings(
         assert len(captured) == 2
         assert (
             run_registry.is_running(
-                run_registry.key_for(
-                    user_id=_USER, document_type="resume", job_posting_id="job-c"
-                )
+                run_registry.key_for(user_id=_USER, document_type="resume", job_posting_id="job-c")
             )
             is False
         )
@@ -444,9 +431,7 @@ def test_gap_gate_still_422s_instantly_and_claims_nothing(
         assert captured == []
         assert (
             run_registry.is_running(
-                run_registry.key_for(
-                    user_id=_USER, document_type="resume", job_posting_id=_JOB
-                )
+                run_registry.key_for(user_id=_USER, document_type="resume", job_posting_id=_JOB)
             )
             is False
         )
@@ -465,9 +450,7 @@ def test_missing_contact_name_400s_and_releases_the_claim(
     from fastapi import HTTPException
 
     captured = _capture_spawned(monkeypatch)
-    key = run_registry.key_for(
-        user_id=_USER, document_type="resume", job_posting_id=_JOB
-    )
+    key = run_registry.key_for(user_id=_USER, document_type="resume", job_posting_id=_JOB)
     try:
         with (
             patch(
@@ -475,9 +458,7 @@ def test_missing_contact_name_400s_and_releases_the_claim(
                 new_callable=AsyncMock,
                 return_value=_optimized_doc(),
             ),
-            patch(
-                "app.routers.tailor._preferences_get", new_callable=AsyncMock, return_value=None
-            ),
+            patch("app.routers.tailor._preferences_get", new_callable=AsyncMock, return_value=None),
             patch(
                 "app.routers.tailor.resolve_contact",
                 new_callable=AsyncMock,
@@ -548,9 +529,7 @@ async def test_backgrounded_lint_failure_finishes_rather_than_erroring(
     client's poll finds a real record. Marking it ``error`` would hide the very
     draft the flagged-persist decision exists to preserve."""
     captured = _capture_spawned(monkeypatch)
-    key = run_registry.key_for(
-        user_id=_USER, document_type="resume", job_posting_id=_JOB
-    )
+    key = run_registry.key_for(user_id=_USER, document_type="resume", job_posting_id=_JOB)
     failure = PipelineLintFailure(
         lint=LintResult(
             ok=False,
@@ -559,7 +538,9 @@ async def test_backgrounded_lint_failure_finishes_rather_than_erroring(
         resume=_RESUME,
         warnings=[],
         llm_result=_LLM_RESULT,
-        record=_record(lint_violations=[LintViolation(code="no_tables", message="t", severity="error")]),
+        record=_record(
+            lint_violations=[LintViolation(code="no_tables", message="t", severity="error")]
+        ),
         payload_md="# Flagged",
     )
     try:
@@ -610,9 +591,7 @@ async def test_backgrounded_cover_letter_lint_failure_finishes_flagged(
     would hide the very draft the flagged-persist decision exists to preserve.
     """
     captured = _capture_spawned(monkeypatch)
-    key = run_registry.key_for(
-        user_id=_USER, document_type="cover_letter", job_posting_id=_JOB
-    )
+    key = run_registry.key_for(user_id=_USER, document_type="cover_letter", job_posting_id=_JOB)
     failure = CoverLetterPipelineLintFailure(
         lint=LintResult(
             ok=False,
@@ -654,9 +633,7 @@ async def test_backgrounded_cover_letter_lint_failure_finishes_flagged(
 
 
 async def test_poll_reports_running_then_the_record() -> None:
-    key = run_registry.key_for(
-        user_id=_USER, document_type="resume", job_posting_id=_JOB
-    )
+    key = run_registry.key_for(user_id=_USER, document_type="resume", job_posting_id=_JOB)
     supabase = MagicMock()
 
     # In flight, nothing persisted yet.
@@ -675,10 +652,14 @@ async def test_poll_reports_running_then_the_record() -> None:
     # The row landed. Even with the registry entry not yet cleared, the record
     # WINS — a poll must not bounce back to "generating…" for the width of the
     # window between persist and finish().
+    #
+    # ``created_at`` is stamped NOW, not at module import: a row written by
+    # this run is necessarily newer than the run, and that ordering is what
+    # separates "the run's own output" from "the run's predecessor" (#788).
     with patch(
         "app.services.tailor.persistence.get_by_job",
         new_callable=AsyncMock,
-        return_value=_record(),
+        return_value=_record(created_at=datetime.now(UTC)),
     ):
         state = await tailor_router.get_resume_by_job(
             job_posting_id=_JOB, supabase=supabase, user_id=_USER
@@ -687,10 +668,64 @@ async def test_poll_reports_running_then_the_record() -> None:
     assert state.record is not None and state.record.id == "rec-1"
 
 
+# ---------------------------------------------------------------------------
+# #788: a re-generation must not be reported as settled.
+#
+# `_document_state` used to let any existing record win outright, so the first
+# poll of a RE-generation returned `status: "idle"` with the OLD letter still
+# in place. `useTailorDocument`'s wait reads that as "the server dropped the
+# run" and told the user "Generation was interrupted. Please retry." — while
+# the run was still going and about to succeed.
+# ---------------------------------------------------------------------------
+
+
+async def test_poll_reports_running_while_regenerating_over_an_existing_record() -> None:
+    """The predecessor record must not mask an in-flight run."""
+    key = run_registry.key_for(user_id=_USER, document_type="resume", job_posting_id=_JOB)
+    run_registry.clear_all()
+
+    # A letter from an earlier run exists...
+    previous = _record(record_id="rec-old", created_at=datetime.now(UTC))
+    # ...and only THEN does a re-generation start.
+    run_registry.begin(key, user_id=_USER)
+
+    with patch(
+        "app.services.tailor.persistence.get_by_job",
+        new_callable=AsyncMock,
+        return_value=previous,
+    ):
+        state = await tailor_router.get_resume_by_job(
+            job_posting_id=_JOB, supabase=MagicMock(), user_id=_USER
+        )
+
+    assert state.status == "running", "an in-flight re-generation must not report idle"
+    # The predecessor rides along so a client anchored on the record id knows
+    # which document it is waiting to replace.
+    assert state.record is not None and state.record.id == "rec-old"
+
+
+async def test_poll_settles_once_the_regeneration_finishes() -> None:
+    """And the new row ends the wait."""
+    key = run_registry.key_for(user_id=_USER, document_type="resume", job_posting_id=_JOB)
+    run_registry.clear_all()
+    run_registry.begin(key, user_id=_USER)
+    run_registry.finish(key)
+
+    with patch(
+        "app.services.tailor.persistence.get_by_job",
+        new_callable=AsyncMock,
+        return_value=_record(record_id="rec-new", created_at=datetime.now(UTC)),
+    ):
+        state = await tailor_router.get_resume_by_job(
+            job_posting_id=_JOB, supabase=MagicMock(), user_id=_USER
+        )
+
+    assert state.status == "idle"
+    assert state.record is not None and state.record.id == "rec-new"
+
+
 async def test_poll_reports_error_with_its_message() -> None:
-    key = run_registry.key_for(
-        user_id=_USER, document_type="resume", job_posting_id=_JOB
-    )
+    key = run_registry.key_for(user_id=_USER, document_type="resume", job_posting_id=_JOB)
     run_registry.fail(key, message="Resume generation failed. Please retry.")
     with patch(
         "app.services.tailor.persistence.get_by_job",
@@ -707,9 +742,7 @@ async def test_poll_reports_error_with_its_message() -> None:
 async def test_poll_is_scoped_to_the_caller() -> None:
     """Another user's in-flight run must not show as ``running`` on my poll."""
     run_registry.begin(
-        run_registry.key_for(
-            user_id="someone-else", document_type="resume", job_posting_id=_JOB
-        ),
+        run_registry.key_for(user_id="someone-else", document_type="resume", job_posting_id=_JOB),
         user_id="someone-else",
     )
     with patch(
@@ -804,9 +837,7 @@ async def test_ats_recheck_404s_for_someone_elses_document() -> None:
     a 404 here is also what stops cross-tenant existence from leaking."""
     from fastapi import HTTPException
 
-    with patch(
-        "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=None
-    ):
+    with patch("app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=None):
         with pytest.raises(HTTPException) as exc:
             await tailor_router.recheck_tailored_resume(
                 resume_id="rec-someone-else", supabase=MagicMock(), user_id=_USER
@@ -968,9 +999,7 @@ def test_unknown_posting_404s_before_spending_an_llm_call(
         # And no claim was left behind for the bogus key.
         assert (
             run_registry.is_running(
-                run_registry.key_for(
-                    user_id=_USER, document_type="resume", job_posting_id="ghost"
-                )
+                run_registry.key_for(user_id=_USER, document_type="resume", job_posting_id="ghost")
             )
             is False
         )
@@ -1045,3 +1074,85 @@ async def test_posting_exists_reads_the_jobs_table_by_id() -> None:
     chain.execute = AsyncMock(return_value=MagicMock(data=[]))
     assert await _posting_exists(supabase, "ghost") is False
     supabase.table.assert_called_with("jobs")
+
+
+# ---- allow_stretch reaches the pipeline on BOTH branches (#785) -------------
+
+
+async def test_backgrounded_cover_letter_forwards_allow_stretch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The opt-in must survive the hop through the detached task.
+
+    #780 plumbed the flag but shipped it inert (nothing sent it); nothing
+    pinned the plumbing either. This is the assertion that would have caught a
+    regression in the hand-off.
+    """
+    captured = _capture_spawned(monkeypatch)
+    success = CoverLetterPipelineSuccess(
+        record=_record(document_type="cover_letter"),
+        letter=_LETTER,
+        warnings=[],
+        lint=LintResult(ok=True, violations=[]),
+        llm_result=_LLM_RESULT,
+    )
+    try:
+        with _pipeline(success, cover_letter=True) as run, _client() as tc:
+            tc.post(
+                "/tailor/cover-letter",
+                json={
+                    "job_description": "Build things.",
+                    "company_name": "Acme",
+                    "job_posting_id": _JOB,
+                    "allow_stretch": True,
+                },
+            )
+            await captured[0]
+        assert run.call_args.kwargs["allow_stretch"] is True
+    finally:
+        for coro in captured:
+            coro.close()
+
+
+def test_jd_only_cover_letter_forwards_allow_stretch() -> None:
+    """The synchronous branch (no ``job_posting_id``) dropped it entirely.
+
+    #780 wired only the backgrounded branch, so a caller on this path had the
+    flag accepted by the request model and then silently ignored — the request
+    validated, the prompt never changed.
+    """
+    success = CoverLetterPipelineSuccess(
+        record=_record(document_type="cover_letter"),
+        letter=_LETTER,
+        warnings=[],
+        lint=LintResult(ok=True, violations=[]),
+        llm_result=_LLM_RESULT,
+    )
+    with _pipeline(success, cover_letter=True) as run, _client() as tc:
+        resp = tc.post(
+            "/tailor/cover-letter",
+            json={
+                "job_description": "Build things.",
+                "company_name": "Acme",
+                "allow_stretch": True,
+            },
+        )
+    assert resp.status_code == 200
+    assert run.call_args.kwargs["allow_stretch"] is True
+
+
+def test_jd_only_cover_letter_default_path_is_unchanged() -> None:
+    """No opt-in in, no opt-in out — #780's byte-identical default path."""
+    success = CoverLetterPipelineSuccess(
+        record=_record(document_type="cover_letter"),
+        letter=_LETTER,
+        warnings=[],
+        lint=LintResult(ok=True, violations=[]),
+        llm_result=_LLM_RESULT,
+    )
+    with _pipeline(success, cover_letter=True) as run, _client() as tc:
+        tc.post(
+            "/tailor/cover-letter",
+            json={"job_description": "Build things.", "company_name": "Acme"},
+        )
+    assert run.call_args.kwargs["allow_stretch"] is False

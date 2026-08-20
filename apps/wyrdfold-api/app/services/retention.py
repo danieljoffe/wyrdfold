@@ -21,12 +21,6 @@ generous because both logs feed live features:
   history, so the floor is a year.
 * ``notifications_sent.sent_at`` is the alert-dedup ledger; its window
   only needs to outlast a posting's active life.
-* ``prescan_shadow.observed_at`` is the pre-scan disagreement shadow log
-  (#60) — explicitly temporary analysis data, append-only with no other
-  lifecycle (2026-07-02 audit: access-hardened but not lifecycle-hardened,
-  so it accumulated forever while the flag was on). 30 days comfortably
-  covers an analysis window; the off-ramp remains "analyse, then drop the
-  table".
 * ``search_events.occurred_at`` is the search-funnel metrics ledger (#467
   §10 PR6). Its ``query`` column is raw-ish user input, so bounded
   retention is part of the privacy posture; 90 days covers funnel
@@ -46,8 +40,8 @@ logger = logging.getLogger(__name__)
 # (table, age column) pairs purged by this service.
 _LLM_COSTS = ("llm_costs", "created_at")
 _NOTIFICATIONS = ("notifications_sent", "sent_at")
-_PRESCAN_SHADOW = ("prescan_shadow", "observed_at")
 _SEARCH_EVENTS = ("search_events", "occurred_at")
+_PHASE1_REJECTIONS = ("phase1_rejections", "judged_at")
 
 
 async def _purge_table(supabase: AsyncClient, table: str, ts_col: str, days: int) -> int:
@@ -82,8 +76,8 @@ async def purge_expired_records(
     *,
     llm_costs_days: int,
     notifications_sent_days: int,
-    prescan_shadow_days: int,
     search_events_days: int,
+    phase1_rejections_days: int,
 ) -> dict[str, int]:
     """Purge expired rows from the logs; return a per-table deleted count.
 
@@ -92,6 +86,8 @@ async def purge_expired_records(
     return {
         _LLM_COSTS[0]: await _purge_table(supabase, *_LLM_COSTS, llm_costs_days),
         _NOTIFICATIONS[0]: await _purge_table(supabase, *_NOTIFICATIONS, notifications_sent_days),
-        _PRESCAN_SHADOW[0]: await _purge_table(supabase, *_PRESCAN_SHADOW, prescan_shadow_days),
         _SEARCH_EVENTS[0]: await _purge_table(supabase, *_SEARCH_EVENTS, search_events_days),
+        _PHASE1_REJECTIONS[0]: await _purge_table(
+            supabase, *_PHASE1_REJECTIONS, phase1_rejections_days
+        ),
     }

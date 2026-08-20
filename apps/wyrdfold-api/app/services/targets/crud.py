@@ -56,6 +56,8 @@ def _parse_target(row: dict[str, Any]) -> JobTarget:
         scoring_profile=ScoringProfile.model_validate(row.get("scoring_profile") or {}),
         search_keywords=row.get("search_keywords") or [],
         activation_status=row.get("activation_status") or "idle",
+        activation_error=row.get("activation_error"),
+        activation_failed_at=row.get("activation_failed_at"),
         profile_version=row.get("profile_version", 1),
         app_active=row["app_active"],
         example_promising_titles=row.get("example_promising_titles") or [],
@@ -84,6 +86,8 @@ def _summarize_target(row: dict[str, Any]) -> JobTargetSummary:
         description=row.get("description"),
         normalized_label=row.get("normalized_label"),
         activation_status=row.get("activation_status") or "idle",
+        activation_error=row.get("activation_error"),
+        activation_failed_at=row.get("activation_failed_at"),
         profile_version=row.get("profile_version", 1),
         app_active=row["app_active"],
         seniority_hint=row.get("seniority_hint"),
@@ -275,14 +279,10 @@ def get_active(supabase: Client) -> list[JobTarget]:
     # scale (tens of rows); at 1000+ active memberships the derived set would
     # silently truncate — page the membership read before that ever happens.
     member_ids_resp = (
-        supabase.table(USER_TARGETS_TABLE)
-        .select("target_id")
-        .eq("is_active", True)
-        .execute()
+        supabase.table(USER_TARGETS_TABLE).select("target_id").eq("is_active", True).execute()
     )
     member_ids = {
-        cast(str, r["target_id"])
-        for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
+        cast(str, r["target_id"]) for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
     }
     rows = cast(list[dict[str, Any]], floor_resp.data or [])
     seen = {cast(str, r["id"]) for r in rows}
@@ -301,11 +301,7 @@ def is_pipeline_active(supabase: Client, target_id: str) -> bool:
     the instance floor OR any active membership.
     """
     t_resp = (
-        supabase.table(TARGETS_TABLE)
-        .select("app_active")
-        .eq("id", target_id)
-        .limit(1)
-        .execute()
+        supabase.table(TARGETS_TABLE).select("app_active").eq("id", target_id).limit(1).execute()
     )
     t_rows = cast(list[dict[str, Any]], t_resp.data or [])
     if not t_rows:
@@ -336,7 +332,16 @@ def get_all(supabase: Client) -> list[JobTarget]:
     return [_parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
-def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget | None:
+def build_update_fields(payload: TargetUpdate) -> dict[str, Any]:
+    """Map a ``TargetUpdate`` partial onto the column dict to write.
+
+    THE one field mapping. ``crud.update`` (sync, for seed/operator callers),
+    ``routers.targets._update_target_async`` and ``from_input._update`` were
+    three byte-identical copies of this; the activation-failure invariant below
+    has to hold on every write path, so it lives here rather than in triplicate.
+
+    ``None`` on the partial means "don't touch the column".
+    """
     updates: dict[str, Any] = {"updated_at": datetime.now(UTC).isoformat()}
     if payload.label is not None:
         updates["label"] = payload.label
@@ -349,6 +354,17 @@ def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget
         updates["search_keywords"] = payload.search_keywords
     if payload.activation_status is not None:
         updates["activation_status"] = payload.activation_status
+        # INVARIANT (#649): the failure context is meaningful only while the row
+        # is in `error`. Writing `error` stamps the reason + time; ANY other
+        # transition clears both. That is what makes re-activation a real retry
+        # path — the pipeline reaching `deriving`/`polling`/`ready` wipes the
+        # previous failure without every call site having to remember to.
+        if payload.activation_status == "error":
+            updates["activation_error"] = payload.activation_error
+            updates["activation_failed_at"] = datetime.now(UTC).isoformat()
+        else:
+            updates["activation_error"] = None
+            updates["activation_failed_at"] = None
     if payload.app_active is not None:
         updates["app_active"] = payload.app_active
     if payload.profile_version is not None:
@@ -366,6 +382,11 @@ def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget
         updates["domain_hints"] = payload.domain_hints
     if payload.role_family is not None:
         updates["role_family"] = payload.role_family
+    return updates
+
+
+def update(supabase: Client, target_id: str, payload: TargetUpdate) -> JobTarget | None:
+    updates = build_update_fields(payload)
 
     resp = supabase.table(TARGETS_TABLE).update(updates).eq("id", target_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
@@ -687,9 +708,7 @@ def link_user_to_target(
     return _parse_user_target(rows[0])
 
 
-def get_fit_score_prose_doc_id(
-    supabase: Client, *, user_id: str, target_id: str
-) -> str | None:
+def get_fit_score_prose_doc_id(supabase: Client, *, user_id: str, target_id: str) -> str | None:
     """The prose-doc version marker on the user's link (E2), or None if the link
     is gone or was never scored. Read right before a lazy refresh recomputes, so
     a concurrent refresh (two quick views) doesn't double-spend the LLM."""

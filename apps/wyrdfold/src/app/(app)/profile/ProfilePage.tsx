@@ -55,18 +55,39 @@ import {
 
 // -- Helpers ------------------------------------------------------------------
 
-function formatDateRange(start: string, end: string | null): string {
-  const fmt = (iso: string) => {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    // local-format-ok: returns a STRING (a range like "Jan 2024 – Present"),
-    // so it cannot carry suppressHydrationWarning itself. The single render
-    // site wraps it in a <span suppressHydrationWarning>. See LocalFormat.tsx.
-    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short' });
-  };
+const MONTH_ABBREV = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+
+/** "YYYY-MM" (or "YYYY-MM-DD") → "Jan 2024" WITHOUT constructing a Date.
+ *  `new Date('2024-01')` parses as UTC midnight, so toLocaleDateString
+ *  rendered every role a month early in any western timezone (ux-sweep
+ *  2026-08-12 §A1 — the résumé was right; this card was the shifted one).
+ *  Pure string math is also timezone-independent across server and client.
+ *  Non-matching input (bare year, prose) passes through untouched. */
+export function formatMonthYear(value: string): string {
+  const m = /^(\d{4})-(\d{2})(?:-\d{2})?$/.exec(value.trim());
+  if (!m) return value;
+  const monthIdx = Number(m[2]) - 1;
+  if (monthIdx < 0 || monthIdx > 11) return value;
+  return `${MONTH_ABBREV[monthIdx]} ${m[1]}`;
+}
+
+export function formatDateRange(start: string, end: string | null): string {
   return end
-    ? `${fmt(start)} \u2013 ${fmt(end)}`
-    : `${fmt(start)} \u2013 Present`;
+    ? `${formatMonthYear(start)} \u2013 ${formatMonthYear(end)}`
+    : `${formatMonthYear(start)} \u2013 Present`;
 }
 
 function gapBadgeVariant(kind: string): 'error' | 'warning' | 'default' {
@@ -790,7 +811,8 @@ export default function ProfilePage() {
                     </Text>
                     {evidenceCount > 0 ? (
                       <Badge variant='default' size='sm'>
-                        {evidenceCount} evidence
+                        {evidenceCount} evidence{' '}
+                        {evidenceCount === 1 ? 'item' : 'items'}
                       </Badge>
                     ) : (
                       <Badge variant='error' size='sm'>

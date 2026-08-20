@@ -20,7 +20,7 @@ describe('CostChart', () => {
   it('renders a figure with the chart aria-label when given data', () => {
     render(<CostChart data={SAMPLE} />);
     expect(
-      screen.getByRole('figure', { name: /llm cost/i })
+      screen.getByRole('figure', { name: /ai cost/i })
     ).toBeInTheDocument();
   });
 

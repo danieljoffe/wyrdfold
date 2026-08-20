@@ -46,6 +46,8 @@ describe('TargetCard', () => {
         fitScoreReasoning={null}
         isActive
         onActivate={noop}
+        onRetry={noop}
+        retrying={false}
         onDeactivate={noop}
         onDelete={noop}
         onViewJobs={noop}
@@ -62,6 +64,8 @@ describe('TargetCard', () => {
         fitScoreReasoning={null}
         isActive
         onActivate={noop}
+        onRetry={noop}
+        retrying={false}
         onDeactivate={noop}
         onDelete={noop}
         onViewJobs={noop}
@@ -79,6 +83,8 @@ describe('TargetCard', () => {
         fitScoreReasoning='Great match'
         isActive
         onActivate={noop}
+        onRetry={noop}
+        retrying={false}
         onDeactivate={noop}
         onDelete={noop}
         onViewJobs={noop}
@@ -95,6 +101,8 @@ describe('TargetCard', () => {
         fitScoreReasoning={null}
         isActive
         onActivate={noop}
+        onRetry={noop}
+        retrying={false}
         onDeactivate={noop}
         onDelete={noop}
         onViewJobs={noop}
@@ -113,6 +121,8 @@ describe('TargetCard', () => {
         fitScoreReasoning={null}
         isActive
         onActivate={noop}
+        onRetry={noop}
+        retrying={false}
         onDeactivate={noop}
         onDelete={noop}
         onViewJobs={noop}
@@ -133,6 +143,8 @@ describe('TargetCard', () => {
         fitScoreReasoning={null}
         isActive
         onActivate={noop}
+        onRetry={noop}
+        retrying={false}
         onDeactivate={noop}
         onDelete={noop}
         onViewJobs={noop}
@@ -149,6 +161,8 @@ describe('TargetCard', () => {
         fitScoreReasoning={null}
         isActive={false}
         onActivate={noop}
+        onRetry={noop}
+        retrying={false}
         onDeactivate={noop}
         onDelete={noop}
         onViewJobs={noop}
@@ -165,6 +179,8 @@ describe('TargetCard', () => {
         fitScoreReasoning={null}
         isActive={false}
         onActivate={noop}
+        onRetry={noop}
+        retrying={false}
         onDeactivate={noop}
         onDelete={noop}
         onViewJobs={noop}
@@ -186,6 +202,8 @@ describe('TargetCard', () => {
         fitScoreReasoning={null}
         isActive={false}
         onActivate={onActivate}
+        onRetry={noop}
+        retrying={false}
         onDeactivate={noop}
         onDelete={noop}
         onViewJobs={noop}
@@ -211,6 +229,8 @@ describe('TargetCard', () => {
         fitScoreReasoning={null}
         isActive={false}
         onActivate={noop}
+        onRetry={noop}
+        retrying={false}
         onDeactivate={noop}
         onDelete={noop}
         onViewJobs={onViewJobs}
@@ -234,11 +254,169 @@ describe('TargetCard', () => {
         fitScoreReasoning={null}
         isActive={false}
         onActivate={noop}
+        onRetry={noop}
+        retrying={false}
         onDeactivate={noop}
         onDelete={noop}
         onViewJobs={noop}
       />
     );
-    expect(screen.getByText(/derivation failed/i)).toBeInTheDocument();
+    expect(screen.getByText(/activation failed/i)).toBeInTheDocument();
+  });
+
+  it('names WHY it failed instead of a bare error, per reason code', async () => {
+    // #649: the card used to say only "Derivation failed" whether the user
+    // had to act or a backend call blipped. Assert the reason reaches the
+    // user — that is the whole point of persisting a code.
+    const { unmount } = render(
+      <TargetCard
+        target={makeTarget({
+          activation_status: 'error',
+          activation_error: 'no_experience_profile',
+        })}
+        fitScore={null}
+        fitScoreReasoning={null}
+        isActive={false}
+        onActivate={noop}
+        onRetry={noop}
+        retrying={false}
+        onDeactivate={noop}
+        onDelete={noop}
+        onViewJobs={noop}
+      />
+    );
+    expect(screen.getByText(/experience profile/i)).toBeInTheDocument();
+    unmount();
+
+    render(
+      <TargetCard
+        target={makeTarget({
+          activation_status: 'error',
+          activation_error: 'derive_timeout',
+        })}
+        fitScore={null}
+        fitScoreReasoning={null}
+        isActive={false}
+        onActivate={noop}
+        onRetry={noop}
+        retrying={false}
+        onDeactivate={noop}
+        onDelete={noop}
+        onViewJobs={noop}
+      />
+    );
+    // A DIFFERENT reason must render DIFFERENT copy, or the mapping is
+    // decorative and the code could be ignored entirely.
+    expect(screen.getByText(/took too long/i)).toBeInTheDocument();
+    expect(screen.queryByText(/experience profile/i)).not.toBeInTheDocument();
+  });
+
+  it('falls back to generic copy for an unknown or absent reason code', () => {
+    // Older rows predate the column, and the server can add a code before
+    // this map catches up — neither may render an empty card.
+    render(
+      <TargetCard
+        target={makeTarget({
+          activation_status: 'error',
+          activation_error: 'something_invented_later',
+        })}
+        fitScore={null}
+        fitScoreReasoning={null}
+        isActive={false}
+        onActivate={noop}
+        onRetry={noop}
+        retrying={false}
+        onDeactivate={noop}
+        onDelete={noop}
+        onViewJobs={noop}
+      />
+    );
+    expect(screen.getByText(/something went wrong/i)).toBeInTheDocument();
+  });
+
+  it('offers Retry on a failed card and does not navigate when clicked', async () => {
+    const user = userEvent.setup();
+    const onRetry = jest.fn();
+    render(
+      <TargetCard
+        target={makeTarget({
+          activation_status: 'error',
+          activation_error: 'pipeline_failed',
+        })}
+        fitScore={null}
+        fitScoreReasoning={null}
+        isActive={false}
+        onActivate={noop}
+        onRetry={onRetry}
+        retrying={false}
+        onDeactivate={noop}
+        onDelete={noop}
+        onViewJobs={noop}
+      />
+    );
+    await user.click(screen.getByRole('button', { name: /retry/i }));
+    expect(onRetry).toHaveBeenCalledWith('t-1');
+    // The whole card is a navigation target; the retry must not also route.
+    expect(mockPush).not.toHaveBeenCalled();
+  });
+
+  it('shows no Retry affordance unless the target actually failed', () => {
+    // Guard against the button leaking onto healthy cards — `ready` is the
+    // overwhelmingly common state.
+    render(
+      <TargetCard
+        target={makeTarget({ activation_status: 'ready' })}
+        fitScore={null}
+        fitScoreReasoning={null}
+        isActive
+        onActivate={noop}
+        onRetry={noop}
+        retrying={false}
+        onDeactivate={noop}
+        onDelete={noop}
+        onViewJobs={noop}
+      />
+    );
+    expect(screen.queryByRole('button', { name: /retry/i })).toBeNull();
+  });
+
+  /**
+   * The card navigated via `router.push` on a `role="button"` div, so there
+   * was no cmd/middle-click to open a target in a new tab and no link to copy
+   * — everything an anchor gives for free (first sweep C4).
+   */
+  function renderPlainCard() {
+    render(
+      <TargetCard
+        target={makeTarget()}
+        fitScore={null}
+        fitScoreReasoning={null}
+        isActive
+        onActivate={noop}
+        onRetry={noop}
+        retrying={false}
+        onDeactivate={noop}
+        onDelete={noop}
+        onViewJobs={noop}
+      />
+    );
+  }
+
+  it('exposes the target as a real link, so it can be opened in a new tab', () => {
+    renderPlainCard();
+    const link = screen.getByRole('link', {
+      name: /senior frontend engineer/i,
+    });
+    expect(link).toHaveAttribute('href', '/targets/t-1');
+  });
+
+  it('does not also fire the card push when the link itself is clicked', async () => {
+    const user = userEvent.setup();
+    renderPlainCard();
+    await user.click(
+      screen.getByRole('link', { name: /senior frontend engineer/i })
+    );
+    // The anchor handles navigation; the card's router.push must not also fire.
+    expect(mockPush).not.toHaveBeenCalled();
   });
 });

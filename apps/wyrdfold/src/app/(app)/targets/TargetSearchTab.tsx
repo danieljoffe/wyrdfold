@@ -24,6 +24,12 @@ interface TargetSearchTabProps {
    * refresh — same contract as {@link onFollow}.
    */
   onCreateSuggestion: (match: MatchedSuggestion) => Promise<boolean>;
+  /**
+   * Hand the typed query to the Manual tab. The zero-result state used to offer
+   * only the LLM fallback, so a user who knew exactly what they wanted had to
+   * switch tabs and retype it into an empty Title field.
+   */
+  onCreateManually: (label: string) => void;
 }
 
 /**
@@ -40,6 +46,7 @@ interface TargetSearchTabProps {
 export default function TargetSearchTab({
   onFollow,
   onCreateSuggestion,
+  onCreateManually,
 }: TargetSearchTabProps) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<TargetSearchResult[]>([]);
@@ -292,7 +299,20 @@ export default function TargetSearchTab({
             <Text variant='meta' className='text-text-secondary'>
               No targets match “{trimmed}” yet — nobody’s set this role up.
             </Text>
-            {renderAiFallback('primary')}
+            <div className='flex flex-wrap items-center gap-2'>
+              {renderAiFallback('primary')}
+              {/* The direct path out of the dead end: the user already typed
+                  the role they want, so carry it rather than making them
+                  retype it into an empty Manual tab. */}
+              <Button
+                name='target-search-create-manually'
+                variant='outline'
+                size='sm'
+                onClick={() => onCreateManually(trimmed)}
+              >
+                Create “{trimmed}” manually
+              </Button>
+            </div>
           </div>
         ) : null
       ) : (

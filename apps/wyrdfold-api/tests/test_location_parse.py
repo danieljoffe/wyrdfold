@@ -171,3 +171,52 @@ def test_prod_corpus_growth(
 ) -> None:
     got = parse_location(raw)
     assert (got.city, got.state, got.country, got.remote) == expected
+
+
+# ---- canonical_country: filter-side folding (#805) ---------------------------
+
+
+def test_canonical_country_folds_alpha2_onto_the_stored_display_form() -> None:
+    """`jobs.country` stores a display form; the filter sends ISO alpha-2.
+    Both sides fold to one token or the filter can never match its own data."""
+    from app.services.location_parse import canonical_country
+
+    assert canonical_country("GB") == canonical_country("UK")
+    assert canonical_country("CA") == canonical_country("Canada")
+    assert canonical_country("DE") == canonical_country("Germany")
+    assert canonical_country("PH") == canonical_country("Philippines")
+    assert canonical_country("us") == canonical_country("United States")
+
+
+def test_canonical_country_keeps_distinct_countries_distinct() -> None:
+    from app.services.location_parse import canonical_country
+
+    assert canonical_country("GB") != canonical_country("US")
+    assert canonical_country("CA") != canonical_country("US")
+    assert canonical_country("DE") != canonical_country("FR")
+
+
+def test_canonical_country_is_none_for_nothing() -> None:
+    from app.services.location_parse import canonical_country
+
+    assert canonical_country(None) is None
+    assert canonical_country("") is None
+    assert canonical_country("   ") is None
+
+
+def test_resolving_ca_here_does_not_make_california_canadian() -> None:
+    """THE reason `ca` lives in a filter-only table rather than `_COUNTRIES`.
+
+    In free text "CA" means California, and teaching the parser otherwise would
+    stamp Canada on every Californian job. A country PICKER carries no such
+    ambiguity, so the two lookups must stay separate.
+    """
+    from app.services.location_parse import canonical_country, parse_location
+
+    assert canonical_country("CA") == canonical_country("Canada")
+
+    parsed = parse_location("San Francisco, CA")
+    assert parsed.state == "CA"
+    assert parsed.country == "US"
+    parsed_la = parse_location("Los Angeles, CA, USA")
+    assert parsed_la.country == "US"

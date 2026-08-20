@@ -9,6 +9,12 @@ Strategy (per fitted-scope.md):
 - Seniority: most common level (mode); union of signals.
 - Domain: union signals; average weight.
 - Negative: union keywords; keep the most negative weight.
+
+"Overlapping" is decided case-INSENSITIVELY throughout. Extractions are LLM
+output and do not agree on casing: a real merge on prod produced
+``Microservices: 3`` and ``microservices: 2`` side by side in one category,
+double-counting the concept at 1.67x its intended weight. Seniority, domain
+and negative already deduped on ``.lower()``; categories did not.
 """
 
 from collections import Counter
@@ -28,12 +34,40 @@ from app.models.targets import (
 _SYSTEM_CONTRIBUTOR = "__system__"
 
 
+def _dedupe_keywords(keywords: dict[str, int]) -> dict[str, int]:
+    """Collapse case-variants of one keyword into a single entry.
+
+    The first spelling encountered wins (dict order is insertion order, so for
+    a merge that is the earliest-contributed profile's casing) and the weights
+    of every variant are averaged, matching the averaging the caller applies to
+    genuine cross-profile overlaps.
+    """
+    grouped: dict[str, tuple[str, list[int]]] = {}
+    for keyword, weight in keywords.items():
+        key = keyword.lower()
+        if key in grouped:
+            grouped[key][1].append(weight)
+        else:
+            grouped[key] = (keyword, [weight])
+    return {display: max(1, round(sum(ws) / len(ws))) for display, ws in grouped.values()}
+
+
 def merge_profiles(profiles: list[ScoringProfile]) -> ScoringProfile:
     """Merge N extracted profiles into one composite profile."""
     if not profiles:
         return ScoringProfile()
     if len(profiles) == 1:
-        return profiles[0].model_copy(deep=True)
+        # Still normalize casing. This branch is the COMMON one — a target with
+        # a single reference JD reaches it through `merge_by_contributor`'s two
+        # `merge_profiles` calls — so leaving it verbatim would exempt most
+        # targets from the dedup. Only categories are touched; seniority /
+        # domain / negative keep their single-profile passthrough semantics
+        # (`_merge_negative` in particular floors the weight at -10, which a
+        # one-profile merge must not impose).
+        only = profiles[0].model_copy(deep=True)
+        for cat in only.categories.values():
+            cat.keywords = _dedupe_keywords(cat.keywords)
+        return only
 
     return ScoringProfile(
         categories=_merge_categories(profiles),
@@ -80,8 +114,10 @@ def _merge_categories(
     profiles: list[ScoringProfile],
 ) -> dict[str, CategoryProfile]:
     """Union all categories, averaging keyword weights and category weights."""
-    # Collect keyword weights per category: {cat_name: {keyword: [weights]}}
-    cat_keywords: dict[str, dict[str, list[int]]] = {}
+    # Collect keyword weights per category, keyed case-insensitively so the
+    # same concept spelled two ways lands in one bucket:
+    #   {cat_name: {lowercased: (first-seen spelling, [weights])}}
+    cat_keywords: dict[str, dict[str, tuple[str, list[int]]]] = {}
     cat_weights: dict[str, list[float]] = {}
 
     for profile in profiles:
@@ -93,15 +129,15 @@ def _merge_categories(
             cat_weights[cat_name].append(cat.weight)
 
             for keyword, weight in cat.keywords.items():
-                if keyword not in cat_keywords[cat_name]:
-                    cat_keywords[cat_name][keyword] = []
-                cat_keywords[cat_name][keyword].append(weight)
+                key = keyword.lower()
+                if key in cat_keywords[cat_name]:
+                    cat_keywords[cat_name][key][1].append(weight)
+                else:
+                    cat_keywords[cat_name][key] = (keyword, [weight])
 
     merged: dict[str, CategoryProfile] = {}
-    for cat_name in cat_keywords:
-        keywords = {
-            kw: max(1, round(sum(ws) / len(ws))) for kw, ws in cat_keywords[cat_name].items()
-        }
+    for cat_name, entries in cat_keywords.items():
+        keywords = {display: max(1, round(sum(ws) / len(ws))) for display, ws in entries.values()}
         cat_w = sum(cat_weights[cat_name]) / len(cat_weights[cat_name])
         merged[cat_name] = CategoryProfile(keywords=keywords, weight=round(cat_w, 2))
 

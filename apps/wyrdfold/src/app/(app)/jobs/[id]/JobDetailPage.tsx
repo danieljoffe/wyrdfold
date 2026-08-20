@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { formatJobSalary } from '@/lib/formatSalary';
+import { displayTitle } from '@/lib/displayTitle';
 import { formatCompanyName } from '@/lib/formatCompanyName';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
@@ -17,7 +18,7 @@ import { formatLocation } from '@/lib/formatLocation';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
-import { useJobDelete } from '../useJobDelete';
+import { useJobRemove } from '../useJobRemove';
 import type { UserTargetWithSummary } from '../../targets/types';
 import JobDetailPanel from '../JobDetailPanel';
 import { MANUAL_SOURCE_ID, type JobPosting } from '../types';
@@ -31,7 +32,7 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
   const [posting, setPosting] = useState<JobPosting | null>(null);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
-  const { deleteJob, deleting } = useJobDelete();
+  const { removeJob, removing: deleting } = useJobRemove();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [fallbackTargetId, setFallbackTargetId] = useState<string | undefined>(
     undefined
@@ -95,7 +96,7 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
         const first = targets.find(t => t.user_target.is_active);
         if (!cancelled && first) setFallbackTargetId(first.target.id);
       } catch {
-        // Non-critical — analysis section just won't auto-trigger
+        // Non-critical — without a target the analysis section stays hidden
       }
     }
     loadTargets();
@@ -127,11 +128,11 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
 
   const handleDelete = useCallback(async () => {
     if (!posting) return;
-    if (await deleteJob(posting.id)) {
+    if (await removeJob(posting.id, undefined)) {
       setConfirmDeleteOpen(false);
       router.push('/jobs');
     }
-  }, [posting, router, deleteJob]);
+  }, [posting, router, removeJob]);
 
   if (loading) {
     return (
@@ -218,15 +219,15 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
               target='_blank'
               rel='noopener noreferrer'
               className='group inline-flex items-center gap-2 min-w-0 max-w-full text-text-primary hover:text-brand-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 rounded-md'
-              aria-label={`Open original posting for ${posting.title} in a new tab`}
+              aria-label={`Open original posting for ${displayTitle(posting)} in a new tab`}
             >
               <Heading
                 variant='component'
                 as='h1'
                 className='min-w-0 truncate underline decoration-dotted decoration-text-tertiary underline-offset-4 group-hover:decoration-brand-500'
-                title={posting.title}
+                title={displayTitle(posting)}
               >
-                {posting.title}
+                {displayTitle(posting)}
               </Heading>
               <ExternalLink
                 className='size-5 shrink-0 text-brand-500'
@@ -238,9 +239,9 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
               variant='component'
               as='h1'
               className='min-w-0 truncate'
-              title={posting.title}
+              title={displayTitle(posting)}
             >
-              {posting.title}
+              {displayTitle(posting)}
             </Heading>
           )}
           <div className='mt-1 flex flex-col gap-0.5 text-text-secondary'>
@@ -298,7 +299,7 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
           title='Remove this posting from your list.'
         >
           <Trash2 className='size-4' aria-hidden />
-          <span>{deleting ? 'Deleting…' : 'Delete posting'}</span>
+          <span>{deleting ? 'Removing…' : 'Remove posting'}</span>
         </Button>
       </div>
 
@@ -306,12 +307,12 @@ export default function JobDetailPage({ id, targetId }: JobDetailPageProps) {
         isOpen={confirmDeleteOpen}
         onClose={() => setConfirmDeleteOpen(false)}
         onConfirm={handleDelete}
-        title='Delete posting?'
-        message={`Delete "${posting.title}" from ${posting.company_name}? This can't be undone.`}
-        confirmLabel='Delete'
+        title='Remove posting?'
+        message={`Remove "${displayTitle(posting)}" from ${posting.company_name}? It will stop appearing in your matched jobs. You can undo this.`}
+        confirmLabel='Remove'
         destructive
         loading={deleting}
-        loadingLabel='Deleting…'
+        loadingLabel='Removing…'
       />
     </div>
   );

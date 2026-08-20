@@ -107,9 +107,7 @@ def test_second_user_links_to_shared_source(service_client: Client) -> None:
     try:
         assert _register(service_client, user_id=uid_a, board_token=tok) == "registered"
         assert _register(service_client, user_id=uid_b, board_token=tok) == "linked"
-        srcs = (
-            service_client.table("sources").select("id").eq("board_token", tok).execute().data
-        )
+        srcs = service_client.table("sources").select("id").eq("board_token", tok).execute().data
         assert len(srcs) == 1  # one shared source, two ownerships
     finally:
         _cleanup(service_client, [tok])
@@ -159,9 +157,7 @@ def test_rls_denies_direct_ownership_insert(
     tok = _token()
     src = (
         service_client.table("sources")
-        .insert(
-            {"provider": "ashby", "board_token": tok, "company_name": "Co", "enabled": True}
-        )
+        .insert({"provider": "ashby", "board_token": tok, "company_name": "Co", "enabled": True})
         .execute()
         .data[0]
     )

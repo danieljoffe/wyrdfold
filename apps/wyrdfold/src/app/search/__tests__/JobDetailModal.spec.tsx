@@ -57,8 +57,8 @@ function result(overrides: Partial<JobSearchResult> = {}): JobSearchResult {
 
 /** Targets already loaded — the picker renders its menu without a fetch. */
 function loadedTargets(
-  targets: { id: string; label: string }[] = [
-    { id: 't1', label: 'Frontend Engineer' },
+  targets: { id: string; label: string; isActive: boolean }[] = [
+    { id: 't1', label: 'Frontend Engineer', isActive: true },
   ]
 ): TargetsSource {
   return { targets, loading: false, error: null, ensureLoaded: jest.fn() };
@@ -118,7 +118,9 @@ describe('JobDetailModal', () => {
     renderModal({ inTargets: [] });
 
     expect(
-      screen.getByText(/add to a target to unlock llm pipelines/i)
+      screen.getByText(
+        /add to a target to unlock fit analysis and resume tailoring/i
+      )
     ).toBeInTheDocument();
     expect(
       screen.getByRole('button', { name: /add to target/i })
@@ -139,7 +141,7 @@ describe('JobDetailModal', () => {
   it('unbound → creates a target from the listing via the from-url flow', async () => {
     const created = {
       user_target: { id: 'ut1' },
-      target: { id: 't1', label: 'Frontend Engineer' },
+      target: { id: 't1', label: 'Frontend Engineer', isActive: true },
       was_matched: false,
     };
     (global.fetch as jest.Mock).mockResolvedValue({
@@ -290,7 +292,7 @@ describe('JobDetailModal', () => {
     expect(
       screen.queryByRole('button', { name: /create a target from this role/i })
     ).not.toBeInTheDocument();
-    expect(screen.queryByText(/unlock llm pipelines/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/unlock fit analysis/i)).not.toBeInTheDocument();
   });
 
   it('closes via the dialog ✕ (shared-ui Modal), calling onClose', () => {
@@ -354,6 +356,6 @@ describe('JobDetailModal', () => {
     expect(
       screen.queryByRole('link', { name: /tailor a r/i })
     ).not.toBeInTheDocument();
-    expect(screen.queryByText(/unlock llm pipelines/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/unlock fit analysis/i)).not.toBeInTheDocument();
   });
 });

@@ -65,7 +65,28 @@ describe('formatSalaryRange', () => {
         currency: 'CAD',
         period: null,
       })
-    ).toBe('CAD 100k–CAD 130k');
+    ).toBe('CAD 100k–130k');
+  });
+
+  it('renders symbol currencies with the symbol on both bounds', () => {
+    // The sweep found "EUR 54k–EUR 75k" on prod (§D4) — known symbols now
+    // render as symbols; codes render once, before the range.
+    expect(
+      formatSalaryRange({
+        min: 54000,
+        max: 75000,
+        currency: 'EUR',
+        period: null,
+      })
+    ).toBe('€54k–€75k');
+    expect(
+      formatSalaryRange({
+        min: 60000,
+        max: 80000,
+        currency: 'GBP',
+        period: null,
+      })
+    ).toBe('£60k–£80k');
   });
 
   it('returns null with no bounds', () => {

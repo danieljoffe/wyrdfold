@@ -1,7 +1,9 @@
 'use client';
 
 import { Fragment, useEffect, useState } from 'react';
+import { ExternalLink } from 'lucide-react';
 import { formatJobSalary } from '@/lib/formatSalary';
+import { displayTitle } from '@/lib/displayTitle';
 import { formatCompanyName } from '@/lib/formatCompanyName';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import { Checkbox } from '@danieljoffe/shared-ui/Checkbox';
@@ -33,6 +35,7 @@ interface JobsListTableProps {
   order: 'asc' | 'desc';
   handleSort: (col: JobsSortColumn) => void;
   sortIndicator: (col: JobsSortColumn) => string;
+  nextSortAction: (col: JobsSortColumn) => 'descending' | 'ascending' | 'clear';
   selectedIds: Set<string>;
   onSelectionChange: (ids: Set<string>) => void;
   analysisTargetId: string | undefined;
@@ -46,7 +49,7 @@ const COLUMNS: { key: JobsSortColumn; label: string }[] = [
   { key: 'score', label: 'Score' },
   { key: 'title', label: 'Title' },
   { key: 'company_name', label: 'Company' },
-  { key: 'created_at', label: 'Posted' },
+  { key: 'posted_at', label: 'Posted' },
 ];
 
 export default function JobsListTable({
@@ -59,6 +62,7 @@ export default function JobsListTable({
   order: sortOrder,
   handleSort,
   sortIndicator,
+  nextSortAction,
   selectedIds,
   onSelectionChange,
   analysisTargetId,
@@ -190,7 +194,15 @@ export default function JobsListTable({
                     type='button'
                     className='flex items-center gap-1 font-medium text-text-secondary hover:text-text-primary'
                     onClick={() => handleSort(col.key)}
-                    aria-label={`Sort by ${col.label}`}
+                    // The label names what the NEXT click does. A static
+                    // "Sort by Title" hides the cycle, and with three states a
+                    // screen-reader user would have no way to know a third
+                    // click clears the sort.
+                    aria-label={
+                      nextSortAction(col.key) === 'clear'
+                        ? `Clear sort on ${col.label}`
+                        : `Sort by ${col.label} ${nextSortAction(col.key)}`
+                    }
                   >
                     {col.label} {sortIndicator(col.key)}
                   </button>
@@ -220,6 +232,14 @@ export default function JobsListTable({
                   )}
                   onClick={() => toggleExpand(job)}
                   onKeyDown={e => {
+                    // Only the ROW's own key events expand it. Space pressed on
+                    // a control INSIDE the row (the select checkbox, the apply
+                    // link) bubbles here, and the ``preventDefault`` below used
+                    // to swallow it — so keyboard users could never select a
+                    // row, only expand it. The mouse path was already guarded
+                    // by the checkbox's stopPropagation wrapper; this is the
+                    // keyboard twin of that guard.
+                    if (e.target !== e.currentTarget) return;
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault();
                       toggleExpand(job);
@@ -229,7 +249,7 @@ export default function JobsListTable({
                   role='row'
                   aria-expanded={expandedId === job.id}
                   aria-controls={`job-detail-${job.id}`}
-                  aria-label={`${job.title} at ${job.company_name}, press Enter to ${expandedId === job.id ? 'collapse' : 'expand'} details`}
+                  aria-label={`${displayTitle(job)} at ${job.company_name}, press Enter to ${expandedId === job.id ? 'collapse' : 'expand'} details`}
                 >
                   <td className='px-3 py-2'>
                     {/* stopPropagation on the wrapper, not the control: the
@@ -239,7 +259,7 @@ export default function JobsListTable({
                       <Checkbox
                         checked={selectedIds.has(job.id)}
                         onChange={() => toggleSelect(job.id)}
-                        aria-label={`Select ${job.title}`}
+                        aria-label={`Select ${displayTitle(job)}`}
                       />
                     </span>
                   </td>
@@ -255,19 +275,27 @@ export default function JobsListTable({
                   </td>
                   <td className='px-3 py-2 font-medium'>
                     <div className='flex flex-col gap-1'>
+                      {/* The title used to BE the outbound ATS link, so the
+                          most obvious click target on the row left the app —
+                          past the score breakdown, match analysis and
+                          tailoring the user came for. The title now expands
+                          the row (the <tr> handler); applying keeps its own
+                          explicit icon. */}
                       <span className='inline-flex items-center gap-2'>
-                        {job.absolute_url ? (
+                        <span className='text-text-primary'>
+                          {displayTitle(job)}
+                        </span>
+                        {job.absolute_url && (
                           <a
                             href={job.absolute_url}
                             target='_blank'
                             rel='noopener noreferrer'
                             className='text-brand-500 hover:text-brand-600'
                             onClick={e => e.stopPropagation()}
+                            aria-label={`Open ${displayTitle(job)} at ${formatCompanyName(job.company_name)} on the employer's site (opens in a new tab)`}
                           >
-                            {job.title}
+                            <ExternalLink className='h-3.5 w-3.5' />
                           </a>
-                        ) : (
-                          job.title
                         )}
                         {job.source_id === MANUAL_SOURCE_ID && (
                           <Badge variant='info'>Discovered</Badge>

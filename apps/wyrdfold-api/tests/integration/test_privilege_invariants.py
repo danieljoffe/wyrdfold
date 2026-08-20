@@ -66,12 +66,16 @@ AUTHENTICATED_EXECUTABLE_DEFINER_FNS: frozenset[str] = frozenset()
 SERVICE_ROLE_ONLY_TABLES: frozenset[str] = frozenset(
     {
         "job_embeddings",
-        "prescan_shadow",
         # #467 §10 PR6 — the search-funnel ledger (identity-free by schema,
         # service-role buffered writes only; 20260725000000).
         "search_events",
     }
 )
+# `prescan_shadow` was here until R3 §1 (#557) dropped the table
+# (20260811000000). It had to be removed, not merely left behind: this guard
+# works by filtering LIVE grants down to this set, so an entry naming a table
+# that no longer exists contributes zero rows and passes vacuously forever.
+# `test_service_role_only_tables_all_exist` below now makes that rot loud.
 
 
 def _psql(query: str) -> str | None:
@@ -178,7 +182,7 @@ def test_authenticated_definer_fns_are_allowlisted(_require_db: None) -> None:
 
 
 def test_service_role_only_tables_have_no_user_grants(_require_db: None) -> None:
-    """`job_embeddings` / `prescan_shadow` must carry no anon/authenticated grants.
+    """Every SERVICE_ROLE_ONLY_TABLES entry must carry no anon/authenticated grants.
 
     Pins 20260702170000: these internal tables are service-role-only. RLS
     (enabled + no policy) already denies user roles, but standing table grants
@@ -206,6 +210,38 @@ def test_service_role_only_tables_have_no_user_grants(_require_db: None) -> None
         "Service-role-only table(s) still grant privileges to "
         "anon/authenticated/PUBLIC — REVOKE them (see 20260702170000):\n  - "
         + "\n  - ".join(offenders)
+    )
+
+
+def test_service_role_only_tables_all_exist(_require_db: None) -> None:
+    """Every name in SERVICE_ROLE_ONLY_TABLES must still be a real table.
+
+    The grant guard above filters live grants *down to* that set, so an entry
+    for a dropped table matches nothing and keeps passing while asserting
+    nothing — the allowlist rots silently and the suite still looks green.
+    (`test_migration_safety.py` guards its GRANDFATHERED list the same way, for
+    the same reason.) Dropping a listed table must therefore be a deliberate
+    edit here, not a silent no-op: R3 §1 (#557) removed `prescan_shadow` when
+    20260811000000 dropped it.
+    """
+    rows = _psql(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+        ORDER BY 1;
+        """
+    )
+    assert rows is not None
+    existing = {r for r in rows.splitlines() if r}
+    # Guard the guard: if the query returned nothing useful, the check below
+    # would "pass" by comparing against an empty set.
+    assert existing, "no public base tables found — the schema query is broken, not the allowlist"
+    missing = sorted(SERVICE_ROLE_ONLY_TABLES - existing)
+    assert not missing, (
+        "SERVICE_ROLE_ONLY_TABLES names table(s) that no longer exist, so the "
+        "grant guard silently asserts nothing for them — remove them:\n  - "
+        + "\n  - ".join(missing)
     )
 
 

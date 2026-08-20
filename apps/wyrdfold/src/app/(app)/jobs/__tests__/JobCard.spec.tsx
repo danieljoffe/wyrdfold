@@ -154,14 +154,57 @@ describe('JobCard', () => {
     await user.click(screen.getByRole('button', { expanded: false }));
     // Click the Delete menu item — this should only open the dialog,
     // not delete directly.
-    await user.click(screen.getByRole('menuitem', { name: /delete/i }));
+    await user.click(screen.getByRole('menuitem', { name: /remove/i }));
     expect(onDelete).not.toHaveBeenCalled();
 
     // Confirm in the dialog.
     const dialog = await screen.findByRole('dialog');
-    await user.click(within(dialog).getByRole('button', { name: /^delete$/i }));
+    await user.click(within(dialog).getByRole('button', { name: /^remove$/i }));
     expect(onDelete).toHaveBeenCalledTimes(1);
     // Confirming delete must NOT also navigate (the click is contained).
     expect(mockPush).not.toHaveBeenCalled();
+  });
+});
+
+// Same keyboard trap as JobsListTable: the card's own Space handler used to
+// swallow a keypress that originated in its select checkbox, so keyboard users
+// could open a card but never select one. The stopPropagation wrapper around
+// the checkbox only ever covered the mouse.
+describe('JobCard — keyboard selection', () => {
+  it('selects the card when Space is pressed on its checkbox', async () => {
+    const onSelectToggle = jest.fn();
+    const user = userEvent.setup();
+    render(
+      <JobCard
+        job={makeJob()}
+        selected={false}
+        onSelectToggle={onSelectToggle}
+        onDelete={noop}
+      />
+    );
+
+    screen.getByLabelText(/select senior frontend engineer/i).focus();
+    await user.keyboard(' ');
+
+    expect(onSelectToggle).toHaveBeenCalled();
+  });
+
+  it('still activates the card when Space is pressed on the card itself', async () => {
+    const onSelectToggle = jest.fn();
+    const user = userEvent.setup();
+    render(
+      <JobCard
+        job={makeJob()}
+        selected={false}
+        onSelectToggle={onSelectToggle}
+        onDelete={noop}
+      />
+    );
+
+    screen.getByRole('button', { name: /senior frontend engineer at acme/i }).focus();
+    await user.keyboard(' ');
+
+    // The card navigates; it must NOT be mistaken for a selection.
+    expect(onSelectToggle).not.toHaveBeenCalled();
   });
 });

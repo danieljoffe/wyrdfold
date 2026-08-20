@@ -100,6 +100,18 @@ class UrlValidateResponse(BaseModel):
     rejection_reason: str | None
 
 
+class RemoveJobRequest(BaseModel):
+    """Which target to remove a posting from.
+
+    ``None`` means "every target of mine that currently holds it" — the
+    All Jobs tab has no single target in scope. The id is validated against
+    the caller's own ``user_targets`` before use; it is never trusted as a
+    filter on its own.
+    """
+
+    target_id: str | None = Field(default=None, max_length=64)
+
+
 class ManualJobRequest(BaseModel):
     url: str = Field(max_length=2048)
     title: str | None = Field(default=None, max_length=500)
@@ -114,6 +126,12 @@ class ManualJobResponse(BaseModel):
     extraction_tier: str
     warnings: list[str]
     needs_manual_fields: bool
+    # The extracted JD body, returned so callers that need it next (the
+    # onboarding path-A tailor kick) don't have to re-fetch the posting.
+    # ``GET /jobs/{id}`` can't serve them: its ownership probe requires a
+    # ``scores`` row, and a brand-new user has no active targets at add
+    # time, so nothing has scored the posting yet.
+    description_html: str | None = None
 
 
 class AddToTargetRequest(BaseModel):
@@ -127,7 +145,6 @@ class AddToTargetRequest(BaseModel):
 
 
 class AddToTargetResponse(BaseModel):
-    success: bool
     job_posting_id: str
     target_id: str
     score: int

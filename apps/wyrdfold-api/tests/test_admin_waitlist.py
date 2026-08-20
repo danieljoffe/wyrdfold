@@ -34,9 +34,7 @@ def sb() -> Any:
     fake.table.return_value.select.return_value.eq.return_value.execute = AsyncMock(
         return_value=MagicMock(data=[])
     )
-    fake.table.return_value.upsert.return_value.execute = AsyncMock(
-        return_value=MagicMock(data=[])
-    )
+    fake.table.return_value.upsert.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
     fake.table.return_value.update.return_value.eq.return_value.execute = AsyncMock(
         return_value=MagicMock(data=[])
     )

@@ -18,13 +18,28 @@ from app.routers.jobs import (
 
 
 def _row(**logistics: object) -> dict[str, object]:
-    return {"id": "j", "logistics_filters": dict(logistics) if logistics else None}
+    log = dict(logistics) if logistics else None
+    return {
+        "id": "j",
+        "logistics_filters": log,
+        "is_remote": bool(log and log.get("remote_status") == "remote"),
+    }
 
 
-def _p(logistics: dict[str, object] | None) -> dict[str, object]:
+def _p(
+    logistics: dict[str, object] | None, *, is_remote: bool | None = None
+) -> dict[str, object]:
     """A minimal posting row carrying only LLM logistics (no structured
-    salary columns) — exercises the fallback path."""
-    return {"id": "j", "logistics_filters": logistics}
+    salary columns) — exercises the fallback path.
+
+    ``is_remote`` mirrors the posting's OWN field. It defaults to agreeing with
+    the extraction, because that is what a real row looks like: the remote-only
+    filter now requires both sources to affirm (#795), and a fixture that left
+    it unset was describing a posting the board never produced.
+    """
+    if is_remote is None and logistics is not None:
+        is_remote = logistics.get("remote_status") == "remote"
+    return {"id": "j", "logistics_filters": logistics, "is_remote": is_remote}
 
 
 # ---- active flag -----------------------------------------------------------
@@ -99,12 +114,55 @@ def test_all_three_compose_as_conjunction() -> None:
 def test_apply_filters_a_list() -> None:
     f = _LogisticsFilter(remote_only=True, min_salary=150_000)
     rows = [
-        {"id": "keep", "logistics_filters": {"remote_status": "remote", "salary_max": 160_000}},
-        {"id": "low", "logistics_filters": {"remote_status": "remote", "salary_max": 90_000}},
-        {"id": "onsite", "logistics_filters": {"remote_status": "onsite", "salary_max": 200_000}},
-        {"id": "empty", "logistics_filters": None},
+        {
+            "id": "keep",
+            "is_remote": True,
+            "logistics_filters": {"remote_status": "remote", "salary_max": 160_000},
+        },
+        {
+            "id": "low",
+            "is_remote": True,
+            "logistics_filters": {"remote_status": "remote", "salary_max": 90_000},
+        },
+        {
+            "id": "onsite",
+            "is_remote": False,
+            "logistics_filters": {"remote_status": "onsite", "salary_max": 200_000},
+        },
+        {"id": "empty", "is_remote": None, "logistics_filters": None},
     ]
     assert [p["id"] for p in _apply_logistics_filter(rows, f)] == ["keep"]
+
+
+# ---- the two remote sources must agree (#795) -------------------------------
+
+
+def test_remote_only_drops_a_posting_the_board_calls_onsite() -> None:
+    """THE bug: the filter trusted the LLM extraction while the card rendered
+    the posting's own field, so "Remote only" returned a job showing
+    "Raleigh, NC". Prod carried 229 such contradictions."""
+    f = _LogisticsFilter(remote_only=True)
+    contradiction = {
+        "id": "raleigh",
+        "is_remote": False,
+        "logistics_filters": {"remote_status": "remote"},
+    }
+    assert _logistics_passes(contradiction, f) is False
+
+
+def test_remote_only_keeps_a_posting_both_sources_call_remote() -> None:
+    f = _LogisticsFilter(remote_only=True)
+    agreed = {"id": "ok", "is_remote": True, "logistics_filters": {"remote_status": "remote"}}
+    assert _logistics_passes(agreed, f) is True
+
+
+def test_remote_only_drops_a_posting_with_no_board_signal() -> None:
+    """A deliberate trade: 86 prod rows had no posting field, and requiring
+    agreement drops them. Loosening `is True` to `is not False` would readmit
+    them without readmitting the contradictions above — the knob is here."""
+    f = _LogisticsFilter(remote_only=True)
+    unknown = {"id": "unk", "is_remote": None, "logistics_filters": {"remote_status": "remote"}}
+    assert _logistics_passes(unknown, f) is False
 
 
 # ---- min_salary prefers the deterministic jobs-level columns ----------------
@@ -259,3 +317,61 @@ def test_country_stays_lenient_only_when_genuinely_unknown() -> None:
     f = _LogisticsFilter(country="CA")
     unknown = {"id": "j", "logistics_filters": None, "country": None}
     assert _logistics_passes(unknown, f) is True
+
+
+# ---- country: two vocabularies, one comparison (#805) ------------------------
+#
+# `jobs.country` stores a canonical DISPLAY form ("UK", "Canada", "Germany");
+# the filter sends ISO alpha-2 ("GB", "CA", "DE"). They were compared with an
+# exact uppercased string match, so only "US" ever matched — and only because
+# the two spellings coincide. Three of the four options the UI offers returned
+# nothing that matched: 2,619 UK rows, 169 Canada, 118 Germany, all unreachable.
+
+
+def test_gb_matches_rows_stored_as_uk() -> None:
+    f = _LogisticsFilter(country="GB")
+    assert _logistics_passes({"id": "j", "country": "UK", "logistics_filters": None}, f) is True
+
+
+def test_ca_matches_rows_stored_as_canada() -> None:
+    """CA is resolvable HERE though the parser deliberately omits it: in free
+    text "CA" means California, but from a country picker it cannot."""
+    f = _LogisticsFilter(country="CA")
+    assert _logistics_passes({"id": "j", "country": "Canada", "logistics_filters": None}, f) is True
+
+
+def test_de_matches_rows_stored_as_germany() -> None:
+    f = _LogisticsFilter(country="DE")
+    assert _logistics_passes({"id": "j", "country": "Germany", "logistics_filters": None}, f) is True
+
+
+def test_a_genuine_mismatch_is_still_rejected() -> None:
+    """The fold must not make everything match everything."""
+    f = _LogisticsFilter(country="GB")
+    assert _logistics_passes({"id": "j", "country": "US", "logistics_filters": None}, f) is False
+    assert (
+        _logistics_passes({"id": "j", "country": "Canada", "logistics_filters": None}, f) is False
+    )
+
+
+def test_unknown_country_is_still_kept_but_capped() -> None:
+    """Leniency is deliberate — a fully-remote role often has no country anchor,
+    and dropping those would hide roles genuinely open in the filtered country.
+    Unbounded is what made it a bug: 20,247 country-less rows flooded the page.
+    """
+    f = _LogisticsFilter(country="GB")
+    rows = [{"id": "uk", "country": "UK", "logistics_filters": None}] + [
+        {"id": f"unknown{i}", "country": None, "logistics_filters": None} for i in range(50)
+    ]
+    got = _apply_logistics_filter(rows, f)
+    ids = [r["id"] for r in got]
+    assert ids[0] == "uk", "the real match must lead"
+    assert len(ids) == 1 + 10, f"unknown tail not capped: {len(ids)}"
+
+
+def test_a_short_unknown_tail_is_left_alone() -> None:
+    f = _LogisticsFilter(country="GB")
+    rows = [{"id": "uk", "country": "UK", "logistics_filters": None}] + [
+        {"id": f"u{i}", "country": None, "logistics_filters": None} for i in range(3)
+    ]
+    assert len(_apply_logistics_filter(rows, f)) == 4

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import logging
 import time
 from collections.abc import Callable, Coroutine
@@ -18,6 +19,7 @@ from app.models.schemas import PollResult
 from app.models.targets import JobTarget
 from app.services import notify
 from app.services.ashby import fetch_ashby_jobs
+from app.services.board_metadata import board_columns
 from app.services.date_normalize import normalize_posted_at
 from app.services.db_write import DB_WRITE_CONCURRENCY, poll_db_read, poll_db_write
 from app.services.experience import optimized
@@ -28,7 +30,7 @@ from app.services.greenhouse import fetch_board_jobs
 from app.services.jd_parser import parse_jd
 from app.services.jsonld import fetch_jsonld_jobs, fetch_salary_from_posting_page
 from app.services.lever import fetch_lever_jobs
-from app.services.llm import MissingUserKeyError
+from app.services.llm import MissingUserKeyError, TrialExpiredError
 from app.services.llm import get_client_async as get_llm_client_async
 from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import enqueue as enqueue_llm_cost
@@ -49,6 +51,7 @@ from app.services.location_parse import parse_location
 from app.services.mock_board import fetch_mock_jobs
 from app.services.qualification import (
     QUALIFICATION_PURPOSE,
+    extract_dictionary_skills,
     is_us_location,
     positively_us_location,
     qualification_hash,
@@ -56,6 +59,11 @@ from app.services.qualification import (
 )
 from app.services.qualification.family_gate import passes_family_gate
 from app.services.recency import refresh_recency_scores_poll
+from app.services.relevance.rejection_store import (
+    fetch_rejected_titles,
+    normalize_title,
+    record_rejections,
+)
 from app.services.relevance.title_triage import (
     PHASE1_PURPOSE,
     TitleVerdict,
@@ -75,8 +83,9 @@ from app.services.target_scoring import (
 )
 from app.services.targets import crud
 from app.services.targets.payers import PayerBudgetGate, build_budget_gate
+from app.services.titles import clean_title_display
 from app.services.validate import liveness_verdict, validate_job_url
-from app.services.workday import fetch_workday_jobs
+from app.services.workday import KnownPosting, fetch_workday_jobs
 from app.supabase_pool import get_async_supabase
 
 logger = logging.getLogger(__name__)
@@ -410,52 +419,17 @@ def _phase1_promising(
     return None
 
 
-# Phase-1 negative-verdict cache (#514 residual). A REJECTED candidate never
-# ingests, so its title re-enters triage every cycle and re-pays the LLM for
-# the same "no" at the source's poll cadence until the posting closes —
-# measured as the dominant LLM line item (17,843 title_triage calls / $8.34
-# per 7d, 2026-07-29). Remember rejections per (target, profile_version,
-# normalized title) for ``settings.phase1_rejection_ttl_hours``; a cache hit
+# Phase-1 negative-verdict memory (#514) lives in Postgres now
+# (``relevance.rejection_store`` / the ``phase1_rejections`` table). The
+# in-process TTL dict it replaces re-billed the entire standing rejected
+# corpus roughly daily — its 24h TTL guaranteed that by design, and Railway's
+# near-daily deploys wiped it anyway (measured 2026-08-12 as ~75-90% of
+# Phase-1 volume; see docs/plan-phase1-rejection-persistence.md). A store hit
 # re-injects a synthetic ``promising=False`` verdict, so every downstream
 # mechanism (attempted-set defer semantics, ``_any_target_admits``, Stage-2
 # floor writes) behaves exactly as if the LLM had re-said no. Admits are
 # never cached: an admitted job INGESTS, so known-ness already stops its
-# re-triage. Keyed on profile_version so a profile edit re-judges everything
-# under the new profile immediately. In-process only — the poller runs under
-# a fleet-wide advisory lock, so one process sees all cycles; a restart just
-# costs one extra verdict per title.
-_PHASE1_REJECTIONS: dict[tuple[str, int, str], float] = {}
-# Hard size bound. ~60k rejections is far beyond a day of fleet-wide triage
-# (~2.5k verdicts/day measured); hitting it means something is looping.
-_PHASE1_REJECTIONS_CAP = 60_000
-
-
-def _phase1_rejection_key(target: JobTarget, title: str) -> tuple[str, int, str]:
-    return (target.id, target.profile_version, " ".join(title.lower().split()))
-
-
-def _phase1_cached_rejection(target: JobTarget, title: str) -> bool:
-    """True iff this (target, title) was LLM-rejected within the TTL."""
-    if settings.phase1_rejection_ttl_hours <= 0:
-        return False
-    expiry = _PHASE1_REJECTIONS.get(_phase1_rejection_key(target, title))
-    return expiry is not None and expiry > time.monotonic()
-
-
-def _phase1_record_rejection(target: JobTarget, title: str) -> None:
-    if settings.phase1_rejection_ttl_hours <= 0:
-        return
-    if len(_PHASE1_REJECTIONS) >= _PHASE1_REJECTIONS_CAP:
-        now = time.monotonic()
-        for key in [k for k, exp in _PHASE1_REJECTIONS.items() if exp <= now]:
-            del _PHASE1_REJECTIONS[key]
-        if len(_PHASE1_REJECTIONS) >= _PHASE1_REJECTIONS_CAP:
-            # Still full of LIVE entries — blunt reset. Losing the cache
-            # costs extra verdicts, never correctness.
-            _PHASE1_REJECTIONS.clear()
-    _PHASE1_REJECTIONS[_phase1_rejection_key(target, title)] = (
-        time.monotonic() + settings.phase1_rejection_ttl_hours * 3600.0
-    )
+# re-triage.
 
 
 def _content_dedupe_key(company: str | None, title: str | None) -> tuple[str, str]:
@@ -746,8 +720,7 @@ async def _active_targets(supabase: AsyncClient) -> list[JobTarget]:
         retry_sync=True,
     )
     member_ids = {
-        cast(str, r["target_id"])
-        for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
+        cast(str, r["target_id"]) for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
     }
     rows = cast(list[dict[str, Any]], floor_resp.data or [])
     seen = {cast(str, r["id"]) for r in rows}
@@ -933,16 +906,42 @@ async def _qualify_one_job(
         with contextlib.suppress(Exception):
             enqueue_llm_cost(None, QUALIFICATION_PURPOSE, result)
 
+    # Free, deterministic, and independent of the LLM verdict above — see
+    # ``skill_dictionary``. Scans the FULL description because local regex
+    # costs nothing; the LLM path needed a truncated window only because
+    # reading was billed per token.
+    dict_skills = extract_dictionary_skills(row.get("title"), row.get("description_html"))
+
+    # DEFER TO THE BOARD (#846). ``row`` is the upsert RESULT, so it already
+    # carries whatever ``board_columns`` wrote moments ago — Ashby's
+    # ``isRemote``, Lever's ``workplaceType``, SmartRecruiters'
+    # ``location.remote``, or a board-stated "Remote" in the location string.
+    # Those are the employer's own answer; the tagger's are inferences from JD
+    # prose. Writing the inference on top is how #795 ended up with 229 prod
+    # contradictions, and it silently nullified #847/#848 — the board value was
+    # written and then overwritten within the same poll.
+    #
+    # So these two keys are omitted when the row already holds a value. Every
+    # other tag below is a fact NO board publishes (role_family, seniority,
+    # is_us, metro, is_genuine_role), so the tagger remains the only source and
+    # keeps writing them unconditionally. Board values re-derive on every poll,
+    # so a board that changes its mind still propagates.
     payload: dict[str, Any] = {
         "is_us": tags.is_us,
         "role_family": tags.role_family,
         "seniority": tags.seniority,
-        "employment_type": tags.employment_type,
         "metro": tags.metro,
-        "is_remote": tags.is_remote,
         "is_genuine_role": tags.is_genuine_role,
+        **({} if row.get("employment_type") else {"employment_type": tags.employment_type}),
+        **({} if row.get("is_remote") is not None else {"is_remote": tags.is_remote}),
         "qualified_at": datetime.now(UTC).isoformat(),
         "qualified_hash": new_hash,
+        # Catalog-wide skill facts (backs /search?skill=react), extracted by
+        # DICTIONARY — no LLM, no per-job cost, so it rides this write for free
+        # rather than buying a second read of text we already store. Written
+        # only when non-empty so a posting that names nothing recognizable
+        # never blanks a value the Phase-2 harvest's LLM read already found.
+        **({"skills_required": dict_skills} if dict_skills else {}),
     }
     # US-only corpus (#60 workstream B): a high-confidence non-US verdict
     # archives the job in the SAME write. The poller's ingest gate already
@@ -1178,8 +1177,7 @@ async def _reconcile_offfamily_promising(supabase: AsyncClient, job_ids: list[st
             )
         if to_retract:
             logger.info(
-                "Family reconcile: retracted %d off-family promising verdict(s) "
-                "across %d job(s)",
+                "Family reconcile: retracted %d off-family promising verdict(s) across %d job(s)",
                 len(to_retract),
                 len(job_ids),
             )
@@ -1442,8 +1440,14 @@ async def _resolve_payer_client(
     grouped rather than interleaved across keys (interleaving would
     cold-start each key's prompt cache).
 
-    Returns ``None`` when the payer can't be served: hosted
-    ``BYOK_REQUIRE_USER_KEYS`` with no stored key (``MissingUserKeyError``).
+    Returns ``None`` when the payer can't be served with their own key
+    (``MissingUserKeyError``). TWO independent conditions raise it, and
+    conflating them has cost a misdiagnosis (#841): either
+    ``BYOK_REQUIRE_USER_KEYS`` is set, **or** the payer's plan is BYOK
+    (``entitlements_for(plan).llm_key_source == "byok"`` — the saas free
+    tier) — see ``llm.get_client_async``. The plan branch fires on its own,
+    so this defer is routine on a hosted deployment even with the flag unset.
+
     Callers defer that payer's grading — jobs stay promising / score NULL
     and grade on a later cycle once a key is added — exactly like the
     over-allowance defer, never billing the operator key for a stranger.
@@ -1453,15 +1457,47 @@ async def _resolve_payer_client(
     if payer_user_id not in cache:
         try:
             cache[payer_user_id] = await get_llm_client_async(supabase, payer_user_id)
+        except TrialExpiredError:
+            # A lapsed trial stops costing money the moment it lapses: the
+            # same defer path as a missing key, so background grading halts
+            # without needing a separate sweep (#841).
+            logger.info(
+                "Background grading deferred for payer %s (trial expired)", payer_user_id
+            )
+            cache[payer_user_id] = None
         except MissingUserKeyError:
             logger.info(
-                "Background grading deferred for payer %s "
-                "(no BYOK key; BYOK_REQUIRE_USER_KEYS set)",
+                "Background grading deferred for payer %s (no stored BYOK key; %s)",
                 payer_user_id,
+                "BYOK_REQUIRE_USER_KEYS is set"
+                if settings.byok_require_user_keys
+                else "their plan requires BYOK",
             )
             cache[payer_user_id] = None
     return cache[payer_user_id]
 
+
+
+async def _call_fetcher(
+    fetcher: Any,
+    board_token: str,
+    known_postings: dict[str, KnownPosting],
+    admissible: Callable[[str, str | None], bool],
+) -> list[StandardJob]:
+    """Call a provider fetcher, handing Workday what we already hold.
+
+    Only Workday needs it — every other provider returns content in its list
+    call, so there is no per-posting request to skip. Signature-sniffed rather
+    than branched on the provider string so a fetcher that grows the parameter
+    picks it up without another edit here.
+    """
+    params = inspect.signature(fetcher).parameters
+    extra: dict[str, Any] = {}
+    if known_postings and "known" in params:
+        extra["known"] = known_postings
+    if "admissible" in params:
+        extra["admissible"] = admissible
+    return cast(list[StandardJob], await fetcher(board_token, **extra))
 
 async def _poll_one_source(
     source: dict[str, Any],
@@ -1494,6 +1530,10 @@ async def _poll_one_source(
         "updated": 0,
         "archived": 0,
         "error": None,
+        # Negative-store consult counters (summed across targets); folded
+        # into one INFO line per cycle by ``poll_due_sources``.
+        "phase1_store_hits": 0,
+        "phase1_store_misses": 0,
     }
     company_name: str = source.get("company_name", "?")
 
@@ -1507,17 +1547,62 @@ async def _poll_one_source(
             summary["error"] = f"{company_name}: unknown provider '{provider}'"
             return summary
 
-        jobs = await fetcher(board_token)
+        # What we already hold for this source, read BEFORE the fetch so
+        # Workday can skip the per-posting detail request for postings whose
+        # list entry is unchanged. Cheap columns only, and a failure here just
+        # means every detail is fetched — today's behaviour.
+        # Targets are normally resolved once per cycle by the caller; the
+        # fallback keeps direct/legacy callers working. Resolved BEFORE the
+        # fetch so Workday can apply the free gates to its list entries and
+        # skip the detail request for postings we would only drop.
+        if active_targets is None:
+            active_targets = await _active_targets(supabase)
+
+        def _admissible(title: str, location: str | None) -> bool:
+            """The two FREE gates, judged on a provider's list entry. Mirrors
+            the row-build loop below — keep them in step, or a posting gets
+            skipped here that the loop would have kept."""
+            return _title_matches_any_target(title, active_targets or []) and _is_us_location(
+                location
+            )
+
+        known_postings: dict[str, KnownPosting] = {}
+        if provider == "workday":
+            try:
+                pre_resp = await poll_db_read(
+                    supabase,
+                    lambda c: (
+                        c.table("jobs")
+                        .select("external_id, title, source_posted_at")
+                        .eq("source_id", source_id)
+                        .is_("archived_at", "null")
+                    ),
+                    label=f"poll known postings {company_name}",
+                    retry_sync=True,
+                )
+                known_postings = {
+                    str(r["external_id"]): KnownPosting(
+                        title=r.get("title"), posted_at_stored=r.get("source_posted_at")
+                    )
+                    for r in cast(list[dict[str, Any]], pre_resp.data or [])
+                    if r.get("external_id")
+                }
+            except Exception:
+                logger.warning(
+                    "poll %s: known-postings read failed; fetching every detail",
+                    company_name,
+                    exc_info=True,
+                )
+
+        jobs = await _call_fetcher(fetcher, board_token, known_postings, _admissible)
         summary["polled"] = True
 
         # Collect ALL external IDs from the API (before title/location filtering)
         # so we don't archive jobs that exist on the board but don't match filters.
         all_external_ids: set[str] = {job.external_id for job in jobs}
 
-        # Targets are normally resolved once per cycle by the caller; the
-        # fallback keeps direct/legacy callers working.
-        if active_targets is None:
-            active_targets = await _active_targets(supabase)
+        # (Targets were resolved above, before the fetch, so the free gates
+        # could be handed to the provider.)
 
         # Existing rows are needed in three places: skipping Phase 1
         # triage for already-known jobs, the (company, title) dedupe, and
@@ -1554,9 +1639,9 @@ async def _poll_one_source(
         # deliberately out of bounds.
         known_ids_resp = await poll_db_read(
             supabase,
-            lambda c: c.table("jobs")
-            .select("external_id, content_hash")
-            .eq("source_id", source_id),
+            lambda c: (
+                c.table("jobs").select("external_id, content_hash").eq("source_id", source_id)
+            ),
             label=f"poll known ids {company_name}",
             retry_sync=True,
         )
@@ -1630,14 +1715,21 @@ async def _poll_one_source(
         if settings.phase1_triage_enabled and active_targets and triage_candidates:
             for active_target in active_targets:
                 if gate.target_blocked(active_target.id):
-                    # Sponsored target whose payer is blocked (over
-                    # allowance / idle / disabled) — spend nothing. Empty
-                    # verdicts → fail-open admit, so jobs still ingest
-                    # (promising, score=NULL) and get graded once the
-                    # payer's window frees up. Same defer semantics as the
-                    # Phase 2 daily cap. Catalog targets (no active user
-                    # link) are never blocked here — their triage bills
-                    # the instance key via ``_resolve_payer_client(None)``.
+                    # Blocked target — spend nothing this cycle. Either a
+                    # sponsored target whose payer is over allowance /
+                    # idle / disabled, or (default) a CATALOG-ONLY target
+                    # nobody is pursuing — see ``grade_catalog_targets``.
+                    #
+                    # Empty verdicts + empty ``attempted`` means every
+                    # title takes the NOT-attempted arm of
+                    # ``_phase1_promising`` → ``None`` = DEFER: excluded
+                    # from scores now, re-triaged when the block lifts.
+                    # (This comment previously claimed "fail-open admit,
+                    # jobs still ingest as promising" — that was the
+                    # pre-#285 blanket fail-open and is no longer true.)
+                    # The JOB row itself is unaffected either way: it is
+                    # already ingested before scoring, and public /search
+                    # reads ``jobs`` without consulting ``scores``.
                     phase1_verdicts[active_target.id] = {}
                     phase1_attempted[active_target.id] = set()  # nothing triaged → all defer
                     logger.info(
@@ -1670,21 +1762,30 @@ async def _poll_one_source(
                 batch_cap = phase1_batch_size()
                 target_verdicts: dict[int, TitleVerdict] = {}
                 attempted_here: set[int] = set()
-                # Negative-verdict cache (#514): titles this target's LLM
-                # rejected within the TTL skip the model and re-enter as a
-                # synthetic promising=False verdict, marked attempted — the
-                # downstream gates treat them exactly like a fresh "no"
-                # (rejected, not budget-deferred). Only the remainder is
-                # actually sent.
+                # Negative-verdict store (#514, persistent): titles this
+                # target's LLM already rejected within the TTL skip the model
+                # and re-enter as a synthetic promising=False verdict, marked
+                # attempted — the downstream gates treat them exactly like a
+                # fresh "no" (rejected, not budget-deferred). Only the
+                # remainder is actually sent. One chunked read per
+                # (source, target); fail-open to the LLM on store errors.
+                cached_rejections = await fetch_rejected_titles(
+                    supabase, active_target, [j.title for _, j in triage_candidates]
+                )
                 send_candidates: list[tuple[int, StandardJob]] = []
                 for cand_idx, cand_job in triage_candidates:
-                    if _phase1_cached_rejection(active_target, cand_job.title):
+                    if normalize_title(cand_job.title) in cached_rejections:
                         global_idx = cand_idx + 1
                         target_verdicts[global_idx] = TitleVerdict(id=global_idx, promising=False)
                         attempted_here.add(global_idx)
                     else:
                         send_candidates.append((cand_idx, cand_job))
+                summary["phase1_store_hits"] += len(triage_candidates) - len(send_candidates)
+                summary["phase1_store_misses"] += len(send_candidates)
                 titles = [job.title for _, job in send_candidates]
+                # Raw promising=False verdicts collected here persist in ONE
+                # write after the batch loop (budget breaks keep what stands).
+                rejected_now: list[tuple[str, int | None]] = []
                 for start in range(0, len(titles), batch_cap):
                     # Re-check the global daily cap before each batch (#60
                     # overspend fix). The per-cycle gate above trips the
@@ -1733,7 +1834,7 @@ async def _poll_one_source(
                     # Shift batch-local ids (1-based within the SENT subset)
                     # to global 1-based job indices via the send-candidate
                     # mapping. A raw promising=False lands in the negative
-                    # cache so the next cycle skips the model for this title.
+                    # store so future cycles skip the model for this title.
                     # Only outright rejections are cached — a low-confidence
                     # promising verdict may be gated out by ``admitted()``
                     # today, but the confidence threshold is a live setting
@@ -1745,9 +1846,11 @@ async def _poll_one_source(
                             global_idx = send_candidates[subset_pos][0] + 1
                             target_verdicts[global_idx] = verdict
                             if not verdict.promising:
-                                _phase1_record_rejection(
-                                    active_target, send_candidates[subset_pos][1].title
+                                rejected_now.append(
+                                    (send_candidates[subset_pos][1].title, verdict.confidence)
                                 )
+                if rejected_now:
+                    await record_rejections(supabase, active_target, rejected_now)
                 phase1_verdicts[active_target.id] = target_verdicts
                 phase1_attempted[active_target.id] = attempted_here
 
@@ -1816,6 +1919,13 @@ async def _poll_one_source(
                 dropped_phase1 += 1
                 continue
 
+            if job.detail_skipped:
+                # Held unchanged, detail deliberately not fetched — ``content``
+                # is empty, so building a row here would blank the stored
+                # description. It stays in ``all_external_ids`` above, so the
+                # stale-archive pass still counts it as seen.
+                continue
+
             salary = job.salary_text or extract_salary_from_html(job.content)
             loc = parse_location(job.location_name)
 
@@ -1825,6 +1935,7 @@ async def _poll_one_source(
                     "external_id": job.external_id,
                     "source_id": source_id,
                     "title": job.title,
+                    "title_display": clean_title_display(job.title),
                     "company_name": company_name,
                     "location": job.location_name,
                     "city": loc.city,
@@ -1836,6 +1947,7 @@ async def _poll_one_source(
                     "source_posted_at": normalize_posted_at(job.posted_at),
                     "salary_text": salary,
                     **salary_columns(salary),
+                    **board_columns(job, loc),
                 }
             )
 
@@ -1882,9 +1994,7 @@ async def _poll_one_source(
         # rescore via bulk_score_for_target at bump time, not here.
         unchanged_skipped = 0
         if rows_to_upsert:
-            rows_to_upsert, unchanged_skipped = _partition_unchanged(
-                rows_to_upsert, known_hashes
-            )
+            rows_to_upsert, unchanged_skipped = _partition_unchanged(rows_to_upsert, known_hashes)
             if unchanged_skipped:
                 summary["unchanged"] = unchanged_skipped
 
@@ -2435,10 +2545,7 @@ _spend_memo: dict[str, Any] = {"at": 0.0, "midnight": None, "value": 0.0}
 
 async def _memoized_total_spend(supabase: AsyncClient, midnight: datetime) -> float:
     now = time.monotonic()
-    if (
-        _spend_memo["midnight"] == midnight
-        and now - _spend_memo["at"] < _SPEND_MEMO_TTL_S
-    ):
+    if _spend_memo["midnight"] == midnight and now - _spend_memo["at"] < _SPEND_MEMO_TTL_S:
         return cast(float, _spend_memo["value"])
     value = await total_llm_spend_all_async(supabase, since=midnight)
     _spend_memo.update(at=now, midnight=midnight, value=value)
@@ -2772,9 +2879,7 @@ def _accumulate_poll_summary(result: PollResult, summary: dict[str, Any]) -> Non
     # #642 visibility: unchanged-row skips ride the log, not PollResult
     # (API model stability). Grep 'poll cycle unchanged' for the cycle sum.
     if summary.get("unchanged"):
-        logger.debug(
-            "poll unchanged-skip: %d rows kept their content_hash", summary["unchanged"]
-        )
+        logger.debug("poll unchanged-skip: %d rows kept their content_hash", summary["unchanged"])
     result.archived_jobs += summary["archived"]
     if summary["error"]:
         result.errors.append(summary["error"])
@@ -2956,6 +3061,13 @@ async def poll_due_sources(
         )
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
 
+    # Negative-store effectiveness, cycle-wide. One INFO line per cycle (not
+    # per source — the #702 log-storm lesson) makes the store's effect
+    # observable in prod: hits should dwarf misses once the corpus warms, and
+    # the count must PERSIST across a deploy — the in-process dict this
+    # replaced silently reset to all-misses on every release.
+    phase1_store_stats = {"hits": 0, "misses": 0}
+
     async def _worker(source: dict[str, Any]) -> None:
         async with semaphore:
             summary = await _poll_one_source_budgeted(
@@ -2968,8 +3080,16 @@ async def poll_due_sources(
         # No await between the source completing and the fold, so a
         # cancellation can never drop a finished source's counts.
         _accumulate_poll_summary(result, summary)
+        phase1_store_stats["hits"] += summary.get("phase1_store_hits", 0)
+        phase1_store_stats["misses"] += summary.get("phase1_store_misses", 0)
 
     await asyncio.gather(*(_worker(s) for s in due))
+    if phase1_store_stats["hits"] or phase1_store_stats["misses"]:
+        logger.info(
+            "phase1 rejection store: %d LLM verdict(s) avoided, %d sent to the model this cycle",
+            phase1_store_stats["hits"],
+            phase1_store_stats["misses"],
+        )
     return result
 
 
@@ -2990,7 +3110,14 @@ async def _poll_one_source_for_target(
     still ingesting fail-open — both resolved once by
     ``poll_sources_for_target``.
     """
-    summary: dict[str, Any] = {"polled": False, "new": 0, "updated": 0, "error": None}
+    summary: dict[str, Any] = {
+        "polled": False,
+        "new": 0,
+        "updated": 0,
+        "error": None,
+        "phase1_store_hits": 0,
+        "phase1_store_misses": 0,
+    }
     company_name: str = source.get("company_name", "?")
     # BYOK (#5 P3): grade on the payer's own key. Single payer here, but
     # memoized so Phase 1 and Phase 2/3 reuse one resolved client.
@@ -3006,7 +3133,47 @@ async def _poll_one_source_for_target(
             summary["error"] = f"{company_name}: unknown provider '{provider}'"
             return summary
 
-        jobs = await fetcher(board_token)
+        # What we already hold for this source, read BEFORE the fetch so
+        # Workday can skip the per-posting detail request for postings whose
+        # list entry is unchanged. Cheap columns only, and a failure here just
+        # means every detail is fetched — today's behaviour.
+        # This path polls for ONE target, so the free gates judge against it
+        # alone. Applied to the provider's LIST entries so Workday can skip
+        # the detail request for postings we would only drop.
+        def _admissible(title: str, location: str | None) -> bool:
+            """Mirrors the row-build loop below — keep them in step, or a
+            posting gets skipped here that the loop would have kept."""
+            return _title_matches_any_target(title, [target]) and _is_us_location(location)
+
+        known_postings: dict[str, KnownPosting] = {}
+        if provider == "workday":
+            try:
+                pre_resp = await poll_db_read(
+                    supabase,
+                    lambda c: (
+                        c.table("jobs")
+                        .select("external_id, title, source_posted_at")
+                        .eq("source_id", source_id)
+                        .is_("archived_at", "null")
+                    ),
+                    label=f"poll known postings {company_name}",
+                    retry_sync=True,
+                )
+                known_postings = {
+                    str(r["external_id"]): KnownPosting(
+                        title=r.get("title"), posted_at_stored=r.get("source_posted_at")
+                    )
+                    for r in cast(list[dict[str, Any]], pre_resp.data or [])
+                    if r.get("external_id")
+                }
+            except Exception:
+                logger.warning(
+                    "poll %s: known-postings read failed; fetching every detail",
+                    company_name,
+                    exc_info=True,
+                )
+
+        jobs = await _call_fetcher(fetcher, board_token, known_postings, _admissible)
         summary["polled"] = True
 
         # #514: this path had no known-row read at all, so already-ingested
@@ -3016,9 +3183,9 @@ async def _poll_one_source_for_target(
         # refresh. Same full-set admission scoping as ``_poll_one_source``.
         known_ids_resp = await poll_db_read(
             supabase,
-            lambda c: c.table("jobs")
-            .select("external_id, content_hash")
-            .eq("source_id", source_id),
+            lambda c: (
+                c.table("jobs").select("external_id, content_hash").eq("source_id", source_id)
+            ),
             label=f"poll known ids {company_name}",
             retry_sync=True,
         )
@@ -3071,19 +3238,25 @@ async def _poll_one_source_for_target(
             else None
         )
         if llm is not None:
-            # Negative-verdict cache (#514): titles this target's LLM already
-            # rejected within the TTL skip the model — synthetic
+            # Negative-verdict store (#514, persistent): titles this target's
+            # LLM already rejected within the TTL skip the model — synthetic
             # promising=False verdict, marked attempted (rejected, not
             # deferred). Same semantics as the scheduled path.
+            cached_rejections = await fetch_rejected_titles(
+                supabase, target, [j.title for _, j in triage_candidates]
+            )
             send_candidates: list[tuple[int, StandardJob]] = []
             for cand_idx, cand_job in triage_candidates:
-                if _phase1_cached_rejection(target, cand_job.title):
+                if normalize_title(cand_job.title) in cached_rejections:
                     global_idx = cand_idx + 1
                     target_verdicts[global_idx] = TitleVerdict(id=global_idx, promising=False)
                     phase1_attempted.add(global_idx)
                 else:
                     send_candidates.append((cand_idx, cand_job))
+            summary["phase1_store_hits"] += len(triage_candidates) - len(send_candidates)
+            summary["phase1_store_misses"] += len(send_candidates)
             titles = [job.title for _, job in send_candidates]
+            rejected_now: list[tuple[str, int | None]] = []
             batch_cap = phase1_batch_size()
             for start in range(0, len(titles), batch_cap):
                 # Re-check the global daily cap before each batch (#60
@@ -3128,14 +3301,18 @@ async def _poll_one_source_for_target(
                         )
                 # Shift batch-local ids (1-based within the SENT subset)
                 # back to global 1-based job indices via the send-candidate
-                # mapping; raw rejections feed the negative cache (#514).
+                # mapping; raw rejections feed the negative store (#514).
                 for batch_idx, verdict in verdicts.items():
                     subset_pos = start + batch_idx - 1  # 0-based
                     if 0 <= subset_pos < len(send_candidates):
                         global_idx = send_candidates[subset_pos][0] + 1
                         target_verdicts[global_idx] = verdict
                         if not verdict.promising:
-                            _phase1_record_rejection(target, send_candidates[subset_pos][1].title)
+                            rejected_now.append(
+                                (send_candidates[subset_pos][1].title, verdict.confidence)
+                            )
+            if rejected_now:
+                await record_rejections(supabase, target, rejected_now)
 
         rows_to_upsert: list[dict[str, Any]] = []
         phase1_idx_by_external_id: dict[str, int] = {}
@@ -3169,6 +3346,13 @@ async def _poll_one_source_for_target(
                 if gj not in phase1_attempted or (v is not None and not v.promising):
                     continue
 
+            if job.detail_skipped:
+                # Held unchanged, detail deliberately not fetched — ``content``
+                # is empty, so building a row here would blank the stored
+                # description. It stays in ``all_external_ids`` above, so the
+                # stale-archive pass still counts it as seen.
+                continue
+
             salary = job.salary_text or extract_salary_from_html(job.content)
             loc = parse_location(job.location_name)
 
@@ -3178,6 +3362,7 @@ async def _poll_one_source_for_target(
                     "external_id": job.external_id,
                     "source_id": source_id,
                     "title": job.title,
+                    "title_display": clean_title_display(job.title),
                     "company_name": company_name,
                     "location": job.location_name,
                     "city": loc.city,
@@ -3189,6 +3374,7 @@ async def _poll_one_source_for_target(
                     "source_posted_at": normalize_posted_at(job.posted_at),
                     "salary_text": salary,
                     **salary_columns(salary),
+                    **board_columns(job, loc),
                 }
             )
 
@@ -3216,9 +3402,7 @@ async def _poll_one_source_for_target(
         # rescore via bulk_score_for_target at bump time, not here.
         unchanged_skipped = 0
         if rows_to_upsert:
-            rows_to_upsert, unchanged_skipped = _partition_unchanged(
-                rows_to_upsert, known_hashes
-            )
+            rows_to_upsert, unchanged_skipped = _partition_unchanged(rows_to_upsert, known_hashes)
             if unchanged_skipped:
                 summary["unchanged"] = unchanged_skipped
 

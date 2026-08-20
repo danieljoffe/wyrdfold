@@ -41,13 +41,43 @@ def _target(id: str = "t1") -> JobTarget:
     )
 
 
-def _rows_supabase(rows: list[dict]) -> MagicMock:
-    """A client whose user_targets select AWAITS to ``rows`` (async client)."""
+def _rows_supabase(rows: list[dict], target_rows: list[dict] | None = None) -> MagicMock:
+    """Async client routing by table.
+
+    ``user_targets`` is read with ``.select().eq()``; ``targets`` with
+    ``.select().in_()`` (the ``_not_deriving`` guard). Routing by table name
+    keeps one fixture honest for both instead of a chain mock that would answer
+    whatever it is asked.
+    """
+    captured: dict[str, list[str]] = {"in_": []}
+
+    def _table(name: str) -> MagicMock:
+        t = MagicMock()
+        if name == "user_targets":
+            t.select.return_value.eq.return_value.execute = AsyncMock(
+                return_value=MagicMock(data=rows)
+            )
+        else:  # "targets"
+
+            def _in(_col: str, ids: list[str]) -> MagicMock:
+                captured["in_"] = list(ids)
+                m = MagicMock()
+                m.execute = AsyncMock(
+                    return_value=MagicMock(data=[r for r in (target_rows or []) if r["id"] in ids])
+                )
+                return m
+
+            t.select.return_value.in_ = _in
+        return t
+
     supabase = MagicMock()
-    supabase.table.return_value.select.return_value.eq.return_value.execute = AsyncMock(
-        return_value=MagicMock(data=rows)
-    )
+    supabase.table.side_effect = _table
+    supabase._captured = captured  # exposed for the cap assertion below
     return supabase
+
+
+def _ready(*ids: str) -> list[dict]:
+    return [{"id": i, "activation_status": "idle"} for i in ids]
 
 
 # ---- stale_target_ids -------------------------------------------------------
@@ -59,12 +89,11 @@ async def test_stale_filter_selects_mismatched_and_null_markers() -> None:
         {"target_id": "fresh", "fit_score": 80, "fit_score_prose_doc_id": "p2"},  # current
         {"target_id": "stale-old", "fit_score": 70, "fit_score_prose_doc_id": "p1"},  # old ver
         {"target_id": "stale-null", "fit_score": 60, "fit_score_prose_doc_id": None},  # untracked
-        {"target_id": "unscored", "fit_score": None, "fit_score_prose_doc_id": None},  # skip
     ]
     stale = await fit_refresh.stale_target_ids(
         _rows_supabase(rows), user_id="u1", current_prose_doc_id="p2", limit=10
     )
-    # Mismatched + null-marker scored rows are stale; the current + unscored are not.
+    # Mismatched + null-marker scored rows are stale; the current one is not.
     assert set(stale) == {"stale-old", "stale-null"}
 
 
@@ -77,6 +106,85 @@ async def test_stale_filter_respects_limit() -> None:
         _rows_supabase(rows), user_id="u1", current_prose_doc_id="p2", limit=3
     )
     assert len(stale) == 3  # capped
+
+
+# ---- unscored links are healed too (C1, 2026-08-15) -------------------------
+#
+# This function used to skip `fit_score IS NULL` on the reasoning that the
+# initial derive was "still pending or was never possible". Nothing ever
+# completes a derive that was never possible, so "pending" became permanent —
+# and this was the ONLY self-heal path in the system. Found on prod with a
+# target unscored for a full day, showing no badge and with no way for the user
+# to recompute it.
+
+
+@pytest.mark.asyncio
+async def test_unscored_links_are_selected_for_healing() -> None:
+    rows = [{"target_id": "unscored", "fit_score": None, "fit_score_prose_doc_id": None}]
+    stale = await fit_refresh.stale_target_ids(
+        _rows_supabase(rows, _ready("unscored")),
+        user_id="u1",
+        current_prose_doc_id="p2",
+        limit=10,
+    )
+    assert stale == ["unscored"]
+
+
+@pytest.mark.asyncio
+async def test_unscored_outranks_merely_stale() -> None:
+    """No badge at all is a worse state than a slightly outdated number, and
+    the per-view cap is small — so unscored spends it first."""
+    rows = [
+        {"target_id": "stale-a", "fit_score": 70, "fit_score_prose_doc_id": "p1"},
+        {"target_id": "stale-b", "fit_score": 71, "fit_score_prose_doc_id": "p1"},
+        {"target_id": "unscored", "fit_score": None, "fit_score_prose_doc_id": None},
+    ]
+    stale = await fit_refresh.stale_target_ids(
+        _rows_supabase(rows, _ready("unscored")),
+        user_id="u1",
+        current_prose_doc_id="p2",
+        limit=2,
+    )
+    assert stale[0] == "unscored"
+    assert len(stale) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_target_mid_derive_is_not_re_derived() -> None:
+    """A seconds-old target is legitimately unscored because its inline derive
+    is still running. Re-deriving it from a page view would pay twice and race
+    the write."""
+    rows = [
+        {"target_id": "in-flight", "fit_score": None, "fit_score_prose_doc_id": None},
+        {"target_id": "abandoned", "fit_score": None, "fit_score_prose_doc_id": None},
+    ]
+    target_rows = [
+        {"id": "in-flight", "activation_status": "deriving"},
+        {"id": "abandoned", "activation_status": "idle"},
+    ]
+    stale = await fit_refresh.stale_target_ids(
+        _rows_supabase(rows, target_rows),
+        user_id="u1",
+        current_prose_doc_id="p2",
+        limit=10,
+    )
+    assert stale == ["abandoned"]
+
+
+@pytest.mark.asyncio
+async def test_status_lookup_is_capped_not_proportional_to_target_count() -> None:
+    """The `in_` list must not grow with how many targets the user has — a big
+    `in_` is both wasteful and a 414 risk on this client."""
+    rows = [
+        {"target_id": f"u{i}", "fit_score": None, "fit_score_prose_doc_id": None}
+        for i in range(200)
+    ]
+    supabase = _rows_supabase(rows, _ready(*[f"u{i}" for i in range(200)]))
+    stale = await fit_refresh.stale_target_ids(
+        supabase, user_id="u1", current_prose_doc_id="p2", limit=3
+    )
+    assert len(stale) == 3
+    assert len(supabase._captured["in_"]) == 3
 
 
 @pytest.mark.asyncio
@@ -119,7 +227,9 @@ def refresh_patches(monkeypatch: pytest.MonkeyPatch) -> dict:
 
     monkeypatch.setattr(fit_refresh, "derive_fit_score", fake_derive)
 
-    async def fake_update(_s, *, user_id, target_id, fit_score, fit_score_reasoning, fit_score_prose_doc_id):  # type: ignore[no-untyped-def]
+    async def fake_update(
+        _s, *, user_id, target_id, fit_score, fit_score_reasoning, fit_score_prose_doc_id
+    ):  # type: ignore[no-untyped-def]
         rec["updates"].append(
             {"target_id": target_id, "fit_score": fit_score, "marker": fit_score_prose_doc_id}
         )

@@ -438,14 +438,8 @@ def _calc_max_possible(profile: ScoringProfile, search_keywords: list[str] | Non
     for cat_profile in profile.categories.values():
         for kw_weight in cat_profile.keywords.values():
             total += kw_weight * cat_profile.weight * _FULL_CREDIT_MULTIPLIER
-    total += (
-        len(profile.seniority.signals)
-        * _SENIORITY_SIGNAL_WEIGHT
-        * _FULL_CREDIT_MULTIPLIER
-    )
-    total += (
-        len(profile.domain.signals) * profile.domain.weight * _FULL_CREDIT_MULTIPLIER
-    )
+    total += len(profile.seniority.signals) * _SENIORITY_SIGNAL_WEIGHT * _FULL_CREDIT_MULTIPLIER
+    total += len(profile.domain.signals) * profile.domain.weight * _FULL_CREDIT_MULTIPLIER
     if search_keywords:
         total += _ROLE_TITLE_WEIGHT * _TITLE_WEIGHT
     return total
@@ -632,9 +626,7 @@ def score_job_with_profile(
         "seniority_signals",
         "negative",
     ):
-        setattr(
-            breakdown, axis, round(getattr(breakdown, axis) / normalizer * 100, 1)
-        )
+        setattr(breakdown, axis, round(getattr(breakdown, axis) / normalizer * 100, 1))
 
     return ScoreResult(
         score=score,

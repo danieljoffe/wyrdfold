@@ -10,8 +10,10 @@ const baseProps = {
   onBatchGenerate: jest.fn(),
   onBatchDelete: jest.fn(),
   onBatchExport: jest.fn(),
+  onBatchStatus: jest.fn(),
   generating: false,
   exporting: false,
+  statusUpdating: false,
   hasApproved: false,
 };
 
@@ -35,7 +37,7 @@ describe('BatchActionBar', () => {
       screen.getByRole('button', { name: /generate tailored resumes/i })
     ).toBeInTheDocument();
     expect(
-      screen.getByRole('button', { name: /^delete$/i })
+      screen.getByRole('button', { name: /^remove$/i })
     ).toBeInTheDocument();
   });
 
@@ -101,11 +103,43 @@ describe('BatchActionBar', () => {
       screen.getByRole('button', { name: /generate tailored resumes/i })
     );
     await user.click(screen.getByRole('button', { name: /export/i }));
-    await user.click(screen.getByRole('button', { name: /^delete$/i }));
+    await user.click(screen.getByRole('button', { name: /^remove$/i }));
 
     expect(onClear).toHaveBeenCalledTimes(1);
     expect(onBatchGenerate).toHaveBeenCalledTimes(1);
     expect(onBatchExport).toHaveBeenCalledTimes(1);
     expect(onBatchDelete).toHaveBeenCalledTimes(1);
+  });
+});
+
+// #10: status was the one pipeline action with no bulk form — marking ten
+// jobs "applied" meant opening each one in turn.
+describe('BatchActionBar — bulk status (#10)', () => {
+  it('offers every job status and reports the picked one', async () => {
+    const onBatchStatus = jest.fn();
+    const user = userEvent.setup();
+    render(
+      <BatchActionBar
+        {...baseProps}
+        selectedCount={3}
+        onBatchStatus={onBatchStatus}
+      />
+    );
+
+    await user.click(screen.getByText(/set status/i));
+    // The full vocabulary, not a hand-picked subset — a bulk control that
+    // can't reach a status the single-job menu can is its own trap.
+    expect(screen.getByText('Applied')).toBeInTheDocument();
+    expect(screen.getByText('Interviewing')).toBeInTheDocument();
+    expect(screen.getByText('Rejected')).toBeInTheDocument();
+
+    await user.click(screen.getByText('Applied'));
+    expect(onBatchStatus).toHaveBeenCalledWith('applied');
+  });
+
+  it('shows progress and blocks re-entry while an update is in flight', () => {
+    render(<BatchActionBar {...baseProps} selectedCount={3} statusUpdating />);
+    expect(screen.getByText(/updating/i)).toBeInTheDocument();
+    expect(screen.queryByText(/set status/i)).not.toBeInTheDocument();
   });
 });

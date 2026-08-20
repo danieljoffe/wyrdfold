@@ -14,6 +14,12 @@ import { extractApiError } from '@/lib/extractApiError';
 interface ConversationChatProps {
   onComplete: () => void;
   onSkip: () => void;
+  /**
+   * Label for the skip affordance. The onboarding wizard wires ``onSkip``
+   * to "advance a step", so it passes "Skip this step"; the profile page
+   * keeps the default, where skipping dismisses the chat entirely.
+   */
+  skipLabel?: string;
 }
 
 interface Message {
@@ -32,6 +38,7 @@ const extractErrorDetail = extractApiError;
 export default function ConversationChat({
   onComplete,
   onSkip,
+  skipLabel = 'Skip for now',
 }: ConversationChatProps) {
   const idPrefix = useId();
   const msgCountRef = useRef(0);
@@ -40,6 +47,12 @@ export default function ConversationChat({
   }
 
   const [messages, setMessages] = useState<Message[]>([]);
+  // The gap the opening question came from (`gap.context`, e.g. "Outcome
+  // lacks a quantified metric: '…'"). Without it the first question can
+  // reference content it never quotes — the sweep (§A4) opened cold with
+  // "…what was the average lift from those tests?" and nothing saying
+  // which tests. Shown until the user answers.
+  const [probeContext, setProbeContext] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
@@ -63,16 +76,39 @@ export default function ConversationChat({
         const res = await fetch(
           '/api/career/experience/conversation/next-probe'
         );
-        if (!res.ok) throw new Error('Failed to load question');
-        const data = (await res.json()) as { question: string };
+        if (!res.ok) {
+          // Carry the API's own message. `!res.ok` used to collapse every
+          // status into "Please try again", which is wrong advice for the
+          // one that actually happens here: a 402 is permanent for this
+          // account, so retrying can never succeed and the user is invited
+          // to loop on a dead action (#857). Empty fallback so we can tell
+          // "the API explained itself" from "we only had a status code".
+          throw new Error(await extractApiError(res, ''));
+        }
+        const data = (await res.json()) as {
+          question: string;
+          gap?: { context?: string | null } | null;
+        };
         if (!cancelled) {
           setMessages([
             { id: nextMsgId(), role: 'assistant', content: data.question },
           ]);
+          setProbeContext(data.gap?.context ?? null);
         }
-      } catch {
-        if (!cancelled)
-          setError('Could not start conversation. Please try again.');
+      } catch (err) {
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message.trim() : '';
+          // A message shaped like "(500)" means ``extractApiError`` only had
+          // a status code to work with — prefer the friendly fallback there.
+          // A real detail ("Your free trial has ended…") wins. Same idiom as
+          // TargetSuggestions' create-from-posting path.
+          const onlyStatus = /^\(\d+\)$/.test(message);
+          setError(
+            message && !onlyStatus
+              ? message
+              : 'Could not start conversation. Please try again.'
+          );
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -260,6 +296,16 @@ export default function ConversationChat({
           Answer a few questions about your experience. Skip any you&apos;d
           rather not answer.
         </Text>
+        {probeContext && messages.length <= 1 && (
+          <Text
+            variant='caption'
+            as='p'
+            role='note'
+            className='mt-2 text-text-tertiary'
+          >
+            Why this question — from your saved experience: {probeContext}
+          </Text>
+        )}
       </div>
 
       {/* Messages area */}
@@ -385,7 +431,7 @@ export default function ConversationChat({
             onClick={onSkip}
             disabled={sending || deriving}
           >
-            Skip for now
+            {skipLabel}
           </Button>
         </div>
       </div>

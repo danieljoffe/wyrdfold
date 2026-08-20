@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -167,7 +168,9 @@ class TestComputePipeline:
         assert [r["posting_id"] for r in mine] == ["p1"]
         assert len(mine) == 1
 
-        everyone = await _fetch_status_logs_window(_faithful_supabase(seed), None, None, {"p1"}, None)
+        everyone = await _fetch_status_logs_window(
+            _faithful_supabase(seed), None, None, {"p1"}, None
+        )
         assert len(everyone) == 2
 
     async def test_empty_data(self):
@@ -192,6 +195,27 @@ class TestComputePipeline:
         assert len(result.velocity) >= 1
         total_resumes = sum(v.resumes_generated for v in result.velocity)
         assert total_resumes == 3
+
+    async def test_velocity_pads_quiet_weeks_through_today(self):
+        # ux-sweep 2026-08-12 §B7: plotting only weeks WITH data dropped
+        # trailing quiet weeks — the chart's axis ended at the last burst
+        # of activity, so a 30d view stopped 10 days before today. Weeks
+        # must be contiguous from first activity through today's week,
+        # with quiet weeks present as zeros.
+        resumes = [
+            {"job_posting_id": "1", "created_at": _ts(_NOW - timedelta(days=28))},
+        ]
+        sb = _mock_supabase({"documents": resumes})
+        result = await compute_pipeline(sb, since=None)
+
+        assert len(result.velocity) == 5  # activity week + 4 through today
+        assert result.velocity[0].resumes_generated == 1
+        assert all(v.resumes_generated == 0 for v in result.velocity[1:])
+        # Contiguous Mondays, no gaps.
+        starts = [v.week_start for v in result.velocity]
+        assert all((b - a).days == 7 for a, b in itertools.pairwise(starts))
+        # The final bucket is the CURRENT week.
+        assert starts[-1] == _NOW.date() - timedelta(days=_NOW.date().weekday())
 
     async def test_previous_is_none_without_prior_window(self):
         sb = _mock_supabase({})
@@ -470,7 +494,9 @@ class TestPipelineGroupByRpcByteIdentical:
         }
         jobs_by_id = {j["id"]: j for j in seed["jobs"]}
         win_pids = {pid for pid in member if jobs_by_id[pid]["cataloged_at"] >= since.isoformat()}
-        ref_logs = await _fetch_status_logs_window(_faithful_supabase(seed), since, None, win_pids, _USER)
+        ref_logs = await _fetch_status_logs_window(
+            _faithful_supabase(seed), since, None, win_pids, _USER
+        )
         ref_current = _kpis_from(ref_counts, ref_logs)
 
         # Funnel is byte-identical to the Python recompute.
@@ -1456,6 +1482,8 @@ def _chunk_tracking_supabase(
 
         for method in ("select", "eq", "gte", "lt", "lte", "order", "limit", "neq"):
             getattr(tbl, method).return_value = tbl
+        # ``.not_.is_(col, "null")`` — the harvest union's not-null filter.
+        tbl.not_.is_.return_value = tbl
 
         def in_recorder(col: str, ids: list, _name: str = name) -> MagicMock:
             in_batches.setdefault(_name, []).append(list(ids))
@@ -1526,11 +1554,12 @@ class TestComputeChunksLargeIdLists:
             assert big and all(s <= 200 for s in big), f"{table} not chunked at 200: {sizes}"
 
     async def test_compute_skills_cost_scopes_by_target_not_posting_membership(self):
-        """#60-perf: skills-cost no longer resolves posting membership via
-        ``scores`` (tens of thousands of rows) + fetches every target posting.
-        It scopes analyses by ``target_id`` directly; since R2 the priority
-        weight comes from each analysis's own scorecard, so there is NO jobs
-        fetch at all."""
+        """#60-perf, amended for the skills harvest: skills-cost never
+        resolves posting membership via per-posting id pulls. Analyses scope
+        by ``target_id`` directly; the harvest union reads ``scores`` in the
+        SAME cheap shape (one target-scoped ``in_``, not posting-id batches);
+        and there is still NO ``jobs`` fetch at all — the harvest's job-level
+        list is denormalized onto ``scores`` precisely to keep it that way."""
         analyses = [
             {
                 "job_posting_id": "p1",
@@ -1548,22 +1577,39 @@ class TestComputeChunksLargeIdLists:
                 "scorecard": {"skills_missing": ["Go"]},
             },
         ]
+        harvest_scores = [
+            {
+                "skills_matched": ["kubernetes"],
+                "skills_missing": ["terraform"],
+                "score": 80,
+                "updated_at": _ts(_NOW),
+            },
+        ]
         in_batches: dict[str, list[list]] = {}
         sb = _chunk_tracking_supabase(
-            {"analyses": analyses, "documents": [], "llm_costs": []},
+            {
+                "analyses": analyses,
+                "scores": harvest_scores,
+                "documents": [],
+                "llm_costs": [],
+            },
             in_batches,
         )
 
         result = await compute_skills_cost(sb, since=_WEEK_AGO, target_ids={"t1"}, user_id=_USER)
 
-        # No membership pull: skills-cost must not touch the ``scores`` table.
-        assert "scores" not in in_batches
-        # And since R2, no ``jobs`` read either — the weight is in-hand from
-        # the analyses' scorecards.
+        # The ONLY scores read is the target-scoped harvest union — never a
+        # posting-membership pull (which would batch posting ids, not the
+        # handful of target ids).
+        assert in_batches.get("scores") == [["t1"]]
+        # And still no ``jobs`` read — the harvest denorm keeps it that way.
         assert "jobs" not in in_batches
-        # Skills flow through from the scorecards.
+        # Skills flow through from BOTH sources: analyses scorecards + the
+        # harvested scores columns.
         skills = {s.skill for s in result.top_skills}
-        assert {"React", "Rust", "Go"} <= skills
+        assert {"React", "Rust", "Go", "kubernetes"} <= skills
+        missing = {m.skill for m in result.top_missing}
+        assert "terraform" in missing
 
 
 # ===========================================================================
@@ -1794,9 +1840,7 @@ class TestTargetsHappyPathSkipsMembershipWalk:
             tables_read.append(name)
             tbl = MagicMock()
             result = MagicMock()
-            result.data = (
-                [{"id": "t1", "label": "Frontend"}] if name == "targets" else []
-            )
+            result.data = [{"id": "t1", "label": "Frontend"}] if name == "targets" else []
             for method in ("select", "eq", "gte", "lt", "lte", "order", "limit", "neq", "in_"):
                 getattr(tbl, method).return_value = tbl
             tbl.execute = AsyncMock(return_value=result)
@@ -1859,7 +1903,15 @@ class TestTargetsHappyPathSkipsMembershipWalk:
         assert result.score_trend == []
         assert result.unscored_count == 0
         assert [b.bucket for b in result.score_distribution] == [
-            "0-10", "10-20", "20-30", "30-40", "40-50",
-            "50-60", "60-70", "70-80", "80-90", "90-100",
+            "0-10",
+            "10-20",
+            "20-30",
+            "30-40",
+            "40-50",
+            "50-60",
+            "60-70",
+            "70-80",
+            "80-90",
+            "90-100",
         ]
         assert all(b.count == 0 for b in result.score_distribution)

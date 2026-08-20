@@ -317,9 +317,7 @@ class TestBatchProcessing:
 
         # The flagged draft is reachable and the posting advanced, exactly as
         # a clean generation would.
-        item = next(
-            c.kwargs["items"][0] for c in mock_update.call_args_list if "items" in c.kwargs
-        )
+        item = next(c.kwargs["items"][0] for c in mock_update.call_args_list if "items" in c.kwargs)
         assert item["status"] == "completed"
         assert item["resume_record_id"] == "rec-flagged"
         assert item["lint_violations"] == ["Page overflow"]

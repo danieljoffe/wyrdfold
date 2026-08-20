@@ -10,8 +10,9 @@ import type { JobSearchResult } from '../types';
  * page (#467 §11.2 fast-follow). Calls wyrdfold-api's `GET
  * /public/listings/{id}` directly with the BFF secret — the same trusted
  * posture as the `/api/public/*` forwarders without bouncing through our own
- * route handler (precedent: the landing page's server-side `signupMode()`
- * fetch reads `WYRDFOLD_API_URL` directly). Forwards the Vercel-trusted client
+ * route handler (precedent: `lib/api/signupMode`, the landing page's
+ * server-side probe, reads `WYRDFOLD_API_URL` directly). Forwards the
+ * Vercel-trusted client
  * IP (`x-real-ip` via `next/headers`) so the API's per-IP limit keys on the
  * real visitor instead of pooling every hard load onto one egress IP.
  *

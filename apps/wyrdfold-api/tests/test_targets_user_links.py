@@ -11,9 +11,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 
 from app.services.targets import crud
 from app.services.targets.fit_score import FitScoreResult
@@ -279,9 +280,7 @@ def test_get_active_target_ids_filters_on_membership_activity() -> None:
     (authz/dedup via get_user_target_ids) still sees the link."""
     supabase = MagicMock()
     chain = supabase.table.return_value.select.return_value
-    chain.eq.return_value.eq.return_value.execute.return_value.data = [
-        {"target_id": "t-active"}
-    ]
+    chain.eq.return_value.eq.return_value.execute.return_value.data = [{"target_id": "t-active"}]
 
     ids = crud.get_active_target_ids(supabase, "user-1")
 
@@ -291,3 +290,325 @@ def test_get_active_target_ids_filters_on_membership_activity() -> None:
     second_eq = chain.eq.return_value.eq.call_args_list[0].args
     assert first_eq == ("user_id", "user-1")
     assert second_eq == ("is_active", True)
+
+
+class TestActiveLimitErrorPayload:
+    """The 409 body for the active-target cap.
+
+    ``message`` is the string the user actually reads — the frontend surfaces
+    it verbatim rather than composing its own — so its wording is a contract,
+    not an implementation detail. Three routes (activate, link/follow,
+    add-from-posting) used to carry byte-identical copies of this dict; they
+    now share one builder.
+    """
+
+    def test_shape_carries_error_limit_count_and_message(self) -> None:
+        from app.routers.targets import _active_limit_error
+        from app.services.targets import crud
+
+        exc = _active_limit_error(crud.ActiveTargetLimitError(current_count=3, limit=3))
+
+        assert exc.status_code == 409
+        assert exc.detail["error"] == "ACTIVE_LIMIT"
+        assert exc.detail["limit"] == 3
+        assert exc.detail["active_count"] == 3
+        assert exc.detail["message"] == (
+            "You already have 3 active targets (limit 3) — deactivate one first."
+        )
+
+    def test_singularizes_at_a_count_of_one(self) -> None:
+        """The default cap is 1, so "1 active targets" was the common case."""
+        from app.routers.targets import _active_limit_error
+        from app.services.targets import crud
+
+        exc = _active_limit_error(crud.ActiveTargetLimitError(current_count=1, limit=1))
+
+        assert exc.detail["message"] == (
+            "You already have 1 active target (limit 1) — deactivate one first."
+        )
+        assert "1 active targets" not in exc.detail["message"]
+
+    def test_message_is_non_empty_so_the_frontend_never_falls_back(self) -> None:
+        from app.routers.targets import _active_limit_error
+        from app.services.targets import crud
+
+        for count, limit in ((0, 1), (1, 1), (2, 5), (10, 10)):
+            exc = _active_limit_error(crud.ActiveTargetLimitError(current_count=count, limit=limit))
+            assert isinstance(exc.detail["message"], str)
+            assert exc.detail["message"].strip()
+            assert "deactivate one first" in exc.detail["message"]
+
+
+class TestActiveLimitPickerPayload:
+    """The 409 names WHICH targets hold the cap.
+
+    Without it the client can only say "deactivate one first" and leave the
+    user to find them. `/targets` could work them out from its own state, but
+    the detail page knows only the target it is showing — so the server sends
+    the choices and every surface can offer the same swap.
+    """
+
+    def test_active_targets_default_to_empty_not_missing(self) -> None:
+        """The key must always exist: a client reading `detail.active_targets`
+        should never have to distinguish absent from empty."""
+        from app.routers.targets import _active_limit_error
+        from app.services.targets import crud
+
+        exc = _active_limit_error(crud.ActiveTargetLimitError(current_count=1, limit=1))
+        assert exc.detail["active_targets"] == []
+
+    def test_active_targets_are_carried_through(self) -> None:
+        from app.routers.targets import _active_limit_error
+        from app.services.targets import crud
+
+        choices = [
+            {"id": "t-1", "label": "Senior Frontend Engineer"},
+            {"id": "t-2", "label": "Staff Full-Stack Engineer"},
+        ]
+        exc = _active_limit_error(crud.ActiveTargetLimitError(current_count=2, limit=2), choices)
+        assert exc.detail["active_targets"] == choices
+        # ...and the message still stands on its own for a client that
+        # ignores the list entirely.
+        assert "deactivate one first" in exc.detail["message"]
+
+    def test_scales_past_a_cap_of_one(self) -> None:
+        """Free is 1, starter 2, pro 5 — the picker is a list at every tier,
+        so nothing may assume a single swap candidate."""
+        from app.routers.targets import _active_limit_error
+        from app.services.targets import crud
+
+        choices = [{"id": f"t-{i}", "label": f"Target {i}"} for i in range(5)]
+        exc = _active_limit_error(crud.ActiveTargetLimitError(current_count=5, limit=5), choices)
+        assert len(exc.detail["active_targets"]) == 5
+        assert exc.detail["message"] == (
+            "You already have 5 active targets (limit 5) — deactivate one first."
+        )
+
+
+class TestActivateWithSwap:
+    """`POST /targets/{id}/activate` with `deactivate_target_id`.
+
+    The active-target cap (1 free / 2 starter / 5 pro) otherwise makes
+    activation a dead end once a user is at their limit. The swap frees a slot
+    they choose and takes it in ONE request, so the window where neither target
+    is active is server-side rather than spanning two client calls.
+    """
+
+    @staticmethod
+    def _spy() -> tuple[Any, list[tuple[str, bool]]]:
+        """Records every is_active flip, in order."""
+        flips: list[tuple[str, bool]] = []
+
+        async def set_active(_sb: Any, *, user_id: str, target_id: str, active: bool) -> None:
+            flips.append((target_id, active))
+
+        return set_active, flips
+
+    @pytest.mark.asyncio
+    async def test_deactivates_the_chosen_target_before_activating(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Order is load-bearing: the cap counts ACTIVE links, so activating
+        first would just hit the same 409 the swap exists to get past."""
+        from app.routers import targets as mod
+
+        set_active, flips = self._spy()
+        monkeypatch.setattr(mod, "_set_link_active", set_active)
+        monkeypatch.setattr(
+            mod,
+            "_active_target_choices",
+            AsyncMock(return_value=[{"id": "old", "label": "Old"}]),
+        )
+        linked = AsyncMock()
+        monkeypatch.setattr(mod, "_link_user_to_target_async", linked)
+
+        await mod._activate_link_with_optional_swap(
+            MagicMock(), user_id="u1", target_id="new", swap_out="old"
+        )
+
+        assert flips == [("old", False)]
+        linked.assert_awaited_once()
+        assert linked.await_args.kwargs["target_id"] == "new"
+
+    @pytest.mark.asyncio
+    async def test_restores_the_swapped_out_target_when_activation_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The failure that matters. Without the rollback a failed swap leaves
+        the user with FEWER active targets than they started with — worse than
+        the refusal they were trying to get past."""
+        from app.routers import targets as mod
+        from app.services.targets import crud
+
+        set_active, flips = self._spy()
+        monkeypatch.setattr(mod, "_set_link_active", set_active)
+        monkeypatch.setattr(
+            mod,
+            "_active_target_choices",
+            AsyncMock(return_value=[{"id": "old", "label": "Old"}]),
+        )
+        monkeypatch.setattr(
+            mod,
+            "_link_user_to_target_async",
+            AsyncMock(side_effect=crud.ActiveTargetLimitError(current_count=1, limit=1)),
+        )
+
+        with pytest.raises(HTTPException) as caught:
+            await mod._activate_link_with_optional_swap(
+                MagicMock(), user_id="u1", target_id="new", swap_out="old"
+            )
+
+        assert caught.value.status_code == 409
+        # Deactivated, then put back.
+        assert flips == [("old", False), ("old", True)]
+
+    @pytest.mark.asyncio
+    async def test_rolls_back_on_an_unexpected_error_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Not just the cap — any failure past the deactivation must restore
+        it, or a transient DB blip silently costs the user their active target."""
+        from app.routers import targets as mod
+
+        set_active, flips = self._spy()
+        monkeypatch.setattr(mod, "_set_link_active", set_active)
+        monkeypatch.setattr(
+            mod,
+            "_active_target_choices",
+            AsyncMock(return_value=[{"id": "old", "label": "Old"}]),
+        )
+        monkeypatch.setattr(
+            mod, "_link_user_to_target_async", AsyncMock(side_effect=RuntimeError("boom"))
+        )
+
+        with pytest.raises(RuntimeError):
+            await mod._activate_link_with_optional_swap(
+                MagicMock(), user_id="u1", target_id="new", swap_out="old"
+            )
+        assert flips == [("old", False), ("old", True)]
+
+    @pytest.mark.asyncio
+    async def test_refuses_to_deactivate_a_target_that_is_not_active(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Otherwise activating one target is a way to deactivate ANY target
+        by id — a write the caller never asked for."""
+        from app.routers import targets as mod
+
+        set_active, flips = self._spy()
+        monkeypatch.setattr(mod, "_set_link_active", set_active)
+        monkeypatch.setattr(
+            mod,
+            "_active_target_choices",
+            AsyncMock(return_value=[{"id": "actually-active", "label": "A"}]),
+        )
+        linked = AsyncMock()
+        monkeypatch.setattr(mod, "_link_user_to_target_async", linked)
+
+        with pytest.raises(HTTPException) as caught:
+            await mod._activate_link_with_optional_swap(
+                MagicMock(), user_id="u1", target_id="new", swap_out="someone-elses"
+            )
+
+        assert caught.value.status_code == 400
+        assert flips == []  # nothing was touched
+        linked.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refuses_to_swap_a_target_against_itself(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.routers import targets as mod
+
+        set_active, flips = self._spy()
+        monkeypatch.setattr(mod, "_set_link_active", set_active)
+        linked = AsyncMock()
+        monkeypatch.setattr(mod, "_link_user_to_target_async", linked)
+
+        with pytest.raises(HTTPException) as caught:
+            await mod._activate_link_with_optional_swap(
+                MagicMock(), user_id="u1", target_id="same", swap_out="same"
+            )
+        assert caught.value.status_code == 400
+        assert flips == []
+        linked.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_without_a_swap_it_behaves_exactly_as_before(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The body is optional; every existing caller passes nothing."""
+        from app.routers import targets as mod
+
+        set_active, flips = self._spy()
+        monkeypatch.setattr(mod, "_set_link_active", set_active)
+        linked = AsyncMock()
+        monkeypatch.setattr(mod, "_link_user_to_target_async", linked)
+
+        await mod._activate_link_with_optional_swap(
+            MagicMock(), user_id="u1", target_id="new", swap_out=None
+        )
+
+        assert flips == []  # no deactivation at all
+        linked.assert_awaited_once()
+
+
+# ---- the cap is checked BEFORE the fit score is billed (#865) ---------------
+
+
+async def test_link_route_refuses_at_cap_without_deriving_a_fit_score() -> None:
+    """`link_target` must not pay for work the cap is about to reject.
+
+    The fit score is an LLM call and is charged to the user via
+    `cost_log.record_async`. It used to run BEFORE the write that raises on
+    the active-target cap, so a refused link still cost the user quota — and
+    it fires exactly when someone is trying to add MORE targets, i.e. when
+    they are most engaged. Same shape as #845, on the interactive side.
+    """
+    from app.routers import targets as targets_router
+
+    called: dict[str, bool] = {"derived": False, "charged": False}
+
+    async def _never_derive(*_a: object, **_k: object) -> object:
+        called["derived"] = True
+        raise AssertionError("fit score derived despite the cap being full")
+
+    async def _never_charge(*_a: object, **_k: object) -> None:
+        called["charged"] = True
+        raise AssertionError("user charged despite the cap being full")
+
+    async def _at_cap(*_a: object, **_k: object) -> None:
+        raise crud.ActiveTargetLimitError(current_count=2, limit=2)
+
+    async def _target(*_a: object, **_k: object) -> object:
+        return MagicMock(id="t-new")
+
+    async def _choices(*_a: object, **_k: object) -> list[dict[str, str]]:
+        return [{"id": "t-old", "label": "Staff Frontend Engineer"}]
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(targets_router, "_target_get", _target)
+        mp.setattr(targets_router, "_raise_if_active_limit_async", _at_cap)
+        mp.setattr(targets_router, "_active_target_choices", _choices)
+        mp.setattr(targets_router, "resolve_current_payload", _never_derive)
+        mp.setattr(targets_router, "derive_fit_score", _never_derive)
+        mp.setattr(targets_router.cost_log, "record_async", _never_charge)
+
+        with pytest.raises(HTTPException) as exc:
+            await targets_router.link_target(
+                request=MagicMock(),
+                target_id="t-new",
+                supabase=MagicMock(),
+                llm=MagicMock(),
+                user_id="user-1",
+            )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["error"] == "ACTIVE_LIMIT"
+    # The point of the test: neither happened.
+    assert called["derived"] is False, "no LLM call may precede the cap check"
+    assert called["charged"] is False, "the user must not be billed for a refused link"
+    # The 409 still carries what the client needs to offer a swap.
+    assert exc.value.detail["active_targets"] == [
+        {"id": "t-old", "label": "Staff Frontend Engineer"}
+    ]

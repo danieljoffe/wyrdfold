@@ -313,6 +313,7 @@ async def run_cover_letter_pipeline(
     critique: str | None = None,
     job_posting_id: str | None = None,
     target_label: str | None = None,
+    allow_stretch: bool = False,
 ) -> CoverLetterPipelineResult:
     """Run the full cover-letter pipeline end-to-end.
 
@@ -341,6 +342,7 @@ async def run_cover_letter_pipeline(
         preferences_tone_notes=(preferences.tone_notes if preferences else None),
         annotations_text=annotations_text,
         critique=critique,
+        allow_stretch=allow_stretch,
     )
 
     await cost_log.record_async(
@@ -372,6 +374,10 @@ async def run_cover_letter_pipeline(
             llm_result=llm_result,
             storage_path=None,
             lint_violations=[v.model_dump() for v in lint_result.violations],
+            # #785: the opt-in is a property of THIS letter, so it rides with
+            # the row. Re-generate on the review page reads it back rather than
+            # re-deriving a per-(job, target) verdict it has no target for.
+            allow_stretch=allow_stretch,
         )
 
     md_lint = lint_markdown(payload_md, document_type="cover_letter")

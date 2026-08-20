@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { formatCompanyName } from '@/lib/formatCompanyName';
+import { displayTitle } from '@/lib/displayTitle';
 import Link from 'next/link';
 import { ArrowRight, ArrowUpRight, Check } from 'lucide-react';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
@@ -127,7 +128,7 @@ export default function ListingDetailBody({
         <CompanyAvatar name={formatCompanyName(job.company_name)} size='lg' />
         <div className='min-w-0 flex-1'>
           <Heading variant='component' as='h2' className='text-balance'>
-            {job.title}
+            {displayTitle(job)}
           </Heading>
           {meta && (
             <Text variant='meta' as='p' className='mt-0.5 text-text-secondary'>
@@ -235,7 +236,7 @@ export default function ListingDetailBody({
       ) : (
         <div className='flex flex-col gap-3 border-t border-border pt-4'>
           <Text variant='meta' as='p' className='text-text-tertiary'>
-            Add to a target to unlock LLM pipelines.
+            Add to a target to unlock fit analysis and resume tailoring.
           </Text>
           <div className='flex flex-wrap items-center gap-2'>
             <AddToTargetMenu

@@ -300,12 +300,17 @@ async def _stamp_consumed_feedback(
 ) -> None:
     if not feedback_ids:
         return
-    await supabase.table("job_feedback").update(
-        {
-            "applied_at": datetime.now(UTC).isoformat(),
-            "applied_run_id": run_id,
-        }
-    ).in_("id", feedback_ids).execute()
+    await (
+        supabase.table("job_feedback")
+        .update(
+            {
+                "applied_at": datetime.now(UTC).isoformat(),
+                "applied_run_id": run_id,
+            }
+        )
+        .in_("id", feedback_ids)
+        .execute()
+    )
 
 
 def _is_empty_patch(patch: ProfilePatch) -> bool:
@@ -631,9 +636,13 @@ async def _apply_staged_merge(
     new_version = cast(int, rpc_version)
 
     if ref_jd_id is not None:
-        await supabase.table("reference_jds").update({"suppressed": False}).eq(
-            "id", ref_jd_id
-        ).eq("target_id", target_id).execute()
+        await (
+            supabase.table("reference_jds")
+            .update({"suppressed": False})
+            .eq("id", ref_jd_id)
+            .eq("target_id", target_id)
+            .execute()
+        )
 
     new_run_id = str(uuid.uuid4())
     update_resp = (
@@ -865,26 +874,18 @@ async def run_llm_learner_off_loop(
     )
 
 
-async def apply_staged_patch_off_loop(
-    *, user_id: str, run_id: str
-) -> LearningRunResult | None:
+async def apply_staged_patch_off_loop(*, user_id: str, run_id: str) -> LearningRunResult | None:
     """Drive :func:`apply_staged_patch` on the pooled async service client (#57
     PR-G2d-a → PR-G2e-2). Propagates :class:`StagedPatchConflictError` so the
     router maps a lost version race to 409."""
     from app.dependencies import get_async_service_supabase
 
-    return await apply_staged_patch(
-        get_async_service_supabase(), user_id=user_id, run_id=run_id
-    )
+    return await apply_staged_patch(get_async_service_supabase(), user_id=user_id, run_id=run_id)
 
 
-async def reject_staged_patch_off_loop(
-    *, user_id: str, run_id: str
-) -> LearningRunResult | None:
+async def reject_staged_patch_off_loop(*, user_id: str, run_id: str) -> LearningRunResult | None:
     """Drive :func:`reject_staged_patch` on the pooled async service client (#57
     PR-G2d-a → PR-G2e-2)."""
     from app.dependencies import get_async_service_supabase
 
-    return await reject_staged_patch(
-        get_async_service_supabase(), user_id=user_id, run_id=run_id
-    )
+    return await reject_staged_patch(get_async_service_supabase(), user_id=user_id, run_id=run_id)

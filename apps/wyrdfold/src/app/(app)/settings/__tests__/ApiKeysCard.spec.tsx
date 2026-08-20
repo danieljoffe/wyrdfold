@@ -61,7 +61,7 @@ describe('ApiKeysCard', () => {
     render(<ApiKeysCard />);
 
     expect(
-      await screen.findByText(/isn’t enabled on this instance/i)
+      await screen.findByText(/isn’t available on this server/i)
     ).toBeInTheDocument();
     // No key form when BYOK is off.
     expect(screen.queryByLabelText(/OpenRouter key/i)).not.toBeInTheDocument();

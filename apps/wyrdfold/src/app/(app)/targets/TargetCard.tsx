@@ -1,15 +1,18 @@
 'use client';
 
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { Briefcase, MoreVertical, Power, Trash2 } from 'lucide-react';
 import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
 import { Dropdown } from '@danieljoffe/shared-ui/Dropdown';
 import type { DropdownItem } from '@danieljoffe/shared-ui/Dropdown';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
+import { Button } from '@danieljoffe/shared-ui/Button';
 import ScoreBadge from '@/components/ScoreBadge';
 import { LocalDate } from '@/components/LocalFormat';
 import { cn } from '@/lib/cn';
 import type { JobTargetSummary } from './types';
+import { activationErrorMessage } from './types';
 
 interface TargetCardProps {
   target: JobTargetSummary;
@@ -30,6 +33,10 @@ interface TargetCardProps {
   fitScore: number | null;
   fitScoreReasoning: string | null;
   onActivate: (id: string) => void;
+  /** Re-run the activation pipeline for a failed target (#649). */
+  onRetry: (id: string) => void;
+  /** True while this card's retry request is in flight. */
+  retrying: boolean;
   onDeactivate: (id: string) => void;
   onDelete: (id: string) => void;
   onViewJobs: (id: string) => void;
@@ -41,6 +48,8 @@ export default function TargetCard({
   fitScore,
   fitScoreReasoning,
   onActivate,
+  onRetry,
+  retrying,
   onDeactivate,
   onDelete,
   onViewJobs,
@@ -113,18 +122,47 @@ export default function TargetCard({
               <ScoreBadge
                 score={fitScore}
                 size='sm'
-                title={fitScoreReasoning ?? 'Fit score'}
+                // This is the ONE 'fit' chip in the app — how well the target
+                // suits the user's experience. Every other ScoreBadge is a
+                // job's 'match' against a target, on a different scale.
+                kind='fit'
+                // The bare number badge was the sweep's "score of what?"
+                // moment (re-sweep R3) — the tooltip now NAMES it before
+                // the reasoning prose.
+                title={`Fit score ${fitScore} — how well this target matches your experience${
+                  fitScoreReasoning ? `. ${fitScoreReasoning}` : ''
+                }`}
               />
             )}
-            <span className='min-w-0 flex-1 truncate text-sm font-medium leading-tight text-text-primary'>
+            {/* A real <a href> — the card's own click is a `router.push` on a
+                `role="button"` div, which gives no cmd/middle-click to open in
+                a new tab, no "copy link address", and no status-bar preview.
+                The title is where people aim, so it carries the link; the
+                surrounding card keeps its convenience click.
+
+                Deliberately NOT a stretched overlay across the whole card:
+                that would put the ⋮ menu's <button> inside an <a> (invalid,
+                and the anchor eats the click) and would kill text selection
+                on the card. `stopPropagation` so a plain click is handled by
+                the link alone rather than also firing the card's push. */}
+            <Link
+              href={detailHref}
+              onClick={e => e.stopPropagation()}
+              className='min-w-0 flex-1 truncate text-sm font-medium leading-tight text-text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2'
+            >
               {target.label}
-            </span>
+            </Link>
           </div>
           <div className='shrink-0' onClick={e => e.stopPropagation()}>
             <Dropdown
               trigger={
                 <span className='inline-flex rounded p-1 text-text-secondary hover:bg-surface-tertiary hover:text-text-primary'>
                   <MoreVertical className='size-4' aria-hidden />
+                  {/* The icon is the whole trigger, so without this the a11y
+                      tree reports an unnamed button — ten of them on a full
+                      page. Naming it with the target disambiguates which card
+                      the menu belongs to. Same pattern as JobDetailPanel. */}
+                  <span className='sr-only'>Actions for {target.label}</span>
                 </span>
               }
               items={items}
@@ -159,13 +197,41 @@ export default function TargetCard({
               Building…
             </span>
           ) : failed ? (
-            <span className='inline-flex items-center gap-1.5 text-xs text-error'>
-              <span
-                className='inline-block size-2 rounded-full bg-error'
-                aria-hidden
-              />
-              Derivation failed
-            </span>
+            // #649: the card used to say only "Derivation failed" — the same
+            // red dot whether the user needs to add their experience or a
+            // backend call blipped. The API now persists WHY, so say it, and
+            // offer the retry that re-activation already performs (any
+            // non-error transition clears the failure server-side).
+            <div className='flex w-full flex-col items-start gap-1.5'>
+              <span className='inline-flex items-start gap-1.5 text-xs text-error'>
+                <span
+                  className='mt-1 inline-block size-2 shrink-0 rounded-full bg-error'
+                  aria-hidden
+                />
+                <span>
+                  Activation failed
+                  {target.activation_failed_at && (
+                    <>
+                      {' '}
+                      (<LocalDate value={target.activation_failed_at} />)
+                    </>
+                  )}{' '}
+                  — {activationErrorMessage(target.activation_error)}
+                </span>
+              </span>
+              <Button
+                variant='bare'
+                size='sm'
+                loading={retrying}
+                onClick={event => {
+                  // The whole card navigates on click; the retry must not.
+                  event.stopPropagation();
+                  onRetry(target.id);
+                }}
+              >
+                Retry
+              </Button>
+            </div>
           ) : (
             <span className='inline-flex items-center gap-1.5 text-xs text-text-secondary'>
               <span

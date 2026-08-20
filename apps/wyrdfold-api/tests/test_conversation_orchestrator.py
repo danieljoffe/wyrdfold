@@ -247,6 +247,69 @@ async def test_handle_turn_does_not_append_when_no_prose_content(
     mock_service_layer["prose_create_version"].assert_not_called()
 
 
+async def test_handle_turn_drops_a_recap_echo_append(
+    mock_service_layer: dict[str, Any],
+) -> None:
+    """Recap-echo guard (Path-C grounding work, 2026-08-13): a prose_append
+    that verbatim-restates a block already in the doc must not create a new
+    version — it would duplicate source-of-truth lines the tailor reproduces."""
+    from app.services.llm.mock import conversation_recap_echo_json
+
+    recap = "Worked at FightCamp 2021-11 to 2024-04."
+    llm = MockLLMClient(
+        scripted={orchestrator.PURPOSE_TURN_ONBOARDING: conversation_recap_echo_json(recap)}
+    )
+    mock_service_layer["prose_get_latest"].return_value = _prose(
+        f"{recap}\n\nShipped the poller rewrite."
+    )
+
+    result = await orchestrator.handle_turn(
+        MagicMock(),
+        llm,
+        user_id=None,
+        conversation_type="onboarding",
+        user_content="what else do you need?",
+        skipped=False,
+    )
+
+    assert result.prose_updated is False
+    mock_service_layer["prose_create_version"].assert_not_called()
+    # The turn itself still lands — only the duplicate append is dropped.
+    assert len(mock_service_layer["_appended_turns"]) == 2
+
+
+async def test_handle_turn_appends_a_superset_of_old_content(
+    mock_service_layer: dict[str, Any],
+) -> None:
+    """The guard is exact-block containment, not similarity: new content that
+    EXTENDS an earlier claim (not a substring of the doc) must still append."""
+    llm = MockLLMClient(
+        scripted={
+            orchestrator.PURPOSE_TURN_ONBOARDING: _llm_response(
+                prose_append=(
+                    "Worked at FightCamp 2021-11 to 2024-04, leading a team of four engineers."
+                )
+            )
+        }
+    )
+    mock_service_layer["prose_get_latest"].return_value = _prose(
+        "Worked at FightCamp 2021-11 to 2024-04."
+    )
+
+    result = await orchestrator.handle_turn(
+        MagicMock(),
+        llm,
+        user_id=None,
+        conversation_type="onboarding",
+        user_content="I worked at FightCamp from Nov 2021 to Apr 2024 leading four engineers",
+        skipped=False,
+    )
+
+    assert result.prose_updated is True
+    create_call = mock_service_layer["prose_create_version"].call_args
+    assert "leading a team of" in create_call.kwargs["content"]
+
+
 async def test_handle_turn_cost_logs_with_correct_purpose_for_update_mode(
     mock_service_layer: dict[str, Any],
 ) -> None:
@@ -344,9 +407,7 @@ def _reset_supabase_mock() -> MagicMock:
     and yields an empty result set (#57 slice 4 — reset_content is now async)."""
     supabase = MagicMock()
     delete_chain = supabase.table.return_value.delete.return_value
-    delete_chain.eq.return_value.execute = AsyncMock(
-        return_value=SimpleNamespace(data=[])
-    )
+    delete_chain.eq.return_value.execute = AsyncMock(return_value=SimpleNamespace(data=[]))
     return supabase
 
 
@@ -547,6 +608,33 @@ def test_turn_prompts_carry_the_ask_first_rule() -> None:
 
     for system in (ONBOARDING_SYSTEM, UPDATE_SYSTEM):
         assert "ask for it in assistant_message instead" in system
+
+
+def test_turn_prompts_carry_the_single_question_rule() -> None:
+    """Path-C walkthrough 2026-08-13: the interviewer stacked questions in one
+    turn. Both turn systems share the contract, so both must carry the rule."""
+    from app.services.conversation.prompts import ONBOARDING_SYSTEM, UPDATE_SYSTEM
+
+    for system in (ONBOARDING_SYSTEM, UPDATE_SYSTEM):
+        assert "exactly ONE question per" in system
+
+
+def test_onboarding_prompt_carries_the_grounding_rule() -> None:
+    """Follow-ups must name the role/project/claim they build on — the user
+    cannot see the interviewer's notes (observed as non sequiturs live)."""
+    from app.services.conversation.prompts import ONBOARDING_SYSTEM
+
+    assert "the user cannot see your notes" in ONBOARDING_SYSTEM
+
+
+def test_probe_prompt_requires_self_contained_questions() -> None:
+    """The old 'No quoting the gap back verbatim' rule PRODUCED context-free
+    questions ('what was the average lift from those tests?'). The probe must
+    now demand a self-contained question and the old rule must stay gone."""
+    from app.services.conversation.prompts import PROBE_SYSTEM
+
+    assert "self-contained" in PROBE_SYSTEM
+    assert "No quoting the gap back verbatim" not in PROBE_SYSTEM
 
 
 def test_derive_prompt_pins_the_exact_marker() -> None:

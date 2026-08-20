@@ -37,6 +37,7 @@ from app.models.schemas import (
     AddToTargetResponse,
     ManualJobRequest,
     ManualJobResponse,
+    RemoveJobRequest,
     UrlValidateRequest,
     UrlValidateResponse,
 )
@@ -57,6 +58,7 @@ from app.services.extract import (
 )
 from app.services.fit.axis_weights import display_score_or_passthrough
 from app.services.job_ingest import materialize_and_score_job
+from app.services.location_parse import canonical_country
 from app.services.qualification.family_gate import passes_family_gate
 from app.services.recency import display_recency_score
 from app.services.supabase_retry import execute_with_retry
@@ -110,7 +112,10 @@ router = APIRouter(
 )
 
 _JP_SELECT_COLS = (
-    "id, external_id, source_id, title, company_name, location, "
+    # ``title_display``: cleaned display form (services/titles.py), NULL when
+    # the raw title is fine. The RPC list paths don't return it yet (stage 2 —
+    # function recreations); the FE falls back to ``title`` there.
+    "id, external_id, source_id, title, title_display, company_name, location, "
     "city, state, country, location_remote, "
     "absolute_url, salary_text, "
     "salary_min, salary_max, salary_currency, salary_period, "
@@ -422,9 +427,71 @@ def _decode_cursor(cursor: str | None) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _keyset_cursor_from_row(row: dict[str, Any], sort: str) -> dict[str, Any]:
-    """Keyset cursor for the next page: the last row's sort value + id."""
-    return {"v": row.get(sort), "id": row["id"]}
+# Wire sort token → the key that actually carries the value on a row. The R2
+# two-timestamp rename kept ``created_at`` as the stable WIRE name while the
+# column (and every row shape built from it — the RPC's RETURNS TABLE, the jobs
+# select) became ``cataloged_at``. Anything that reads the sort value off a row
+# has to go through this map; reading the wire name directly finds nothing.
+_SORT_ROW_KEY = {"created_at": "cataloged_at", "posted_at": "source_posted_at"}
+
+# Sorts whose value is text, and so must be collated the way Postgres collates
+# it rather than by raw codepoint. See ``_python_sort_key``.
+_TEXT_SORTS = frozenset({"company_name", "title"})
+
+
+def _sort_row_key(sort: str) -> str:
+    """The row key holding ``sort``'s value (see ``_SORT_ROW_KEY``)."""
+    return _SORT_ROW_KEY.get(sort, sort)
+
+
+def _python_sort_key(row: dict[str, Any], sort: str, row_id: str) -> tuple[Any, ...]:
+    """Sort key for the Python-paginated paths, aligned with the SQL paths.
+
+    Two properties the naive ``row.get(sort)`` key lacked, both of which the
+    user sees as "load more breaks the sorting":
+
+    - **Collation.** Postgres collates text case-insensitively at the primary
+      level, so ``abridge`` sits between ``Accenture`` and ``aim``. Python's
+      default string order is by codepoint, which puts EVERY capitalised
+      company ahead of EVERY lowercase one — page 1 ended at "Verkada" and
+      page 2 opened with "airspace-intelligence.com", i.e. the alphabet
+      visibly restarting mid-list. ``casefold()`` first, raw value second
+      (so the order is still total, and stable for genuine case-only ties).
+    - **A tiebreaker.** Equal sort values (one company's whole posting list,
+      a batch of rows sharing a timestamp) were left in whatever order the
+      chunked ``in_()`` re-fetch happened to return, which is not stable
+      across requests. Offset pagination over an unstable order silently
+      duplicates and drops rows at every page boundary. The id breaks the tie
+      the same way the SQL paths do (``ORDER BY <col> <dir>, job_posting_id
+      <dir>`` — the caller's ``reverse=`` flips both, as it does there).
+    """
+    value = row.get(_sort_row_key(sort))
+    if sort in _TEXT_SORTS:
+        text = value if isinstance(value, str) else ""
+        return (text.casefold(), text, row_id)
+    return ("" if value is None else value, row_id)
+
+
+def _keyset_cursor_from_row(row: dict[str, Any], sort: str) -> dict[str, Any] | None:
+    """Keyset cursor for the next page: the last row's sort value + id.
+
+    ``None`` when the row can't produce one, which the caller renders as "no
+    next page". That beats the alternative: a cursor carrying ``v: null``
+    drops the RPC's keyset predicate entirely (``$7 IS NULL OR ...``), so the
+    next page is the FIRST page again — load-more appending page 1 to itself,
+    forever. That is exactly what the ``created_at`` sort did before
+    ``_sort_row_key`` existed (the RPC returns ``cataloged_at``).
+    """
+    row_key = _sort_row_key(sort)
+    if row_key not in row:
+        logger.error(
+            "keyset cursor: row has no %r key for sort %r; ending pagination "
+            "rather than re-serving the first page",
+            row_key,
+            sort,
+        )
+        return None
+    return {"v": row.get(row_key), "id": row["id"]}
 
 
 def _offset_from_cursor(cursor: dict[str, Any]) -> int:
@@ -455,6 +522,16 @@ async def _list_jobs_for_target_rpc(
     cursor: dict[str, Any],
     user_id: str | None = None,
 ) -> dict[str, Any]:
+    # Neither RPC knows ``posted_at``: their SQL maps the sort token through a
+    # CASE whose ELSE branch is ``score``, so an unrecognised token does not
+    # error — it silently serves a SCORE-ordered page under a Posted heading.
+    # The Python path also has to put the ~4% of rows with no provider date
+    # LAST in both directions, which a keyset over a nullable column cannot
+    # page through. Both reasons point the same way: use the two-query path.
+    if sort == "posted_at":
+        raise _RpcIneligibleError(
+            "RPC path skipped: posted_at sorts a nullable provider date, nulls last"
+        )
     # The RPC can't apply the post-fetch location filter, so its keyset would
     # walk pre-filter rows and pages would render half-empty. Force the
     # two-query fallback, which filters the full set then paginates.
@@ -661,8 +738,24 @@ _SCORE_ROW_COLS = (
 # zero extra round-trips.
 _JOBS_EMBED = (
     ", jobs!inner(id, role_family, source_posted_at, cataloged_at, "
-    "salary_min, salary_max, salary_currency, salary_period, country)"
+    "salary_min, salary_max, salary_currency, salary_period, country, is_remote)"
 )
+
+
+def _jobs_embed_for(sort: str) -> str:
+    """``_JOBS_EMBED``, plus the column this sort's window is ordered BY.
+
+    A PostgREST ``order=jobs(<col>)`` may only name a column the embed actually
+    projects (it orders the embedded subquery), so ``company_name`` / ``title``
+    have to ride along when — and only when — the window is drawn by them.
+    Carrying both unconditionally measured ~0.1s per request on a full window
+    for rows nothing reads; ``cataloged_at`` is already there for the recency
+    tier, so the ``created_at`` sort adds nothing.
+    """
+    column = _sort_row_key(sort)
+    if column in {"company_name", "title"}:
+        return _JOBS_EMBED.replace("jobs!inner(id,", f"jobs!inner(id, {column},", 1)
+    return _JOBS_EMBED
 
 
 def _embedded_jobs_field(row: dict[str, Any], field: str) -> Any:
@@ -738,6 +831,174 @@ def _apply_score_floor(query: Any, min_score: int | None) -> Any:
     return query.or_(f"axis_scores.is.null,recency_score.gte.{min_score}")
 
 
+# ── The candidate window (#813) ─────────────────────────────────────────────
+# PostgREST caps ANY single response at 1,000 rows. The two-query paths used to
+# select their candidate ``scores`` rows unbounded and rank whatever came back,
+# so on any target above the cap they ranked, totalled and paginated an
+# ARBITRARY sample — prod measured 1,000 of 7,086 live rows for one target, and
+# *which* 1,000 was whatever the plan happened to yield.
+#
+# The window stays the same size. What makes it correct is that it is now drawn
+# in the FINAL RANKING'S ORDER, so those rows are the HEAD of the list rather
+# than a sample of it, and drawn AFTER the selective posting filters, so it is
+# not spent on rows that cannot match. Rows past the window are still not
+# listed; that is now a bounded tail rather than a silent 86% hole, and it is
+# logged when it happens.
+_CANDIDATE_WINDOW = 1000
+
+
+def _apply_candidate_posting_filters(
+    query: Any, *, company: str | None, search: str | None, archived_view: bool
+) -> Any:
+    """Push the ``jobs``-column filters into the candidate query.
+
+    These predicates used to run only in ``_fetch_jobs_chunked``, i.e. AFTER
+    the window was drawn — so they threw the window away instead of narrowing
+    it. Driving the real path against prod, ``search=frontend&country=US`` on a
+    7,086-row target returned 66 rows; with the filters pushed down the same
+    call returns 124 and its window no longer saturates, i.e. the list is now
+    complete rather than a fragment. It is also FASTER (measured 1.10s ->
+    0.51s): the window stops being spent on rows the re-fetch would discard.
+
+    The archived view selects without the ``jobs`` embed (it has to surface
+    globally-archived rows), so there is no relation to filter through; it
+    keeps the post-fetch predicates.
+    """
+    if archived_view:
+        return query
+    if company:
+        query = query.eq("jobs.company_name", company)
+    tokens = _tokenize_search(search)
+    if len(tokens) == 1:
+        query = query.ilike("jobs.title", f"%{tokens[0]}%")
+    elif tokens:
+        # Same OR-across-tokens semantics as ``_apply_title_search``; scoped to
+        # the embed so it can't collide with the score floor's top-level or().
+        parts = [f"title.ilike.*{_escape_or_token(t)}*" for t in tokens]
+        query = query.or_(",".join(parts), reference_table="jobs")
+    return query
+
+
+def _order_candidate_window(
+    query: Any, *, sort: str, ascending: bool, archived_view: bool, tier: str | None
+) -> Any:
+    """Order the candidate query so its bounded window is the head of the list.
+
+    Mirrors what the Python ranking does further down, because a window drawn
+    in any other order is a sample:
+
+    - **score** — ``_rank_graded_first`` puts graded rows above Pending ones in
+      both directions, ranks graded by the DISPLAY value (which, absent custom
+      axis weights, IS the stored ``recency_score`` — see
+      ``_display_sort_value``) and Pending ones by posted date. One ORDER BY
+      cannot express two tiers keyed on different columns, which is why the
+      caller draws the tiers as separate windows and this takes ``graded``.
+    - **company_name / title / created_at** — a plain ``jobs`` column, ordered
+      through the embed.
+    - **archived view** — selected without the embed, so its sort column is not
+      reachable from here. Deterministic (id) rather than head-of-order; the
+      archived list is small enough that the window rarely binds.
+
+    NULLS LAST throughout: on a DESC sort Postgres would otherwise lead with
+    the NULLs and let them crowd the real head out of the window.
+    """
+    desc = not ascending
+    if sort == "score":
+        column = "recency_score" if tier == "graded" else "job_first_seen_at"
+        return query.order(column, desc=desc, nullsfirst=False).order(
+            "job_posting_id", desc=desc
+        )
+    if archived_view:
+        return query.order("job_posting_id", desc=desc)
+    # The undated tier has no provider date to order by — fall back to when we
+    # catalogued it, which is the only freshness signal those rows carry.
+    column = "cataloged_at" if tier == "undated" else _sort_row_key(sort)
+    return query.order(f"jobs({column})", desc=desc, nullsfirst=False).order(
+        "job_posting_id", desc=desc
+    )
+
+
+async def _fetch_candidate_window(
+    make_query: Callable[[], Any],
+    *,
+    sort: str,
+    ascending: bool,
+    archived_view: bool,
+    company: str | None,
+    search: str | None,
+    label: str,
+) -> list[dict[str, Any]]:
+    """Candidate ``scores`` rows for the two-query paths: a bounded window in
+    ranking order (see ``_CANDIDATE_WINDOW``).
+
+    ``make_query`` builds a FRESH base query per call, because some sorts need
+    MORE THAN ONE window and each needs its own head:
+
+    - **score** — graded rows rank by ``recency_score``, Pending ones by posted
+      date. One ORDER BY can't express two tiers keyed on different columns.
+    - **posted_at** — a listing with no provider date sorts last in both
+      directions, so on a target whose DATED candidates already fill the window
+      the undated ones fall outside it entirely and become unreachable on this
+      sort, rather than merely last (#825: 293 such rows on the measured
+      target, whose 7,037 candidates overflow a 1,000-row window). Giving them
+      their own window puts them at the tail AND keeps them reachable.
+
+    Everything else takes a single window. The tiers run concurrently, so the
+    extra window costs a round-trip's width, not its latency.
+    """
+    tiers: tuple[str, ...]
+    if sort == "score":
+        tiers = ("graded", "pending")
+    elif sort == "posted_at" and not archived_view:
+        # The archived view selects without the jobs embed, so ``source_posted_at``
+        # isn't reachable to split on — it keeps the single id-ordered window.
+        tiers = ("dated", "undated")
+    else:
+        tiers = ()
+
+    async def _window(tier: str | None) -> list[dict[str, Any]]:
+        query = _apply_candidate_posting_filters(
+            make_query(), company=company, search=search, archived_view=archived_view
+        )
+        if tier in ("graded", "pending"):
+            # ``is_graded`` is the denormalized twin of ``_is_pending``'s
+            # axis_scores signal — prod-verified to agree on every row of the
+            # measured target (zero rows disagree in either direction).
+            query = query.eq("is_graded", tier == "graded")
+        elif tier == "dated":
+            query = query.not_.is_("jobs.source_posted_at", "null")
+        elif tier == "undated":
+            query = query.is_("jobs.source_posted_at", "null")
+        query = _order_candidate_window(
+            query,
+            sort=sort,
+            ascending=ascending,
+            archived_view=archived_view,
+            tier=tier,
+        ).range(0, _CANDIDATE_WINDOW - 1)
+        resp = await execute_with_retry(
+            query.execute, label=label, retry_statement_timeout=True
+        )
+        rows = cast(list[dict[str, Any]], resp.data or [])
+        if len(rows) >= _CANDIDATE_WINDOW:
+            logger.warning(
+                "candidate window saturated at %d rows (%s, sort=%s, tier=%s): "
+                "matches past the window are not listed",
+                _CANDIDATE_WINDOW,
+                label,
+                sort,
+                tier,
+            )
+        return rows
+
+    if not tiers:
+        return await _window(None)
+    # Concatenated in tier order — graded before Pending, dated before undated —
+    # which is the order the ranking below expects to find them in.
+    windows = await asyncio.gather(*(_window(t) for t in tiers))
+    return [row for window in windows for row in window]
+
+
 def _rank_graded_first(
     rows: list[dict[str, Any]],
     *,
@@ -760,6 +1021,45 @@ def _rank_graded_first(
     pkey = pending_value if pending_value is not None else value
     pending = sorted((r for r in rows if _is_pending(r)), key=pkey, reverse=not ascending)
     return graded + pending
+
+
+# How many exempt (Pending) rows may ride along behind the qualifying graded
+# ones when the user has set an explicit score floor. Small on purpose: the tail
+# is a SIGNAL that ungraded work exists, not a browsable list. Remove the floor
+# to browse it.
+_PENDING_TAIL_CAP = 10
+
+# Same idea for a country filter's unknown-country tail (#805): a short tail is
+# a signal that country-less (usually fully-remote) roles exist; a full page of
+# them is indistinguishable from a broken filter.
+_UNKNOWN_COUNTRY_TAIL_CAP = 10
+
+
+def _cap_pending_tail(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Trim the Pending tail behind an explicit score floor (#795).
+
+    ``_apply_score_floor`` exempts not-yet-graded rows so a grading backlog
+    can't hide promising jobs. The exemption was UNBOUNDED, and that is what
+    made "Score 85+" indefensible in prod: the target's best graded row scored
+    80, so ZERO graded rows cleared the bar, and the page filled with 100 exempt
+    rows scoring 4–58. Every row on screen contradicted the filter the user had
+    just set.
+
+    ``_rank_graded_first`` already puts graded rows first, so this only has to
+    stop the tail from becoming the whole answer. Rows are already ranked:
+    graded, then Pending.
+
+    Deliberately NOT applied to the profile-default floor — only to a floor the
+    user typed. The default is the passive background bar, and silently trimming
+    new intake out of the ordinary list is the harm the exemption exists to
+    prevent. An explicit chip is a precise question and deserves a precise
+    answer.
+    """
+    graded = [r for r in ranked if not _is_pending(r)]
+    pending = [r for r in ranked if _is_pending(r)]
+    if len(pending) <= _PENDING_TAIL_CAP:
+        return ranked
+    return graded + pending[:_PENDING_TAIL_CAP]
 
 
 def _prefer_score_row(candidate: dict[str, Any], current: dict[str, Any]) -> bool:
@@ -889,6 +1189,7 @@ async def _assemble_jobs_page(
     user_id: str | None,
     logistics: _LogisticsFilter | None = None,
     include_unknown_salary_by_target: dict[str, bool] | None = None,
+    explicit_floor: bool = False,
 ) -> dict[str, Any]:
     """Shared tail of both two-query list paths (per-target + cross-target).
 
@@ -929,6 +1230,7 @@ async def _assemble_jobs_page(
     # pre-filter total and render short. The score cutoff is NOT here — it's
     # already folded into min_score at the query layer.
     has_pref_filter = _preferences_have_post_fetch_filter(preferences)
+
     def _include_unknown_salary_for_row(row: dict[str, Any]) -> bool:
         """``_include_unknown_salary`` for a scores row (no hydrated posting
         exists yet at pre-filter time). Same precedence: explicit per-target
@@ -979,9 +1281,7 @@ async def _assemble_jobs_page(
         }
         logistics_prefiltered = True
 
-    has_logistics_filter = (
-        logistics is not None and logistics.active and not logistics_prefiltered
-    )
+    has_logistics_filter = logistics is not None and logistics.active and not logistics_prefiltered
     has_post_fetch_filter = has_location_filter or has_pref_filter or has_logistics_filter
 
     now = datetime.now(UTC)
@@ -1035,6 +1335,10 @@ async def _assemble_jobs_page(
                 r["job_posting_id"],
             ),
         )
+        # An explicit floor is a precise question; the exempt Pending tail must
+        # not become the whole answer (#795).
+        if explicit_floor:
+            ranked = _cap_pending_tail(ranked)
         page_ids = [r["job_posting_id"] for r in ranked[offset : offset + page_size]]
         total: int | None = len(ranked)
     else:
@@ -1090,14 +1394,14 @@ async def _assemble_jobs_page(
 
         def _sort_key(p: dict[str, Any]) -> Any:
             if sort == "score":
-                # Same DISPLAY value the scores-layer sort uses (#47).
+                # Same DISPLAY value the scores-layer sort uses (#47), with the
+                # same id tiebreaker that branch already applies.
                 ts = by_id.get(p["id"])
-                return _display(ts) if ts else 0
-            # 'created_at' is the stable WIRE token; the row key is the
-            # renamed cataloged_at (R2 two-timestamp model).
-            row_key = "cataloged_at" if sort == "created_at" else sort
-            val = p.get(row_key)
-            return "" if val is None else val
+                return ((_display(ts) if ts else 0), p["id"])
+            # Collation-aligned + tie-broken, so page N+1 continues exactly
+            # where page N stopped. ``created_at`` is the stable WIRE token;
+            # the row key is the renamed cataloged_at (R2 two-timestamp model).
+            return _python_sort_key(p, sort, p["id"])
 
         if sort == "score":
             # Pending below graded (#47); graded by display value, Pending by
@@ -1108,8 +1412,40 @@ async def _assemble_jobs_page(
                 ascending=ascending,
                 pending_value=lambda p: (fs_lookup.get(p["id"]) or "", p["id"]),
             )
+        elif status != "archived":
+            # PRESERVE THE WINDOW'S ORDER — do not re-derive it (#815).
+            #
+            # The candidate window (#813) already came back ordered by this
+            # sort's column, in Postgres's collation, id-tiebroken — the same
+            # order the RPC paths serve. Re-sorting here in Python re-opened the
+            # divergence #812 narrowed: ``casefold`` approximates the collation
+            # but is not it (glibc ignores leading punctuation at the primary
+            # level, Python's codepoint order does not), so `.NET Developer` and
+            # `(1508) Engineer` swapped depending only on whether a chip forced
+            # this path instead of the RPC. Prod, title ASC: the two orders
+            # agreed for 21 rows and then diverged.
+            #
+            # Safe because ``by_id`` is still in window order — the off-family
+            # gate and the logistics pre-filter both rebuild it by iteration —
+            # and everything between here and there only ever DROPS rows.
+            window_rank = {jid: i for i, jid in enumerate(by_id)}
+            postings.sort(key=lambda p: window_rank.get(p["id"], len(window_rank)))
         else:
-            postings.sort(key=_sort_key, reverse=not ascending)
+            # The archived view selects without the ``jobs`` embed, so its
+            # window could only be ordered by id (see
+            # ``_order_candidate_window``) — here the Python key IS the sort.
+            #
+            # Rows with no value for the sort column go LAST in BOTH directions,
+            # matching the NULLS LAST the window asks for everywhere else. A
+            # single ``reverse=`` flips the whole key, so the partition has to
+            # happen outside the sort. This is load-bearing for ``posted_at``:
+            # ~4% of listings carry no provider date, and "unknown" must not
+            # lead the list just because the direction flipped.
+            row_key = _sort_row_key(sort)
+            present = [p for p in postings if p.get(row_key) is not None]
+            absent = [p for p in postings if p.get(row_key) is None]
+            present.sort(key=_sort_key, reverse=not ascending)
+            postings = [*present, *absent]
         if total is None:
             total = len(postings)
             postings = postings[offset : offset + page_size]
@@ -1122,6 +1458,42 @@ async def _assemble_jobs_page(
 
     next_cursor = _offset_next_cursor(offset, page_size, total or 0)
     return {"postings": postings, "next_cursor": next_cursor, "total": total}
+
+
+async def _removed_pairs(
+    supabase: AsyncClient, *, user_id: str | None, target_ids: list[str]
+) -> set[tuple[str, str]]:
+    """``(target_id, job_posting_id)`` pairs the caller removed from a target.
+
+    Removal is per-(user, target, job) on purpose — see
+    ``remove_job_from_target``. The pair granularity is load-bearing on the
+    cross-target paths: a job removed from target A must stay visible under
+    target B, so these paths cannot collapse to a flat set of job ids.
+
+    Anonymous / operator callers (``user_id is None``) have no removals.
+    """
+    if user_id is None or not target_ids:
+        return set()
+    resp = (
+        await supabase.table("user_target_job_removals")
+        .select("target_id, job_posting_id")
+        .eq("user_id", user_id)
+        .in_("target_id", target_ids)
+        .execute()
+    )
+    return {
+        (cast(dict[str, Any], r)["target_id"], cast(dict[str, Any], r)["job_posting_id"])
+        for r in resp.data or []
+    }
+
+
+async def _removed_job_ids(
+    supabase: AsyncClient, *, user_id: str | None, target_ids: list[str]
+) -> set[str]:
+    """Job ids removed from any of ``target_ids``. Safe to flatten only when
+    the caller is scoped to a SINGLE target — see ``_removed_pairs``."""
+    pairs = await _removed_pairs(supabase, user_id=user_id, target_ids=target_ids)
+    return {job_id for _tid, job_id in pairs}
 
 
 async def _list_jobs_for_target_two_query(
@@ -1142,6 +1514,7 @@ async def _list_jobs_for_target_two_query(
     preferences: TargetPreferences | None = None,
     user_id: str | None = None,
     logistics: _LogisticsFilter | None = None,
+    explicit_floor: bool = False,
 ) -> dict[str, Any]:
     """Fallback: two-query pattern with pagination pushed to the scores layer.
 
@@ -1154,20 +1527,41 @@ async def _list_jobs_for_target_two_query(
     """
     offset = _offset_from_cursor(cursor)
     sort_col = "score" if sort == "score" else sort
-    # Fetch every candidate score row for the target (score floor applied at the
-    # DB). No server-side ORDER BY or exact count: _assemble_jobs_page re-ranks
-    # by the DISPLAY value and derives the total from the row set, so both would
-    # be pure waste (an exact count on every list request that nothing reads).
+    # Candidate score rows for the target, as a BOUNDED WINDOW IN RANKING ORDER
+    # (#813 — this used to select unbounded and rank whatever 1,000 rows
+    # PostgREST happened to return). The score floor and the posting filters are
+    # applied at the DB so the window isn't spent on rows that cannot appear.
+    # Still no exact count: _assemble_jobs_page derives the total from the row
+    # set it ranks.
     archived_view = status == "archived"
-    ts_query = (
-        supabase.table("scores")
-        .select(_SCORE_ROW_COLS + ("" if archived_view else _JOBS_EMBED))
-        .eq("target_id", target_id)
-        .eq("excluded", False)
+
+    def _candidate_query() -> Any:
+        query = (
+            supabase.table("scores")
+            .select(_SCORE_ROW_COLS + ("" if archived_view else _jobs_embed_for(sort)))
+            .eq("target_id", target_id)
+            .eq("excluded", False)
+        )
+        query = _scores_live_join(query, archived_view=archived_view)
+        return _apply_score_floor(query, min_score)
+
+    ts_rows = await _fetch_candidate_window(
+        _candidate_query,
+        sort=sort,
+        ascending=ascending,
+        archived_view=archived_view,
+        company=company,
+        search=search,
+        label="jobs/target_two_query_scores",
     )
-    ts_query = _scores_live_join(ts_query, archived_view=archived_view)
-    ts_query = _apply_score_floor(ts_query, min_score)
-    ts_rows = cast(list[dict[str, Any]], (await ts_query.execute()).data or [])
+
+    # Drop what the caller removed from THIS target. The RPC twin does the
+    # same as a SQL anti-join; this path filters in Python because PostgREST
+    # can't express NOT EXISTS. Both must agree — a job that survives here but
+    # not there (or vice versa) reappears purely on which sort the user picked.
+    removed = await _removed_job_ids(supabase, user_id=user_id, target_ids=[target_id])
+    if removed:
+        ts_rows = [r for r in ts_rows if r["job_posting_id"] not in removed]
 
     if not ts_rows:
         return {"postings": [], "next_cursor": None, "total": 0}
@@ -1176,7 +1570,8 @@ async def _list_jobs_for_target_two_query(
 
     # Single-target: the same axis weights apply to every row.
     return await _assemble_jobs_page(
-        supabase,
+        explicit_floor=explicit_floor,
+        supabase=supabase,
         by_id=score_lookup,
         weights_for_row=lambda _row: axis_weights,
         offset=offset,
@@ -1213,6 +1608,7 @@ async def _list_jobs_for_target(
     preferences: TargetPreferences | None = None,
     user_id: str | None = None,
     logistics: _LogisticsFilter | None = None,
+    explicit_floor: bool = False,
 ) -> dict[str, Any]:
     """List jobs for a target view, sorted/paginated by target-specific scores.
 
@@ -1265,6 +1661,7 @@ async def _list_jobs_for_target(
     ):
         return await _list_jobs_for_target_two_query(
             supabase,
+            explicit_floor=explicit_floor,
             axis_weights=axis_weights,
             preferences=preferences,
             logistics=logistics,
@@ -1316,6 +1713,7 @@ async def _list_jobs_for_target(
         # shows the blend, not the raw score.
         return await _list_jobs_for_target_two_query(
             supabase,
+            explicit_floor=explicit_floor,
             axis_weights=axis_weights,
             preferences=preferences,
             logistics=logistics,
@@ -1334,6 +1732,7 @@ async def _list_jobs_for_target(
     # sorts bail to two-query above), passed for consistency / future-proofing.
     return await _list_jobs_for_target_two_query(
         supabase,
+        explicit_floor=explicit_floor,
         axis_weights=axis_weights,
         preferences=preferences,
         logistics=logistics,
@@ -1373,6 +1772,16 @@ async def _list_jobs_across_user_targets_rpc(
     custom-weight view uses this fast path instead of the scan-everything
     two-query fallback. Empty/None ⇒ the RPC ranks + returns the raw score
     exactly as before (index-only)."""
+    # Neither RPC knows ``posted_at``: their SQL maps the sort token through a
+    # CASE whose ELSE branch is ``score``, so an unrecognised token does not
+    # error — it silently serves a SCORE-ordered page under a Posted heading.
+    # The Python path also has to put the ~4% of rows with no provider date
+    # LAST in both directions, which a keyset over a nullable column cannot
+    # page through. Both reasons point the same way: use the two-query path.
+    if sort == "posted_at":
+        raise _RpcIneligibleError(
+            "RPC path skipped: posted_at sorts a nullable provider date, nulls last"
+        )
     if search and len(_tokenize_search(search)) > 1:
         raise _RpcIneligibleError("RPC path skipped: multi-word search uses OR semantics")
     offset = _offset_from_cursor(cursor)
@@ -1433,6 +1842,7 @@ async def _list_jobs_across_user_targets(
     user_id: str | None = None,
     logistics: _LogisticsFilter | None = None,
     include_unknown_salary_by_target: dict[str, bool] | None = None,
+    explicit_floor: bool = False,
 ) -> dict[str, Any]:
     """Untargeted list — the union of jobs scored against any of the user's
     active targets, deduplicated by job id.
@@ -1453,6 +1863,7 @@ async def _list_jobs_across_user_targets(
     if has_location_filter or has_logistics or status == "archived":
         return await _list_jobs_across_user_targets_two_query(
             supabase,
+            explicit_floor=explicit_floor,
             user_target_ids=user_target_ids,
             page_size=page_size,
             sort=sort,
@@ -1493,6 +1904,7 @@ async def _list_jobs_across_user_targets(
         )
     return await _list_jobs_across_user_targets_two_query(
         supabase,
+        explicit_floor=explicit_floor,
         user_target_ids=user_target_ids,
         page_size=page_size,
         sort=sort,
@@ -1529,6 +1941,7 @@ async def _list_jobs_across_user_targets_two_query(
     user_id: str | None = None,
     logistics: _LogisticsFilter | None = None,
     include_unknown_salary_by_target: dict[str, bool] | None = None,
+    explicit_floor: bool = False,
 ) -> dict[str, Any]:
     """Untargeted list — returns the union of jobs scored against any of the
     user's active targets, deduplicated by job id.
@@ -1551,26 +1964,53 @@ async def _list_jobs_across_user_targets_two_query(
     # column. ``min_score`` still filters on the raw fit score.
 
     archived_view = status == "archived"
-    score_query = (
-        supabase.table("scores")
-        .select(_SCORE_ROW_COLS + ", target_id" + ("" if archived_view else _JOBS_EMBED))
-        .in_("target_id", list(user_target_ids))
-        .eq("excluded", False)
-    )
-    score_query = _scores_live_join(score_query, archived_view=archived_view)
-    score_query = _apply_score_floor(score_query, min_score)
-    # This fallback exists because the cross-target RPC hit a statement
-    # timeout — under the same contention its own scores read dies of the
-    # identical 57014 (observed unhandled on the dashboard top-matches read,
-    # 2026-08-05 #604). One backoff retry lets the fallback actually absorb
-    # the failure it was built for; if it still times out, the app-wide
-    # APIError handler turns 57014 into a clean 503.
-    score_resp = await execute_with_retry(
-        score_query.execute,
+
+    def _candidate_query() -> Any:
+        query = (
+            supabase.table("scores")
+            .select(
+                _SCORE_ROW_COLS
+                + ", target_id"
+                + ("" if archived_view else _jobs_embed_for(sort))
+            )
+            .in_("target_id", list(user_target_ids))
+            .eq("excluded", False)
+        )
+        query = _scores_live_join(query, archived_view=archived_view)
+        return _apply_score_floor(query, min_score)
+
+    # Bounded window in ranking order (#813). This union spans every active
+    # target, so it overran PostgREST's 1,000-row cap sooner than the
+    # per-target path and lost even more to the dedup below.
+    #
+    # ``_fetch_candidate_window`` retries a statement timeout once: this
+    # fallback exists because the cross-target RPC hit one, and under the same
+    # contention its own scores read dies of the identical 57014 (observed
+    # unhandled on the dashboard top-matches read, 2026-08-05 #604). If it
+    # still times out, the app-wide APIError handler turns 57014 into a clean
+    # 503.
+    score_rows = await _fetch_candidate_window(
+        _candidate_query,
+        sort=sort,
+        ascending=ascending,
+        archived_view=archived_view,
+        company=company,
+        search=search,
         label="jobs/cross_target_two_query_scores",
-        retry_statement_timeout=True,
     )
-    score_rows = cast(list[dict[str, Any]], score_resp.data or [])
+
+    # Drop removed (target, job) pairs BEFORE the best-target collapse below,
+    # mirroring the RPC's anti-join inside ``best``. Filtering after the
+    # collapse would hide a job everywhere the moment the target it was
+    # removed from happened to win the dedup — "remove from this target" has
+    # to leave it visible under the others.
+    removed = await _removed_pairs(
+        supabase, user_id=user_id, target_ids=list(user_target_ids)
+    )
+    if removed:
+        score_rows = [
+            r for r in score_rows if (r["target_id"], r["job_posting_id"]) not in removed
+        ]
 
     if not score_rows:
         return {"postings": [], "next_cursor": None, "total": 0}
@@ -1595,7 +2035,8 @@ async def _list_jobs_across_user_targets_two_query(
         return weights_by_target.get(tid) if tid else None
 
     return await _assemble_jobs_page(
-        supabase,
+        explicit_floor=explicit_floor,
+        supabase=supabase,
         by_id=best,
         weights_for_row=_weights_for,
         offset=offset,
@@ -1750,6 +2191,7 @@ def _logistics_passes(
         salary_max=posting.get("salary_max"),
         salary_min=posting.get("salary_min"),
         posting_country=posting.get("country"),
+        posting_is_remote=posting.get("is_remote"),
         include_unknown_salary=include_unknown_salary,
     )
 
@@ -1763,14 +2205,35 @@ def _logistics_core(
     salary_max: Any,
     salary_min: Any,
     posting_country: Any = None,
+    posting_is_remote: Any = None,
     include_unknown_salary: bool,
 ) -> bool:
     """The one logistics predicate. Both callers — the posting-level filter
     and the scores-row pre-filter (#654) — route through here so the two
     layers cannot drift; a divergence would silently change which jobs a
     filter returns depending on which path a request happened to take."""
-    if f.remote_only and log.get("remote_status") != "remote":
-        return False
+    if f.remote_only:
+        # BOTH sources must affirm (#795). The filter used to trust only the
+        # LLM-extracted ``remote_status`` while the card rendered the posting's
+        # own ``is_remote``/``location`` — so a job the employer marked
+        # on-site showed up under Remote-only reading "Raleigh, NC".
+        #
+        # Measured on prod at the time of the fix: of 682 rows the extraction
+        # called remote, 367 agreed with the posting, 229 were flat
+        # CONTRADICTIONS, and 86 had no posting field at all. Requiring
+        # agreement drops the 229 (the bug) and the 86 (missing data) — a
+        # deliberate trade of recall for trust. Loosening the `is True` to
+        # `is not False` would readmit the 86 without readmitting the leaks.
+        extraction_remote = log.get("remote_status") == "remote"
+        if not extraction_remote or posting_is_remote is not True:
+            if extraction_remote and posting_is_remote is False:
+                # Surface the contradictions so they can be reviewed rather
+                # than silently dropped — this is the population worth fixing
+                # upstream in the extraction.
+                logger.info(
+                    "remote_filter.disagreement extraction=remote posting_is_remote=False"
+                )
+            return False
     if f.min_salary is not None:
         if salary_currency == "USD" and salary_period == "yearly":
             bound = salary_max or salary_min
@@ -1788,7 +2251,21 @@ def _logistics_core(
         # rows — so "absent ⇒ keep" admitted the other 96% and the filter was
         # inert (selecting Canada returned a full page of US jobs, 2026-08-08).
         country = posting_country if posting_country is not None else log.get("location_country")
-        if country is not None and str(country).upper() != f.country.upper():
+        # BOTH sides are folded to one token (#805). ``jobs.country`` stores a
+        # DISPLAY form ("UK", "Canada", "Germany"); the filter sends ISO
+        # alpha-2 ("GB", "CA", "DE"). An exact string compare therefore matched
+        # only "US", and only because the two spellings coincide — "United
+        # Kingdom" could not reach 2,619 rows stored as "UK", "Canada" 169, or
+        # "Germany" 118. Three of the four options the UI offers returned
+        # nothing that matched.
+        #
+        # Leniency for an UNKNOWN country is kept on purpose: a fully-remote
+        # role often carries no country anchor, and excluding those would hide
+        # roles genuinely open in the filtered country. What was wrong is that
+        # it was UNBOUNDED — 20,247 null-country rows flooded the page. The
+        # bound lives in ``_apply_logistics_filter``, which can see the whole
+        # list; this predicate stays per-row.
+        if country is not None and canonical_country(country) != canonical_country(f.country):
             return False
     return True
 
@@ -1812,6 +2289,7 @@ def _score_row_passes_logistics(
         salary_max=_embedded_jobs_field(row, "salary_max"),
         salary_min=_embedded_jobs_field(row, "salary_min"),
         posting_country=_embedded_jobs_field(row, "country"),
+        posting_is_remote=_embedded_jobs_field(row, "is_remote"),
         include_unknown_salary=include_unknown_salary,
     )
 
@@ -1829,11 +2307,43 @@ def _apply_logistics_filter(
     if not f.active:
         return postings
     resolve = include_unknown_salary_for or (lambda _p: False)
-    return [
-        p
-        for p in postings
-        if _logistics_passes(p, f, include_unknown_salary=resolve(p))
-    ]
+    kept = [p for p in postings if _logistics_passes(p, f, include_unknown_salary=resolve(p))]
+    if f.country:
+        kept = _cap_unknown_country(kept, f.country)
+    return kept
+
+
+def _cap_unknown_country(
+    rows: list[dict[str, Any]], wanted: str
+) -> list[dict[str, Any]]:
+    """Bound the unknown-country tail behind a country filter (#805).
+
+    ``_logistics_core`` keeps a row whose country is unknown, on purpose: a
+    fully-remote role often carries no country anchor, and dropping those would
+    hide roles genuinely open in the filtered country.
+
+    Unbounded, though, that leniency WAS the bug. 20,247 of ~60k postings have
+    no country, so picking a country returned a page of jobs whose country
+    nobody knows — the same shape as the score floor's exempt Pending tail, and
+    treated the same way: real matches first, unknowns as a short tail.
+
+    Order within each group is preserved; this only decides how many unknowns
+    ride along.
+    """
+    target = canonical_country(wanted)
+    known = [r for r in rows if canonical_country(_row_country(r)) == target]
+    unknown = [r for r in rows if _row_country(r) is None]
+    if len(unknown) <= _UNKNOWN_COUNTRY_TAIL_CAP:
+        return rows
+    return known + unknown[:_UNKNOWN_COUNTRY_TAIL_CAP]
+
+
+def _row_country(row: dict[str, Any]) -> Any:
+    """The country a row is judged on — the deterministic column first, the
+    Phase-2 grader's field second. Mirrors ``_logistics_core``."""
+    if row.get("country") is not None:
+        return row.get("country")
+    return (row.get("logistics_filters") or {}).get("location_country")
 
 
 # ── Per-user target preferences (#60) ───────────────────────────────────────
@@ -2075,7 +2585,11 @@ async def _list_jobs_operator(
         # a pre-filter page whose total is wrong and whose contents may
         # mostly get trimmed. Fetch the full (pre-location) set ordered
         # server-side, filter in Python, then paginate from the result.
-        query = query.order(operator_sort, desc=not ascending).limit(_OPERATOR_LOCATION_SCAN_CAP)
+        query = (
+            query.order(operator_sort, desc=not ascending)
+            .order("id", desc=not ascending)
+            .limit(_OPERATOR_LOCATION_SCAN_CAP)
+        )
         resp = await query.execute()
         all_rows = cast(list[dict[str, Any]], list(resp.data or []))
         if len(all_rows) >= _OPERATOR_LOCATION_SCAN_CAP:
@@ -2097,8 +2611,13 @@ async def _list_jobs_operator(
             "total": len(filtered),
             "applied_min_score": min_score,
         }
-    query = query.order(operator_sort, desc=not ascending).range(
-        operator_offset, operator_offset + page_size - 1
+    # The id tiebreaker is load-bearing, not cosmetic: OFFSET pagination over a
+    # non-unique ORDER BY (``company_name`` has whole blocks of equal values) is
+    # not stable in Postgres — successive pages may repeat and skip rows.
+    query = (
+        query.order(operator_sort, desc=not ascending)
+        .order("id", desc=not ascending)
+        .range(operator_offset, operator_offset + page_size - 1)
     )
     resp = await query.execute()
     operator_total = resp.count or 0
@@ -2114,7 +2633,7 @@ async def _list_jobs_operator(
 async def list_jobs(
     cursor: str | None = Query(None),
     page_size: int = Query(20, ge=1, le=100),
-    sort: str = Query("score", pattern="^(score|created_at|company_name|title)$"),
+    sort: str = Query("score", pattern="^(score|created_at|posted_at|company_name|title)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     min_score: int | None = Query(None, ge=0, le=100),
     status: str | None = Query(
@@ -2208,6 +2727,11 @@ async def list_jobs(
     # explicitly opt out of the default; ``applied_min_score`` is
     # echoed in the response so the UI can render a "filtered to ≥N"
     # chip with a clear affordance.
+    # Captured BEFORE the profile default fills it in: only a floor the user
+    # actually typed caps the exempt Pending tail (#795). The passive default
+    # must keep showing new intake — trimming it there is the harm the
+    # exemption exists to prevent.
+    explicit_floor = min_score is not None and min_score > 0
     if min_score is None and user_id is not None:
         min_score = await _default_min_score_for_user(supabase, user_id)
 
@@ -2235,6 +2759,7 @@ async def list_jobs(
                 min_score = cutoff if min_score is None else max(min_score, cutoff)
         result = await _list_jobs_for_target(
             supabase,
+            explicit_floor=explicit_floor,
             target_id=target_id,
             page_size=page_size,
             sort=sort,
@@ -2274,6 +2799,7 @@ async def list_jobs(
             include_unknown_salary_by_target[ut.target_id] = ut.pref_include_unknown_salary
         result = await _list_jobs_across_user_targets(
             supabase,
+            explicit_floor=explicit_floor,
             user_target_ids=user_target_ids,
             page_size=page_size,
             sort=sort,
@@ -2341,16 +2867,23 @@ async def _pipeline_counts_python(
     per-user status (``user_jobs`` row; absent → ``'new'``)."""
     score_query = (
         supabase.table("scores")
-        .select("job_posting_id")
+        .select("job_posting_id, target_id")
         .in_("target_id", list(target_ids))
         .eq("excluded", False)
     )
     # Floor exempts Pending rows so the tab counts match the list (#47).
     score_query = _apply_score_floor(score_query, min_score)
     score_resp = await score_query.execute()
-    job_ids = sorted(
-        {cast(str, r["job_posting_id"]) for r in cast(list[dict[str, Any]], score_resp.data or [])}
-    )
+    score_rows = cast(list[dict[str, Any]], score_resp.data or [])
+    # Removed pairs are excluded from the list, so they must be excluded from
+    # the counts too — otherwise the tab badge keeps counting jobs the user
+    # can no longer see.
+    removed = await _removed_pairs(supabase, user_id=user_id, target_ids=list(target_ids))
+    if removed:
+        score_rows = [
+            r for r in score_rows if (r["target_id"], r["job_posting_id"]) not in removed
+        ]
+    job_ids = sorted({cast(str, r["job_posting_id"]) for r in score_rows})
     counts: dict[str, int] = {}
     for i in range(0, len(job_ids), _IN_CHUNK_SIZE):
         chunk = job_ids[i : i + _IN_CHUNK_SIZE]
@@ -2649,6 +3182,7 @@ async def add_manual_job(
         extraction_tier=extraction.tier,
         warnings=warnings,
         needs_manual_fields=False,
+        description_html=description_html or None,
     )
 
 
@@ -2665,9 +3199,7 @@ async def _get_target_async(supabase: AsyncClient, target_id: str) -> JobTarget 
     return _parse_target(rows[0]) if rows else None
 
 
-async def _active_targets_for_user_async(
-    supabase: AsyncClient, user_id: str
-) -> list[JobTarget]:
+async def _active_targets_for_user_async(supabase: AsyncClient, user_id: str) -> list[JobTarget]:
     """Async inline of ``crud.get_active_for_user`` — the caller's active
     memberships as full target rows (``crud`` stays sync for its poller callers,
     #57 PR-G2e-4). Mirrors ``targets._active_targets_for_user``."""
@@ -2690,23 +3222,18 @@ async def _all_active_targets_async(supabase: AsyncClient) -> list[JobTarget]:
     EXISTS(active membership)`` pipeline predicate, two indexed reads deduped in
     Python (the operator/api-key manual-add fan-out, #57 PR-G2e-4). Mirrors
     ``targets._active_targets``."""
-    floor_resp = await (
-        supabase.table("targets").select("*").eq("app_active", True).execute()
-    )
+    floor_resp = await supabase.table("targets").select("*").eq("app_active", True).execute()
     member_ids_resp = await (
         supabase.table("user_targets").select("target_id").eq("is_active", True).execute()
     )
     member_ids = {
-        cast(str, r["target_id"])
-        for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
+        cast(str, r["target_id"]) for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
     }
     rows = cast(list[dict[str, Any]], floor_resp.data or [])
     seen = {cast(str, r["id"]) for r in rows}
     missing = sorted(member_ids - seen)
     if missing:
-        member_resp = await (
-            supabase.table("targets").select("*").in_("id", missing).execute()
-        )
+        member_resp = await supabase.table("targets").select("*").in_("id", missing).execute()
         rows.extend(cast(list[dict[str, Any]], member_resp.data or []))
     return [_parse_target(r) for r in rows]
 
@@ -2722,6 +3249,38 @@ async def _user_set_scores_included_async(
         "user_set_scores_included",
         {"p_job_posting_id": job_posting_id, "p_target_ids": target_ids},
     ).execute()
+
+
+async def _user_admit_score_async(
+    supabase: AsyncClient, job_posting_id: str, target_id: str
+) -> None:
+    """Admit a deliberately-added posting into the target's pipeline (#830).
+
+    ``target-membership`` — what draws the "✓ In <target>" badge and unlocks
+    match/tailor — requires ``promising IS TRUE``, not merely a scores row.
+    ``add-to-target`` stage-2 scores the pair and force-includes it, but never
+    set ``promising``, so an explicit user add produced a row the badge logic
+    excludes BY CONSTRUCTION: the UI flipped to a bound state optimistically,
+    and a reload showed no trace of it.
+
+    ``promising`` was introduced as the Phase-1 triage verdict, so setting it
+    here widens its meaning from "Phase 1 admitted this" to "something admitted
+    this" — with the user as the other admitting authority. That is the honest
+    reading: the column gates pipeline membership, and a user asking for a job
+    to be in a target is a stronger signal than a title-only LLM guess. Kept as
+    its own helper (not folded into the RPC) so the widening is greppable.
+
+    Service-role: ``scores`` writes are not user-writable, same as the
+    force-include beside it. Module-level so no bare ``.execute()`` sits in a
+    handler body (the #107 guard).
+    """
+    await (
+        supabase.table("scores")
+        .update({"promising": True})
+        .eq("job_posting_id", job_posting_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
 
 
 async def _load_live_job(supabase: AsyncClient, job_id: str) -> dict[str, Any] | None:
@@ -2824,9 +3383,10 @@ async def add_job_to_target(
 
     # Best-effort bookkeeping AFTER the score row is committed (mirrors
     # materialize_and_score_job): a transient failure in any of these must not
-    # fail the whole action — the score (the core effect) is already written, so
-    # a 500 here would read as "nothing happened" when the job IS scored and
-    # will show under the target. Each step is independent and logged.
+    # fail the whole action — the score (the core effect) is already written.
+    # NB this block used to claim the job "will show under the target" off the
+    # back of that score alone. It did not: membership needs `promising` too,
+    # which is step 2 below and was the whole of #830.
     #  1. Force-include under THIS one target so a negative-keyword ``excluded``
     #     flag can't hide a job the user deliberately added — scoped to the single
     #     target, on the service-role client (audit #24 F4).
@@ -2834,6 +3394,14 @@ async def add_job_to_target(
         await _user_set_scores_included_async(service_supabase, job_id, [body.target_id])
     except Exception:
         logger.exception("add-to-target force-include failed for job %s", job_id)
+    #  2. Admit it into the pipeline (#830). `excluded=False` alone is not
+    #     membership — `target-membership` also requires `promising IS TRUE`,
+    #     so without this the badge, match and tailor stay locked and a reload
+    #     erases every trace of the add.
+    try:
+        await _user_admit_score_async(service_supabase, job_id, body.target_id)
+    except Exception:
+        logger.exception("add-to-target admit failed for job %s", job_id)
     #  3. Mark it 'saved' in the caller's pipeline — parity with the from-url add
     #     path (targets/from_input.py): a deliberately-added posting is 'saved',
     #     not the auto-surfaced 'new'. Service-role, keyed by the caller's user_id.
@@ -2849,7 +3417,6 @@ async def add_job_to_target(
     job_list_cache.invalidate()
 
     return AddToTargetResponse(
-        success=True,
         job_posting_id=job_id,
         target_id=body.target_id,
         score=result.score,
@@ -3027,15 +3594,19 @@ async def _upsert_user_job_async(
     the not-yet-converted routers, so the async handler inlines the same upsert
     rather than fork a twin (#57 slice 3/4 — mirrors ``persistence.
     mark_job_resume_draft``)."""
-    await supabase.table("user_jobs").upsert(
-        {
-            "user_id": user_id,
-            "job_posting_id": job_posting_id,
-            "status": status,
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
-        on_conflict="user_id,job_posting_id",
-    ).execute()
+    await (
+        supabase.table("user_jobs")
+        .upsert(
+            {
+                "user_id": user_id,
+                "job_posting_id": job_posting_id,
+                "status": status,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+            on_conflict="user_id,job_posting_id",
+        )
+        .execute()
+    )
 
 
 @router.get("/{posting_id}")
@@ -3123,3 +3694,143 @@ async def delete_job(
 
     job_list_cache.invalidate()
     return {"success": True, "deleted_id": posting_id}
+
+
+async def _targets_holding_posting(
+    supabase: AsyncClient, *, user_id: str, posting_id: str
+) -> list[str]:
+    """The caller's own target ids that currently carry this posting.
+
+    Scoped through ``user_targets`` first so a target id is never taken from
+    request input — the same privacy boundary ``target_membership`` documents.
+    """
+    ut_resp = (
+        await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
+    )
+    owned = {cast(dict[str, Any], r)["target_id"] for r in ut_resp.data or []}
+    if not owned:
+        return []
+    score_resp = (
+        await supabase.table("scores")
+        .select("target_id")
+        .eq("job_posting_id", posting_id)
+        .in_("target_id", list(owned))
+        .execute()
+    )
+    return sorted({cast(dict[str, Any], r)["target_id"] for r in score_resp.data or []})
+
+
+async def _upsert_target_removals_async(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    posting_id: str,
+    target_ids: list[str],
+) -> None:
+    """Record "the caller removed this posting from these targets".
+
+    Idempotent: re-removing an already-removed pair is a no-op rather than a
+    duplicate-key error, so a double-click or a retried request is harmless.
+    """
+    await (
+        supabase.table("user_target_job_removals")
+        .upsert(
+            [
+                {"user_id": user_id, "target_id": tid, "job_posting_id": posting_id}
+                for tid in target_ids
+            ],
+            on_conflict="user_id,target_id,job_posting_id",
+        )
+        .execute()
+    )
+
+
+async def _delete_target_removals_async(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    posting_id: str,
+    target_id: str | None,
+) -> list[str]:
+    """Undo removals; returns the target ids the posting was restored to."""
+    query = (
+        supabase.table("user_target_job_removals")
+        .delete()
+        .eq("user_id", user_id)
+        .eq("job_posting_id", posting_id)
+    )
+    if target_id is not None:
+        query = query.eq("target_id", target_id)
+    resp = await query.execute()
+    return sorted(cast(dict[str, Any], r)["target_id"] for r in resp.data or [])
+
+
+@router.post("/{posting_id}/remove")
+async def remove_job_from_target(
+    posting_id: str,
+    body: RemoveJobRequest,
+    user_id: str = Depends(get_current_user_id),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+) -> dict[str, Any]:
+    """Remove a posting from one of the caller's targets (or from all of them).
+
+    This is the honest version of what the UI used to call "Delete". That
+    button soft-archived the caller's ``user_jobs`` row and told the user it
+    "can't be undone", while the row stayed in the list — the archived
+    exclusion was implemented in the Python hydration path but missing from
+    both list RPCs, so a default ``sort=score`` view kept showing it.
+
+    Removal is deliberately per-(user, target, job) rather than a flag on
+    ``scores``:
+
+    * ``scores.excluded`` is recomputed by the scorer on every re-score, so a
+      removal written there comes back on the next poll.
+    * ``scores`` rows are per-target and targets are shared with co-searchers,
+      so writing removal there would remove the job from other users' lists.
+
+    A global hard delete stays off the table — it cascades into every other
+    follower's ``user_jobs`` / ``status_log`` (audit #29 round 3 / H1).
+
+    ``target_id`` omitted removes the posting from every one of the caller's
+    targets that currently holds it, which is what "Remove" has to mean on the
+    All Jobs tab where no single target is in scope.
+    """
+    await _assert_user_owns_posting_async(supabase, posting_id, user_id)
+
+    holding = await _targets_holding_posting(supabase, user_id=user_id, posting_id=posting_id)
+    if body.target_id is not None:
+        if body.target_id not in holding:
+            # Never confirm the existence of a target the caller doesn't own.
+            raise HTTPException(status_code=404, detail="Posting not found in that target")
+        target_ids = [body.target_id]
+    else:
+        target_ids = holding
+
+    if target_ids:
+        await _upsert_target_removals_async(
+            supabase, user_id=user_id, posting_id=posting_id, target_ids=target_ids
+        )
+
+    job_list_cache.invalidate()
+    return {"success": True, "removed_from": target_ids}
+
+
+@router.delete("/{posting_id}/remove")
+async def undo_remove_job_from_target(
+    posting_id: str,
+    target_id: str | None = None,
+    user_id: str = Depends(get_current_user_id),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+) -> dict[str, Any]:
+    """Undo a removal — the recourse the old "can't be undone" delete lacked.
+
+    Scoped to the caller's own rows by RLS *and* by an explicit ``user_id``
+    filter. Omitting ``target_id`` restores the posting to every target the
+    caller had removed it from.
+    """
+    restored = await _delete_target_removals_async(
+        supabase, user_id=user_id, posting_id=posting_id, target_id=target_id
+    )
+
+    job_list_cache.invalidate()
+    return {"success": True, "restored_to": restored}

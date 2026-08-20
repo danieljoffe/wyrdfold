@@ -3,6 +3,178 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-08-18 — reading config is not tracing the path (#841 was backwards)
+
+#841 was filed claiming free accounts drain the operator's LLM credit with no
+aggregate ceiling. The opposite is true: free accounts are **refused** with a
+402 before any LLM client is constructed. The filing traced `resolve_llm_quota`
+correctly — and that trace was downstream of a gate free users never reach.
+`llm/__init__.py:224` raises on an **OR**: `BYOK_REQUIRE_USER_KEYS` _or_ the
+caller's plan being BYOK, which the saas free tier always is. The flag was
+indeed unset; the plan branch fires on its own. **Decision:** a claim about what
+code _costs_ or _permits_ requires walking the call path from the entry point,
+not reading the settings that appear in it. Config tells you what a branch would
+do if reached; only the path tells you whether it is reached. Two aggravating
+details worth remembering: the issue's own "Verify before flipping" section
+prescribed the check (create one free account) that would have caught it, written
+by the same author who then skipped it — and the test suite was **already
+correct**, with `test_get_client_saas_free_without_key_is_refused` setting the
+flag to `False` explicitly. A coverage gap was assumed and asserted before the
+tests were read. Rule lives in the general "prove the diagnosis" rule; the
+misleading log that pointed at the wrong variable was fixed in #859.
+
+## 2026-08-18 — a server route handler cannot read a URL fragment (#856)
+
+Beta invites bounced to `/login?auth_error=missing_code` while the owner's own
+sign-in worked perfectly through the same callback. The invite was landing with
+a valid session in the **URL fragment** (`#access_token=…`), which browsers
+strip before the request leaves — so the server-side handler saw no `code` and
+no `token_hash` and fell through. The cause was upstream: `invite_user_by_email`
+is **server-initiated**, so no PKCE `code_verifier` exists in the recipient's
+browser, and a `{{ .ConfirmationURL }}` template therefore falls back to implicit
+flow. Sign-in is **browser**-initiated, gets `?code=`, and works. **Decision:**
+whether an auth callback receives a query or a fragment is decided by _who
+initiated the flow_, not by the URL — reason about the initiator first. Fix is
+the `token_hash` template form, which bypasses GoTrue's redirect entirely and is
+device-independent (it also survives opening the mail on another device, which
+PKCE does not). Two second-order lessons: the first hypothesis (redirect
+allowlist) was wrong and was only settled by asking for the **actual landing
+URL**; and `GET /auth/callback 307` is logged identically for success and
+failure, so the logs could not discriminate — the operator's answer could.
+Standing risk: these templates live only in the hosted Supabase dashboard, so no
+test, CI job or review can detect a regression (#860).
+
+## 2026-08-18 — an absent log line is evidence (#862)
+
+A Stripe webhook returned 200 and `user_profiles.plan` demonstrably flipped to
+`starter`, but `_set_plan`'s `billing: plan=… user=…` line was nowhere in the
+Railway logs. Chasing that discrepancy rather than accepting the happy outcome
+found that **production discards every `logger.info`** — 84 call sites, including
+all of `scheduler.py`'s outcome reporting. `init_logging` returns early unless
+`log_format == "json"`, and the `root.setLevel(logging.INFO)` that keeps child
+loggers off the stdlib WARNING default sits _inside_ that branch; `LOG_FORMAT` is
+unset on Railway, so it never runs. uvicorn's own access logs kept appearing,
+which made the gap look like normal traffic. **Decision:** log **level** and log
+**format** are independent concerns and must not share a branch. Also: when a
+verified outcome is missing its expected log line, treat the absence as a finding
+rather than noise — the outcome being correct is exactly what makes the missing
+line easy to wave away. Aggravating detail: #859 had just improved one of those
+`logger.info` lines, validated against tests rather than against production log
+output, so the improvement is invisible in prod until this is fixed.
+
+## 2026-08-18 — one environment named `development` was serving production (#861)
+
+`STRIPE_SECRET_KEY` on the service behind wyrdfold.com is an `sk_test_` key, so
+no real customer could subscribe — a live card against a test-mode Checkout is
+rejected, and Stripe renders a customer-facing "Sandbox" badge on the payment
+page. Combined with #841 (free accounts walled), there was **no path by which
+anyone could become a paying user**. The root cause is topology, not a pasted
+value: there is one Railway project with one environment, named `development`,
+and it is production. The test key is correct _for a development environment_;
+there is simply nowhere else for it to live. **Decision:** fix the environment
+split, not the key — a wrong value replaced in place leaves the same trap for the
+next environment-specific setting, and #856/#860 are the same shape (hosted
+config with no non-production place to exercise it). Silver lining used
+deliberately: because prod was in test mode, the full checkout → webhook →
+`user_profiles.plan` chain was exercised end to end at zero cost, so when live
+keys land the only untested variable is the key itself.
+
+## 2026-08-18 — `promising` now means "admitted", not "Phase 1 admitted"
+
+`scores.promising` arrived as the Phase-1 title-triage verdict and its column
+comment said exactly that. But it is also what `target-membership` reads to
+decide pipeline membership — the "✓ In &lt;target&gt;" badge, and the gate on
+match/tailor. So when `add-to-target` scored a pair without setting it, an
+explicit user add produced a row the badge logic excluded **by construction**:
+the panel flipped to a bound state and a reload erased it (#830). **Decision:**
+`add-to-target` sets `promising = True`, widening the column from "Phase 1
+admitted this" to "something admitted this", with the user as the other
+admitting authority. Rationale: the column's JOB is to gate membership, and a
+user asking for a job to be in a target is a stronger signal than a title-only
+LLM guess — so the widened reading is the truthful one, not a convenience. The
+alternative, a provenance column, is a migration and buys nothing the user's
+action needs. Kept in its own greppable helper (`_user_admit_score_async`)
+rather than folded into the force-include RPC, so the widening is findable.
+Known limit, accepted: membership also applies the #277 family gate, so an
+OFF-family user add still won't badge — bypassing that _does_ need provenance,
+and neither case in #830 was off-family. Lesson: when one column serves two
+readers, the name should describe what it gates, not who first wrote it.
+
+## 2026-08-18 — A measurement is a claim: three predicates that each invented a bug
+
+Three separate times in one day a prod query produced an alarming number, and
+all three were the query's fault, not the code's. (1) Ingestion "fell 93%"
+after the catalog-grading change — the windows were US-evening vs US-overnight;
+the same UTC slice two days earlier, **before** the release, was identical
+(weekends run ~4/h against a weekday ~47/h). (2) Salary parsing had "133
+failures" — the test was `salary_min IS NULL`, but `parse_salary_text`
+documents `"up to $X"` as a **MAX-only** bound, so correctly-parsed rows have a
+NULL min; the real corpus-wide failure count is **1**, a typo in an employer's
+own posting. (3) Newly-graded scores "still carried logistics" — counted by
+`updated_at`, which includes OLD rows re-graded; Phase 2 no longer _emits_
+logistics so the upsert doesn't touch that column, and doesn't blank it. On
+`created_at` the count is 0. **Decision:** before reporting a number, state the
+predicate and check it against the code's documented behaviour — `created_at`
+answers "did the new config take", `updated_at` only "was this re-graded"; and
+never compare a time window against a differently-shaped one. Acting on any of
+the three would have reverted a working change or "fixed" a correct parser.
+
+## 2026-08-18 — Two LLM writers were guessing at facts the boards publish outright
+
+Phase 2 inferred `remote_status`/`country`/`salary` into
+`scores.logistics_filters`, and the qualification tagger inferred
+`jobs.is_remote`/`employment_type` — while Ashby publishes `isRemote`,
+`workplaceType`, `employmentType` and a structured `postalAddress`, Lever
+publishes `workplaceType` and an already-ISO `country`, and SmartRecruiters
+models `location.remote` + `location.hybrid` as separate booleans. The fetchers
+read ~6 of 24–40 published fields and dropped the rest. Two inference paths
+over the same question also disagree — #795 measured 229 prod contradictions on
+remote alone. Worse, the tagger runs on the **upsert result** and overwrote
+those columns unconditionally, so reading the board (#847/#848) was a complete
+no-op until the tagger learned to defer (#851): the board fact was written and
+overwritten inside one poll. **Decision:** structured field where the board
+publishes it; deterministic parse of the location string for Greenhouse and
+Workday, which publish no remote flag but state it in the text; LLM never.
+Lesson: when a value has more than one writer, find the LAST one before
+claiming the first works. Also: Workday's list entry has six fields and we
+already read all six — its country sits behind the per-posting detail call
+#828 cut to ~3%, so "does the platform publish it" is the wrong question;
+"which endpoint, at what cost" is the right one.
+
+## 2026-08-18 — A workaround outlived the problem it was working around
+
+Catalog targets (`app_active`, no active `user_targets` link) were Phase-1
+graded every cycle on the instance key, producing scores nobody read — the
+dominant LLM line item while zero user targets were active. The reason it was
+there: a 2026-07-30 rule ("never spend money nobody will consume") had starved
+the public /search corpus to one sponsored target's family, and the fix was to
+let catalog targets grade again. But that starvation came from dropping them
+out of the ACTIVE SET, which stopped their **source polling** — the corpus
+starved for lack of ingestion, not grading. Meanwhile `/search` was changed to
+read `jobs` directly, skipping `scores` entirely, which fixed the real cause
+and made the workaround redundant. Nobody removed it. Verified before shipping:
+28.3% of recently-ingested jobs carry no promising score at all, so ingestion
+does not depend on admission. **Decision:** gate grading only, never polling,
+behind `GRADE_CATALOG_TARGETS` (default off). Lesson: one flag (`app_active`)
+drove two unrelated concerns — "poll this target's sources" and "grade against
+it" — so fixing one necessarily moved the other.
+
+## 2026-08-18 — Config outranks code, so a shipped fix can do nothing
+
+The landing page probed `/signup-mode` without the BFF secret, got a 403, and
+its fail-safe reported `closed` — so the homepage signup CTA could never open,
+whatever the operator switch said. Invisible by construction: a 403 from your
+own perimeter is a misconfiguration, but the code treated it identically to
+"backend down". Found only by reading HTTP logs and noticing the same endpoint
+returning 200 from one caller and 403 from another. The same shape nearly
+repeated within the day: `LOGISTICS_EXTRACTION_ENABLED=true` on Railway would
+have overridden a new `False` default and left half of #851 inert — caught
+because the deploy note said so, and the var was removed **before** the merge.
+**Decision:** when a change's effect depends on an env var, say so in the PR
+and verify the var's state as part of the release, not after. Lesson: a
+fail-safe that swallows a misconfiguration converts a loud bug into a silent
+one; distinguish "degraded" from "wired wrong".
+
 ## 2026-07-31 — The URL-health net ran daily and could never catch anything
 
 The dead-link archival cascade (HEAD checks → 3 consecutive failures →
@@ -29,12 +201,15 @@ schema audit forced the verdict days before the shadow corpus hit its own
 the SIGNAL is real (promising jobs avg cosine 0.38 vs 0.25 for duds; 83% of
 gate-passers are promising) but the armed threshold (0.3981, calibrated
 2026-07-04) would have dropped **61.5% of promising matches**. Meanwhile the
-cost problem it was built for had shrunk under it (deepseek + caching + caps →
-grading ≈ $1/mo). A first read of the raw admit-rate matrix was mistaken for a
+cost problem it was built for had shrunk under it (deepseek + caching + caps
+had made grading cheap enough that the gate no longer paid for itself). A first
+read of the raw admit-rate matrix was mistaken for a
 "signal is worthless" verdict — the ~5% admit rate was the _designed_
 asymmetry; only the outcome-join could judge it. **Decision:** retire the gate
 (drop `prescan_cosine_threshold`, gate/holdout/allowlist code + flags;
-`prescan_shadow` + recorder dropped after its retention drain ~2026-08-09) but
+`prescan_shadow` + recorder dropped after its retention drain — the recorder in
+R2, the table itself in R3 §1 on 2026-08-11 once prod confirmed it had drained
+to 0 rows, `20260811000000_r3_drop_prescan_shadow.sql`) but
 KEEP the full embedding stack — live grades show cosine is the strongest cheap
 fit predictor (avg fit ~7→67 monotone), so it orders the Phase-2 daily-cap
 queue; the threshold trade-off curve is preserved in the audit doc for any

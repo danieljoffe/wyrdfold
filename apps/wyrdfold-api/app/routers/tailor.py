@@ -97,6 +97,7 @@ from app.services.docx.pandoc_render import (
 )
 from app.services.experience import gap_tracker, optimized, preferences
 from app.services.llm.client import LLMClient
+from app.services.run_registry import RunState
 from app.services.tailor import (
     CoverLetterPipelineLintFailure,
     CoverLetterPipelineSuccess,
@@ -171,15 +172,19 @@ async def _upsert_user_job(
 ) -> None:
     """Async inline of ``persistence.upsert_user_job`` (sync twin kept for the
     jobs / status routers). Mirrors a pipeline-status write into ``user_jobs``."""
-    await supabase.table("user_jobs").upsert(
-        {
-            "user_id": user_id,
-            "job_posting_id": job_posting_id,
-            "status": status,
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
-        on_conflict="user_id,job_posting_id",
-    ).execute()
+    await (
+        supabase.table("user_jobs")
+        .upsert(
+            {
+                "user_id": user_id,
+                "job_posting_id": job_posting_id,
+                "status": status,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+            on_conflict="user_id,job_posting_id",
+        )
+        .execute()
+    )
 
 
 async def _get_records(
@@ -204,9 +209,7 @@ async def _target_scoring_profile_row(
 ) -> dict[str, Any] | None:
     """The ``targets`` row (scoring_profile only) for *target_id*, or None.
     A non-handler helper so the #107 guard sees the handler await the read."""
-    resp = await (
-        supabase.table("targets").select("scoring_profile").eq("id", target_id).execute()
-    )
+    resp = await supabase.table("targets").select("scoring_profile").eq("id", target_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return rows[0] if rows else None
 
@@ -226,15 +229,11 @@ async def _posting_exists(supabase: AsyncClient, job_posting_id: str) -> bool:
     (``_fetch_job_description`` → 404); this is the same contract — a 202 must
     only ever mean "accepted work that can actually run".
     """
-    resp = await (
-        supabase.table("jobs").select("id").eq("id", job_posting_id).limit(1).execute()
-    )
+    resp = await supabase.table("jobs").select("id").eq("id", job_posting_id).limit(1).execute()
     return bool(cast(list[dict[str, Any]], resp.data or []))
 
 
-async def _fetch_postings_by_ids(
-    supabase: AsyncClient, ids: list[str]
-) -> list[dict[str, Any]]:
+async def _fetch_postings_by_ids(supabase: AsyncClient, ids: list[str]) -> list[dict[str, Any]]:
     """Batch-fetch ``jobs`` rows for *ids* (id/title/description_html)."""
     resp = await (
         supabase.table("jobs").select("id, title, description_html").in_("id", ids).execute()
@@ -369,8 +368,7 @@ def _claim_run_or_202(
                 "code": "tailor_concurrent_limit",
                 "limit": max_concurrent,
                 "message": (
-                    "Too many documents generating at once. "
-                    "Wait for one to finish, then try again."
+                    "Too many documents generating at once. Wait for one to finish, then try again."
                 ),
             },
         )
@@ -430,9 +428,7 @@ async def create_tailored_resume(
     # A 202 must only ever mean "accepted work that can actually run" — see
     # _posting_exists. Checked before the reuse probe and the claim, so a bogus
     # id costs one indexed lookup and nothing else.
-    if body.job_posting_id is not None and not await _posting_exists(
-        supabase, body.job_posting_id
-    ):
+    if body.job_posting_id is not None and not await _posting_exists(supabase, body.job_posting_id):
         raise HTTPException(status_code=404, detail="job posting not found")
 
     # Reuse check (#504): skip pipeline if a similar resume exists in the target
@@ -666,9 +662,7 @@ async def create_tailored_cover_letter(
     ):
         return _running_202()
 
-    if body.job_posting_id is not None and not await _posting_exists(
-        supabase, body.job_posting_id
-    ):
+    if body.job_posting_id is not None and not await _posting_exists(supabase, body.job_posting_id):
         raise HTTPException(status_code=404, detail="job posting not found")
 
     if body.job_posting_id is None:
@@ -687,13 +681,15 @@ async def create_tailored_cover_letter(
             critique=body.critique,
             job_posting_id=body.job_posting_id,
             target_label=body.target_label,
+            # The JD-only path silently dropped this (#780 wired only the
+            # backgrounded branch), so a caller without a posting was accepted
+            # and then ignored. Same flag, same meaning, both branches.
+            allow_stretch=body.allow_stretch,
         )
         # A lint failure is no longer a 422 — the draft is persisted flagged,
         # so it comes back as a normal record whose ``lint_violations`` say why
         # it needs attention (mirrors ``_resume_response``).
-        if not isinstance(
-            result, CoverLetterPipelineSuccess | CoverLetterPipelineLintFailure
-        ):
+        if not isinstance(result, CoverLetterPipelineSuccess | CoverLetterPipelineLintFailure):
             raise HTTPException(status_code=500, detail="Unexpected pipeline result")
         return TailorResponse(record=result.record, lint_warnings=result.lint.warnings)
 
@@ -763,6 +759,7 @@ async def _run_cover_letter_task(
             critique=body.critique,
             job_posting_id=body.job_posting_id,
             target_label=body.target_label,
+            allow_stretch=body.allow_stretch,
         )
         run_registry.finish(key)
     except Exception:
@@ -805,6 +802,25 @@ async def list_tailored_cover_letters(
 # ---- Resume lifecycle (#505) -------------------------------------------------
 
 
+def _run_already_landed(record: TailoredResumeRecord | None, st: RunState) -> bool:
+    """Has this still-``running`` entry already written the row we just read?
+
+    True only when the row is at least as new as the run — i.e. the task
+    persisted and simply hasn't called ``finish()`` yet. Treating that as
+    settled keeps a completed poll from bouncing back to "generating…".
+
+    A record with no usable timestamp is treated as a PREDECESSOR (``False``),
+    because the alternative — silently calling an in-flight run finished — is
+    the failure mode #788 is about.
+    """
+    if record is None or record.created_at is None:
+        return False
+    created = record.created_at
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    return bool(created >= st.started_at)
+
+
 async def _document_state(
     supabase: AsyncClient,
     job_posting_id: str,
@@ -817,10 +833,18 @@ async def _document_state(
     Read-only — no LLM spend and no writes, so it carries no budget gate and is
     safe to poll on a timer.
 
-    The record is read FIRST and wins: a task that has persisted its row but
-    hasn't yet cleared its registry entry must report the finished document,
-    not ``running``. The reverse order would make a poll bounce back to
-    "generating…" for the width of that window.
+    A run in flight is reported as ``running`` **even when a record already
+    exists** — that record is then the in-flight run's predecessor, not its
+    result. Reporting ``idle`` there (which this did until #788) left the
+    client unable to tell "still working" from "settled", so a re-generation
+    announced *"Generation was interrupted"* on its first poll while the run
+    was still going and about to succeed.
+
+    The one case that must NOT report ``running`` is a task that has persisted
+    its row but not yet cleared its registry entry — otherwise a finished poll
+    bounces back to "generating…" for the width of that window. That is
+    distinguished by timestamp: a row written at/after the run began is the
+    run's own output, so the run is effectively done.
     """
     record = await persistence.get_by_job(
         supabase, job_posting_id, user_id=user_id, document_type=document_type
@@ -829,13 +853,16 @@ async def _document_state(
         user_id=user_id, document_type=document_type, job_posting_id=job_posting_id
     )
     st = run_registry.get(key)
+
+    if st is not None and st.status == "running" and not _run_already_landed(record, st):
+        # Predecessor record rides along so a client that anchors on the record
+        # id can tell which document it is still waiting to replace.
+        return TailoredDocumentState(record=record, status="running")
     if record is not None:
         # A settled document. Any lingering ``error`` belongs to a run that
         # already has a persisted predecessor to fall back on, so don't dress
         # a usable draft up as a failure.
         return TailoredDocumentState(record=record, status="idle")
-    if st is not None and st.status == "running":
-        return TailoredDocumentState(record=None, status="running")
     if st is not None and st.status == "error":
         return TailoredDocumentState(record=None, status="error", message=st.error)
     return TailoredDocumentState(record=None, status="idle")
@@ -864,9 +891,7 @@ async def get_resume_by_job(
     Still 200-with-null rather than 404 for the empty state, so the browser
     doesn't log a failed request on every job-detail visit before generation.
     """
-    return await _document_state(
-        supabase, job_posting_id, user_id=user_id, document_type="resume"
-    )
+    return await _document_state(supabase, job_posting_id, user_id=user_id, document_type="resume")
 
 
 @router.get("/cover-letters/by-job/{job_posting_id}")

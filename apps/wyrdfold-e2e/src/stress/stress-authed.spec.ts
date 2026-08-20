@@ -175,7 +175,7 @@ test('dashboard journey', async ({ page }) => {
     'dash.toggle.back-to-today',
     'dashboard',
     async () => {
-      await page.getByRole('button', { name: /^today$/i }).click();
+      await page.getByRole('button', { name: /^overview$/i }).click();
     },
     async () => {
       await expect(page.getByText(/top matches/i)).toBeVisible({
@@ -503,7 +503,7 @@ test('jobs list journey', async ({ page }) => {
       analysisJobId = href ? href.split('/jobs/')[1] : null;
     },
     async () => {
-      await expect(page.getByText('LLM Analysis')).toBeVisible({
+      await expect(page.getByText('Match analysis')).toBeVisible({
         timeout: 30_000,
       });
       await expect(

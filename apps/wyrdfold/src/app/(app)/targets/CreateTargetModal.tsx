@@ -1,10 +1,11 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Modal } from '@danieljoffe/shared-ui/Modal';
 import { Input } from '@danieljoffe/shared-ui/Input';
 import { Textarea } from '@danieljoffe/shared-ui/Textarea';
 import { Tabs, type Tab } from '@danieljoffe/shared-ui/Tabs';
+import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/kit/Button';
 import TargetSearchTab from './TargetSearchTab';
 import type { MatchedSuggestion, TargetSearchResult } from './types';
@@ -20,6 +21,20 @@ export interface UrlSubmission {
 
 type Mode = 'search' | 'manual' | 'url';
 
+/**
+ * What the user had typed when a create failed, so the modal can come back
+ * holding it. Creation closes the modal optimistically (the happy path is the
+ * common one), which meant a failure dropped the typed URL or title on the
+ * floor — for `from-url` in particular, the error tells you to try something
+ * else, and you no longer have the thing you typed to try it with.
+ */
+export interface CreateTargetDraft {
+  mode: Exclude<Mode, 'search'>;
+  label?: string;
+  description?: string;
+  jdUrl?: string;
+}
+
 interface CreateTargetModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -27,6 +42,14 @@ interface CreateTargetModalProps {
   onSubmitUrl: (payload: UrlSubmission) => void;
   onFollow: (target: TargetSearchResult) => Promise<boolean>;
   onCreateSuggestion: (match: MatchedSuggestion) => Promise<boolean>;
+  /** Restored on open after a failed submit; cleared by the parent. */
+  draft?: CreateTargetDraft | undefined;
+  /**
+   * Why the last submit failed. Rendered inline next to the field that caused
+   * it, and shown only on that tab — see the alert below for why the toast
+   * alone was not enough.
+   */
+  error?: string | undefined;
 }
 
 export default function CreateTargetModal({
@@ -36,6 +59,8 @@ export default function CreateTargetModal({
   onSubmitUrl,
   onFollow,
   onCreateSuggestion,
+  draft,
+  error,
 }: CreateTargetModalProps) {
   // Discovery-first: default to searching the shared catalog so a user follows
   // an existing target instead of minting a duplicate; Manual / From URL are
@@ -45,11 +70,36 @@ export default function CreateTargetModal({
   const [description, setDescription] = useState('');
   const [jdUrl, setJdUrl] = useState('');
 
+  // `Tabs` is uncontrolled, so the only way to move the user to another tab is
+  // to remount it with a new `defaultTab`. Both jumps below need that: a
+  // restored draft (land back where you failed) and "create this manually"
+  // out of an empty search.
+  const [tabsKey, setTabsKey] = useState(0);
+  const [initialTab, setInitialTab] = useState<Mode>('search');
+
+  const jumpTo = useCallback((next: Mode) => {
+    setMode(next);
+    setInitialTab(next);
+    setTabsKey(k => k + 1);
+  }, []);
+
+  // Re-open holding the failed draft. Keyed on `draft` identity: the parent
+  // hands over a fresh object per failure, so a second failure re-seeds even
+  // if the user had edited the field in between.
+  useEffect(() => {
+    if (!isOpen || !draft) return;
+    setLabel(draft.label ?? '');
+    setDescription(draft.description ?? '');
+    setJdUrl(draft.jdUrl ?? '');
+    jumpTo(draft.mode);
+  }, [isOpen, draft, jumpTo]);
+
   const reset = useCallback(() => {
     setLabel('');
     setDescription('');
     setJdUrl('');
     setMode('search');
+    setInitialTab('search');
   }, []);
 
   const handleClose = useCallback(() => {
@@ -72,8 +122,10 @@ export default function CreateTargetModal({
       // No user-supplied title — the label is always derived from the posting.
       onSubmitUrl({ jd_url: trimmedUrl });
     }
-    reset();
-  }, [mode, label, description, jdUrl, onSubmitManual, onSubmitUrl, reset]);
+    // Deliberately NOT reset here: the parent closes the modal optimistically
+    // and, on failure, re-opens it seeded with this draft. Wiping now would
+    // race that restore and hand the user an empty form after an error.
+  }, [mode, label, description, jdUrl, onSubmitManual, onSubmitUrl]);
 
   const canSubmit =
     mode === 'manual'
@@ -90,6 +142,10 @@ export default function CreateTargetModal({
         <TargetSearchTab
           onFollow={onFollow}
           onCreateSuggestion={onCreateSuggestion}
+          onCreateManually={q => {
+            setLabel(q);
+            jumpTo('manual');
+          }}
         />
       ),
     },
@@ -107,7 +163,7 @@ export default function CreateTargetModal({
           />
           <Textarea
             label='Description (optional)'
-            helperText='A short note about this role. The LLM will use it (alongside your experience) to canonicalize the target and derive a scoring profile.'
+            helperText='A short note about this role — used alongside your experience to name the target and build its scoring profile.'
             placeholder='Roles I want to optimize for...'
             value={description}
             onChange={e => setDescription(e.target.value)}
@@ -134,6 +190,11 @@ export default function CreateTargetModal({
     },
   ];
 
+  // The error belongs to the tab that produced it — an extraction failure has
+  // nothing to say while the user is looking at Manual.
+  const showError =
+    Boolean(error) && draft !== undefined && mode === draft.mode;
+
   return (
     <Modal
       isOpen={isOpen}
@@ -148,7 +209,10 @@ export default function CreateTargetModal({
             size='sm'
             onClick={handleClose}
           >
-            Cancel
+            {/* Search applies each Follow immediately, so there is no draft to
+                abandon and "Cancel" read as "undo what I just did" right after
+                a successful follow. */}
+            {mode === 'search' ? 'Done' : 'Cancel'}
           </Button>
           {mode !== 'search' && (
             <Button
@@ -164,9 +228,26 @@ export default function CreateTargetModal({
         </div>
       }
     >
+      {/* A failed create was announced ONLY by a toast, which auto-dismisses --
+          while this modal stayed open holding the draft and showing nothing.
+          The from-url fetch runs 10-20s, so the user who looks away comes back
+          to a modal that looks untouched. Same defect #742 fixed for the
+          suggest actions; the create path kept it. */}
+      {showError && (
+        <div
+          role='alert'
+          className='mb-1 rounded-md border border-error/30 bg-error-light p-3'
+        >
+          <Text variant='meta' as='p' className='text-error'>
+            {error}
+          </Text>
+        </div>
+      )}
+
       <Tabs
+        key={tabsKey}
         tabs={tabs}
-        defaultTab='search'
+        defaultTab={initialTab}
         variant='underline'
         onChange={id => setMode(id as Mode)}
       />

@@ -68,6 +68,7 @@ from app.services.llm import cost_log
 from app.services.llm.client import LLMClient
 from app.services.source_registration import register_source_from_url
 from app.services.targets import crud
+from app.services.targets.activation import ActivationError
 from app.services.targets.derive_profile import (
     DEFAULT_PURPOSE as DERIVE_JD_PURPOSE,
 )
@@ -94,6 +95,12 @@ from app.services.targets.normalize_manual import (
 from app.services.targets.normalize_manual import (
     normalize_manual_input,
 )
+from app.services.targets.normalize_posting_title import (
+    DEFAULT_PURPOSE as NORMALIZE_TITLE_PURPOSE,
+)
+from app.services.targets.normalize_posting_title import (
+    normalize_posting_title,
+)
 from app.services.targets.profile_writes import apply_profile_merge_rpc_async
 
 logger = logging.getLogger(__name__)
@@ -115,33 +122,8 @@ DERIVATION_TIMEOUT_S = 60.0
 
 
 async def _update(supabase: AsyncClient, target_id: str, payload: TargetUpdate) -> JobTarget | None:
-    """Async inline of ``crud.update`` — same partial field mapping."""
-    updates: dict[str, Any] = {"updated_at": datetime.now(UTC).isoformat()}
-    if payload.label is not None:
-        updates["label"] = payload.label
-        updates["normalized_label"] = crud.normalize_label(payload.label)
-    if payload.description is not None:
-        updates["description"] = payload.description
-    if payload.scoring_profile is not None:
-        updates["scoring_profile"] = payload.scoring_profile.model_dump()
-    if payload.search_keywords is not None:
-        updates["search_keywords"] = payload.search_keywords
-    if payload.activation_status is not None:
-        updates["activation_status"] = payload.activation_status
-    if payload.app_active is not None:
-        updates["app_active"] = payload.app_active
-    if payload.profile_version is not None:
-        updates["profile_version"] = payload.profile_version
-    if payload.example_promising_titles is not None:
-        updates["example_promising_titles"] = payload.example_promising_titles
-    if payload.example_unpromising_titles is not None:
-        updates["example_unpromising_titles"] = payload.example_unpromising_titles
-    if payload.seniority_hint is not None:
-        updates["seniority_hint"] = payload.seniority_hint
-    if payload.domain_hints is not None:
-        updates["domain_hints"] = payload.domain_hints
-    if payload.role_family is not None:
-        updates["role_family"] = payload.role_family
+    """Async inline of ``crud.update`` — shares its field mapping verbatim."""
+    updates = crud.build_update_fields(payload)
     resp = await supabase.table(crud.TARGETS_TABLE).update(updates).eq("id", target_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return crud._parse_target(rows[0]) if rows else None
@@ -274,9 +256,7 @@ async def _list_reference_jds(supabase: AsyncClient, target_id: str) -> list[Tar
     return [crud._parse_ref_jd(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
-async def _count_user_reference_jds(
-    supabase: AsyncClient, *, target_id: str, user_id: str
-) -> int:
+async def _count_user_reference_jds(supabase: AsyncClient, *, target_id: str, user_id: str) -> int:
     """Async inline of ``crud.count_user_reference_jds`` (the #47 per-user cap)."""
     resp = (
         await supabase.table(crud.REF_JDS_TABLE)
@@ -299,15 +279,19 @@ async def _upsert_user_job_async(
     the not-yet-converted callers, so the deferred URL derive inlines the same
     upsert rather than fork a twin (#57 PR-G2e-4 — mirrors
     ``jobs._upsert_user_job_async``)."""
-    await supabase.table("user_jobs").upsert(
-        {
-            "user_id": user_id,
-            "job_posting_id": job_posting_id,
-            "status": status,
-            "updated_at": datetime.now(UTC).isoformat(),
-        },
-        on_conflict="user_id,job_posting_id",
-    ).execute()
+    await (
+        supabase.table("user_jobs")
+        .upsert(
+            {
+                "user_id": user_id,
+                "job_posting_id": job_posting_id,
+                "status": status,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+            on_conflict="user_id,job_posting_id",
+        )
+        .execute()
+    )
 
 
 async def _apply_fit_score(
@@ -316,7 +300,7 @@ async def _apply_fit_score(
     *,
     user_id: str,
     target: JobTarget,
-    payload: OptimizedPayload,
+    payload: OptimizedPayload | None,
 ) -> None:
     """Derive a per-user fit score and upsert it onto the user's link.
 
@@ -338,6 +322,21 @@ async def _apply_fit_score(
         supabase, llm, cost_supabase=supabase, user_id=user_id
     )
     payload = fresh if fresh is not None else payload
+    if payload is None:
+        # No experience to score against, from either source. Callers used to
+        # guard this with `if payload is not None` on the INLINE capture and
+        # skip silently — but the inline value is only a fallback here, so that
+        # guard also skipped users who had a resolvable profile, and left no
+        # trace when it did. A link with a null fit_score is now healed on the
+        # next /targets/mine view (fit_refresh.stale_target_ids), so deferring
+        # is fine; being undiagnosable was not.
+        logger.warning(
+            "No payload to fit-score target %s for user %s — leaving the link "
+            "unscored for the lazy refresh to pick up",
+            target.id,
+            user_id,
+        )
+        return
     fit_result, llm_result = await derive_fit_score(llm, payload=payload, target=target)
     await cost_log.record_async(
         supabase,
@@ -412,20 +411,29 @@ async def derive_manual_target_bg(
             if updated is None:
                 logger.error("Failed to update target %s after deferred derive", target_id)
                 return
-            if payload is not None:
-                await _apply_fit_score(
-                    supabase, llm, user_id=user_id, target=updated, payload=payload
-                )
+            await _apply_fit_score(supabase, llm, user_id=user_id, target=updated, payload=payload)
     except TimeoutError:
         logger.error(
             "Deferred manual-target derivation timed out after %ss for target %s",
             DERIVATION_TIMEOUT_S,
             target_id,
         )
-        await _update(supabase, target_id, TargetUpdate(activation_status="error"))
+        await _update(
+            supabase,
+            target_id,
+            TargetUpdate(
+                activation_status="error", activation_error=ActivationError.DERIVE_TIMEOUT
+            ),
+        )
     except Exception:
         logger.exception("Deferred manual-target derivation failed for target %s", target_id)
-        await _update(supabase, target_id, TargetUpdate(activation_status="error"))
+        await _update(
+            supabase,
+            target_id,
+            TargetUpdate(
+                activation_status="error", activation_error=ActivationError.PIPELINE_FAILED
+            ),
+        )
 
 
 async def _contribute_reference_jd(
@@ -456,9 +464,7 @@ async def _contribute_reference_jd(
     # #47 per-user cap — bounds a single follower's footprint on the shared
     # profile. Over cap: skip the contribution entirely (do NOT touch the shared
     # profile).
-    contributed = await _count_user_reference_jds(
-        supabase, target_id=target_id, user_id=user_id
-    )
+    contributed = await _count_user_reference_jds(supabase, target_id=target_id, user_id=user_id)
     if contributed >= settings.reference_jd_max_per_user_per_target:
         logger.info(
             "URL corpus contribution skipped: user %s at reference-JD cap (%d) for target %s",
@@ -596,10 +602,22 @@ async def derive_url_target_bg(
             DERIVATION_TIMEOUT_S,
             target_id,
         )
-        await _update(supabase, target_id, TargetUpdate(activation_status="error"))
+        await _update(
+            supabase,
+            target_id,
+            TargetUpdate(
+                activation_status="error", activation_error=ActivationError.DERIVE_TIMEOUT
+            ),
+        )
     except Exception:
         logger.exception("Deferred URL-target derivation failed for target %s", target_id)
-        await _update(supabase, target_id, TargetUpdate(activation_status="error"))
+        await _update(
+            supabase,
+            target_id,
+            TargetUpdate(
+                activation_status="error", activation_error=ActivationError.PIPELINE_FAILED
+            ),
+        )
 
 
 # ---- Inline create-or-link orchestration -----------------------------------
@@ -672,25 +690,38 @@ async def _create_or_link_from_suggestion(
     matched = await find_matching_target(supabase, suggestion.label)
     if matched is not None:
         link = await _link(supabase, user_id=user_id, target_id=matched.id, is_active=False)
-        if payload is not None:
-            spawn_detached(
-                _apply_fit_score(
-                    supabase, llm, user_id=user_id, target=matched, payload=payload
-                ),
-                name=f"fit-score-{matched.id}",
-            )
+        spawn_detached(
+            _apply_fit_score(supabase, llm, user_id=user_id, target=matched, payload=payload),
+            name=f"fit-score-{matched.id}",
+        )
         return CreateOrLinkResult(user_target=link, target=matched, was_matched=True)
 
     # New target: create immediately in "deriving" so it appears in the
     # list with a pending indicator while the background task derives the
     # scoring profile (+ fit score when we have a profile).
+    # `description` is deliberately NOT persisted here (#868). The suggestion's
+    # description is résumé-INFORMED — `normalize_manual_input` and
+    # `suggest_targets` both take the caller's `payload`, and in prod that
+    # produced shared rows reading "…a natural fit given your cross-team design
+    # system work at <employer A> and <employer B>". `targets` is the shared
+    # catalog: every co-follower can read that row, and it survives the author's
+    # account deletion.
+    #
+    # `derive_profile_from_label` states the rule this restores: the shared
+    # target is "grounded in role-generic industry knowledge of the label alone
+    # — never an individual's résumé — so a shared target's rubric isn't skewed
+    # by whoever activated it. The résumé feeds `fit_score` separately."
+    #
+    # It also fills `description` at activation with the role-generic form
+    # ("WHAT THIS ROLE IS in general"), so this is a short null window, not a
+    # permanent loss — and `analysis.py` already treats a null description as
+    # optional. The rich per-user rationale still reaches the UI in the
+    # suggestion RESPONSE; it just stops being written to a row it doesn't
+    # belong in.
     target, link = await _create_and_link(
         supabase,
         user_id=user_id,
-        payload=TargetCreate(
-            label=suggestion.label,
-            description=suggestion.description,
-        ),
+        payload=TargetCreate(label=suggestion.label),
         activation_status="deriving",
     )
     spawn_detached(
@@ -829,6 +860,63 @@ def _schedule_url_bg_tasks(
     )
 
 
+def _raw_url_label(extracted_title: str | None) -> str:
+    """The pre-canonicalization label: strip, fall back, truncate."""
+    return ((extracted_title or "").strip() or "Untitled Target")[:200]
+
+
+async def _canonical_url_label(
+    supabase: AsyncClient,
+    llm: LLMClient,
+    *,
+    user_id: str,
+    extracted_title: str | None,
+    jd_text: str,
+) -> str:
+    """Canonical role label for a posting, falling back to the raw title.
+
+    Deliberately non-fatal. This step improves the NAME; it is not what makes
+    the target work. A normalizer outage (provider 5xx, malformed JSON, schema
+    violation, budget breaker) must not turn a working create-from-URL into a
+    502 — the user would lose the whole flow to cosmetics. On any failure we
+    keep today's behavior exactly: the raw posting title.
+
+    The call is billed like every other: an unlogged LLM call makes the cost
+    ledger under-report real spend, which both loosens ``enforce_llm_budget``
+    (it reads that ledger) and makes the usage card lie. The sibling manual
+    path has always recorded its normalize call; this one must too.
+    """
+    raw = _raw_url_label(extracted_title)
+    try:
+        normalized, norm_result = await normalize_posting_title(llm, title=raw, jd_text=jd_text)
+    except Exception:
+        logger.warning(
+            "normalize_posting_title failed; falling back to the raw posting title",
+            exc_info=True,
+            extra={"raw_label": raw},
+        )
+        return raw
+
+    # Record before returning, and never let a ledger write cost the user the
+    # create — the label is already in hand by this point.
+    try:
+        await cost_log.record_async(
+            supabase,
+            user_id=user_id,
+            purpose=NORMALIZE_TITLE_PURPOSE,
+            result=norm_result,
+            metadata={"user_id": user_id, "raw_label": raw},
+        )
+    except Exception:
+        logger.warning("cost_log for normalize_posting_title failed", exc_info=True)
+
+    canonical = normalized.label.strip()
+    # An empty/whitespace label would produce a blank card and a useless dedup
+    # key; the schema's min_length should prevent it, but the fallback is one
+    # line and the failure mode is user-visible.
+    return canonical[:200] if canonical else raw
+
+
 async def from_url(
     supabase: AsyncClient,
     llm: LLMClient,
@@ -846,11 +934,24 @@ async def from_url(
 
     The label is ALWAYS derived from the posting's own title — there is no
     user-supplied title override (an inaccurate one poisons matching + the
-    shared catalog). Matching keys off that derived title, so duplicate
-    detection runs inline without any LLM call. The profile derivation + merge
-    + fit score + job materialization are all deferred to a detached task.
+    shared catalog). The profile derivation + merge + fit score + job
+    materialization are all deferred to a detached task.
+
+    The raw posting title is CANONICALIZED first (one inline LLM call). A
+    posting title sells one requisition at one company, so verbatim it yields
+    targets like "Senior Product Builder (Product Manager), Enterprise
+    Readiness & Admin Platform" — not a role profile, and unable to dedup,
+    because ``crud.normalize_label`` keeps punctuation and comma-suffixes in
+    the UNIQUE key. Canonicalizing has to precede ``find_matching_target``:
+    the canonical form is what matches and what becomes the dedup key.
     """
-    label = ((extracted_title or "").strip() or "Untitled Target")[:200]
+    label = await _canonical_url_label(
+        supabase,
+        llm,
+        user_id=user_id,
+        extracted_title=extracted_title,
+        jd_text=jd_text,
+    )
 
     matched = await find_matching_target(supabase, label)
     if matched is not None:

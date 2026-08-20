@@ -89,6 +89,7 @@ describe('JobUrlInput', () => {
         success: true,
         posting_id: 'p1',
         extracted: { title: 'Senior Engineer', company_name: 'Acme' },
+        description_html: '<p>Great job</p>',
       }),
     });
     const onComplete = jest.fn();
@@ -107,6 +108,38 @@ describe('JobUrlInput', () => {
     expect(onComplete).toHaveBeenCalledWith({
       postingId: 'p1',
       title: 'Senior Engineer',
+      descriptionHtml: '<p>Great job</p>',
+    });
+  });
+
+  it('threads a null descriptionHtml when the response has no JD', async () => {
+    jest.useFakeTimers();
+    // Older API responses (or extraction misses) omit description_html —
+    // the payoff must degrade to null, not undefined/crash.
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        success: true,
+        posting_id: 'p1',
+        extracted: { title: 'Senior Engineer', company_name: 'Acme' },
+      }),
+    });
+    const onComplete = jest.fn();
+    const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
+    render(<JobUrlInput onComplete={onComplete} onSkip={jest.fn()} />);
+
+    await user.type(screen.getByLabelText(/job posting url/i), URL);
+    await user.click(screen.getByRole('button', { name: /^add job$/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Senior Engineer')).toBeInTheDocument();
+    });
+
+    jest.advanceTimersByTime(1500);
+    expect(onComplete).toHaveBeenCalledWith({
+      postingId: 'p1',
+      title: 'Senior Engineer',
+      descriptionHtml: null,
     });
   });
 
@@ -152,11 +185,11 @@ describe('JobUrlInput', () => {
     });
   });
 
-  it('invokes onSkip when "Skip for now" is clicked', async () => {
+  it('invokes onSkip when "Skip this step" is clicked', async () => {
     const onSkip = jest.fn();
     const user = userEvent.setup();
     render(<JobUrlInput onComplete={jest.fn()} onSkip={onSkip} />);
-    await user.click(screen.getByRole('button', { name: /skip for now/i }));
+    await user.click(screen.getByRole('button', { name: /skip this step/i }));
     expect(onSkip).toHaveBeenCalledTimes(1);
   });
 });

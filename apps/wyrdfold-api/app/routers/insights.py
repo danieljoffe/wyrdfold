@@ -18,12 +18,23 @@ from supabase import AsyncClient
 
 from app.cache import insights_cache, make_cache_key
 from app.dependencies import (
+    get_async_service_supabase,
     get_async_user_supabase,
     get_current_user_id,
     verify_supabase_jwt,
 )
-from app.models.insights import PipelineInsights, SkillsCostInsights, TargetInsights
+from app.models.insights import (
+    NearMissInsights,
+    PipelineInsights,
+    SkillsCostInsights,
+    TargetInsights,
+)
 from app.services.insights import compute_pipeline, compute_skills_cost, compute_targets
+from app.services.relevance.near_miss import (
+    NEAR_MISS_CONFIDENCE_CEILING,
+    NEAR_MISS_WINDOW_DAYS,
+    compute_near_misses,
+)
 
 # JWT-only — insights are personal analytics. The api-key path would let a
 # leaked operator key dump cross-tenant aggregates.
@@ -99,11 +110,32 @@ async def _user_target_ids(supabase: AsyncClient, user_id: str) -> set[str]:
     ``crud.get_user_target_ids`` (which stays sync for its sync callers) — an
     async handler holds the async user client and can't hand it to that sync
     helper (#57 slice 3)."""
-    resp = (
-        await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
-    )
+    resp = await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
     rows = cast(list[dict[str, Any]], resp.data or [])
     return {r["target_id"] for r in rows}
+
+
+async def _member_target_rows(
+    supabase: AsyncClient, target_ids: set[str]
+) -> list[tuple[str, str, int]]:
+    """``(id, label, profile_version)`` for the caller's member targets.
+
+    Read on the caller's client, bounded to ids that came from
+    ``_user_target_ids`` — the membership resolution IS the authorization
+    boundary. ``targets`` itself is catalog-wide readable
+    (``targets_authenticated_read`` is ``qual: true``), so an unbounded
+    select here would return every catalog target, not the caller's.
+    """
+    resp = await (
+        supabase.table("targets")
+        .select("id, label, profile_version")
+        .in_("id", sorted(target_ids))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    return [
+        (str(r["id"]), str(r.get("label") or ""), int(r.get("profile_version") or 1)) for r in rows
+    ]
 
 
 # Handlers are `async def`: their DB reads run natively on the event loop via the
@@ -154,9 +186,7 @@ async def target_insights(
     target_ids = await _user_target_ids(supabase, user_id)
     if not target_ids:
         return _empty_targets()
-    result = await compute_targets(
-        supabase, _since(period), target_ids=target_ids, user_id=user_id
-    )
+    result = await compute_targets(supabase, _since(period), target_ids=target_ids, user_id=user_id)
     insights_cache.set(cache_key, result)
     return result
 
@@ -177,5 +207,44 @@ async def skills_cost_insights(
     result = await compute_skills_cost(
         supabase, _since(period), user_id=user_id, target_ids=target_ids
     )
+    insights_cache.set(cache_key, result)
+    return result
+
+
+@router.get("/near-misses")
+async def near_miss_insights(
+    user_id: str = Depends(get_current_user_id),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+    service: AsyncClient = Depends(get_async_service_supabase),
+) -> NearMissInsights:
+    """Low-confidence Phase-1 rejections per target — free mining of the
+    persistent rejection store (#703). Fixed 30d window, no period param:
+    near-misses are actionable-now target-tuning signals, not trends.
+
+    ``phase1_rejections`` is service-role-only, so the read runs on the
+    service client — but ONLY for target rows resolved through the
+    caller's OWN JWT-bound client first (#557 §2: a service read must
+    never trust caller-supplied target ids).
+    """
+    cache_key = make_cache_key(f"insights:near-misses:u={user_id}")
+    cached: NearMissInsights | None = insights_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    # MEMBERSHIP is the authorization boundary, and it lives on
+    # ``user_targets`` (RLS: auth.uid() = user_id) — NOT on ``targets``,
+    # which is catalog-wide readable (``targets_authenticated_read`` is
+    # ``qual: true``). Selecting targets directly on the caller client
+    # would return EVERY catalog target and leak other users' near-miss
+    # signals. Resolve the user's memberships first; only those ids bound
+    # the service-role rejection read.
+    target_ids = await _user_target_ids(supabase, user_id)
+    if not target_ids:
+        return NearMissInsights(
+            targets=[],
+            confidence_ceiling=NEAR_MISS_CONFIDENCE_CEILING,
+            window_days=NEAR_MISS_WINDOW_DAYS,
+        )
+    target_rows = await _member_target_rows(supabase, target_ids)
+    result = await compute_near_misses(service, target_rows)
     insights_cache.set(cache_key, result)
     return result

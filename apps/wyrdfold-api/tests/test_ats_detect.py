@@ -360,3 +360,36 @@ async def test_detect_smartrecruiters_from_api_url():
     assert result.provider == "smartrecruiters"
     assert result.board_token == "visa"
     assert result.job_count == 42
+
+
+# --- company_name board-noise cleaning (ux-sweep 2026-08-12 §D4) ---
+
+
+class TestCleanCompanyName:
+    def test_strips_careers_page_suffix(self):
+        from app.services.ats_detect import clean_company_name
+
+        assert clean_company_name("ATOMS Careers page") == "ATOMS"
+        assert clean_company_name("Acme Careers") == "Acme"
+        assert clean_company_name("Initech Career Site") == "Initech"
+        assert clean_company_name("Foo Job Board") == "Foo"
+        assert clean_company_name("Bar Jobs") == "Bar"
+
+    def test_keeps_clean_names_and_never_empties(self):
+        from app.services.ats_detect import clean_company_name
+
+        assert clean_company_name("Stripe") == "Stripe"
+        # A name that IS the noise word survives untouched rather than
+        # collapsing to an empty company.
+        assert clean_company_name("Careers") == "Careers"
+
+    def test_detect_result_normalizes_on_construction(self):
+        from app.services.ats_detect import DetectResult
+
+        result = DetectResult(
+            provider="lever",
+            board_token="atoms",
+            company_name="ATOMS Careers page",
+            job_count=3,
+        )
+        assert result.company_name == "ATOMS"

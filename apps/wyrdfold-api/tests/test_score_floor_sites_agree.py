@@ -64,9 +64,7 @@ _GRADED_SIGNAL_FORMS = (
 _FLOORED_RPCS = ("pipeline_counts", "get_cross_target_jobs")
 
 
-_ANY_FUNCTION_HEADER = re.compile(
-    r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+public\.", re.IGNORECASE
-)
+_ANY_FUNCTION_HEADER = re.compile(r"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+public\.", re.IGNORECASE)
 
 
 def _strip_sql_comments(sql: str) -> str:
@@ -107,9 +105,7 @@ def _latest_definition(fn_name: str) -> tuple[Path, str]:
         rf"CREATE\s+OR\s+REPLACE\s+FUNCTION\s+public\.{re.escape(fn_name)}\s*\(",
         re.IGNORECASE,
     )
-    hits = sorted(
-        path for path in MIGRATIONS_DIR.glob("*.sql") if pattern.search(path.read_text())
-    )
+    hits = sorted(path for path in MIGRATIONS_DIR.glob("*.sql") if pattern.search(path.read_text()))
     if not hits:
         raise AssertionError(f"no migration defines public.{fn_name}")
     latest = hits[-1]
@@ -304,9 +300,7 @@ def test_unfloored_rpc_stays_unfloored() -> None:
     instead; that guard is the only thing keeping the flat floor harmless.
     """
     source = JOBS_ROUTER.read_text()
-    guard = re.search(
-        r"if min_score and min_score > 0:\s*\n\s*raise _RpcIneligibleError\(", source
-    )
+    guard = re.search(r"if min_score and min_score > 0:\s*\n\s*raise _RpcIneligibleError\(", source)
     assert guard is not None, (
         "_list_jobs_for_target_rpc no longer bails out when min_score is set. "
         "get_target_jobs floors with a flat score >= p_min_score and cannot "

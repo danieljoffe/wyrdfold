@@ -1,8 +1,9 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Spinner } from '@danieljoffe/shared-ui/Spinner';
 import Button from '@/components/kit/Button';
+import ConfirmModal from '@/components/ConfirmModal';
 import LinkButton from '@/components/kit/LinkButton';
 import { useToast } from '@/state/Toast/ToastProvider';
 import { loadJobDescription } from './loadJobDescription';
@@ -13,6 +14,11 @@ interface CoverLetterSectionProps {
   jobPostingId: string;
   companyName: string;
   roleTitle: string;
+  /** The match analysis' recommendation, when it advises skipping. Present =
+   *  confirm before spending. Generation is billed per run, and a Skip job is
+   *  exactly where the model may decline to apply on the user's behalf — so
+   *  being charged for a refusal with no warning is the worst case. */
+  skipReason?: string | undefined;
 }
 
 /**
@@ -24,7 +30,9 @@ export default function CoverLetterSection({
   jobPostingId,
   companyName,
   roleTitle,
+  skipReason,
 }: CoverLetterSectionProps) {
+  const [confirmOpen, setConfirmOpen] = useState(false);
   const { toast } = useToast();
   const { record, loading, generating, error, generate } = useTailorDocument({
     jobPostingId,
@@ -41,7 +49,23 @@ export default function CoverLetterSection({
     if (!error) toastedRef.current = null;
   }, [error, toast]);
 
-  async function handleGenerate() {
+  /** Gate a billed run behind a confirm when the analysis says skip. */
+  function requestGenerate() {
+    if (skipReason) {
+      setConfirmOpen(true);
+      return;
+    }
+    void handleGenerate(false);
+  }
+
+  /**
+   * ``allowStretch`` is only ever true when the user has just confirmed the
+   * skip warning — that click IS the "I know it's a reach, write it anyway".
+   * Without forwarding it the model may decline on their behalf and bill them
+   * for the refusal, which is the exact failure the warning promised to let
+   * them push past.
+   */
+  async function handleGenerate(allowStretch: boolean) {
     const jd = await loadJobDescription(jobPostingId);
     if (!jd.ok) {
       toast({
@@ -59,6 +83,7 @@ export default function CoverLetterSection({
       job_posting_id: jobPostingId,
       company_name: companyName,
       role_title: roleTitle,
+      ...(allowStretch ? { allow_stretch: true } : {}),
     });
     if (ok) {
       toast({ variant: 'success', title: 'Cover letter generated' });
@@ -99,14 +124,31 @@ export default function CoverLetterSection({
   }
   if (!record) {
     return (
-      <Button
-        name='generate-cover-letter'
-        variant='secondary'
-        size='sm'
-        onClick={handleGenerate}
-      >
-        Generate Cover Letter
-      </Button>
+      <>
+        <Button
+          name='generate-cover-letter'
+          variant='secondary'
+          size='sm'
+          onClick={requestGenerate}
+        >
+          Generate cover letter
+        </Button>
+        {confirmOpen && (
+          <ConfirmModal
+            isOpen
+            onClose={() => setConfirmOpen(false)}
+            onConfirm={() => {
+              setConfirmOpen(false);
+              void handleGenerate(true);
+            }}
+            title='Generate anyway?'
+            message={`The match analysis recommends skipping this one: "${skipReason}" Generating a cover letter is billed per run. We'll write the strongest honest letter we can from your transferable experience.`}
+            confirmLabel='Generate anyway'
+            cancelLabel='Cancel'
+            name='cover-letter-spend-confirm'
+          />
+        )}
+      </>
     );
   }
   return (
@@ -125,11 +167,13 @@ export default function CoverLetterSection({
         flagged ? 'This draft failed ATS checks — open it to fix' : undefined
       }
     >
+      {/* Sentence case, matching ResumeSection's "Review tailored resume" —
+          the two buttons sit side by side in the same toolbar. */}
       {isApproved
-        ? 'View Cover Letter'
+        ? 'View cover letter'
         : flagged
-          ? 'Fix Cover Letter'
-          : 'Review Cover Letter'}
+          ? 'Fix cover letter'
+          : 'Review cover letter'}
     </LinkButton>
   );
 }

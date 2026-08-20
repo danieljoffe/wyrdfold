@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import LegalDocument, { type LegalSection } from '../_components/LegalDocument';
+import { LEGAL_ENTITY_ADDRESS, LEGAL_ENTITY_NAME } from '@/lib/legalEntity';
 
 const PRIVACY_EMAIL = 'privacy@wyrdfold.com';
 const LEGAL_EMAIL = 'legal@wyrdfold.com';
@@ -25,10 +26,10 @@ const SECTIONS: LegalSection[] = [
     heading: 'Who we are',
     body: (
       <p>
-        WyrdFold (“we”, “us”) is operated by [Legal Entity Name], [registered
-        address]. This policy explains what personal data we process when you
-        use WyrdFold and the choices you have. For any privacy question, contact
-        us at <MailLink address={PRIVACY_EMAIL} />.
+        WyrdFold (“we”, “us”) is operated by {LEGAL_ENTITY_NAME},{' '}
+        {LEGAL_ENTITY_ADDRESS}. This policy explains what personal data we
+        process when you use WyrdFold and the choices you have. For any privacy
+        question, contact us at <MailLink address={PRIVACY_EMAIL} />.
       </p>
     ),
   },
@@ -36,30 +37,47 @@ const SECTIONS: LegalSection[] = [
     heading: 'Information we collect',
     body: (
       <>
-        <p>We collect only what the service needs to run your job search:</p>
+        <p>
+          We collect the following categories of personal data to operate the
+          service:
+        </p>
         <ul className='ml-5 list-disc space-y-1'>
           <li>
-            <b>Account data</b> — your email address (sign-in is a magic link,
-            so we do not store a password).
+            <b>Account data</b> — your email address. We use magic-link sign-in,
+            so we do not store a password.
           </li>
           <li>
-            <b>Career profile</b> — the experience, resume text, skills, and
-            preferences you provide or import, and the roles you save, hide, or
-            give feedback on.
+            <b>Uploaded resumes</b> — including work history, education, skills,
+            and contact details.
           </li>
           <li>
-            <b>Generated documents</b> — the tailored resumes and cover letters
-            WyrdFold drafts for you.
+            <b>Derived experience documents</b> — structured profiles extracted
+            from your resumes to power our matching engine.
           </li>
           <li>
-            <b>Usage &amp; device data</b> — we may collect your IP address,
-            browser type, device identifiers, pages visited, referring URLs,
-            timestamps, and interactions with the service, used to operate and
-            improve it.
+            <b>Conversation transcripts</b> — your interactions with our AI
+            assistant during the job-search process.
           </li>
           <li>
-            <b>Billing data</b> — if you subscribe, your payment is handled by
-            Stripe; we receive subscription status, not your full card details.
+            <b>Generated outputs</b> — tailored resumes, cover letters, and
+            match scores produced for you.
+          </li>
+          <li>
+            <b>AI reasoning logs</b> — internal scoring and rationale generated
+            about your career history and job fit, used to rank matches and
+            never shared with employers.
+          </li>
+          <li>
+            <b>Job interactions</b> — roles you save, hide, or give feedback on.
+          </li>
+          <li>
+            <b>Usage &amp; device data</b> — IP address, browser type, pages
+            visited, timestamps, and feature interactions, used to operate and
+            improve the service.
+          </li>
+          <li>
+            <b>Billing data</b> — subscription status via Stripe. We do not
+            receive or store your full payment card details.
           </li>
         </ul>
       </>
@@ -87,8 +105,8 @@ const SECTIONS: LegalSection[] = [
           providers through <b>OpenRouter</b> (a service that securely routes
           requests to AI model providers).{' '}
           <b>Only the information necessary to complete your request is sent</b>
-          , and <b>Zero-Data-Retention</b> is enabled on that account, so those
-          providers do not retain your content after processing your request.
+          . We have requested <b>Zero-Data-Retention</b> from our providers and
+          are in the process of confirming its activation.
         </p>
         <p>
           If you provide your own AI provider API key (BYOK), we use it only to
@@ -110,11 +128,16 @@ const SECTIONS: LegalSection[] = [
             <b>Stripe</b> — subscription payments.
           </li>
           <li>
-            <b>Resend</b> — transactional and alert email.
+            <b>Voyage AI</b> — text embeddings used for job matching. Receives
+            job-posting text and role labels, not your resume.
           </li>
           <li>
-            <b>Sentry</b> and <b>Google Analytics</b> — error monitoring and
-            product analytics.
+            <b>Brave Search</b> and <b>Firecrawl</b> — discovering and fetching
+            public job postings. These receive job URLs and search queries, not
+            your personal data.
+          </li>
+          <li>
+            <b>Sentry</b> — error monitoring.
           </li>
         </ul>
       </>
@@ -180,7 +203,8 @@ const SECTIONS: LegalSection[] = [
         </p>
         <ul className='ml-5 list-disc space-y-1'>
           <li>
-            deleted accounts and their profile data are removed within 30 days;
+            when you delete your account via Settings, all data associated with
+            it is removed from our database immediately;
           </li>
           <li>
             backups that may still contain the data are cycled out within 30
@@ -230,21 +254,19 @@ const SECTIONS: LegalSection[] = [
     heading: 'Cookies and tracking',
     body: (
       <>
-        <p>We use a small number of cookies and similar technologies:</p>
+        <p>
+          We use only the cookies the service needs to function. We do not use
+          advertising or cross-site tracking cookies.
+        </p>
         <ul className='ml-5 list-disc space-y-1'>
           <li>
             <b>Essential &amp; authentication</b> — to keep you signed in and to
             secure the service. These are required for WyrdFold to work.
           </li>
-          <li>
-            <b>Analytics</b> — Google Analytics uses cookies and/or local
-            storage to help us understand usage.
-          </li>
         </ul>
         <p>
-          You can control non-essential cookies through your browser or any
-          consent controls we provide. WyrdFold does not currently respond to
-          browser “Do Not Track” signals.
+          You can control cookies through your browser. WyrdFold does not
+          currently respond to browser “Do Not Track” signals.
         </p>
       </>
     ),
@@ -297,8 +319,8 @@ const SECTIONS: LegalSection[] = [
     body: (
       <p>
         Questions about your privacy? Email <MailLink address={PRIVACY_EMAIL} />{' '}
-        (privacy) or <MailLink address={LEGAL_EMAIL} /> (legal), or write to
-        [Legal Entity Name], [registered address].
+        (privacy) or <MailLink address={LEGAL_EMAIL} /> (legal), or write to{' '}
+        {LEGAL_ENTITY_NAME}, {LEGAL_ENTITY_ADDRESS}.
       </p>
     ),
   },

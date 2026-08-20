@@ -67,6 +67,9 @@ _EXPORT_TABLES: tuple[str, ...] = (
     "source_registrations",  # deleted on erasure (the user's from-url board registrations)
     "user_api_keys",
     "contribution_votes",  # deleted on erasure
+    # The user's own "remove this posting from this target" curation. Deleted
+    # on erasure, so portability requires exporting it too.
+    "user_target_job_removals",
     "reference_jds",  # anonymized on erasure (the user's shared contributions)
 )
 
@@ -83,6 +86,16 @@ _EXPORT_TABLES: tuple[str, ...] = (
 # notifications_sent (read separately below) also has no authenticated
 # grant and stays on the service client for the same 42501 reason.
 _SERVICE_ROLE_TABLES: frozenset[str] = frozenset({"user_api_keys", "reference_jds"})
+
+# Per-user tables the export covers OUTSIDE the ``_EXPORT_TABLES`` loop because
+# they need more than "select * where user_id = $1":
+#   * notifications_sent — service-client read (no authenticated grant) gated on
+#     profile visibility, so the #88 cross-user backstop survives; see
+#     ``collect_user_data``.
+# Named here rather than left implicit so the export/erasure lockstep guard
+# (``test_export_inventory_in_lockstep_with_deletion``) still proves TOTAL
+# coverage instead of being loosened to tolerate a gap.
+_EXPORT_HANDLED_SEPARATELY: frozenset[str] = frozenset({"notifications_sent"})
 
 # user_api_keys is exported through this projection only — never the
 # ``ciphertext`` column. Listing the provider + last4 lets the user see
@@ -132,13 +145,22 @@ async def collect_user_data(
     profile_rows = await _select_all(supabase, "user_profiles", "user_id", user_id)
     data["user_profiles"] = profile_rows
 
-    # notifications_sent is keyed by user_profiles.id, not the auth uid —
-    # and has no SELECT policy, so it reads via the service client.
-    profile_id = str(profile_rows[0]["id"]) if profile_rows else None
-    if profile_id is not None:
-        data["notifications_sent"] = await _select_all(
-            service_supabase, "notifications_sent", "user_profile_id", profile_id
-        )
+    # notifications_sent has no authenticated SELECT grant, so it can only be
+    # read with the service client — which bypasses RLS and would therefore
+    # happily return ``user_id``'s rows to whoever asked. R3 §2 (#557) removed
+    # the ``user_profiles.id`` surrogate this used to be keyed by, but NOT the
+    # profile-visibility gate that came with it: the service read runs only if
+    # the caller's own RLS client could see that user's profile row. That keeps
+    # the #88 backstop (``test_rls_backstop_blocks_cross_user_export``) — a
+    # client collecting someone else's user_id gets an empty list, not their
+    # alert history. `user_api_keys` / `reference_jds` are read straight off the
+    # service client and do NOT have this property; this table keeps it because
+    # it costs one condition.
+    data["notifications_sent"] = (
+        await _select_all(service_supabase, "notifications_sent", "user_id", user_id)
+        if profile_rows
+        else []
+    )
 
     # scores has no user_id; pull the rows for the user's targets (already
     # collected above) so the export carries the Phase-2 grader fields

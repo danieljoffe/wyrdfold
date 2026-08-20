@@ -65,12 +65,21 @@ _USER_ID_TABLES: tuple[str, ...] = (
     "user_jobs",
     "status_log",
     "user_targets",
+    # The alert dedup ledger. Keyed by the auth uid since R3 §2 (#557,
+    # 20260811010000) — it used to carry a ``user_profiles.id`` surrogate and
+    # needed its own ordered step plus a profile lookup to erase.
+    "notifications_sent",
     # The user's personal link to a shared ``sources`` row (from-url board
     # registration). Deleted like ``user_targets``: the shared source survives
     # for the corpus, only this user's ownership/attribution is erased.
     "source_registrations",
     "contribution_votes",  # the user's anonymous ref-JD votes (#5 P3)
     "user_api_keys",
+    # "I removed this posting from this target" — purely the caller's own
+    # curation of their own list. Nothing shared hangs off it (the ``scores``
+    # row and the ``jobs`` row both survive for everyone else), so it is a
+    # plain delete rather than an anonymize.
+    "user_target_job_removals",
 )
 
 # Shared tables that carry a ``user_id`` but whose rows are NOT deleted on
@@ -121,10 +130,13 @@ async def delete_account(supabase: AsyncClient, *, user_id: str) -> dict[str, in
     3. scrub the user's derived PII from shared ``scores`` rows — the rows
        survive (shared catalog), only the Phase-2 grader fields are nulled
        (see the module docstring);
-    4. ``notifications_sent`` (keyed by ``user_profiles.id``, not the uid);
-    5. the ``user_profiles`` row;
-    6. the auth user — last, so a failure there leaves an empty,
+    4. the ``user_profiles`` row;
+    5. the auth user — last, so a failure there leaves an empty,
        re-onboardable account rather than orphaned data.
+
+    ``notifications_sent`` used to need its own ordered step here because it
+    was keyed by ``user_profiles.id``. R3 §2 (#557) repointed it at the auth
+    uid, so it erases in the step-2 loop like every other per-user table.
     """
     report: dict[str, int] = {}
 
@@ -172,18 +184,10 @@ async def delete_account(supabase: AsyncClient, *, user_id: str) -> dict[str, in
             reaped += 1
     report["targets_reaped"] = reaped
 
-    # 4. notifications_sent is keyed by user_profiles.id, not the auth uid.
-    profile_id = await _resolve_profile_id(supabase, user_id)
-    if profile_id is not None:
-        report["notifications_sent"] = await _delete_by(
-            supabase, "notifications_sent", "user_profile_id", profile_id
-        )
-
-    # 5. The profile row itself (also ON DELETE CASCADEs notifications_sent,
-    #    a no-op now that step 4 already cleared them).
+    # 4. The profile row itself.
     report["user_profiles"] = await _delete_by(supabase, "user_profiles", "user_id", user_id)
 
-    # 6. Finally the auth account.
+    # 5. Finally the auth account.
     await supabase.auth.admin.delete_user(user_id)
     report["auth_user"] = 1
 
@@ -209,18 +213,6 @@ async def _anonymize_user_id(supabase: AsyncClient, table: str, user_id: str) ->
     """
     resp = await supabase.table(table).update({"user_id": None}).eq("user_id", user_id).execute()
     return len(resp.data or [])
-
-
-async def _resolve_profile_id(supabase: AsyncClient, user_id: str) -> str | None:
-    resp = (
-        await supabase.table("user_profiles")
-        .select("id")
-        .eq("user_id", user_id)
-        .limit(1)
-        .execute()
-    )
-    rows = cast(list[dict[str, Any]], resp.data or [])
-    return str(rows[0]["id"]) if rows else None
 
 
 async def _user_target_ids(supabase: AsyncClient, user_id: str) -> list[str]:
@@ -268,9 +260,6 @@ async def _scrub_shared_scores(supabase: AsyncClient, target_ids: list[str]) -> 
     update_payload: dict[str, Any] = dict.fromkeys(_SCORE_PII_COLUMNS, None)
     update_payload["scoring_status"] = "stage2"
     resp = (
-        await supabase.table("scores")
-        .update(update_payload)
-        .in_("target_id", target_ids)
-        .execute()
+        await supabase.table("scores").update(update_payload).in_("target_id", target_ids).execute()
     )
     return len(resp.data or [])

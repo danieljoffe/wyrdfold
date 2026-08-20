@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
+import { formatCompanyName } from '@/lib/formatCompanyName';
+import { localDateStamp } from '@/lib/localDateStamp';
 import {
   ArrowLeft,
   Download,
@@ -24,7 +26,7 @@ import MarkdownPreviewEditor from '@/components/MarkdownPreviewEditor';
 import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
-import { isFlaggedDraft } from '../../types';
+import { hasRestorableMarkdown, isFlaggedDraft } from '../../types';
 import type {
   AtsRecheckResponse,
   JobPosting,
@@ -83,12 +85,22 @@ export default function ResumeReviewPage({
   } = useTailorDocument({ jobPostingId, kind: 'resume' });
 
   const [postingLoading, setPostingLoading] = useState(true);
-  const [notFound, setNotFound] = useState(false);
+  // ``GET /jobs/{id}`` gates on a ``scores`` row (privacy boundary), so a
+  // just-added manual posting 404s until background scoring lands — exactly
+  // the window the onboarding path-A payoff arrives in (#720 follow-up,
+  // release smoke 2026-08-13). A missing posting therefore degrades the
+  // chrome (subtitle, filename slug) but must never gate the document:
+  // the draft is the user's own, fetched per-user via by-job.
+  const [postingMissing, setPostingMissing] = useState(false);
   const [approving, setApproving] = useState(false);
   const [unapproving, setUnapproving] = useState(false);
   const [rechecking, setRechecking] = useState(false);
   const [lintWarnings, setLintWarnings] = useState<LintViolation[]>([]);
   const [confirmReadaptOpen, setConfirmReadaptOpen] = useState(false);
+  // Which length the pending re-adapt should target. The API has accepted
+  // `page_budget` since the tailor pipeline was written, but nothing in the UI
+  // ever set it, so every resume came back at the 2-page default.
+  const [readaptPages, setReadaptPages] = useState<1 | 2>(2);
   // The version awaiting restore confirmation; null when no dialog is open.
   const [versionToRestore, setVersionToRestore] =
     useState<ResumeVersion | null>(null);
@@ -103,11 +115,15 @@ export default function ResumeReviewPage({
   // is absent — the production API populates it, but unit-test fixtures
   // often elide payload internals.
   const defaultFilename = useMemo(() => {
-    if (!record || !posting) return '';
+    if (!record) return '';
     const name =
       (record.payload as { contact?: { name?: string } }).contact?.name ??
       'resume';
-    return `${slugify(name)}-${slugify(posting.company_name)}-${new Date().toISOString().slice(0, 10)}`;
+    // Without the posting (still scoring — see ``postingMissing``) there is
+    // no company to slug; a name-date filename beats blocking the download.
+    return posting
+      ? `${slugify(name)}-${slugify(formatCompanyName(posting.company_name))}-${localDateStamp()}`
+      : `${slugify(name)}-${localDateStamp()}`;
   }, [record, posting]);
 
   // The posting is fetched independently of the document — the hook owns the
@@ -117,7 +133,7 @@ export default function ResumeReviewPage({
     try {
       const jobRes = await fetch(`/api/jobs/${jobPostingId}`);
       if (jobRes.status === 404) {
-        setNotFound(true);
+        setPostingMissing(true);
         return;
       }
       if (!jobRes.ok) {
@@ -374,7 +390,7 @@ export default function ResumeReviewPage({
   }
 
   async function handleDownload() {
-    if (!record || !posting) return;
+    if (!record) return;
     const ok = await flushPendingSave();
     if (!ok) return;
     try {
@@ -425,6 +441,7 @@ export default function ResumeReviewPage({
       job_description: record.jd_snapshot,
       job_posting_id: record.job_posting_id,
       force_fresh: true,
+      page_budget: readaptPages,
     });
     if (ok) {
       toast({ variant: 'success', title: 'Resume re-adapted with AI' });
@@ -466,24 +483,15 @@ export default function ResumeReviewPage({
   }
 
   function restoreVersion(version: ResumeVersion) {
-    // Versions before the markdown pivot stored only structured payload.
-    // Newer versions include payload_md. We fall back to current markdown
-    // if the snapshot has no markdown to restore.
-    const md = (version as ResumeVersion & { payload_md?: string | null })
-      .payload_md;
-    if (!md) {
-      toast({
-        variant: 'error',
-        title: 'This version predates markdown — cannot restore',
-      });
-      return;
-    }
+    // Guarded by ``hasRestorableMarkdown`` at the call site, so this only
+    // fires for snapshots that genuinely carry markdown. Kept as a
+    // belt-and-braces check rather than a user-facing dead end.
+    if (!hasRestorableMarkdown(version)) return;
     setVersionToRestore(version);
   }
 
   async function performRestore(version: ResumeVersion) {
-    const md = (version as ResumeVersion & { payload_md?: string | null })
-      .payload_md;
+    const md = version.payload_md;
     if (!md) return;
     // Snapshot the current draft before swapping markdown so the
     // pre-restore content is recoverable from the same version
@@ -510,7 +518,12 @@ export default function ResumeReviewPage({
   const documentMissing =
     !recordLoading && !generating && !record && !generationError;
 
-  if (notFound || documentMissing) {
+  // ``postingMissing`` deliberately does NOT reach this gate: the posting
+  // 404s until scoring lands (see its declaration), and the payoff flow
+  // arrives before that. Only the DOCUMENT's absence means "not found" —
+  // a foreign/garbage posting id has no document either, so it still ends
+  // here.
+  if (documentMissing) {
     return (
       <div className='mx-auto max-w-4xl p-6'>
         <Heading variant='hero' as='h1'>
@@ -566,7 +579,12 @@ export default function ResumeReviewPage({
     );
   }
 
-  if (postingLoading || recordLoading || !record || !posting) {
+  if (
+    postingLoading ||
+    recordLoading ||
+    !record ||
+    (!posting && !postingMissing)
+  ) {
     return (
       <div
         className='mx-auto max-w-4xl space-y-4 p-6'
@@ -616,13 +634,33 @@ export default function ResumeReviewPage({
     v => v.severity === 'error'
   );
 
+  // Warnings live on the RECORD, not just in state (#12). They used to be set
+  // only by a re-check response, so a warning from the original generation was
+  // invisible until you happened to re-run the check — and vanished again on
+  // reload. ``lintWarnings`` state still wins when populated: it carries
+  // violations from a REJECTED save, which describe markdown that is on screen
+  // but was never persisted, so the record cannot know about them.
+  const recordWarnings = (record.lint_violations ?? []).filter(
+    v => v.severity === 'warning'
+  );
+  const shownWarnings = lintWarnings.length > 0 ? lintWarnings : recordWarnings;
+
+  // Three-state lint contract (#656): ``null`` = never linted, ``[]`` = linted
+  // with nothing to report, non-empty = violations. Only a record that was
+  // ACTUALLY linted may claim a pass — an unlinted one must stay silent rather
+  // than imply a check it never ran.
+  const atsClean = record.lint_violations != null && lintErrors.length === 0;
+
   return (
     <div className='mx-auto max-w-4xl space-y-4 p-6'>
       <div className='flex items-center justify-between'>
         <Breadcrumbs
           items={[
             { label: 'Jobs', href: '/jobs' },
-            { label: crumbLabel(posting.title), href: `/jobs/${jobPostingId}` },
+            {
+              label: crumbLabel(posting?.title ?? 'Job'),
+              href: `/jobs/${jobPostingId}`,
+            },
             { label: 'Resume' },
           ]}
         />
@@ -630,6 +668,13 @@ export default function ResumeReviewPage({
           {flagged && (
             <Badge variant='error' size='sm'>
               Needs fixes
+            </Badge>
+          )}
+          {/* #12: the pass result used to exist only in a 4s toast, so a user
+              who looked away could not tell "passed" from "never checked". */}
+          {atsClean && !flagged && (
+            <Badge variant='success' size='sm'>
+              ATS clean
             </Badge>
           )}
           {isApproved && (
@@ -645,7 +690,15 @@ export default function ResumeReviewPage({
           Review tailored resume
         </Heading>
         <Text variant='body' className='text-text-secondary'>
-          {posting.title} &mdash; {posting.company_name}
+          {posting ? (
+            <>
+              {posting.title} &mdash; {formatCompanyName(posting.company_name)}
+            </>
+          ) : (
+            // Scoring hasn't linked the posting to a target yet, so the
+            // job detail is temporarily unavailable — the draft isn't.
+            'Job details are still processing — they\u2019ll appear here shortly.'
+          )}
         </Text>
       </div>
 
@@ -708,13 +761,13 @@ export default function ResumeReviewPage({
         </div>
       )}
 
-      {lintWarnings.length > 0 && (
+      {shownWarnings.length > 0 && (
         <div className='rounded-md border border-warning/30 bg-warning/10 p-3'>
           <Text variant='caption' className='mb-1 text-warning'>
             ATS Lint
           </Text>
           <ul className='list-inside list-disc space-y-1'>
-            {lintWarnings.map((w, i) => (
+            {shownWarnings.map((w, i) => (
               <li key={i}>
                 <Text variant='meta' as='span'>
                   [{w.code}] {w.message}
@@ -725,21 +778,17 @@ export default function ResumeReviewPage({
         </div>
       )}
 
+      {/* Cost only — tokens/model/latency are developer telemetry (ux-sweep
+          2026-08-12 §C12); they stay reachable in the native tooltip. */}
       <div className='flex flex-wrap gap-x-4 gap-y-1 rounded-md bg-surface-secondary px-3 py-2'>
-        <Text variant='meta' as='span'>
-          Cost: ${record.cost_usd.toFixed(4)}
-        </Text>
-        <Text variant='meta' as='span'>
-          Tokens:{' '}
-          <LocalNumber value={record.input_tokens + record.output_tokens} />
-        </Text>
-        {record.model && (
-          <Text variant='meta' as='span'>
-            Model: {record.model}
-          </Text>
-        )}
-        <Text variant='meta' as='span'>
-          Latency: {(record.latency_ms / 1000).toFixed(1)}s
+        <Text
+          variant='meta'
+          as='span'
+          title={`${record.input_tokens + record.output_tokens} tokens · ${
+            record.model ?? 'unknown model'
+          } · ${(record.latency_ms / 1000).toFixed(1)}s`}
+        >
+          Generated for ${record.cost_usd.toFixed(4)}
         </Text>
       </div>
 
@@ -797,23 +846,36 @@ export default function ResumeReviewPage({
                         <LocalDateTime value={v.created_at} />
                       </Text>
                     </span>
-                    {!isApproved && (
-                      <Button
-                        name={`restore-version-${v.id}`}
-                        variant='bare'
-                        className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
-                        size='sm'
-                        // "Load" by itself is ambiguous to SR users
-                        // when several versions are listed — they'd
-                        // hear "Load" repeated with no way to
-                        // distinguish. Disambiguate via the version
-                        // source + timestamp.
-                        aria-label={`Load ${v.source.replace('_', ' ')} version from ${new Date(v.created_at).toLocaleString()}`}
-                        onClick={() => restoreVersion(v)}
-                      >
-                        Load
-                      </Button>
-                    )}
+                    {!isApproved &&
+                      (hasRestorableMarkdown(v) ? (
+                        <Button
+                          name={`restore-version-${v.id}`}
+                          variant='bare'
+                          className='text-text-secondary hover:bg-surface-elevated hover:text-text-primary'
+                          size='sm'
+                          // "Load" by itself is ambiguous to SR users
+                          // when several versions are listed — they'd
+                          // hear "Load" repeated with no way to
+                          // distinguish. Disambiguate via the version
+                          // source + timestamp.
+                          aria-label={`Load ${v.source.replace('_', ' ')} version from ${new Date(v.created_at).toLocaleString()}`}
+                          onClick={() => restoreVersion(v)}
+                        >
+                          Load
+                        </Button>
+                      ) : (
+                        // Say so up front instead of offering a button that
+                        // only fails on click. Reachable now only for rows
+                        // written before the snapshot carried markdown.
+                        <Text
+                          variant='meta'
+                          as='span'
+                          className='text-text-tertiary'
+                          title='This snapshot stored no markdown, so there is nothing to restore.'
+                        >
+                          Not restorable
+                        </Text>
+                      ))}
                   </li>
                 ))}
               </ul>
@@ -896,7 +958,27 @@ export default function ResumeReviewPage({
                 {
                   label: 'Re-adapt with AI',
                   icon: <RotateCcw className='size-4' aria-hidden />,
-                  onClick: () => setConfirmReadaptOpen(true),
+                  onClick: () => {
+                    setReadaptPages(2);
+                    setConfirmReadaptOpen(true);
+                  },
+                  disabled:
+                    generating ||
+                    approving ||
+                    saveStatus === 'saving' ||
+                    isApproved,
+                },
+                {
+                  // Two entries rather than a length setting tucked elsewhere:
+                  // the choice only matters at the moment you regenerate, and
+                  // a separate control would be a state the user has to
+                  // remember they set.
+                  label: 'Re-adapt to one page',
+                  icon: <RotateCcw className='size-4' aria-hidden />,
+                  onClick: () => {
+                    setReadaptPages(1);
+                    setConfirmReadaptOpen(true);
+                  },
                   disabled:
                     generating ||
                     approving ||
@@ -965,9 +1047,11 @@ export default function ResumeReviewPage({
         onConfirm={handleReadapt}
         title='Re-adapt resume?'
         message={
-          isApproved
-            ? 'Generate a new resume from scratch? This will replace the approved resume — the current one stays in version history but will no longer be the active draft.'
-            : 'Re-generate this resume from scratch? Current draft is saved as a version first.'
+          `${
+            isApproved
+              ? 'Generate a new resume from scratch? This will replace the approved resume — the current one stays in version history but will no longer be the active draft.'
+              : 'Re-generate this resume from scratch? Current draft is saved as a version first.'
+          } Target length: ${readaptPages === 1 ? 'one page' : 'two pages'}.`
         }
         confirmLabel='Regenerate'
         loading={generating}

@@ -141,7 +141,15 @@ export default function SettingsPage() {
   // on first render so the two never disagree about the initial tab. No
   // activeTab state — nothing here renders differently by tab (unlike
   // TargetDetail's lazy JD fetch); the URL is the only consumer.
-  const initialTabRef = useRef(parseTab(searchParams.get('tab')));
+  // Returning from Stripe (?billing=success|cancelled) must land on the
+  // Account tab — the card that reflects what just happened. Without this
+  // the user lands on Preferences (export styles, score threshold) after
+  // paying, and never sees their new plan (#863).
+  const initialTabRef = useRef(
+    searchParams.get('billing')
+      ? ('account' as const)
+      : parseTab(searchParams.get('tab'))
+  );
 
   const handleTabChange = useCallback(
     (tabId: string) => {
@@ -565,8 +573,8 @@ export default function SettingsPage() {
               </Text>
               {!emailAvailable && (
                 <Text variant='meta' className='text-text-tertiary'>
-                  Email notifications are unavailable until the operator
-                  configures the email provider credentials.
+                  Email notifications aren&rsquo;t available on this server yet
+                  — check back soon.
                 </Text>
               )}
               {emailAvailable && prefs?.email && (
@@ -619,8 +627,8 @@ export default function SettingsPage() {
               </Text>
               {!smsAvailable && (
                 <Text variant='meta' className='text-text-tertiary'>
-                  SMS notifications are unavailable until the operator
-                  configures Twilio credentials.
+                  SMS notifications aren&rsquo;t available on this server yet —
+                  check back soon.
                 </Text>
               )}
               <Text variant='meta' className='text-text-tertiary'>

@@ -136,6 +136,15 @@ class Settings(BaseSettings):
     # rate-can't-be-computed cases — a fresh stats window, or a pipeline
     # already starved to ~$0/day). 0 disables the floor rule.
     llm_credit_min_remaining_usd: float = Field(default=2.0, ge=0.0)
+    # Early warning for a SELF-RESETTING key cap (a $N/day key limit):
+    # alarm once this fraction of the current window's cap is consumed.
+    # Runway-days is the wrong lens for a resetting cap — it reads
+    # permanently low (cap ÷ trailing rate), so the 2026-08-13 daily-cap
+    # exhaustion alarmed only at $0.00, after the pipeline was already
+    # dead, and kept alarming after the cap was raised. The fraction rule
+    # fires while there is still budget to act on (warning at the
+    # threshold, error at exhaustion). 0 disables it.
+    llm_credit_key_cap_alert_fraction: float = Field(default=0.8, ge=0.0, le=1.0)
 
     # BYOK (#5). Master key for AES-256-GCM envelope encryption of
     # per-user provider API keys at rest in `user_api_keys`. Base64 of
@@ -233,20 +242,38 @@ class Settings(BaseSettings):
     # See app/services/retention.py.
     retention_purge_enabled: bool = False
     retention_purge_tick_hours: int = Field(default=24, ge=1, le=720)
+
+    # Activation staleness sweep (#557 §3 / #649). `deriving` and `polling` are
+    # IN-FLIGHT states — a detached task is supposed to be advancing them. When
+    # that task dies nothing notices, and the target is stranded (prod had one
+    # sitting in `polling` for 27 days). This sweep converges such rows back to
+    # `idle`, the re-activatable state, so they heal on the user's next visit.
+    # Opt-in, like every other sweep here (retention/url_health/discovery): a
+    # self-hosted deployment should not get unrequested background writes. The
+    # one-shot heal in 20260811020000 fixes rows already stranded; this flag is
+    # the ONGOING guard, so prod wants ACTIVATION_SWEEP_ENABLED=true.
+    activation_sweep_enabled: bool = False
+    activation_sweep_tick_hours: int = Field(default=6, ge=1, le=168)
+    # Deliberately generous: the cutoff keys on `updated_at`, which a running
+    # pipeline does not touch BETWEEN status transitions, so a tight window
+    # could reclaim a live activation. Hours, not minutes.
+    activation_stale_after_hours: int = Field(default=6, ge=1, le=720)
     # llm_costs.created_at feeds the rolling budget windows (≤30d) and the
     # cost/insights history, so the floor is a year; 0 = keep forever.
     llm_costs_retention_days: int = Field(default=365, ge=0)
     # notifications_sent.sent_at is the alert-dedup ledger; 180d is well
     # past any posting's active life. 0 = keep forever.
     notifications_sent_retention_days: int = Field(default=180, ge=0)
-    # prescan_shadow.observed_at — the pre-scan disagreement shadow log
-    # (#60): explicitly TEMPORARY analysis data with no other lifecycle
-    # (2026-07-02 audit). 30d covers an analysis window; 0 = keep forever.
-    prescan_shadow_retention_days: int = Field(default=30, ge=0)
     # search_events.occurred_at — the search-funnel metrics ledger (#467
     # §10 PR6). `query` is user input, so bounded retention is part of the
     # privacy posture; 90d covers funnel iteration. 0 = keep forever.
     search_events_retention_days: int = Field(default=90, ge=0)
+    # phase1_rejections.judged_at — the persistent Phase-1 negative-verdict
+    # store. Rows older than the read TTL (phase1_rejection_ttl_hours,
+    # default 60d) are dead weight the read path already ignores; sweep at
+    # TTL + slack so a TTL raise never races the sweep. Also collects rows
+    # stranded under stale profile_versions. 0 = keep forever.
+    phase1_rejections_retention_days: int = Field(default=90, ge=0)
 
     # Firecrawl — set API key to enable JS-rendered page extraction fallback.
     firecrawl_api_key: str = Field(default="", repr=False)
@@ -372,6 +399,11 @@ class Settings(BaseSettings):
     # description" (title/company/location only).
     qualification_jd_snippet_chars: int = Field(default=600, ge=0)
 
+    # deepseek-v3-2 won the bake-off on quality-per-dollar (100% valid JSON,
+    # ~6x the recall of the sub-cent tier, ~1/14th of Sonnet's cost). Pinned
+    # into the prompt-regression golden so a swap can't merge silently.
+    skills_extraction_model: ModelId = "deepseek-v3-2"
+
     # US-only corpus (#60 workstream B). When on, the qualification tagger
     # ARCHIVES (stamps ``archived_at``) a job the instant it tags it
     # high-confidence non-US — closing the loop between the L2 ``is_us``
@@ -479,7 +511,31 @@ class Settings(BaseSettings):
     # preserved — score-neutral within grader sampling noise. Historical
     # scores are NOT backfilled (per the user); the column populates on
     # newly-graded jobs going forward.
-    logistics_extraction_enabled: bool = True
+    #
+    # Flipped back OFF 2026-08-18 (#846): the boards publish these facts and we
+    # now read them. Ashby/Lever/SmartRecruiters state remote, employment type
+    # and country outright; Greenhouse/Workday state remote in the location
+    # string, which ``location_parse`` already reads. Paying a reasoning model
+    # to infer the employer's own answer bought nothing — and the /jobs filter
+    # already PREFERS the deterministic columns, keeping the grader's output as
+    # a fallback that covers "graded rows only" (~4% for country, per
+    # ``routers/jobs.py``). So this turns off a minority fallback, not the
+    # primary source. Salary is unaffected: that filter reads jobs.salary_*,
+    # parsed deterministically from the posting's own salary text.
+    logistics_extraction_enabled: bool = False
+
+    # Skills harvest (plan-phase2-structured-harvest.md): the Phase-2 grader
+    # additionally emits skills_required / skills_matched / skills_missing —
+    # structured, normalized, capped lists mined from the SAME read that
+    # produces the grade (marginal cost ≈ output tokens only). Purely
+    # informational, never a score input; the eval re-baseline that shipped
+    # this flag proved band stability with the addendum on. Fields persist to
+    # the scores row (pair-level, denormalized for the insights aggregation —
+    # the analyses-only source covered ~146 rows ever). It does NOT write
+    # jobs.skills_required: that column is the search facet, owned solely by
+    # the skill dictionary so the vocabulary stays canonical.
+    # Historical grades are NOT backfilled; columns populate as jobs (re)grade.
+    skills_harvest_enabled: bool = True
 
     # Learner re-score projection / learning-rate cap (#5 P4). Before a
     # high-confidence ``ProfilePatch`` auto-applies, the learner projects the
@@ -536,6 +592,10 @@ class Settings(BaseSettings):
     # root logger so log-aggregation tools can index each field. See
     # app/logging_config.py.
     log_format: Literal["text", "json"] = "text"
+    #: Root log level. Separate from ``log_format`` on purpose — they were
+    #: entangled once and production lost every INFO record for it (#862).
+    #: Tunable without a deploy so verbosity can be raised during an incident.
+    log_level: str = "INFO"
 
     # CORS — comma-separated allowlist of origins permitted to call the API
     # from a browser. Empty disables CORS (server-to-server only). Production
@@ -587,19 +647,19 @@ class Settings(BaseSettings):
     # over-budget boards surface via the WARNING log = catalog-hygiene
     # candidates. Keep it well under poll_cycle_timeout_seconds. 0 disables.
     poll_source_budget_seconds: int = Field(default=300, ge=0)
-    # In-process TTL cache for Phase-1 REJECTED titles (#514 residual). A
-    # rejected candidate never ingests, so the same title re-enters triage
-    # every poll cycle and re-pays the LLM verdict at the source's cadence
-    # (~4h) until the posting closes. Measured 2026-07-29:
-    # relevance.title_triage = 17,843 calls / $8.34 over 7 days — the
-    # dominant LLM line item, mostly repeat verdicts on unchanged titles.
-    # A rejection is remembered per (target, profile_version, title) for
-    # this many hours; profile edits bump profile_version, which re-judges
-    # everything under the new profile immediately. In-memory only: a
-    # restart clears it (worst case = one extra verdict per title), and the
-    # poller holds a fleet-wide advisory lock so exactly one process polls.
-    # 0 disables.
-    phase1_rejection_ttl_hours: float = Field(default=24.0, ge=0.0)
+    # TTL for the persistent Phase-1 rejection store (#514; the
+    # ``phase1_rejections`` table — see
+    # docs/plan-phase1-rejection-persistence.md). A rejected candidate never
+    # ingests, so the same title re-enters triage every poll of its source
+    # until the posting closes; the store remembers the "no" per
+    # (target, profile_version, normalized title) so it isn't re-bought.
+    # Profile edits bump profile_version, which re-judges everything under
+    # the new profile immediately — the TTL exists only to bound staleness
+    # against prompt/model drift, NOT as the primary lifecycle. Its
+    # in-process predecessor defaulted to 24h and re-billed the entire
+    # standing rejected corpus daily (~75-90% of Phase-1 volume, measured
+    # 2026-08-12); 1440h = 60 days. 0 disables the store entirely.
+    phase1_rejection_ttl_hours: float = Field(default=1440.0, ge=0.0)
     # Postgres advisory-lock key for the scheduled poll. A single stable
     # bigint so only ONE poll runs at a time across every replica AND the
     # Vercel cron — pg_try_advisory_lock returns false to a second caller,
@@ -772,9 +832,51 @@ class Settings(BaseSettings):
     free_max_active_targets: int = Field(default=1, ge=1)
     starter_max_active_targets: int = Field(default=2, ge=1)
     pro_max_active_targets: int = Field(default=5, ge=1)
+    # Trial tier (#841): a new account runs on HOST keys so onboarding works,
+    # bounded by BOTH a total spend ceiling and a duration.
+    #
+    # The ceiling is the real control and the duration is the backstop — an
+    # idle trial still costs money every poll cycle, so time-boxing is what
+    # stops background spend on an account that has stopped converting.
+    #
+    # Unlike starter/pro this budget counts BACKGROUND purposes too
+    # (``PlanEntitlements.quota_excluded_purposes is None``): a paid tier
+    # excludes them because a subscription is already paying for them, which
+    # a trial has nothing behind. Excluding them here would leave the ceiling
+    # bounding only the cheap half.
+    #
+    # The window is NOT a new mechanic — the budget guard's rolling window is
+    # ``MONTHLY_WINDOW_DAYS`` (30) and the trial is far shorter, so "spend in
+    # the last 30 days" IS "spend during the trial" for any trial account.
+    # Keep ``trial_days`` well under that or the ceiling stops being a total.
+    #
+    # Defaults are deliberately conservative — the repo is public, so the real
+    # values belong in the environment, not here.
+    trial_days: int = Field(default=3, ge=1)
+    trial_billable_budget_usd: float = Field(default=1.0, ge=0.0)
+    trial_max_active_targets: int = Field(default=1, ge=1)
     # On-click deep job analysis: max LLM-backed runs per user per rolling
     # 24h. Cache hits don't write llm_costs rows, so re-views stay free.
     analysis_daily_limit: int = Field(default=20, ge=0)
+    # Grade CATALOG-ONLY targets — ``app_active`` rows with no active
+    # ``user_targets`` link, i.e. seed targets nobody is pursuing. Their
+    # Phase-1/Phase-2 grading bills the INSTANCE key, and measured against
+    # prod it is the dominant line item while serving nobody: the scores it
+    # writes are re-derived anyway by the activation fan-out
+    # (``bulk_title_score_for_target``, "runs at target activation so postings
+    # that pre-date the target still appear").
+    #
+    # Default False = seed targets still POLL (sources fetched, jobs ingested,
+    # discovery runs — the catalog keeps growing, which is what they exist for)
+    # but are not LLM-graded until a real user activates them.
+    #
+    # SAFE because public ``/search`` reads the ``jobs`` table and skips
+    # ``scores`` entirely (``services/job_search.py``) — ``promising`` does not
+    # gate the public corpus. NB an EARLIER rule ("never spend money nobody
+    # will consume") did starve that corpus, but it dropped catalog targets
+    # from the ACTIVE SET, killing their source polling. This flag is narrower
+    # by construction: it gates grading only and never touches polling.
+    grade_catalog_targets: bool = False
     # Max concurrent backgrounded tailoring runs per user (#656). Backgrounding
     # the ~39s resume pipeline removed the serialization a blocking request
     # imposed on a browser tab, and `enforce_llm_budget` meters spend whose

@@ -40,26 +40,48 @@ const MIN_SALARY_OPTIONS: { value: string; label: string }[] = [
   { value: '200000', label: '$200k+' },
 ];
 
+// Ordered by how many postings the corpus actually holds, so the common
+// choices sit at the top of the menu. Values are ISO alpha-2 because the API
+// caps `country` at 4 chars; the server folds them onto the stored display
+// form (`GB`->`UK`, `CA`->`Canada`) via `canonical_country` (#805).
+//
+// Hand-maintained, and it will drift as the corpus grows — a country missing
+// from this list is unreachable from the UI even though the filter would
+// handle it. Worth replacing with a distinct-countries endpoint if the list
+// starts changing often.
 const COUNTRY_OPTIONS: { value: string; label: string }[] = [
   { value: '', label: 'Any country' },
   { value: 'US', label: 'United States' },
-  { value: 'CA', label: 'Canada' },
   { value: 'GB', label: 'United Kingdom' },
+  { value: 'PH', label: 'Philippines' },
+  { value: 'IN', label: 'India' },
+  { value: 'MY', label: 'Malaysia' },
+  { value: 'CA', label: 'Canada' },
+  { value: 'HU', label: 'Hungary' },
   { value: 'DE', label: 'Germany' },
+  { value: 'AU', label: 'Australia' },
+  { value: 'BR', label: 'Brazil' },
+  { value: 'IT', label: 'Italy' },
+  { value: 'CR', label: 'Costa Rica' },
+  { value: 'FR', label: 'France' },
+  { value: 'MX', label: 'Mexico' },
 ];
 
 const SORT_LABEL: Record<JobsSortColumn, string> = {
   score: 'Score',
   title: 'Title',
   company_name: 'Company',
-  created_at: 'Posted',
+  posted_at: 'Posted',
+  // Not offered in SORT_COLUMNS — the token stays valid so an old bookmarked
+  // ``?sort=created_at`` still resolves (to our catalog date) instead of 422ing.
+  created_at: 'Added',
 };
 
 const SORT_COLUMNS: JobsSortColumn[] = [
   'score',
   'title',
   'company_name',
-  'created_at',
+  'posted_at',
 ];
 
 interface JobsFilterProps {

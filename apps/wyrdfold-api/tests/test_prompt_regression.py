@@ -40,6 +40,7 @@ _PROMPTS: tuple[tuple[str, str], ...] = (
     ("phase1_triage.system", "app.services.relevance.title_triage:_SYSTEM_PROMPT"),
     ("phase2_fit.system", "app.services.fit.job_fit:_SYSTEM_PROMPT"),
     ("phase2_fit.logistics_addendum", "app.services.fit.job_fit:_LOGISTICS_PROMPT_ADDENDUM"),
+    ("phase2_fit.skills_addendum", "app.services.fit.job_fit:_SKILLS_PROMPT_ADDENDUM"),
     (
         "derive_target_from_label.generic",
         "app.services.targets.derive_profile_from_label:SYSTEM_PROMPT_GENERIC",
@@ -49,9 +50,41 @@ _PROMPTS: tuple[tuple[str, str], ...] = (
     ("lateral_discovery.system", "app.services.targets.lateral_discovery:_SYSTEM_PROMPT"),
     ("target_fit_score.system", "app.services.targets.fit_score:SYSTEM_PROMPT"),
     ("cover_letter.system", "app.services.tailor.prompts:COVER_LETTER_SYSTEM"),
+    # Opt-in addendum appended to the above when the caller passes
+    # ``allow_stretch``. Pinned separately so the default path's golden stays
+    # byte-identical and the stretch text still can't drift unreviewed.
+    (
+        "cover_letter.stretch_addendum",
+        "app.services.tailor.prompts:COVER_LETTER_STRETCH_ADDENDUM",
+    ),
     ("resume_tailor.system", "app.services.tailor.prompts:TAILOR_SYSTEM"),
     ("qualification_tagger.system", "app.services.qualification.tagger:_SYSTEM_PROMPT"),
     ("feedback_learner.system", "app.services.llm_learner:SYSTEM_PROMPT"),
+    # Deep-analysis prompt — was MISSING from this contract even though
+    # CONTRIBUTING lists services/analysis/ as guarded (found while fixing
+    # the re-sweep R2 vocabulary leak). Note: no eval script exercises this
+    # surface yet — the pin at least makes edits visible and reviewable.
+    ("analysis.system", "app.services.analysis.prompts:ANALYSIS_SYSTEM"),
+    # Conversation interviewer prompts (Path-C onboarding + career-log +
+    # probe phrasing) — pinned 2026-08-13 with the grounding/one-question
+    # rework. No eval script exercises this surface either; like analysis,
+    # the pin turns silent prompt drift into a reviewable diff. The prose
+    # these prompts elicit becomes the tailor's source-of-truth, so they are
+    # quality-bearing inputs even without a scored eval.
+    ("conversation.onboarding.system", "app.services.conversation.prompts:ONBOARDING_SYSTEM"),
+    ("conversation.update.system", "app.services.conversation.prompts:UPDATE_SYSTEM"),
+    ("conversation.probe.system", "app.services.conversation.prompts:PROBE_SYSTEM"),
+    # Label-canonicalization prompts. Neither was pinned, because neither file
+    # matches the CONTRIBUTING globs (which name derive_profile*.py but not the
+    # normalize_* siblings). They are quality-bearing all the same: the label
+    # they produce becomes ``crud.normalize_label``'s input, i.e. the
+    # ``targets_normalized_label_key`` UNIQUE key, so a drift here decides
+    # whether two users' targets converge on one catalog row or fork into two.
+    ("normalize_manual.system", "app.services.targets.normalize_manual:SYSTEM_PROMPT"),
+    (
+        "normalize_posting_title.system",
+        "app.services.targets.normalize_posting_title:SYSTEM_PROMPT",
+    ),
 )
 
 # label -> "module:attr". Per-purpose default model selection + version markers.
@@ -70,7 +103,13 @@ _SCALARS: tuple[tuple[str, str], ...] = (
     ("model.target_fit_score", "app.services.targets.fit_score:DEFAULT_MODEL"),
     ("model.qualification_tagger", "app.services.qualification.tagger:QUALIFICATION_MODEL"),
     ("model.feedback_learner", "app.services.llm_learner:DEFAULT_MODEL"),
+    ("model.analysis", "app.services.analysis.analyze:DEFAULT_MODEL"),
     ("prompt_version.derive_target_from_jd", "app.services.targets.derive_profile:PROMPT_VERSION"),
+    ("model.normalize_manual", "app.services.targets.normalize_manual:DEFAULT_MODEL"),
+    (
+        "model.normalize_posting_title",
+        "app.services.targets.normalize_posting_title:DEFAULT_MODEL",
+    ),
 )
 
 _REGEN_HINT = "UPDATE_PROMPT_GOLDENS=1 uv run pytest tests/test_prompt_regression.py"

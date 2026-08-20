@@ -4,9 +4,11 @@ import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import dynamic from 'next/dynamic';
 import { useAdminTableFetch } from '@/hooks/useAdminTableFetch';
 import { useToast } from '@/state/Toast/ToastProvider';
+import AddJobByUrlButton from './AddJobByUrlButton';
 import JobsFilter from './JobsFilter';
 import { filtersToApiParams } from './jobsFilterFields';
 import JobsListMobile from './JobsListMobile';
+import JobsPendingOnlyNote from './JobsPendingOnlyNote';
 import JobsTableSkeleton from './JobsTableSkeleton';
 import type { JobPosting, JobsFilterState, JobsSortColumn } from './types';
 
@@ -68,6 +70,9 @@ interface JobsListViewProps {
     | undefined;
   onTableSortChange?:
     ((sort: JobsSortColumn, order: 'asc' | 'desc') => void) | undefined;
+  /** Refresh the list after a toolbar "add job by URL" succeeds. Optional so
+   *  callers that don't offer the affordance don't have to thread it. */
+  onJobAdded?: (() => void) | undefined;
 }
 
 export default function JobsListView({
@@ -81,6 +86,7 @@ export default function JobsListView({
   onPostingsLoaded,
   controlledTableState,
   onTableSortChange,
+  onJobAdded,
 }: JobsListViewProps) {
   const [deleteKey, setDeleteKey] = useState(0);
   const { toast } = useToast();
@@ -118,6 +124,7 @@ export default function JobsListView({
     order,
     handleSort,
     sortIndicator,
+    nextSortAction,
   } = useAdminTableFetch<JobPosting, JobsSortColumn>({
     endpoint: '/api/jobs',
     defaultSort: 'score',
@@ -149,12 +156,26 @@ export default function JobsListView({
 
   return (
     <div className='flex flex-col gap-4'>
-      <JobsFilter
-        filters={filters}
-        onChange={onFiltersChange}
-        sort={sort}
-        order={order}
-        handleSort={handleSort}
+      <div className='flex flex-wrap items-start justify-between gap-2'>
+        <JobsFilter
+          filters={filters}
+          onChange={onFiltersChange}
+          sort={sort}
+          order={order}
+          handleSort={handleSort}
+        />
+        {/* Kept beside the filters so the flow stays reachable at ANY list
+            size. It used to live only in the empty state and the 1–4 thin
+            callout, which meant "add a job I found elsewhere" disappeared
+            exactly when the list started working. */}
+        {onJobAdded && (
+          <AddJobByUrlButton name='jobs-toolbar-add' onJobAdded={onJobAdded} />
+        )}
+      </div>
+      <JobsPendingOnlyNote
+        postings={postings}
+        loading={loading}
+        minScore={filters.minScore}
       />
       {/* Reserve a minimum height so the list doesn't collapse between
           result sets during a filter/search/sort refetch — that shrink-then-
@@ -174,6 +195,7 @@ export default function JobsListView({
             order={order}
             handleSort={handleSort}
             sortIndicator={sortIndicator}
+            nextSortAction={nextSortAction}
             selectedIds={selectedIds}
             onSelectionChange={onSelectionChange}
             analysisTargetId={analysisTargetId}
@@ -191,6 +213,7 @@ export default function JobsListView({
             onSelectionChange={onSelectionChange}
             onRefetch={handleRefetch}
             loadError={error}
+            targetId={targetId}
           />
         )}
       </div>

@@ -37,7 +37,7 @@ const paths: {
     icon: MessageCircle,
     title: "I'm not sure where to start",
     description:
-      "Answer a few questions and we'll build your master document from scratch.",
+      "Answer a few questions and we'll build your experience profile from scratch.",
   },
 ];
 
@@ -77,7 +77,7 @@ export default function PathChooser({ onSelect, onSkip }: PathChooserProps) {
           size='sm'
           onClick={onSkip}
         >
-          Skip for now
+          Skip setup for now
         </Button>
       </div>
     </div>

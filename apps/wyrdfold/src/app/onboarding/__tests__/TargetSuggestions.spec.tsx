@@ -16,6 +16,9 @@ jest.mock('next/navigation', () => ({
 beforeEach(() => {
   fetchMock.mockReset();
   mockPush.mockReset();
+  // The component caches fetched suggestions per tab — without this,
+  // one test's successful fetch feeds the next test's mount.
+  sessionStorage.clear();
 });
 
 afterEach(() => {
@@ -72,7 +75,7 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
       <TargetSuggestions
         onComplete={jest.fn()}
         onSkip={jest.fn()}
-        jobData={{ postingId: 'p1', title: 'Eng' }}
+        jobData={{ postingId: 'p1', title: 'Eng', descriptionHtml: null }}
       />
     );
     expect(
@@ -89,7 +92,7 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
       <TargetSuggestions
         onComplete={jest.fn()}
         onSkip={jest.fn()}
-        jobData={{ postingId: 'p1', title: 'Eng' }}
+        jobData={{ postingId: 'p1', title: 'Eng', descriptionHtml: null }}
       />
     );
 
@@ -115,12 +118,6 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
       if (u.includes('/activate')) {
         return Promise.resolve({ ok: true, json: async () => ({}) });
       }
-      if (u === '/api/jobs/p1') {
-        return Promise.resolve({
-          ok: true,
-          json: async () => ({ description_html: '<p>Great job</p>' }),
-        });
-      }
       if (u.includes('/tailor/resume') && init?.method === 'POST') {
         return Promise.resolve({
           ok: true,
@@ -128,6 +125,66 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
         });
       }
       if (u.includes('/onboarding/complete')) {
+        return Promise.resolve({ ok: true, json: async () => ({}) });
+      }
+      // Everything else — including GET /api/jobs/p1 — 404s, exactly like
+      // prod: the posting has no score row yet, so the detail endpoint
+      // can't serve it. The payoff must not depend on it.
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        json: async () => ({}),
+      });
+    });
+    const onComplete = jest.fn();
+
+    render(
+      <TargetSuggestions
+        onComplete={onComplete}
+        onSkip={jest.fn()}
+        jobData={{
+          postingId: 'p1',
+          title: 'Eng',
+          descriptionHtml: '<p>Great job</p>',
+        }}
+      />
+    );
+
+    await waitFor(() => {
+      expect(mockPush).toHaveBeenCalledWith('/jobs/p1/resume');
+    });
+    // The wizard's own completion flow is bypassed — the review page IS
+    // the completion.
+    expect(onComplete).not.toHaveBeenCalled();
+    const urls = (fetchMock.mock.calls as unknown[][]).map(([u]) => String(u));
+    // The onboarding-complete flag was confirmed before navigating (the
+    // redirect-loop guard).
+    expect(urls.some(u => u.includes('/onboarding/complete'))).toBe(true);
+    // The JD travels via jobData — no detail fetch (it would 404 until
+    // the background activation scores the posting).
+    expect(urls).not.toContain('/api/jobs/p1');
+    // The tailor kick used the threaded JD.
+    const tailorCall = (fetchMock.mock.calls as unknown[][]).find(([u]) =>
+      String(u).includes('/tailor/resume')
+    );
+    expect(
+      JSON.parse((tailorCall?.[1] as { body: string }).body)
+    ).toMatchObject({
+      job_description: '<p>Great job</p>',
+      job_posting_id: 'p1',
+    });
+  });
+
+  it('skips the resume draft entirely when no JD was extracted', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      const u = String(url);
+      if (u.includes('/from-posting/')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ id: 't1', label: 'Senior Engineer' }),
+        });
+      }
+      if (u.includes('/activate')) {
         return Promise.resolve({ ok: true, json: async () => ({}) });
       }
       return Promise.resolve({
@@ -142,20 +199,21 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
       <TargetSuggestions
         onComplete={onComplete}
         onSkip={jest.fn()}
-        jobData={{ postingId: 'p1', title: 'Eng' }}
+        jobData={{ postingId: 'p1', title: 'Eng', descriptionHtml: null }}
       />
     );
 
-    await waitFor(() => {
-      expect(mockPush).toHaveBeenCalledWith('/jobs/p1/resume');
-    });
-    // The wizard's own completion flow is bypassed — the review page IS
-    // the completion.
-    expect(onComplete).not.toHaveBeenCalled();
-    // The onboarding-complete flag was confirmed before navigating (the
-    // redirect-loop guard).
+    await waitFor(
+      () => {
+        expect(onComplete).toHaveBeenCalled();
+      },
+      { timeout: 4000 }
+    );
+    // No JD → no tailor kick and no navigation; the normal completion
+    // flow takes over.
     const urls = (fetchMock.mock.calls as unknown[][]).map(([u]) => String(u));
-    expect(urls.some(u => u.includes('/onboarding/complete'))).toBe(true);
+    expect(urls.some(u => u.includes('/tailor/resume'))).toBe(false);
+    expect(mockPush).not.toHaveBeenCalled();
   });
 
   it('falls back to the completion flow when the resume draft fails', async () => {
@@ -167,7 +225,7 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
           json: async () => ({ id: 't1', label: 'Senior Engineer' }),
         });
       }
-      // Everything downstream (detail fetch, tailor) fails — e.g. LLM
+      // Everything downstream (the tailor kick) fails — e.g. LLM
       // budget or gap gate.
       return Promise.resolve({
         ok: false,
@@ -181,7 +239,11 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
       <TargetSuggestions
         onComplete={onComplete}
         onSkip={jest.fn()}
-        jobData={{ postingId: 'p1', title: 'Eng' }}
+        jobData={{
+          postingId: 'p1',
+          title: 'Eng',
+          descriptionHtml: '<p>Great job</p>',
+        }}
       />
     );
 
@@ -208,7 +270,7 @@ describe('TargetSuggestions — Path A (jobData provided)', () => {
       <TargetSuggestions
         onComplete={jest.fn()}
         onSkip={jest.fn()}
-        jobData={{ postingId: 'p1', title: 'Eng' }}
+        jobData={{ postingId: 'p1', title: 'Eng', descriptionHtml: null }}
       />
     );
 
@@ -404,7 +466,201 @@ describe('TargetSuggestions — Path B/C (no jobData)', () => {
     });
   });
 
-  it('invokes onSkip when "Skip for now" is clicked from the manual fallback', async () => {
+  it('surfaces the refusal instead of advancing when every link is rejected', async () => {
+    // #857 / #864: the cap 409 and the trial 402 were both swallowed by a
+    // bare `catch {}`, and the wizard advanced to "You're all set!" — the
+    // user asked for targets, got none, and was told it worked.
+    const onComplete = jest.fn();
+    fetchMock.mockImplementation((url: string) => {
+      if (typeof url === 'string' && url.endsWith('/api/targets/suggest')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            matches: [makeSuggestion('Frontend Engineer', true, null)],
+          }),
+        });
+      }
+      if (typeof url === 'string' && url === '/api/targets') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => makeTarget({ id: 't-1' }),
+        });
+      }
+      if (typeof url === 'string' && /\/link$/.test(url)) {
+        const detail = "You're on Starter, which allows 2 active targets.";
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          clone: () => ({ json: async () => ({ detail }) }),
+          json: async () => ({ detail }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+
+    const user = userEvent.setup();
+    render(<TargetSuggestions onComplete={onComplete} onSkip={jest.fn()} />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('heading', { level: 2, name: /suggested targets/i })
+      ).toBeInTheDocument();
+    });
+    await user.click(screen.getByRole('button', { name: /create 1 target/i }));
+
+    // The API's own message, verbatim — it names the cap and the plan.
+    expect(
+      await screen.findByText(/allows 2 active targets/i)
+    ).toBeInTheDocument();
+
+    // And it must NOT sail on to the completion screen. Waiting past the
+    // 1500ms auto-advance so this can't pass by simply being early.
+    await new Promise(r => setTimeout(r, 1800));
+    expect(onComplete).not.toHaveBeenCalled();
+  });
+
+  it('reports the created count via onTargetsCreated (completion-copy input)', async () => {
+    // CompletionScreen branches its copy on this number (sweep
+    // 2026-08-14 P2): a zero-target finish must not claim "all set".
+    fetchMock.mockImplementation((url: string) => {
+      if (typeof url === 'string' && url.endsWith('/api/targets/suggest')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            matches: [
+              makeSuggestion('Frontend Engineer', true, null),
+              makeSuggestion('Backend Engineer', true, null),
+            ],
+          }),
+        });
+      }
+      if (typeof url === 'string' && url === '/api/targets') {
+        return Promise.resolve({
+          ok: true,
+          json: async () =>
+            makeTarget({ id: `t-${Math.random().toString(36).slice(2, 6)}` }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+
+    const onTargetsCreated = jest.fn();
+    const user = userEvent.setup();
+    render(
+      <TargetSuggestions
+        onComplete={jest.fn()}
+        onSkip={jest.fn()}
+        onTargetsCreated={onTargetsCreated}
+      />
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('heading', { level: 2, name: /suggested targets/i })
+      ).toBeInTheDocument();
+    });
+
+    // Deselect one of the two pre-selected suggestions, then create —
+    // the reported count must reflect what was actually created (1),
+    // not what was offered (2).
+    await user.click(screen.getByText('Backend Engineer'));
+    await user.click(screen.getByRole('button', { name: /create 1 target/i }));
+
+    await waitFor(() => expect(onTargetsCreated).toHaveBeenCalledWith(1));
+  });
+
+  it('reports zero when the user continues without targets', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (typeof url === 'string' && url.endsWith('/api/targets/suggest')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            matches: [makeSuggestion('Frontend Engineer', true, null)],
+          }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+
+    const onTargetsCreated = jest.fn();
+    const onComplete = jest.fn();
+    const user = userEvent.setup();
+    render(
+      <TargetSuggestions
+        onComplete={onComplete}
+        onSkip={jest.fn()}
+        onTargetsCreated={onTargetsCreated}
+      />
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('heading', { level: 2, name: /suggested targets/i })
+      ).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByText('Frontend Engineer')); // deselect
+    await user.click(
+      screen.getByRole('button', { name: /continue without targets/i })
+    );
+
+    // Zero-selection short-circuits straight to onComplete — no target
+    // writes, no creation report (the wizard's count stays at its 0
+    // default, which is exactly what CompletionScreen should see).
+    await waitFor(() => expect(onComplete).toHaveBeenCalled());
+    expect(onTargetsCreated).not.toHaveBeenCalled();
+    const targetPosts = fetchMock.mock.calls.filter(
+      ([url, init]: [string, RequestInit | undefined]) =>
+        url === '/api/targets' && init?.method === 'POST'
+    );
+    expect(targetPosts.length).toBe(0);
+  });
+
+  it('creates the target from the label alone, never the résumé-informed blurb', async () => {
+    // #868: the suggestion's description is written from the user's résumé
+    // ("…given your work at <employer>"). `targets` is the SHARED catalog —
+    // co-followers can read it and it outlives the author's account. The
+    // rationale still renders on the card; it must not be persisted.
+    fetchMock.mockImplementation((url: string) => {
+      if (typeof url === 'string' && url.endsWith('/api/targets/suggest')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            matches: [makeSuggestion('Frontend Engineer', true, null)],
+          }),
+        });
+      }
+      if (typeof url === 'string' && url === '/api/targets') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => makeTarget({ id: 't-1' }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+
+    const user = userEvent.setup();
+    render(<TargetSuggestions onComplete={jest.fn()} onSkip={jest.fn()} />);
+    await waitFor(() => {
+      expect(
+        screen.getByRole('heading', { level: 2, name: /suggested targets/i })
+      ).toBeInTheDocument();
+    });
+    await user.click(screen.getByRole('button', { name: /create 1 target/i }));
+
+    await waitFor(() => {
+      const post = fetchMock.mock.calls.find(
+        ([url, init]: [string, RequestInit | undefined]) =>
+          url === '/api/targets' && init?.method === 'POST'
+      );
+      expect(post).toBeDefined();
+      const body = JSON.parse((post![1] as RequestInit).body as string);
+      expect(body.label).toBe('Frontend Engineer');
+      expect(body.description).toBeUndefined();
+    });
+  });
+
+  it('invokes onSkip when "Skip this step" is clicked from the manual fallback', async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ matches: [] }),
@@ -413,8 +669,124 @@ describe('TargetSuggestions — Path B/C (no jobData)', () => {
     const user = userEvent.setup();
     render(<TargetSuggestions onComplete={jest.fn()} onSkip={onSkip} />);
 
-    const skip = await screen.findByRole('button', { name: /skip for now/i });
+    const skip = await screen.findByRole('button', { name: /skip this step/i });
     await user.click(skip);
     expect(onSkip).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('TargetSuggestions — per-tab suggestion cache (sweep 2026-08-14 A3)', () => {
+  const CACHE_KEY = 'wyrdfold.onboarding.suggestions';
+
+  const seedCache = (labels: string[], cachedAt = Date.now()) => {
+    sessionStorage.setItem(
+      CACHE_KEY,
+      JSON.stringify({
+        cachedAt,
+        matches: labels.map(l => makeSuggestion(l, true, null)),
+      })
+    );
+  };
+
+  beforeEach(() => {
+    sessionStorage.clear();
+  });
+
+  it('serves the cached set on mount without a suggest POST', async () => {
+    seedCache(['Frontend Engineer', 'Backend Engineer']);
+
+    render(<TargetSuggestions onComplete={jest.fn()} onSkip={jest.fn()} />);
+
+    // Cards render straight from the cache…
+    expect(await screen.findByText('Frontend Engineer')).toBeInTheDocument();
+    expect(screen.getByText('Backend Engineer')).toBeInTheDocument();
+    // …with everything pre-selected, same as a fresh fetch…
+    expect(
+      screen.getByRole('button', { name: /create 2 targets/i })
+    ).toBeInTheDocument();
+    // …and NO billed suggest call fired.
+    const suggestCalls = fetchMock.mock.calls.filter(([u]) =>
+      String(u).endsWith('/api/targets/suggest')
+    );
+    expect(suggestCalls.length).toBe(0);
+  });
+
+  it('ignores an expired cache entry and fetches fresh', async () => {
+    seedCache(['Stale Engineer'], Date.now() - 31 * 60 * 1000);
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        matches: [makeSuggestion('Fresh Engineer', true, null)],
+      }),
+    });
+
+    render(<TargetSuggestions onComplete={jest.fn()} onSkip={jest.fn()} />);
+
+    expect(await screen.findByText('Fresh Engineer')).toBeInTheDocument();
+    expect(screen.queryByText('Stale Engineer')).not.toBeInTheDocument();
+  });
+
+  it('a successful suggest writes the cache', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        matches: [makeSuggestion('Platform Engineer', true, null)],
+      }),
+    });
+
+    render(<TargetSuggestions onComplete={jest.fn()} onSkip={jest.fn()} />);
+
+    expect(await screen.findByText('Platform Engineer')).toBeInTheDocument();
+    const cached = JSON.parse(sessionStorage.getItem(CACHE_KEY) ?? 'null');
+    expect(cached?.matches?.[0]?.suggestion?.label).toBe('Platform Engineer');
+    expect(typeof cached?.cachedAt).toBe('number');
+  });
+
+  it('"Refresh suggestions" is a deliberate reroll: clears the cache and re-POSTs', async () => {
+    seedCache(['Frontend Engineer']);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        matches: [makeSuggestion('Rerolled Engineer', true, null)],
+      }),
+    });
+    const user = userEvent.setup();
+
+    render(<TargetSuggestions onComplete={jest.fn()} onSkip={jest.fn()} />);
+    expect(await screen.findByText('Frontend Engineer')).toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole('button', { name: /refresh suggestions/i })
+    );
+
+    expect(await screen.findByText('Rerolled Engineer')).toBeInTheDocument();
+    const suggestCalls = fetchMock.mock.calls.filter(([u]) =>
+      String(u).endsWith('/api/targets/suggest')
+    );
+    expect(suggestCalls.length).toBe(1);
+    // The rerolled set replaces the cached one.
+    const cached = JSON.parse(sessionStorage.getItem(CACHE_KEY) ?? 'null');
+    expect(cached?.matches?.[0]?.suggestion?.label).toBe('Rerolled Engineer');
+  });
+
+  it('creating targets consumes the cache', async () => {
+    seedCache(['Frontend Engineer']);
+    fetchMock.mockImplementation((url: string) => {
+      if (typeof url === 'string' && url === '/api/targets') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => makeTarget({ id: 't-new' }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+    const user = userEvent.setup();
+
+    render(<TargetSuggestions onComplete={jest.fn()} onSkip={jest.fn()} />);
+    expect(await screen.findByText('Frontend Engineer')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /create 1 target/i }));
+
+    await waitFor(() => expect(sessionStorage.getItem(CACHE_KEY)).toBeNull());
   });
 });

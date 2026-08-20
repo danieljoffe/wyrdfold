@@ -1,6 +1,12 @@
 import React from 'react';
 import '@testing-library/jest-dom';
-import { render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import CoverLetterReviewPage from '../CoverLetterReviewPage';
 
 const mockToast = jest.fn();
@@ -215,5 +221,247 @@ describe('CoverLetterReviewPage — #656 envelope + flagged drafts', () => {
     render(<CoverLetterReviewPage jobPostingId='j-1' />);
     await screen.findByLabelText('Cover letter markdown');
     expect(screen.queryByText(/Failed ATS checks/i)).toBeNull();
+  });
+
+  describe('posting 404 — pre-scoring window (#724 sibling)', () => {
+    // ``GET /jobs/{id}`` gates on a ``scores`` row, so a just-added manual
+    // posting 404s until background scoring lands. The letter is the
+    // caller's own document — the posting fetch degrades the chrome, never
+    // gates the page.
+    const posting404 = (url: string) =>
+      url === '/api/jobs/j-1'
+        ? { ok: false, status: 404, json: async () => ({}) }
+        : undefined;
+
+    it('renders the letter even while the posting is still unscored', async () => {
+      mockPage({ record: RECORD, status: 'idle' }, posting404);
+
+      render(<CoverLetterReviewPage jobPostingId='j-1' />);
+
+      const surface = await screen.findByLabelText('Cover letter markdown');
+      expect(surface.textContent).toContain('Cover letter draft');
+      expect(screen.queryByText(/Cover letter not found/i)).toBeNull();
+      expect(
+        screen.getByText(/Job details are still processing/i)
+      ).toBeInTheDocument();
+      // Filename degrades to name-date — there is no company to slug.
+      const filenameInput = screen.getByLabelText(
+        'Download filename'
+      ) as HTMLInputElement;
+      expect(filenameInput.placeholder).toMatch(/-cover-letter-/);
+      expect(filenameInput.placeholder).not.toMatch(/acme/i);
+    });
+
+    it('disables regenerate while the posting is unavailable', async () => {
+      // Regeneration POSTs the posting's company + title — without them the
+      // confirm would silently no-op, so the control must read as disabled.
+      mockPage({ record: RECORD, status: 'idle' }, posting404);
+
+      render(<CoverLetterReviewPage jobPostingId='j-1' />);
+      await screen.findByLabelText('Cover letter markdown');
+
+      fireEvent.click(screen.getByLabelText('More actions'));
+      const regen = await screen.findByRole('menuitem', {
+        name: /re-generate with ai/i,
+      });
+      expect(regen).toHaveAttribute('aria-disabled', 'true');
+    });
+
+    it('still reports not-found when there is no letter either', async () => {
+      mockPage({ record: null, status: 'idle' }, posting404);
+
+      render(<CoverLetterReviewPage jobPostingId='j-1' />);
+
+      expect(
+        await screen.findByText(/Cover letter not found/i)
+      ).toBeInTheDocument();
+    });
+  });
+});
+
+/**
+ * "Re-generate with AI" — the request it actually sends (#785).
+ *
+ * Three defects live in one POST, and none of them could be seen before: this
+ * page had no test that inspected the regenerate body at all. jest mocks
+ * `fetch`, so a body missing a field the API requires is indistinguishable
+ * from a correct one, and typecheck cannot see across the HTTP boundary —
+ * exactly how #780's `allow_stretch` shipped inert.
+ *
+ * 1. The body omitted `job_description`, which `CoverLetterRequest` requires
+ *    (`min_length=1`, no default). Every re-generate launched from this page
+ *    422'd before reaching the model.
+ * 2. It omitted `allow_stretch`, so a letter the user had explicitly opted
+ *    into on a Skip-verdict job could come back a refusal (#785).
+ * 3. It treated the 202 as completion and re-read immediately, which returns
+ *    the PREVIOUS letter — a success toast over unchanged content.
+ */
+describe('CoverLetterReviewPage — re-generate request (#785)', () => {
+  const BY_JOB = '/api/jobs/tailor/by-job/j-1/cover-letter';
+  const REGEN_POST = '/api/jobs/tailor/cover-letter';
+
+  type State = { record: unknown; status: string };
+
+  /**
+   * Wire the page's fetches. `afterPost` is the sequence of by-job poll
+   * responses served once the kick-off POST has been made; the last entry
+   * repeats. Defaults to "the old letter, forever" — what the real route
+   * reports while a re-generation is in flight, because `_document_state`
+   * reads the record first and lets it win.
+   */
+  function mockRegen(
+    record: Record<string, unknown>,
+    opts: { postStatus?: number; postOk?: boolean; afterPost?: State[] } = {}
+  ): { bodies: Record<string, unknown>[] } {
+    const { postStatus = 202, postOk = true, afterPost = [] } = opts;
+    const bodies: Record<string, unknown>[] = [];
+    let posted = false;
+    let pollIdx = 0;
+
+    global.fetch = jest
+      .fn()
+      .mockImplementation(
+        (url: string, init?: { method?: string; body?: string }) => {
+          if (url === REGEN_POST && init?.method === 'POST') {
+            posted = true;
+            bodies.push(
+              JSON.parse(init.body ?? '{}') as Record<string, unknown>
+            );
+            const payload = { status: 'running' };
+            return Promise.resolve({
+              ok: postOk,
+              status: postStatus,
+              json: async () => payload,
+              clone: () => ({ json: async () => payload }),
+            } as unknown as Response);
+          }
+          if (url === BY_JOB) {
+            const body =
+              posted && afterPost.length > 0
+                ? (afterPost[
+                    Math.min(pollIdx++, afterPost.length - 1)
+                  ] as State)
+                : { record, status: 'idle' };
+            return Promise.resolve({
+              ok: true,
+              status: 200,
+              json: async () => body,
+            } as Response);
+          }
+          if (url === '/api/jobs/j-1') {
+            return Promise.resolve({
+              ok: true,
+              status: 200,
+              json: async () => POSTING,
+            } as Response);
+          }
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({ versions: [], cap: 5 }),
+          } as Response);
+        }
+      ) as unknown as typeof fetch;
+
+    return { bodies };
+  }
+
+  /** Advance past one poll interval and flush the fetches it triggers. */
+  async function tickPoll() {
+    await act(async () => {
+      jest.advanceTimersByTime(2600);
+    });
+  }
+
+  /** Load the page, then drive menu → confirm. Timers go fake at the click so
+   *  the poll is under the test's control. */
+  async function clickRegenerate() {
+    render(<CoverLetterReviewPage jobPostingId='j-1' />);
+    await screen.findByLabelText('Cover letter markdown');
+
+    fireEvent.click(screen.getByLabelText('More actions'));
+    fireEvent.click(
+      await screen.findByRole('menuitem', { name: /re-generate with ai/i })
+    );
+    const confirm = await screen.findByRole('button', {
+      name: /^regenerate$/i,
+    });
+
+    jest.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(confirm);
+    });
+  }
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('sends the JD the letter was written against', async () => {
+    // Without this the API rejects the request outright — the button was dead.
+    const h = mockRegen(RECORD);
+    await clickRegenerate();
+
+    expect(h.bodies).toHaveLength(1);
+    expect(h.bodies[0]).toMatchObject({
+      job_description: 'snapshot',
+      job_posting_id: 'j-1',
+      company_name: 'Acme',
+      role_title: 'Senior FE',
+    });
+  });
+
+  it('carries the letter’s own stretch opt-in forward', async () => {
+    // The user already confirmed "I know it's a reach" for THIS letter. The
+    // verdict that justified it is per-(job, target) and unavailable here, so
+    // the persisted flag is the only faithful source.
+    const h = mockRegen({ ...RECORD, allow_stretch: true });
+    await clickRegenerate();
+
+    expect(h.bodies[0]).toMatchObject({ allow_stretch: true });
+  });
+
+  it('omits allow_stretch for a letter generated on the default path', async () => {
+    // #780's "the default path stays byte-identical" property: a good-fit job
+    // must not silently acquire the stretch addendum on re-generate.
+    const h = mockRegen({ ...RECORD, allow_stretch: false });
+    await clickRegenerate();
+
+    expect(h.bodies[0]).not.toHaveProperty('allow_stretch');
+  });
+
+  it('waits for a NEW letter before claiming success', async () => {
+    // The kick-off is a 202. While the run is in flight the poll route still
+    // answers with the PREVIOUS letter and status "idle", so only a changed
+    // record id means "done".
+    const NEXT = { ...RECORD, id: 'cl-2', payload_md: '# Regenerated letter' };
+    mockRegen(RECORD, {
+      afterPost: [
+        { record: RECORD, status: 'idle' },
+        { record: NEXT, status: 'idle' },
+      ],
+    });
+    await clickRegenerate();
+
+    // One interval in: still the old letter, and nothing claimed yet.
+    await tickPoll();
+    expect(mockToast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ variant: 'success' })
+    );
+    expect(
+      (await screen.findByLabelText('Cover letter markdown')).textContent
+    ).toContain('Cover letter draft');
+
+    // Second interval: the new record lands and replaces the draft.
+    await tickPoll();
+    expect(
+      (await screen.findByLabelText('Cover letter markdown')).textContent
+    ).toContain('Regenerated letter');
+    expect(mockToast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        variant: 'success',
+        title: expect.stringMatching(/re-generated with ai/i),
+      })
+    );
   });
 });

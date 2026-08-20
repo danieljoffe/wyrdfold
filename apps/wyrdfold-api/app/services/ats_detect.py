@@ -13,6 +13,22 @@ from app.services.smartrecruiters import SMARTRECRUITERS_BASE
 
 PROBE_DELAY = 0.1
 
+# Board titles double as our company_name, and providers let companies name
+# their board "Acme Careers page" — which then labels every posting's Company
+# column (prod: "ATOMS Careers page"; ux-sweep 2026-08-12 §D4). Strip the
+# board-noise suffix once, at detection time. Conservative: only the exact
+# trailing phrases, case-insensitive; a cleaning that would empty the name
+# is discarded.
+_BOARD_NOISE_SUFFIX = re.compile(
+    r"\s+(?:careers?(?:\s+page|\s+site)?|job\s+board|jobs)\s*$",
+    re.IGNORECASE,
+)
+
+
+def clean_company_name(name: str) -> str:
+    cleaned = _BOARD_NOISE_SUFFIX.sub("", name).strip()
+    return cleaned or name
+
 
 @dataclass
 class DetectResult:
@@ -20,6 +36,12 @@ class DetectResult:
     board_token: str
     company_name: str
     job_count: int
+
+    def __post_init__(self) -> None:
+        # Every provider path constructs a DetectResult, so normalizing here
+        # covers greenhouse/lever/ashby/workday/smartrecruiters and any
+        # future provider without per-site cleaning calls.
+        self.company_name = clean_company_name(self.company_name)
 
 
 # URL patterns that let us skip probing and go straight to a provider.

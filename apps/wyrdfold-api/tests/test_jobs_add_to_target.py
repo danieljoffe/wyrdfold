@@ -153,7 +153,6 @@ def test_add_to_target_writes_via_service_role_ownership_checked_on_caller(
 
     assert r.status_code == 200
     assert r.json() == {
-        "success": True,
         "job_posting_id": _JOB_ID,
         "target_id": _TARGET_ID,
         "score": 71,
@@ -268,3 +267,68 @@ async def test_load_live_job_returns_none_when_no_row_matches() -> None:
 
     sb, _q = _query_stub([])
     assert await _load_live_job(sb, _JOB_ID) is None
+
+
+def test_add_to_target_admits_the_row_into_the_pipeline(
+    overrides: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#830: a scores row is NOT membership. ``target-membership`` — which draws
+    the "✓ In <target>" badge and unlocks match/tailor — requires
+    ``promising IS TRUE``. Without this write the add produced a row the badge
+    logic excludes by construction: the panel flipped to a bound state
+    optimistically, and a reload erased every trace of it.
+
+    Verified in prod before the fix: adding a job returned 200 with a real
+    score, and ``target-membership`` came back empty for it.
+    """
+    user_sb = MagicMock(name="user_client")
+    service_sb = MagicMock(name="service_client")
+    captured: dict[str, object] = {}
+    _wire(
+        monkeypatch,
+        user_sb=user_sb,
+        service_sb=service_sb,
+        job={"id": _JOB_ID, "title": "Frontend Engineer", "description_html": "<p>JD</p>"},
+        follows_target=True,
+        target=_fake_target(),
+        captured=captured,
+    )
+
+    r = TestClient(app).post(f"/jobs/{_JOB_ID}/add-to-target", json={"target_id": _TARGET_ID})
+    assert r.status_code == 200
+
+    # The admit is an UPDATE on scores, scoped to exactly this (job, target)
+    # pair, on the service-role client — scores are not user-writable.
+    service_sb.table.assert_any_call("scores")
+    updates = [
+        c.args[0]
+        for c in service_sb.table.return_value.update.call_args_list
+        if c.args and isinstance(c.args[0], dict)
+    ]
+    assert {"promising": True} in updates, "the add must admit the row into the pipeline"
+    user_sb.table.assert_not_called()
+
+
+def test_admit_failure_does_not_fail_the_add(
+    overrides: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Best-effort, like the force-include beside it. The score is the core
+    effect and is already committed, so a transient admit failure must not 500
+    an action that partly succeeded — the next add (or a poll) can re-admit."""
+    user_sb = MagicMock(name="user_client")
+    service_sb = MagicMock(name="service_client")
+    captured: dict[str, object] = {}
+    _wire(
+        monkeypatch,
+        user_sb=user_sb,
+        service_sb=service_sb,
+        job={"id": _JOB_ID, "title": "Frontend Engineer", "description_html": "<p>JD</p>"},
+        follows_target=True,
+        target=_fake_target(),
+        captured=captured,
+    )
+    service_sb.table.return_value.update.side_effect = RuntimeError("transient")
+
+    r = TestClient(app).post(f"/jobs/{_JOB_ID}/add-to-target", json={"target_id": _TARGET_ID})
+    assert r.status_code == 200
+    assert r.json()["job_posting_id"] == _JOB_ID

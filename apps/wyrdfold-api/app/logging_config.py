@@ -100,19 +100,43 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-def init_logging(log_format: str) -> None:
-    """Wire the JSON formatter onto the root logger when opted in.
+def init_logging(log_format: str, log_level: str = "INFO") -> None:
+    """Set the root log LEVEL, and wire the JSON formatter when opted in.
+
+    Level and format are independent concerns and must not share a branch
+    (#862). They used to: the ``setLevel`` call lived inside the
+    ``json``-only body, so the default ``text`` format left root at the
+    stdlib ``WARNING`` and production silently discarded **every**
+    application ``logger.info`` — 84 call sites, including billing plan
+    changes and the whole of ``scheduler.py``'s outcome reporting. uvicorn
+    configures its own ``uvicorn.access`` logger at INFO, so request lines
+    kept appearing and the gap looked like normal traffic.
+
+    The old guard was ``if root.level == logging.NOTSET``, which can never
+    fire: root's level is ``WARNING`` (30) both on a fresh interpreter and
+    after uvicorn's ``dictConfig``. So the call was dead code, and setting
+    ``LOG_FORMAT=json`` would NOT have fixed it either — the level is now
+    set unconditionally from ``log_level``.
 
     Idempotent: re-init replaces any prior JsonFormatter handler so a
     reload (e.g. ``uvicorn --reload``) doesn't stack duplicates.
 
-    No-op when ``log_format`` is anything other than ``"json"`` — falls
-    through to uvicorn / stdlib defaults so local dev stays readable.
+    Formatting still falls through to uvicorn / stdlib defaults for any
+    ``log_format`` other than ``"json"``, so local dev stays readable.
     """
+    root = logging.getLogger()
+    # LEVEL FIRST, and unconditionally — before the format early-return.
+    resolved = logging.getLevelName(log_level.upper())
+    if not isinstance(resolved, int):  # unknown name -> INFO, never silence
+        logging.getLogger(__name__).warning(
+            "unknown LOG_LEVEL %r — falling back to INFO", log_level
+        )
+        resolved = logging.INFO
+    root.setLevel(resolved)
+
     if log_format != "json":
         return
 
-    root = logging.getLogger()
     # Clear any prior JSON handler from a reload — keep other handlers
     # the host may have attached (uvicorn, Sentry, etc.).
     for h in list(root.handlers):
@@ -122,8 +146,3 @@ def init_logging(log_format: str) -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
     root.addHandler(handler)
-    # Don't lower the level beyond what callers configured — but make
-    # sure root has a level set so child loggers without explicit
-    # configuration aren't silenced by the WARNING default.
-    if root.level == logging.NOTSET:
-        root.setLevel(logging.INFO)

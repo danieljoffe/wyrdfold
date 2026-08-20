@@ -9,6 +9,10 @@ import { Skeleton } from '@danieljoffe/shared-ui/Skeleton';
 import { Tabs, type Tab } from '@danieljoffe/shared-ui/Tabs';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Breadcrumbs, { crumbLabel } from '@/components/kit/Breadcrumbs';
+import Button from '@/components/kit/Button';
+import { extractApiError } from '@/lib/extractApiError';
+import { parseActiveLimit, type ActiveLimitDetail } from '@/lib/activeLimit';
+import SwapActiveTargetModal from '../SwapActiveTargetModal';
 import { useToast } from '@/state/Toast/ToastProvider';
 import type {
   JobTarget,
@@ -38,10 +42,26 @@ interface TargetDetailProps {
 const TAB_IDS = ['scoring', 'preferences', 'jds', 'learning'] as const;
 type TabId = (typeof TAB_IDS)[number];
 
-function parseTab(raw: string | null): TabId {
-  return (TAB_IDS as readonly string[]).includes(raw ?? '')
-    ? (raw as TabId)
-    : 'scoring';
+/**
+ * Slugs people reasonably guess for a tab whose URL name is shorter than its
+ * label. The Reference JDs tab is `?tab=jds`, so a link typed or remembered as
+ * `reference-jds` used to land silently on Scoring — the fallback gives no clue
+ * that the requested tab was not the one shown.
+ */
+const TAB_ALIASES: Record<string, TabId> = {
+  'reference-jds': 'jds',
+  reference_jds: 'jds',
+  referencejds: 'jds',
+  jd: 'jds',
+  prefs: 'preferences',
+};
+
+/** Exported for direct unit cover — the component's `useSearchParams` is
+ *  module-mocked to a fixed value, so the aliasing is not reachable through it. */
+export function parseTab(raw: string | null): TabId {
+  const key = (raw ?? '').trim().toLowerCase();
+  if ((TAB_IDS as readonly string[]).includes(key)) return key as TabId;
+  return TAB_ALIASES[key] ?? 'scoring';
 }
 
 export default function TargetDetail({ id }: TargetDetailProps) {
@@ -50,6 +70,10 @@ export default function TargetDetail({ id }: TargetDetailProps) {
   const [referenceJDs, setReferenceJDs] = useState<TargetReferenceJD[]>([]);
   const [jdsLoaded, setJdsLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [toggling, setToggling] = useState(false);
+  // Set when activation is refused by the active-target cap; drives the
+  // swap picker. Null the rest of the time.
+  const [swapDetail, setSwapDetail] = useState<ActiveLimitDetail | null>(null);
   const { toast } = useToast();
 
   const pathname = usePathname();
@@ -106,6 +130,73 @@ export default function TargetDetail({ id }: TargetDetailProps) {
       // The rest of the page still works.
     }
   }, [id]);
+
+  /**
+   * Flip this user's membership from the detail header.
+   *
+   * Deliberately re-reads the row on success rather than flipping local
+   * state optimistically: activation can be rejected server-side by the
+   * active-target cap, and the header is the only place on this page that
+   * reports membership state — showing "Active" for a request the server
+   * refused would be worse than a beat of latency.
+   */
+  const handleToggleActive = useCallback(
+    async (swapOut?: string) => {
+      if (!userTarget) return;
+      const activating = !userTarget.is_active;
+      setToggling(true);
+      try {
+        const res = await fetch(
+          `/api/targets/${id}/${activating ? 'activate' : 'deactivate'}`,
+          {
+            method: 'POST',
+            ...(swapOut
+              ? {
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ deactivate_target_id: swapOut }),
+                }
+              : {}),
+          }
+        );
+        if (!res.ok) {
+          // The cap has a way out, so offer the picker rather than a toast the
+          // user can only read and obey. Same treatment the cards grid gives
+          // it — this header is the other place activation can be attempted,
+          // and it is the one the target's own page sends you to.
+          const capped = activating ? await parseActiveLimit(res) : null;
+          if (capped) {
+            setSwapDetail(capped);
+            return;
+          }
+          throw new Error(
+            await extractApiError(
+              res,
+              activating ? 'Activate failed' : 'Deactivate failed'
+            )
+          );
+        }
+        setSwapDetail(null);
+        toast({
+          variant: 'success',
+          title: activating ? 'Target activated' : 'Target deactivated',
+        });
+        await fetchUserTarget();
+      } catch (err) {
+        toast({
+          variant: 'error',
+          title:
+            err instanceof Error
+              ? err.message
+              : activating
+                ? 'Activate failed'
+                : 'Deactivate failed',
+        });
+      } finally {
+        setToggling(false);
+      }
+    },
+    [id, userTarget, toast, fetchUserTarget]
+  );
 
   const fetchReferenceJDs = useCallback(async () => {
     try {
@@ -303,16 +394,53 @@ export default function TargetDetail({ id }: TargetDetailProps) {
 
         {/* The caller's OWN membership state — mirrors TargetCard. (Was the
             shared catalog flag pre-P0; that now means "instance-sponsored",
-            which is not what a user's "Active" badge should say.) */}
-        {userTarget?.is_active && (
-          <Badge variant='brand-solid' size='sm'>
-            Active
-          </Badge>
-        )}
+            which is not what a user's "Active" badge should say.)
+
+            Both states render. Previously only the active branch existed, so
+            "inactive" was signalled by the ABSENCE of a badge — indistinguishable
+            from "membership still loading", and invisible to anyone who hadn't
+            already seen an active target to compare against. A user could tune
+            weights and preferences at length here without ever learning the
+            target was switched off and matching nothing. */}
+        {userTarget != null &&
+          (userTarget.is_active ? (
+            <Badge variant='brand-solid' size='sm'>
+              Active
+            </Badge>
+          ) : (
+            <Badge variant='default' size='sm'>
+              Inactive
+            </Badge>
+          ))}
         {userTarget?.fit_score != null && (
           <Badge variant='default' size='sm'>
             Fit {userTarget.fit_score}
           </Badge>
+        )}
+
+        {/* Activation was reachable ONLY from the card kebab on /targets, so
+            arriving here by deep link left no way to act on what the badge
+            says. */}
+        {userTarget != null && (
+          <Button
+            name={
+              userTarget.is_active ? 'target-deactivate' : 'target-activate'
+            }
+            variant='outline'
+            size='sm'
+            className='ml-auto'
+            onClick={() => void handleToggleActive()}
+            disabled={toggling}
+            aria-busy={toggling}
+          >
+            {toggling
+              ? userTarget.is_active
+                ? 'Pausing…'
+                : 'Activating…'
+              : userTarget.is_active
+                ? 'Deactivate'
+                : 'Activate'}
+          </Button>
         )}
       </div>
 
@@ -321,6 +449,15 @@ export default function TargetDetail({ id }: TargetDetailProps) {
         defaultTab={initialTabRef.current}
         variant='underline'
         onChange={handleTabChange}
+      />
+
+      <SwapActiveTargetModal
+        detail={swapDetail}
+        incomingLabel={target?.label ?? ''}
+        onClose={() => setSwapDetail(null)}
+        onSwap={async deactivateId => {
+          await handleToggleActive(deactivateId);
+        }}
       />
     </div>
   );

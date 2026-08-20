@@ -172,6 +172,13 @@ class CoverLetterRequest(BaseModel):
     job_posting_id: str | None = None
     target_label: str | None = None
     """Target label for annotation resolution (#499)."""
+    allow_stretch: bool = False
+    """The user's explicit "I know it's a reach — write it anyway".
+
+    Set by the UI only after the user confirms a pre-spend warning on a job
+    whose match analysis recommends skipping. Without it the model may decline
+    to apply on the candidate's behalf, which is honest but is not what
+    someone who has just paid for a letter asked for."""
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +221,15 @@ class TailoredResumeRecord(BaseModel):
     approved_at: datetime | None = None
     source_resume_id: str | None = None
     """Points to the original resume when this was cloned via reuse (#504)."""
+
+    allow_stretch: bool = False
+    """Whether this document was generated under the user's stretch opt-in (#785).
+
+    Persisted so "Re-generate with AI" on the review page can reuse the intent
+    the user already expressed. It cannot be re-derived there: the Skip verdict
+    lives on ``JobAnalysis``, which is per-(job, target), and that route has no
+    target in scope — a job matching several targets has several verdicts.
+    ``False`` for every resume and for every row predating the column."""
 
     lint_violations: list[LintViolation] | None = None
     """ATS lint state (#656). ``None`` = never linted (every row predating the

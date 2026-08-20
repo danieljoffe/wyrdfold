@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
+import { formatCompanyName } from '@/lib/formatCompanyName';
+import { localDateStamp } from '@/lib/localDateStamp';
 import {
   ArrowLeft,
   ShieldCheck,
@@ -43,7 +45,50 @@ interface CoverLetterReviewPageProps {
 
 const AUTOSAVE_DEBOUNCE_MS = 1500;
 
+/** Re-generation is backgrounded (#656): the POST returns 202 and the pipeline
+ *  runs ~27s server-side. Same cadence as ``useTailorDocument``. */
+const REGEN_POLL_INTERVAL_MS = 2500;
+const REGEN_MAX_POLLS = 96; // ~4 minutes
+
 type SaveStatus = 'idle' | 'pending' | 'saving' | 'saved' | 'error';
+
+const delay = (ms: number) =>
+  new Promise<void>(resolve => setTimeout(resolve, ms));
+
+/**
+ * Poll the by-job route until a letter NEWER than `previousId` lands.
+ *
+ * Anchored on the record id, never on "a record exists": the route returns the
+ * most recent document, and while a re-generation is in flight it reports the
+ * PREVIOUS letter with `status: 'idle'` — the API's `_document_state` reads the
+ * record first and lets it win. The id is therefore the only usable completion
+ * signal on this surface.
+ *
+ * Returns null when the run failed, the poll broke, or the ceiling was hit. The
+ * server keeps going past the ceiling, so that is a "reload in a moment", not a
+ * cancellation.
+ */
+async function waitForNewLetter(
+  jobPostingId: string,
+  previousId: string
+): Promise<TailoredResumeRecord | null> {
+  for (let attempt = 0; attempt < REGEN_MAX_POLLS; attempt += 1) {
+    await delay(REGEN_POLL_INTERVAL_MS);
+    let state: TailoredDocumentState;
+    try {
+      const res = await fetch(
+        `/api/jobs/tailor/by-job/${jobPostingId}/cover-letter`
+      );
+      if (!res.ok) return null;
+      state = (await res.json()) as TailoredDocumentState;
+    } catch {
+      return null;
+    }
+    if (state.record && state.record.id !== previousId) return state.record;
+    if (state.status === 'error') return null;
+  }
+  return null;
+}
 
 function slugify(value: string): string {
   return (
@@ -71,6 +116,9 @@ export default function CoverLetterReviewPage({
 
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
+  // Posting 404'd (pre-scoring window) — degrade the chrome, never gate the
+  // document. See the load() comment and #724 for the diagnosed race.
+  const [postingMissing, setPostingMissing] = useState(false);
   const [approving, setApproving] = useState(false);
   const [unapproving, setUnapproving] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
@@ -86,11 +134,15 @@ export default function CoverLetterReviewPage({
   const [versionsOpen, setVersionsOpen] = useState(false);
 
   const defaultFilename = useMemo(() => {
-    if (!record || !posting) return '';
+    if (!record) return '';
     const name =
       (record.payload as { contact?: { name?: string } }).contact?.name ??
       'cover-letter';
-    return `${slugify(name)}-${slugify(posting.company_name)}-cover-letter-${new Date().toISOString().slice(0, 10)}`;
+    // Without the posting (still scoring — see ``postingMissing``) there is
+    // no company to slug; a name-date filename beats blocking the download.
+    return posting
+      ? `${slugify(name)}-${slugify(formatCompanyName(posting.company_name))}-cover-letter-${localDateStamp()}`
+      : `${slugify(name)}-cover-letter-${localDateStamp()}`;
   }, [record, posting]);
 
   const load = useCallback(async () => {
@@ -100,20 +152,28 @@ export default function CoverLetterReviewPage({
         fetch(`/api/jobs/${jobPostingId}`),
         fetch(`/api/jobs/tailor/by-job/${jobPostingId}/cover-letter`),
       ]);
-      if (jobRes.status === 404 || letterRes.status === 404) {
+      // ``GET /jobs/{id}`` gates on a ``scores`` row, so a just-added manual
+      // posting 404s until background scoring lands (#724's race, fixed here
+      // for the sibling page). A missing posting degrades the chrome —
+      // subtitle, filename slug, regenerate — but never gates the letter:
+      // the document is the caller's own, fetched per-user.
+      if (letterRes.status === 404) {
         setNotFound(true);
         return;
       }
-      if (!jobRes.ok || !letterRes.ok) {
+      if (!letterRes.ok || (!jobRes.ok && jobRes.status !== 404)) {
         toast({ variant: 'error', title: 'Failed to load cover letter' });
         return;
       }
-      const job = (await jobRes.json()) as JobPosting;
+      if (jobRes.status === 404) {
+        setPostingMissing(true);
+      } else {
+        setPosting((await jobRes.json()) as JobPosting);
+      }
       // #656 envelope: this route returns {record, status, message}, not a
       // bare record. Reading it as a record silently yielded an undefined id
       // and empty markdown — the page rendered but was inert.
       const state = (await letterRes.json()) as TailoredDocumentState;
-      setPosting(job);
       if (!state.record) {
         setNotFound(true);
         return;
@@ -374,7 +434,7 @@ export default function CoverLetterReviewPage({
   }
 
   async function handleDownload() {
-    if (!record || !posting) return;
+    if (!record) return;
     const ok = await flushPendingSave();
     if (!ok) return;
     try {
@@ -409,6 +469,7 @@ export default function CoverLetterReviewPage({
 
   async function handleRegenerate() {
     if (!record || !posting) return;
+    const previousId = record.id;
     setRegenerating(true);
     try {
       await flushPendingSave();
@@ -417,9 +478,23 @@ export default function CoverLetterReviewPage({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          // REQUIRED by ``CoverLetterRequest`` (min_length=1, no default).
+          // Omitting it 422'd every re-generate launched from this page —
+          // the button has never worked. The record's own snapshot is the
+          // right JD: it is the text this letter was written against, and
+          // the posting fetch on this route doesn't carry a description.
+          job_description: record.jd_snapshot,
           job_posting_id: jobPostingId,
-          company_name: posting.company_name,
+          // Display-cleaned: this string is the letter's addressee — feed
+          // junk ("003 Humana Inc.") and the LLM writes to it verbatim.
+          company_name: formatCompanyName(posting.company_name),
           role_title: posting.title,
+          // #785: carry this letter's own stretch opt-in forward. Without it
+          // a re-generate on a Skip-verdict job can come back a refusal and
+          // replace a letter the user already chose to have written. The
+          // verdict can't be re-derived here — it is per-(job, target) and
+          // this route has no target in scope — so the record is the record.
+          ...(record.allow_stretch ? { allow_stretch: true } : {}),
         }),
       });
       if (!res.ok) {
@@ -433,10 +508,25 @@ export default function CoverLetterReviewPage({
         });
         return;
       }
-      toast({ variant: 'success', title: 'Cover letter re-generated with AI' });
+      // The kick-off returns 202 and the pipeline runs detached for ~27s, so
+      // the modal closes here rather than on completion — the user is free to
+      // leave, the run persists either way. Re-reading immediately (what this
+      // used to do) always returned the OLD letter under a success toast.
       setConfirmRegenerateOpen(false);
+      const next = await waitForNewLetter(jobPostingId, previousId);
+      if (!next) {
+        toast({
+          variant: 'error',
+          title: 'Still re-generating — reload in a moment to see the letter.',
+        });
+        return;
+      }
+      setRecord(next);
+      setMarkdown(next.payload_md ?? '');
+      setSaveStatus('idle');
+      setLintWarnings([]);
       setVersions(null);
-      await load();
+      toast({ variant: 'success', title: 'Cover letter re-generated with AI' });
     } catch {
       toast({
         variant: 'error',
@@ -499,7 +589,7 @@ export default function CoverLetterReviewPage({
     );
   }
 
-  if (loading || !record || !posting) {
+  if (loading || !record || (!posting && !postingMissing)) {
     return (
       <div
         className='mx-auto max-w-4xl space-y-4 p-6'
@@ -509,7 +599,7 @@ export default function CoverLetterReviewPage({
         {/* Back link */}
         <Skeleton className='h-5 w-24' />
 
-        {/* Hero h1 "Review Cover Letter" + body subtitle ("Job Title — Company"). */}
+        {/* Hero h1 "Review cover letter" + body subtitle ("Job Title — Company"). */}
         <div className='space-y-2'>
           <Skeleton variant='rectangular' className='h-10 w-80' />
           <Skeleton className='h-4 w-72' />
@@ -549,16 +639,37 @@ export default function CoverLetterReviewPage({
     v => v.severity === 'error'
   );
 
+  // See the resume page for the rationale (#12): warnings must come off the
+  // RECORD so they survive a reload, with transient state winning when a save
+  // was rejected — those violations describe unsaved on-screen markdown.
+  const recordWarnings = (record.lint_violations ?? []).filter(
+    v => v.severity === 'warning'
+  );
+  const shownWarnings = lintWarnings.length > 0 ? lintWarnings : recordWarnings;
+
+  // null = never linted, [] = linted clean, non-empty = violations (#656).
+  // Only an actually-linted record may claim a pass.
+  const atsClean = record.lint_violations != null && lintErrors.length === 0;
+
   return (
     <div className='mx-auto max-w-4xl space-y-4 p-6'>
       <div className='flex items-center justify-between'>
         <Breadcrumbs
           items={[
             { label: 'Jobs', href: '/jobs' },
-            { label: crumbLabel(posting.title), href: `/jobs/${jobPostingId}` },
+            {
+              label: crumbLabel(posting?.title ?? 'Job'),
+              href: `/jobs/${jobPostingId}`,
+            },
             { label: 'Cover letter' },
           ]}
         />
+        {/* #12: the pass result used to live only in a 4s toast. */}
+        {atsClean && !flagged && (
+          <Badge variant='success' size='sm'>
+            ATS clean
+          </Badge>
+        )}
         {isApproved && (
           <Badge variant='success' size='sm'>
             Locked
@@ -568,10 +679,18 @@ export default function CoverLetterReviewPage({
 
       <div>
         <Heading variant='hero' as='h1'>
-          Review Cover Letter
+          Review cover letter
         </Heading>
         <Text variant='body' className='text-text-secondary'>
-          {posting.title} &mdash; {posting.company_name}
+          {posting ? (
+            <>
+              {posting.title} &mdash; {formatCompanyName(posting.company_name)}
+            </>
+          ) : (
+            // Scoring hasn't linked the posting to a target yet, so the
+            // job detail is temporarily unavailable — the letter isn't.
+            'Job details are still processing — they’ll appear here shortly.'
+          )}
         </Text>
       </div>
 
@@ -621,13 +740,13 @@ export default function CoverLetterReviewPage({
         </div>
       )}
 
-      {lintWarnings.length > 0 && (
+      {shownWarnings.length > 0 && (
         <div className='rounded-md border border-warning/30 bg-warning/10 p-3'>
           <Text variant='caption' className='mb-1 text-warning'>
             ATS Lint
           </Text>
           <ul className='list-inside list-disc space-y-1'>
-            {lintWarnings.map((w, i) => (
+            {shownWarnings.map((w, i) => (
               <li key={i}>
                 <Text variant='meta' as='span'>
                   [{w.code}] {w.message}
@@ -638,21 +757,17 @@ export default function CoverLetterReviewPage({
         </div>
       )}
 
+      {/* Cost only — tokens/model/latency are developer telemetry (ux-sweep
+          2026-08-12 §C12); they stay reachable in the native tooltip. */}
       <div className='flex flex-wrap gap-x-4 gap-y-1 rounded-md bg-surface-secondary px-3 py-2'>
-        <Text variant='meta' as='span'>
-          Cost: ${record.cost_usd.toFixed(4)}
-        </Text>
-        <Text variant='meta' as='span'>
-          Tokens:{' '}
-          <LocalNumber value={record.input_tokens + record.output_tokens} />
-        </Text>
-        {record.model && (
-          <Text variant='meta' as='span'>
-            Model: {record.model}
-          </Text>
-        )}
-        <Text variant='meta' as='span'>
-          Latency: {(record.latency_ms / 1000).toFixed(1)}s
+        <Text
+          variant='meta'
+          as='span'
+          title={`${record.input_tokens + record.output_tokens} tokens · ${
+            record.model ?? 'unknown model'
+          } · ${(record.latency_ms / 1000).toFixed(1)}s`}
+        >
+          Generated for ${record.cost_usd.toFixed(4)}
         </Text>
       </div>
 
@@ -794,11 +909,15 @@ export default function CoverLetterReviewPage({
                   label: 'Re-generate with AI',
                   icon: <RotateCcw className='size-4' aria-hidden />,
                   onClick: () => setConfirmRegenerateOpen(true),
+                  // ``!posting``: regeneration POSTs the posting's company +
+                  // title, which aren't available in the pre-scoring window —
+                  // disabled beats a silently no-op confirm.
                   disabled:
                     regenerating ||
                     approving ||
                     saveStatus === 'saving' ||
-                    isApproved,
+                    isApproved ||
+                    !posting,
                 },
                 ...(isApproved
                   ? [
@@ -842,7 +961,9 @@ export default function CoverLetterReviewPage({
             className='text-text-tertiary'
             aria-live='polite'
           >
-            {!isApproved && saveLabel(saveStatus)}
+            {regenerating
+              ? 'Re-generating with AI — this takes about 30 seconds'
+              : !isApproved && saveLabel(saveStatus)}
           </Text>
           <Text variant='meta' as='span' className='text-text-tertiary'>
             <LocalNumber value={markdown.length} /> chars

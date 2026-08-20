@@ -284,15 +284,19 @@ async def test_bulk_score_for_target_scores_and_preserves_promising() -> None:
     sb.push(
         "scores",
         "select",
-        [{"job_posting_id": "good", "promising": True},
-         {"job_posting_id": "bad", "promising": False}],
+        [
+            {"job_posting_id": "good", "promising": True},
+            {"job_posting_id": "bad", "promising": False},
+        ],
     )
     sb.push("scores", "select", [])  # second page drained → terminate
     sb.push(
         "jobs",
         "select",
-        [{"id": "good", "title": "Senior Frontend Engineer", "description_html": "<p>React</p>"},
-         {"id": "bad", "title": "Senior Frontend Engineer", "description_html": "<p>React</p>"}],
+        [
+            {"id": "good", "title": "Senior Frontend Engineer", "description_html": "<p>React</p>"},
+            {"id": "bad", "title": "Senior Frontend Engineer", "description_html": "<p>React</p>"},
+        ],
     )
 
     target = _target(core={"React": 3, "TypeScript": 3})
@@ -314,9 +318,15 @@ async def test_bulk_score_for_target_streams_multiple_pages() -> None:
     sb = _AsyncBulkSupabase()
     sb.push("targets", "select", [{"app_active": True}])
     sb.push("scores", "select", [{"job_posting_id": "j1", "promising": True}])
-    sb.push("jobs", "select", [{"id": "j1", "title": "Senior FE", "description_html": "<p>React</p>"}])
+    sb.push(
+        "jobs", "select", [{"id": "j1", "title": "Senior FE", "description_html": "<p>React</p>"}]
+    )
     sb.push("scores", "select", [{"job_posting_id": "j2", "promising": True}])
-    sb.push("jobs", "select", [{"id": "j2", "title": "Staff FE", "description_html": "<p>TypeScript</p>"}])
+    sb.push(
+        "jobs",
+        "select",
+        [{"id": "j2", "title": "Staff FE", "description_html": "<p>TypeScript</p>"}],
+    )
     sb.push("scores", "select", [])  # empty page → terminate
 
     target = _target(core={"React": 3, "TypeScript": 3})
@@ -579,9 +589,7 @@ def test_rescore_endpoint_returns_count(
     # #57 PR-G2e-4: /rescore runs on the async service client via the router-inline
     # ``_get_target_async`` + the ``bulk_score_for_target`` twin.
     monkeypatch.setattr(jobs_router, "_get_target_async", AsyncMock(return_value=target))
-    monkeypatch.setattr(
-        jobs_router, "bulk_score_for_target", AsyncMock(return_value=42)
-    )
+    monkeypatch.setattr(jobs_router, "bulk_score_for_target", AsyncMock(return_value=42))
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
     # /rescore now requires the operator-only ``verify_api_key`` dep —
     # not callable from the FE, so the route's auth model is api-key.
