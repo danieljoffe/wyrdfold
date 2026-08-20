@@ -15,7 +15,7 @@ import os
 import tempfile
 from collections.abc import Iterator
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -36,7 +36,9 @@ from app.models.user_profile import (
     LlmUsageWindow,
     NotificationPreferences,
     NotificationPreferencesUpdate,
+    OnboardingPath,
     OnboardingStatus,
+    OnboardingStep,
     OnboardingStepUpdate,
     ResumeStyleSettings,
     ResumeStyleSettingsUpdate,
@@ -293,16 +295,18 @@ async def update_resume_style(
 # ---------------------------------------------------------------------------
 
 
-_KNOWN_STEPS = {
-    "path-chooser",
-    "identity",
-    "upload-resume",
-    "add-job",
-    "pick-targets",
-    "conversation",
-    "completion",
-}
-_KNOWN_PATHS = {"A", "B", "C"}
+# DERIVED from the response model's Literal, not restated (#887).
+#
+# These were two hand-maintained lists of the same vocabulary: this set gates
+# the READ (an unrecognised stored step is served as None) while
+# ``OnboardingStep`` gates the WRITE. Adding a step to only one half fails in a
+# way that reads like data loss rather than a missing enum member — the PATCH
+# 422s, or the value writes and then vanishes on the next read, restarting the
+# wizard at ``path-chooser``. The subscribe gate is where that stops being
+# survivable: a user returns to that step from Stripe Checkout, so a forgotten
+# member greets someone who just paid with a wizard that forgot them.
+_KNOWN_STEPS = frozenset(get_args(OnboardingStep))
+_KNOWN_PATHS = frozenset(get_args(OnboardingPath))
 
 
 def _read_onboarding(row: dict[str, Any]) -> OnboardingStatus:

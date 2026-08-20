@@ -20,7 +20,10 @@ import { useToast } from '@/state/Toast/ToastProvider';
 // plans to Stripe Prices; a drifted label here can't change what's billed.
 const PLAN_LABELS: Record<string, string> = {
   free: 'Free (bring your own key)',
-  trial: 'Free trial',
+  // NOT "Free trial" (#887). `trial` is the stamp an unsubscribed account
+  // carries, with an already-elapsed clock — naming it a trial promises a
+  // window that never opens.
+  trial: 'No subscription',
   starter: 'Starter — $7/mo',
   pro: 'Pro — $19/mo',
 };
@@ -198,10 +201,17 @@ export default function BillingCard() {
         ) : account.plan === 'trial' ? (
           /* A trial runs on HOSTED keys, so it must NOT get the free-plan
              copy telling the user to add an OpenRouter key — that is the
-             dead end #841 exists to remove. */
+             dead end #841 exists to remove.
+
+             It must also not say the trial is still running (#887). There is
+             no trial period any more — the Terms say so — and `trial` is now
+             simply what an unsubscribed account is stamped with, seeded with
+             an already-elapsed clock so it gets no free inference. "Subscribe
+             before it ends" describes a countdown that finished before the
+             user read the sentence. */
           <Text variant='meta' className='text-text-secondary'>
-            Your trial runs on our AI keys. Subscribe before it ends to keep job
-            matching and tailored resumes running.
+            AI features need an active subscription. Choose a plan below to
+            start job matching and tailored resumes.
           </Text>
         ) : (
           <Text variant='meta' className='text-text-secondary'>
