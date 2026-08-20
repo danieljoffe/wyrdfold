@@ -140,6 +140,12 @@ export default function TargetSuggestions({
   // observed); stage the copy so the wait doesn't read as a hang.
   const analyzeStage = useStagedMessage(ANALYZE_STAGES, loading);
   const [error, setError] = useState<string | null>(null);
+  // Distinct from ``error``: suggestions are DERIVED from the experience
+  // profile, so skipping the resume step makes this failure certain rather
+  // than exceptional. Showing it in red as "No experience profile found"
+  // reads as a malfunction one click after the user chose to skip — see the
+  // catch block below.
+  const [needsResume, setNeedsResume] = useState(false);
   const [createdLabel, setCreatedLabel] = useState<string | null>(null);
   const [draftingResume, setDraftingResume] = useState(false);
   const [suggestions, setSuggestions] = useState<MatchedSuggestion[]>([]);
@@ -231,6 +237,21 @@ export default function TargetSuggestions({
     };
   }, [jobData, onComplete, onTargetsCreated, router]);
 
+  /** True when the account has no optimized experience doc to suggest from. */
+  async function isMissingExperienceProfile(): Promise<boolean> {
+    try {
+      const res = await fetch('/api/career/experience/optimized');
+      if (res.status === 404) return true;
+      if (!res.ok) return false;
+      const body = (await res.json()) as { payload?: unknown } | null;
+      return !body || !body.payload;
+    } catch {
+      // Can't tell — fall through to the generic error rather than claiming
+      // a cause we have not established.
+      return false;
+    }
+  }
+
   // Paths B/C: fetch suggestions from LLM (or serve the per-tab cache)
   useEffect(() => {
     if (jobData) return;
@@ -265,6 +286,14 @@ export default function TargetSuggestions({
         }
       } catch (err) {
         if (!cancelled) {
+          // Is this simply "you skipped the resume"? Ask the server rather
+          // than pattern-matching its wording, which would break the moment
+          // that copy is reworded. Only on the failure path, so the happy
+          // path costs nothing.
+          if (await isMissingExperienceProfile()) {
+            if (!cancelled) setNeedsResume(true);
+            return;
+          }
           // Same friendly-fallback pattern as the from-posting branch:
           // surface a real server detail (LLM budget exceeded etc.)
           // when present, fall back to the manual-creation hint when
@@ -576,6 +605,14 @@ export default function TargetSuggestions({
           })}
         </div>
 
+        {needsResume && (
+          <Alert variant='info'>
+            Suggested targets are built from your resume, and that step was
+            skipped — so there is nothing to suggest from yet. Use{' '}
+            <b>Change path</b> above to go back and add it, or create a target
+            yourself below.
+          </Alert>
+        )}
         {error && <Alert variant='error'>{error}</Alert>}
 
         <div className='flex items-center justify-between'>
@@ -638,6 +675,14 @@ export default function TargetSuggestions({
         </Text>
       </div>
 
+      {needsResume && (
+        <Alert variant='info'>
+          Suggested targets are built from your resume, and that step was
+          skipped — so there is nothing to suggest from yet. Use{' '}
+          <b>Change path</b> above to go back and add it, or create a target
+          yourself below.
+        </Alert>
+      )}
       {error && <Alert variant='error'>{error}</Alert>}
 
       <Card
