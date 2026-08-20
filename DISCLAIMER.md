@@ -30,9 +30,10 @@ jurisdiction, none of which are automatically true of your deployment.
 
 Two consequences worth stating plainly:
 
-- **You become the data controller** for anyone using your instance. The
-  obligations under the GDPR, UK GDPR, CCPA, or your local equivalent attach to
-  you, not to us.
+- **You are responsible for your own compliance.** If you operate a self-hosted
+  instance, it is for you to determine your role under applicable
+  data-protection law and to meet the obligations that apply to your
+  deployment. We are not in a position to make that determination for you.
 - **Your policy text binds you, not us.** Publishing a modified Privacy Policy
   from a fork creates no obligation on the operator of wyrdfold.com, and we are
   not a party to any agreement you form with your users.

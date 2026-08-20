@@ -171,13 +171,17 @@ const SECTIONS: LegalSection[] = [
             <b>Stripe</b> — subscription payments.
           </li>
           <li>
-            <b>Voyage AI</b> — text embeddings used for job matching. Receives
-            job-posting text and role labels, not your resume.
+            <b>Voyage AI</b> — text embeddings used for matching. Receives job
+            postings, role labels, and{' '}
+            <b>extracts of your experience profile</b> (the structured text
+            derived from your resume), which are turned into numeric vectors so
+            we can compare them to roles.
           </li>
           <li>
             <b>Brave Search</b> and <b>Firecrawl</b> — discovering and fetching
-            public job postings. These receive job URLs and search queries, not
-            your personal data.
+            public job postings. These receive job URLs and role-keyword search
+            queries (for example a job title plus a careers-site filter). They
+            are not sent your resume, your profile, or your identity.
           </li>
           <li>
             <b>Sentry</b> — error monitoring.
@@ -406,11 +410,21 @@ const SECTIONS: LegalSection[] = [
           <b>Your rights and how to use them.</b> You have the rights to know,
           access, delete, correct, and to non-discrimination for exercising
           them. Deletion, correction, and export are self-service in Settings;
-          otherwise email <MailLink address={PRIVACY_EMAIL} /> from the address
-          on your account, which is how we verify a request. We respond within
-          45 days and may extend once where the law allows, telling you if we
-          do. An authorized agent may act for you with written permission and
-          verification of your identity.
+          otherwise email <MailLink address={PRIVACY_EMAIL} />. Emailing from
+          the address on your account is the usual way we verify a request, and
+          we may ask for other information reasonably necessary to confirm your
+          identity — for example if you no longer have access to that inbox. We
+          generally respond within 45 days, or within the period required by
+          applicable law, and where permitted we may extend and will tell you if
+          we do. An authorized agent may act for you with your written
+          permission and verification of your identity.
+        </p>
+        <p>
+          <b>Appeals.</b> If we deny a request you make under California privacy
+          law, you may appeal by replying to our decision or emailing{' '}
+          <MailLink address={PRIVACY_EMAIL} /> with “appeal” in the subject. We
+          will review it and tell you the outcome, and our reasons, within the
+          time the law allows.
         </p>
       </>
     ),
