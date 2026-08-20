@@ -28,10 +28,12 @@ const SECTIONS: LegalSection[] = [
         <p>
           These Terms of Service (“Terms”) govern your use of the hosted
           WyrdFold service at wyrdfold.com. The service is operated by{' '}
-          <b>{LEGAL_ENTITY_NAME}</b>, a sole proprietorship based in California,
-          United States, at {LEGAL_ENTITY_ADDRESS} (“we”, “us”). That is the
-          contracting party under these Terms — “WyrdFold” is the name of the
-          service, not a separate legal entity. You can reach us at{' '}
+          <b>{LEGAL_ENTITY_NAME}</b>, a sole proprietor located in California,
+          United States, at {LEGAL_ENTITY_ADDRESS}, doing business as WyrdFold
+          (“we”, “us”). <b>{LEGAL_ENTITY_NAME} is the contracting party</b>{' '}
+          under these Terms; “WyrdFold” is a trading name for that business, not
+          a separate company, corporation, or limited-liability entity. You can
+          reach us at{' '}
           <a
             className='underline underline-offset-2'
             href={`mailto:${LEGAL_EMAIL}`}
@@ -290,8 +292,8 @@ const SECTIONS: LegalSection[] = [
           WyrdFold requires a paid subscription to access its AI-powered
           features. There is no free tier or trial period. Subscriptions are
           billed in advance on a recurring basis until cancelled. Billing is
-          handled by Stripe under its own terms and privacy practices; we never
-          receive or store your card details.
+          handled by Stripe under its own terms and privacy practices — payment
+          card information goes to Stripe rather than being stored by WyrdFold.
         </p>
         <p>
           <b>Cancelling.</b> You can cancel at any time from your account
@@ -386,9 +388,14 @@ const SECTIONS: LegalSection[] = [
           </li>
         </ul>
         <p>
-          The FSL permits self-hosting for your own use. Using the code to
-          operate a commercial service that competes with our hosted offering is
-          not permitted under it.
+          The FSL imposes additional restrictions on certain commercial uses,
+          including offering a competing hosted service. These Terms do not
+          interpret, extend, or limit that license —{' '}
+          <b>
+            refer to the FSL text itself for the complete terms governing the
+            source code
+          </b>
+          , published in the repository alongside the code it covers.
         </p>
         <p>
           <b>Bring-your-own-key (BYOK).</b> A self-hosted deployment can be
@@ -420,9 +427,9 @@ const SECTIONS: LegalSection[] = [
         WyrdFold is actively developed. We may add, change, or remove features,
         change or replace the third-party services we integrate with, and
         discontinue functionality. We do not promise that any particular feature
-        will remain available. Where a change materially reduces the core
-        functionality of a paid plan, we will give notice as described under{' '}
-        <i>Changes to these terms</i>, and you may cancel.
+        will remain available. Where a change materially reduces the
+        functionality of the paid service, we will give notice as described
+        under <i>Changes to these terms</i>, and you may cancel.
       </p>
     ),
   },
@@ -535,14 +542,19 @@ const SECTIONS: LegalSection[] = [
       <p>
         You agree to indemnify and hold harmless {LEGAL_ENTITY_NAME} from any
         third-party claim, demand, loss, or expense (including reasonable legal
-        fees) arising out of: content you upload or submit through the service;
-        your use of the service in breach of these Terms or of applicable law;
-        your infringement of another person’s intellectual property, privacy, or
-        other rights; or documents you submit to an employer. We will notify you
-        of any such claim, and you may not settle it in a way that imposes any
-        obligation or admission on us without our prior written consent. This
-        does not apply to the extent the claim arises from our own breach of
-        these Terms.
+        fees) arising out of: your use of the service in breach of these Terms
+        or of applicable law; your infringement of another person’s intellectual
+        property, privacy, or other rights; or content you supply that is
+        fraudulent or that you know to be false or misleading.
+        <b>
+          {' '}
+          Using WyrdFold as intended — including submitting a generated document
+          to an employer — is not by itself a basis for indemnification.
+        </b>{' '}
+        We will notify you of any such claim, and you may not settle it in a way
+        that imposes any obligation or admission on us without our prior written
+        consent. This does not apply to the extent the claim arises from our own
+        acts, omissions, or breach of these Terms.
       </p>
     ),
   },
@@ -599,8 +611,13 @@ const SECTIONS: LegalSection[] = [
       <ul className='ml-5 list-disc space-y-1'>
         <li>
           <b>Entire agreement.</b> These Terms are the entire agreement between
-          you and us regarding the hosted service, and replace any earlier
-          version.
+          you and us regarding the hosted service, and supersede any prior
+          version of these Terms with respect to your use of it from the
+          effective date onward. The <PrivacyLink /> is a statement of our data
+          practices rather than a contractual term incorporated here, so that we
+          can update it as privacy law requires without amending this agreement;
+          it governs how we handle your personal information, and nothing in
+          these Terms overrides it.
         </li>
         <li>
           <b>Severability.</b> If any provision is found unenforceable, the

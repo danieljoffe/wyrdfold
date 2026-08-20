@@ -102,8 +102,8 @@ const SECTIONS: LegalSection[] = [
         <p>
           To score matches and draft applications, the relevant parts of your
           profile and the job text are sent to third-party large-language-model
-          providers through <b>OpenRouter</b> (a service that securely routes
-          requests to AI model providers).{' '}
+          providers (“<b>AI providers</b>”) through <b>OpenRouter</b>, a service
+          that routes requests to them.{' '}
           <b>Only the information necessary to complete your request is sent</b>
           .{' '}
           <b>
@@ -235,16 +235,21 @@ const SECTIONS: LegalSection[] = [
           </li>
         </ul>
         <p>
-          Deletion covers your profile and experience data, uploaded resumes,
-          generated resumes and cover letters, saved jobs and pipeline history,
-          notification settings, and your account itself. Before deleting, you
-          can download all of it from{' '}
+          Deletion covers <b>Your Content</b> (your profile and experience data
+          and any resumes you upload), <b>Generated Content</b>, saved jobs and
+          pipeline history, notification settings, and your account itself.
+          Before deleting, you can download all of it from{' '}
           <span className='font-mono text-sm'>Settings → Export my data</span>—
           the export covers the same records the deletion removes.
         </p>
         <p>
-          Generated resumes and cover letters are yours; deleting your account
-          removes our copies, not any copy you have downloaded or sent.
+          <b>Generated Content</b> — the resumes and cover letters WyrdFold
+          produces for you — is yours, as set out in our{' '}
+          <Link className='underline underline-offset-2' href='/terms'>
+            Terms of Service
+          </Link>
+          . Deleting your account removes our copies, not any copy you have
+          downloaded or already sent.
         </p>
         <p>
           <b>

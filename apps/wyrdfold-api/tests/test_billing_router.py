@@ -234,6 +234,31 @@ def test_webhook_non_entitled_status_downgrades_to_free(saas_billing: None, sb: 
     assert _plan_updates(sb) == [{"plan": "free"}]
 
 
+def test_webhook_cancel_at_period_end_keeps_access_until_the_period_ends(
+    saas_billing: None, sb: MagicMock
+) -> None:
+    """The Terms promise it, so pin it (#439 legal review, flow A).
+
+    "Cancelling stops future charges and takes effect at the end of the billing
+    period you have already paid for — you keep access until then." Stripe
+    models that as ``cancel_at_period_end=true`` with the status STILL
+    ``active``; it only becomes ``canceled`` when the period actually ends.
+
+    So the property under test is that we key entitlement on **status**, not on
+    the cancellation flag. Reading ``cancel_at_period_end`` and downgrading on
+    it would revoke access the moment someone cancels — taking away time they
+    have already paid for, and contradicting the Terms.
+    """
+    event = _sub_event(status="active")
+    event["data"]["object"]["cancel_at_period_end"] = True
+
+    body, sig = _signed(event)
+    r = _client(sb).post("/billing/webhook", content=body, headers={"stripe-signature": sig})
+
+    assert r.status_code == 200
+    assert _plan_updates(sb) == [{"plan": "pro"}]
+
+
 def test_webhook_subscription_deleted_downgrades_to_free(saas_billing: None, sb: MagicMock) -> None:
     body, sig = _signed(_sub_event("customer.subscription.deleted"))
     r = _client(sb).post("/billing/webhook", content=body, headers={"stripe-signature": sig})
