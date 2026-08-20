@@ -37,6 +37,10 @@ Two consequences worth stating plainly:
   from a fork creates no obligation on the operator of wyrdfold.com, and we are
   not a party to any agreement you form with your users.
 
+We do not vet, approve, or assume any responsibility for third-party
+self-hosted instances, regardless of whether they use our source code or a
+modified version of our policies.
+
 ## Not legal advice
 
 Nothing in this repository is legal advice. If you are operating a service that

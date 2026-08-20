@@ -3,6 +3,12 @@
 [![CI](https://github.com/danieljoffe/wyrdfold/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/danieljoffe/wyrdfold/actions/workflows/ci.yml)
 [![License: FSL-1.1-ALv2](https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg)](./LICENSE.md)
 
+> 📄 **Legal:** the binding [Terms of Service](https://wyrdfold.com/terms) and
+> [Privacy Policy](https://wyrdfold.com/privacy) are the versions rendered live
+> on our site. The source files in this repo are for transparency only — see
+> [DISCLAIMER.md](./DISCLAIMER.md), which also covers what changes if you
+> self-host.
+
 **Self-hostable, bring-your-own-key job-search automation.** WyrdFold polls
 job boards (Greenhouse, Lever, Ashby, and more) against the roles you're
 targeting, triages and grades every posting for fit with a two-phase LLM
@@ -45,12 +51,8 @@ commercial service — and each release automatically becomes Apache-2.0 two
 years on. Chosen to keep self-hosting genuinely free while reserving the
 option of a hosted version.
 
-The Terms and Privacy Policy sources in this repo are published for
-transparency, not as the operative agreement — the binding versions are the
-ones rendered at [wyrdfold.com/terms](https://wyrdfold.com/terms) and
-[wyrdfold.com/privacy](https://wyrdfold.com/privacy). See
-[DISCLAIMER.md](./DISCLAIMER.md), which also covers what changes if you
-self-host.
+Self-hosting has legal consequences of its own — see
+[DISCLAIMER.md](./DISCLAIMER.md).
 
 ## Architecture
 
