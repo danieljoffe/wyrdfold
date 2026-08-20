@@ -657,7 +657,7 @@ export default function TermsPage() {
   return (
     <LegalDocument
       title='Terms of Service'
-      effective='July 21, 2026'
+      effective='August 20, 2026'
       intro={
         <p>
           These terms govern your use of the hosted WyrdFold service. Please
