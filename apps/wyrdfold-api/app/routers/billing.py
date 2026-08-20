@@ -129,8 +129,26 @@ async def _ensure_customer(supabase: AsyncClient, user_id: str) -> str:
     return customer.id
 
 
+#: Where Checkout returns the user, keyed by ``CheckoutRequest.return_to``.
+#:
+#: Deliberately a server-side lookup off a closed enum rather than a path (or
+#: URL) taken from the request. Stripe redirects to whatever ``success_url``
+#: says, so honouring a caller-supplied value would hand an attacker an open
+#: redirect with a payment confirmation attached to it — the most credible
+#: possible landing page for a phishing hop. A caller can only name a key; it
+#: cannot describe a destination.
+_RETURN_PATHS: dict[str, str] = {
+    "settings": "/settings",
+    "onboarding": "/onboarding",
+}
+
+
 class CheckoutRequest(BaseModel):
     plan: Literal["starter", "pro"]
+    #: Which surface the purchase started from, so Checkout can hand the user
+    #: back to it (#887). Defaults to ``settings`` — the historical behaviour
+    #: and the only caller before onboarding gained a subscribe step.
+    return_to: Literal["settings", "onboarding"] = "settings"
 
 
 class BillingUrlResponse(BaseModel):
@@ -194,6 +212,10 @@ async def create_checkout_session(
     """Hosted-Checkout URL for subscribing to a managed tier."""
     price = _price_for_plan(body.plan)
     app_url = _app_url()
+    # Pydantic has already rejected anything outside the enum, so the lookup
+    # cannot miss; the default keeps a body without ``return_to`` on the old
+    # path rather than failing a request that used to work.
+    return_path = _RETURN_PATHS.get(body.return_to, _RETURN_PATHS["settings"])
     customer_id = await _ensure_customer(supabase, user_id)
     session = await asyncio.to_thread(
         lambda: _client().checkout.sessions.create(
@@ -201,8 +223,8 @@ async def create_checkout_session(
                 "mode": "subscription",
                 "customer": customer_id,
                 "line_items": [{"price": price, "quantity": 1}],
-                "success_url": f"{app_url}/settings?billing=success",
-                "cancel_url": f"{app_url}/settings?billing=cancelled",
+                "success_url": f"{app_url}{return_path}?billing=success",
+                "cancel_url": f"{app_url}{return_path}?billing=cancelled",
                 "client_reference_id": user_id,
                 # Stamped onto the subscription so every webhook event carries
                 # the user id — no reverse lookup needed on the hot path.

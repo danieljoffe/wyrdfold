@@ -153,9 +153,16 @@ async def get_llm_client(
     except TrialExpiredError as exc:
         # Same 402, deliberately different instruction: this user cannot act
         # on "add an API key" (#841). Keep the two messages distinct.
+        #
+        # Says "requires a subscription", NOT "your trial has ended" (#887).
+        # There is no trial period — the Terms say so — and a new account is
+        # seeded `plan='trial'` with an already-elapsed stamp precisely so it
+        # gets no free inference. Every user who reaches this line therefore
+        # never had a trial to lose, and telling them one expired describes an
+        # entitlements-table internal rather than their situation.
         raise HTTPException(
             status_code=402,
-            detail="Your free trial has ended. Subscribe in Settings to keep using AI features.",
+            detail="WyrdFold needs an active subscription to use AI features.",
         ) from exc
     except MissingUserKeyError as exc:
         raise HTTPException(

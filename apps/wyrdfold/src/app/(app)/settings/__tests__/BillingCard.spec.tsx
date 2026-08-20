@@ -143,13 +143,22 @@ describe('BillingCard', () => {
     // A trial runs on HOSTED keys. Showing it the free-plan copy ("add one
     // above") points at a field that is disabled when BYOK is unavailable —
     // the dead end #841 exists to remove.
+    //
+    // It must not describe a countdown either (#887). `trial` is now simply
+    // what an unsubscribed account is stamped with, seeded already-elapsed,
+    // so "Free trial" and "Subscribe before it ends" both name a window that
+    // never opens. Asserted as absences so the old copy cannot come back.
     (global.fetch as jest.Mock).mockResolvedValueOnce(
       jsonOk(account({ plan: 'trial' }))
     );
     render(<BillingCard />);
 
-    expect(await screen.findByText(/Free trial/)).toBeInTheDocument();
-    expect(screen.getByText(/Subscribe before it ends/)).toBeInTheDocument();
+    expect(await screen.findByText(/No subscription/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/AI features need an active subscription/)
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Free trial/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/before it ends/)).not.toBeInTheDocument();
     expect(screen.queryByText(/add one above/)).not.toBeInTheDocument();
     // Still convertible: the upgrade path must remain on screen.
     expect(

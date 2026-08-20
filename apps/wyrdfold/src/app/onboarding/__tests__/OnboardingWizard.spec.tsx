@@ -107,6 +107,21 @@ jest.mock('../IdentityStep', () => ({
   ),
 }));
 
+// No skip button, deliberately — SubscribeStep takes no ``onSkip``. Every
+// other step's skip advances to something that still works without it;
+// skipping the gate lands on a step that 402s. A stub that offered one would
+// let the wizard tests pass through a door the real component doesn't have.
+jest.mock('../SubscribeStep', () => ({
+  __esModule: true,
+  default: ({ onComplete }: { onComplete: () => void }) => (
+    <div data-testid='subscribe-step-stub'>
+      <button type='button' onClick={onComplete}>
+        subscribe-complete
+      </button>
+    </div>
+  ),
+}));
+
 jest.mock('../CompletionScreen', () => ({
   __esModule: true,
   default: () => <div data-testid='completion-screen-stub'>completion</div>,
@@ -347,6 +362,11 @@ describe('OnboardingWizard — skip semantics (2026-08-13 walkthrough)', () => {
       })
     );
     await user.click(screen.getByRole('button', { name: 'identity-skip' }));
+    // The subscribe gate now sits between identity and the first
+    // AI-backed step (#887).
+    await user.click(
+      screen.getByRole('button', { name: 'subscribe-complete' })
+    );
 
     // Advanced to upload-resume; nothing completed, nowhere navigated.
     expect(screen.getByTestId('resume-uploader-stub')).toBeInTheDocument();
@@ -367,6 +387,11 @@ describe('OnboardingWizard — skip semantics (2026-08-13 walkthrough)', () => {
       })
     );
     await user.click(screen.getByRole('button', { name: 'identity-skip' }));
+    // The subscribe gate now sits between identity and the first
+    // AI-backed step (#887).
+    await user.click(
+      screen.getByRole('button', { name: 'subscribe-complete' })
+    );
     await user.click(screen.getByRole('button', { name: 'resume-skip' }));
     await user.click(screen.getByRole('button', { name: 'job-skip' }));
     await user.click(screen.getByRole('button', { name: 'targets-skip' }));
@@ -388,6 +413,11 @@ describe('OnboardingWizard — skip semantics (2026-08-13 walkthrough)', () => {
       })
     );
     await user.click(screen.getByRole('button', { name: 'identity-complete' }));
+    // The subscribe gate now sits between identity and the first
+    // AI-backed step (#887).
+    await user.click(
+      screen.getByRole('button', { name: 'subscribe-complete' })
+    );
 
     await user.click(
       screen.getByRole('button', { name: /finish setup later/i })
@@ -418,6 +448,11 @@ describe('OnboardingWizard — skip semantics (2026-08-13 walkthrough)', () => {
       })
     );
     await user.click(screen.getByRole('button', { name: 'identity-skip' }));
+    // The subscribe gate now sits between identity and the first
+    // AI-backed step (#887).
+    await user.click(
+      screen.getByRole('button', { name: 'subscribe-complete' })
+    );
     await user.click(screen.getByRole('button', { name: 'resume-skip' }));
     await user.click(screen.getByRole('button', { name: 'job-skip' }));
     await user.click(screen.getByRole('button', { name: 'targets-skip' }));
@@ -485,6 +520,11 @@ describe('OnboardingWizard — change path (sweep 2026-08-14 B1)', () => {
     // Path C's first real step is identity, then conversation.
     expect(screen.getByTestId('identity-step-stub')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'identity-complete' }));
+    // The subscribe gate now sits between identity and the first
+    // AI-backed step (#887).
+    await user.click(
+      screen.getByRole('button', { name: 'subscribe-complete' })
+    );
     expect(screen.getByTestId('conversation-chat-stub')).toBeInTheDocument();
   });
 });
@@ -513,12 +553,12 @@ describe('OnboardingWizard — Path A (resume + role)', () => {
       })
     );
 
-    // The counter excludes path-chooser (§A4): Path A counts 5 steps and
-    // identity is step 1 of 5. ProgressBar: Math.round((1/5)*100) = 20.
+    // The counter excludes path-chooser (§A4): Path A counts 6 steps and
+    // identity is step 1 of 6. ProgressBar: Math.round((1/6)*100) = 17.
     const progressBar = screen.getByRole('progressbar');
     expect(progressBar).toHaveAttribute('aria-valuemax', '100');
-    expect(progressBar).toHaveAttribute('aria-valuenow', '20');
-    expect(screen.getByText('Step 1 of 5')).toBeInTheDocument();
+    expect(progressBar).toHaveAttribute('aria-valuenow', '17');
+    expect(screen.getByText('Step 1 of 6')).toBeInTheDocument();
   });
 
   it('advances through identity -> upload-resume -> add-job -> pick-targets -> completion', async () => {
@@ -533,6 +573,11 @@ describe('OnboardingWizard — Path A (resume + role)', () => {
 
     // Step 1: identity -> next
     await user.click(screen.getByRole('button', { name: 'identity-complete' }));
+    // The subscribe gate now sits between identity and the first
+    // AI-backed step (#887).
+    await user.click(
+      screen.getByRole('button', { name: 'subscribe-complete' })
+    );
     expect(screen.getByTestId('resume-uploader-stub')).toBeInTheDocument();
 
     // Step 2: upload-resume -> next
@@ -558,6 +603,11 @@ describe('OnboardingWizard — Path A (resume + role)', () => {
       })
     );
     await user.click(screen.getByRole('button', { name: 'identity-complete' }));
+    // The subscribe gate now sits between identity and the first
+    // AI-backed step (#887).
+    await user.click(
+      screen.getByRole('button', { name: 'subscribe-complete' })
+    );
     await user.click(screen.getByRole('button', { name: 'resume-complete' }));
     await user.click(screen.getByRole('button', { name: 'job-complete' }));
     await user.click(screen.getByRole('button', { name: 'targets-complete' }));
@@ -578,12 +628,12 @@ describe('OnboardingWizard — Path B (resume only)', () => {
     );
 
     expect(screen.getByTestId('identity-step-stub')).toBeInTheDocument();
-    // The counter excludes path-chooser (§A4): Path B counts 4 steps and
-    // identity is step 1 of 4. ProgressBar: Math.round((1/4)*100) = 25.
+    // The counter excludes path-chooser (§A4): Path B counts 5 steps and
+    // identity is step 1 of 5. ProgressBar: Math.round((1/5)*100) = 20.
     const progressBar = screen.getByRole('progressbar');
     expect(progressBar).toHaveAttribute('aria-valuemax', '100');
-    expect(progressBar).toHaveAttribute('aria-valuenow', '25');
-    expect(screen.getByText('Step 1 of 4')).toBeInTheDocument();
+    expect(progressBar).toHaveAttribute('aria-valuenow', '20');
+    expect(screen.getByText('Step 1 of 5')).toBeInTheDocument();
   });
 
   it('skips the add-job step and goes directly to pick-targets', async () => {
@@ -596,6 +646,11 @@ describe('OnboardingWizard — Path B (resume only)', () => {
       })
     );
     await user.click(screen.getByRole('button', { name: 'identity-complete' }));
+    // The subscribe gate now sits between identity and the first
+    // AI-backed step (#887).
+    await user.click(
+      screen.getByRole('button', { name: 'subscribe-complete' })
+    );
     await user.click(screen.getByRole('button', { name: 'resume-complete' }));
 
     expect(screen.getByTestId('target-suggestions-stub')).toBeInTheDocument();
@@ -624,6 +679,11 @@ describe('OnboardingWizard — Path C (conversation)', () => {
     );
 
     await user.click(screen.getByRole('button', { name: 'identity-complete' }));
+    // The subscribe gate now sits between identity and the first
+    // AI-backed step (#887).
+    await user.click(
+      screen.getByRole('button', { name: 'subscribe-complete' })
+    );
     expect(screen.getByTestId('conversation-chat-stub')).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: 'chat-complete' }));

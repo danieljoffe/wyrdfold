@@ -286,9 +286,15 @@ async def test_get_llm_client_translates_expired_trial_to_a_different_402(
 ) -> None:
     """Both refusals are 402, but they must not say the same thing (#841).
 
-    An expired trial user has no OpenRouter key and no reason to get one —
-    telling them to add one is the dead end the trial exists to remove. The
+    A user refused here has no OpenRouter key and no reason to get one —
+    telling them to add one is the dead end this branch exists to remove. The
     message must point at subscribing instead.
+
+    It must also NOT say "trial" (#887). There is no trial period; a new
+    account is stamped ``plan='trial'`` with an already-elapsed clock purely
+    so it gets no free inference, so everyone who reaches this line never had
+    a trial to lose. Naming one describes an entitlements-table internal and
+    promises a window that never opened.
     """
     from app.services.llm import TrialExpiredError
 
@@ -307,7 +313,10 @@ async def test_get_llm_client_translates_expired_trial_to_a_different_402(
 
     assert exc.value.status_code == 402
     detail = exc.value.detail.lower()
-    assert "trial" in detail and "subscribe" in detail
+    assert "subscription" in detail
     # The precise failure this guards against: falling through to the BYOK
-    # branch and telling a trial user to go and buy an API key.
+    # branch and telling this user to go and buy an API key.
     assert "openrouter" not in detail
+    assert "api key" not in detail
+    # And the copy regression #887 fixed — a countdown that never ran.
+    assert "trial" not in detail
