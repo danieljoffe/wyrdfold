@@ -174,6 +174,68 @@ def test_patch_step_writes_both_path_and_step(client_factory):
     }
 
 
+def test_patch_step_round_trips_subscribe(client_factory):
+    """The subscribe gate survives write → read (#887).
+
+    Both halves are asserted because they used to be two hand-kept lists —
+    the write model's Literal and the read's ``_KNOWN_STEPS``. A step present
+    in only one writes fine and then reads back as None, which restarts the
+    wizard at ``path-chooser``. This is the step a user returns to from Stripe
+    Checkout, so that reset would greet someone who just paid with a wizard
+    that had forgotten them.
+    """
+    sb = MagicMock()
+    _select_returns(
+        sb,
+        {
+            "onboarding_completed_at": None,
+            "onboarding_path": "B",
+            "onboarding_current_step": "subscribe",
+        },
+    )
+    client = client_factory(sb)
+    r = client.patch("/profile/onboarding/step", json={"current_step": "subscribe"})
+
+    assert r.status_code == 200
+    assert sb.table.return_value.update.call_args.args[0] == {
+        "onboarding_current_step": "subscribe"
+    }
+    # The read half: served back, NOT nulled as an unknown step.
+    assert r.json()["current_step"] == "subscribe"
+
+
+def test_step_vocabulary_matches_the_wizard(client_factory):
+    """The API's steps and the wizard's ``Step`` union must be the same set.
+
+    They are separate declarations in separate languages, and drift is silent
+    in the direction that matters: the FE adds a step, PATCH 422s (fire-and-
+    forget, so nothing surfaces), and the user's resume point quietly stops
+    advancing. Parsed out of the TSX rather than restated here — a copy in
+    this file would drift alongside the one it is meant to catch.
+    """
+    import re
+    from pathlib import Path
+    from typing import get_args
+
+    from app.models.user_profile import OnboardingStep
+
+    wizard = (
+        Path(__file__).resolve().parents[2]
+        / "wyrdfold/src/app/onboarding/OnboardingWizard.tsx"
+    )
+    assert wizard.is_file(), f"wizard not found at {wizard} — fix this path, don't skip"
+
+    source = wizard.read_text()
+    union = re.search(r"^type Step =\s*(.*?);", source, re.S | re.M)
+    assert union, "could not find the `type Step` union in OnboardingWizard.tsx"
+    fe_steps = set(re.findall(r"'([a-z-]+)'", union.group(1)))
+
+    # Guard the guard: if the regex silently matched nothing, the comparison
+    # below would pass by vacuity for any API vocabulary at all.
+    assert len(fe_steps) > 3, f"parsed too few steps ({fe_steps}) — the regex broke"
+    assert fe_steps == set(get_args(OnboardingStep))
+
+
 def test_patch_step_rejects_unknown_step_value(client_factory):
     sb = MagicMock()
     _select_returns(
