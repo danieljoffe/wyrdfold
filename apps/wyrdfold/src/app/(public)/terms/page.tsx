@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import LegalDocument, { type LegalSection } from '../_components/LegalDocument';
+import { LEGAL_ENTITY_NAME } from '@/lib/legalEntity';
 
 // Placeholder — confirm the real legal-contact mailbox before publishing.
 const CONTACT_EMAIL = 'legal@wyrdfold.com';
@@ -18,7 +19,7 @@ const SECTIONS: LegalSection[] = [
     body: (
       <p>
         These Terms of Service (“Terms”) govern your use of WyrdFold, operated
-        by [Legal Entity Name] (“we”, “us”). By creating an account or using the
+        by {LEGAL_ENTITY_NAME} (“we”, “us”). By creating an account or using the
         service, you agree to these Terms and to our{' '}
         <Link className='underline underline-offset-2' href='/privacy'>
           Privacy Policy
