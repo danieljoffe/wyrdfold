@@ -173,9 +173,14 @@ const SECTIONS: LegalSection[] = [
           <li>
             <b>Voyage AI</b> — text embeddings used for matching. Receives job
             postings, role labels, and{' '}
-            <b>extracts of your experience profile</b> (the structured text
-            derived from your resume), which are turned into numeric vectors so
-            we can compare them to roles.
+            <b>extracts of your experience profile</b> — job titles, employers,
+            dates, skills, and accomplishments — which are turned into numeric
+            vectors so we can compare them to roles.{' '}
+            <b>
+              Your name, email, phone number, address, and profile links are not
+              part of those extracts
+            </b>
+            , and no account identifier is sent with them.
           </li>
           <li>
             <b>Brave Search</b> and <b>Firecrawl</b> — discovering and fetching
