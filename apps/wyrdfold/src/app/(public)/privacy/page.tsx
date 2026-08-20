@@ -522,7 +522,7 @@ export default function PrivacyPage() {
   return (
     <LegalDocument
       title='Privacy Policy'
-      effective='July 21, 2026'
+      effective='August 20, 2026'
       intro={
         <p>
           This Privacy Policy explains how WyrdFold handles your personal data.

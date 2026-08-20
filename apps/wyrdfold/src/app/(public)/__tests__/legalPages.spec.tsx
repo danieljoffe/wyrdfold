@@ -50,6 +50,28 @@ describe.each([
     }
   });
 
+  it('ships neither a draft notice nor an unfilled placeholder', () => {
+    // The draft banner used to be the safety net against an accidental early
+    // publish. It was removed once the documents were reviewed and the entity
+    // resolved from the environment — so this test inherits that job, and does
+    // it better: the banner only worked if a human re-read it.
+    //
+    // Deliberately NOT asserting the absence of `[bracketed]` placeholders
+    // here. `legalEntity.ts` renders a visible `[Legal Entity Name]` when the
+    // env var is unset, and it is unset under jest — so such an assertion
+    // would fail on a correctly-built page and prove nothing about production.
+    // Whether the real deploy resolved its entity vars is a DEPLOY property,
+    // checked against the live pages in the release gate. That check earned
+    // its place: it caught LEGAL_ENTITY_NAME set to the brand rather than the
+    // operator on the 2026-08-20 release.
+    const { container } = render(<Page />);
+    const text = container.textContent ?? '';
+
+    expect(text.length).toBeGreaterThan(2000);
+    expect(text).not.toMatch(/pending\s+legal\s+review/i);
+    expect(text).not.toMatch(/starting\s+template/i);
+  });
+
   it('links to its counterpart rather than only naming it', () => {
     // Counsel asked that "Privacy Policy" / "Terms of Service" be real links
     // everywhere they are referenced, not bare text.
