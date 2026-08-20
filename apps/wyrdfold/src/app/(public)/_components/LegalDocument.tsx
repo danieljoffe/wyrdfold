@@ -17,10 +17,15 @@ interface LegalDocumentProps {
  * Shared shell for the public legal pages (Terms, Privacy). Renders inside the
  * (public) marketing layout, so it inherits the header, beta strip, and footer.
  *
- * NOTE: the content passed in is an UNREVIEWED SCAFFOLD. Bracketed placeholders
- * (e.g. `[Legal Entity Name]`) and the draft banner below must be completed by
- * counsel before these pages are relied on. The `signup_mode=open` launch gate
- * depends on that review.
+ * The draft banner this used to render is gone: the documents went through
+ * external review (#439) and the operating entity now resolves from the
+ * environment, so nothing bracketed remains. It said "every [bracketed]
+ * placeholder must be completed and this notice removed before publishing" —
+ * on a page with no placeholders left, which undercut the documents it was
+ * meant to protect.
+ *
+ * `legalPages.spec.tsx` asserts an effective date renders here and that no
+ * repository-disclaimer text reaches these pages.
  */
 export default function LegalDocument({
   title,
@@ -38,21 +43,6 @@ export default function LegalDocument({
           Effective date: {effective}
         </p>
       </header>
-
-      {/* Draft notice — remove once counsel has reviewed and the bracketed
-          placeholders are filled in. Kept visible on purpose so an
-          accidental early publish is obvious rather than silent. */}
-      <div
-        role='note'
-        className='mt-6 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-text-secondary'
-      >
-        <span className='font-semibold text-text-primary'>
-          Draft — pending legal review.
-        </span>{' '}
-        This is a starting template, not legal advice. Every{' '}
-        <span className='font-mono text-xs'>[bracketed]</span> placeholder must
-        be completed and this notice removed before publishing.
-      </div>
 
       <div className='mt-8 space-y-4 text-base leading-relaxed text-text-secondary'>
         {intro}
