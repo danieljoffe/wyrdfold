@@ -1433,10 +1433,28 @@ async def get_active_targets(
     return TargetsListResponse(targets=targets)
 
 
+async def _llm_for_background_refresh(supabase: AsyncClient, user_id: str) -> "LLMClient | None":
+    """An LLM client for a BEST-EFFORT background task, or None if unentitled.
+
+    ``get_llm_client`` is a route dependency, and FastAPI resolves dependencies
+    before the handler body runs — so declaring it on a read makes the WHOLE
+    read 402 for anyone without a subscription, even when the LLM is only
+    wanted for optional background work. Resolving it here instead keeps the
+    refusal scoped to the thing that actually needs inference.
+    """
+    from app.services.llm import MissingUserKeyError, TrialExpiredError, get_client_async
+
+    try:
+        return await get_client_async(supabase, user_id)
+    except (TrialExpiredError, MissingUserKeyError):
+        # Not entitled: skip the refresh. Their cached scores still render;
+        # they simply do not get refreshed until they subscribe.
+        return None
+
+
 @router.get("/mine", response_model=MyTargetsSummaryListResponse)
 async def get_my_targets(
     supabase: AsyncClient = Depends(get_async_service_supabase),
-    llm: LLMClient = Depends(get_llm_client),
     user_id: str = Depends(get_current_user_id),
 ) -> MyTargetsSummaryListResponse:
     """Return the current user's linked targets with fit scores.
@@ -1460,10 +1478,17 @@ async def get_my_targets(
     # service client now (#57 PR-G2e-5), so it's spawned DETACHED (never a starlette
     # ``BackgroundTask`` — the async pool deadlocks under uvloop there).
     if items:
-        spawn_detached(
-            fit_refresh.refresh_stale_for_user(supabase, llm, user_id=user_id),
-            name=f"fit-refresh-{user_id}",
-        )
+        # Resolved HERE, not as a route dependency (#893): this endpoint is a
+        # pure read of the caller's own list, and the client is wanted only for
+        # the optional refresh below. As a dependency it made the entire list
+        # 402 for an unsubscribed user — so "Finish setup later" landed on a
+        # dashboard that could not load their targets at all.
+        llm = await _llm_for_background_refresh(supabase, user_id)
+        if llm is not None:
+            spawn_detached(
+                fit_refresh.refresh_stale_for_user(supabase, llm, user_id=user_id),
+                name=f"fit-refresh-{user_id}",
+            )
     return MyTargetsSummaryListResponse(targets=items)
 
 
