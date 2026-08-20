@@ -145,6 +145,14 @@ const SECTIONS: LegalSection[] = [
             <b>Sentry</b> — error monitoring.
           </li>
         </ul>
+        <p>
+          WyrdFold does not make automated decisions that have legal or
+          similarly significant effects on you. All AI-generated content —
+          including match scores, resumes, and cover letters — is provided as a
+          draft for your review and editing before any submission or use. You
+          retain full control over the final content you choose to share with
+          employers.
+        </p>
       </>
     ),
   },

@@ -45,6 +45,13 @@ commercial service — and each release automatically becomes Apache-2.0 two
 years on. Chosen to keep self-hosting genuinely free while reserving the
 option of a hosted version.
 
+The Terms and Privacy Policy sources in this repo are published for
+transparency, not as the operative agreement — the binding versions are the
+ones rendered at [wyrdfold.com/terms](https://wyrdfold.com/terms) and
+[wyrdfold.com/privacy](https://wyrdfold.com/privacy). See
+[DISCLAIMER.md](./DISCLAIMER.md), which also covers what changes if you
+self-host.
+
 ## Architecture
 
 | Project                 | Stack                                                         | Deploy           |
