@@ -105,8 +105,13 @@ const SECTIONS: LegalSection[] = [
           providers through <b>OpenRouter</b> (a service that securely routes
           requests to AI model providers).{' '}
           <b>Only the information necessary to complete your request is sent</b>
-          . We have requested <b>Zero-Data-Retention</b> from our providers and
-          are in the process of confirming its activation.
+          .{' '}
+          <b>
+            Zero-Data-Retention is enabled on our account for all model groups
+          </b>
+          , so those providers do not retain your content after processing your
+          request, and we have <b>opted out of provider training</b>, so your
+          data is never routed to a provider that would train on it.
         </p>
         <p>
           If you provide your own AI provider API key (BYOK), we use it only to
