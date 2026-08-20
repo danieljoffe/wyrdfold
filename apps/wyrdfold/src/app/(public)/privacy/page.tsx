@@ -114,8 +114,14 @@ const SECTIONS: LegalSection[] = [
           data is never routed to a provider that would train on it.
         </p>
         <p>
-          If you provide your own AI provider API key (BYOK), we use it only to
-          make requests on your behalf and for no other purpose.
+          <b>
+            Bring-your-own-key (BYOK) is not currently offered on the hosted
+            service
+          </b>
+          , so AI features here always run on our provider account. A
+          self-hosted WyrdFold can be configured with its own AI provider key,
+          in which case data goes directly from that deployment to the provider
+          and we neither receive nor process it.
         </p>
         <p>We rely on the following sub-processors to run WyrdFold:</p>
         <ul className='ml-5 list-disc space-y-1'>
@@ -228,7 +234,28 @@ const SECTIONS: LegalSection[] = [
             law.
           </li>
         </ul>
-        <p>Generated resumes and cover letters remain your content.</p>
+        <p>
+          Deletion covers your profile and experience data, uploaded resumes,
+          generated resumes and cover letters, saved jobs and pipeline history,
+          notification settings, and your account itself. Before deleting, you
+          can download all of it from{' '}
+          <span className='font-mono text-sm'>Settings → Export my data</span>—
+          the export covers the same records the deletion removes.
+        </p>
+        <p>
+          Generated resumes and cover letters are yours; deleting your account
+          removes our copies, not any copy you have downloaded or sent.
+        </p>
+        <p>
+          <b>
+            Deleting your account does not by itself cancel a paid subscription
+          </b>
+          . Cancel your subscription first if you want billing to stop — see our{' '}
+          <Link className='underline underline-offset-2' href='/terms'>
+            Terms of Service
+          </Link>
+          .
+        </p>
       </>
     ),
   },
