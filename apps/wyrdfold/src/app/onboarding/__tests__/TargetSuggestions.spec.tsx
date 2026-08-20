@@ -790,3 +790,89 @@ describe('TargetSuggestions — per-tab suggestion cache (sweep 2026-08-14 A3)',
     await waitFor(() => expect(sessionStorage.getItem(CACHE_KEY)).toBeNull());
   });
 });
+
+// ---- skipping the resume must not look like a malfunction (#895) -----------
+//
+// Suggestions are DERIVED from the experience profile, so "Skip this step" on
+// upload-resume makes the very next step's first request fail every time. It
+// used to surface the server's own wording — a red "No experience profile
+// found" one click after the user chose to skip.
+
+function suggestFailure(status: number, detail: string) {
+  return {
+    ok: false,
+    status,
+    clone: () => ({ json: async () => ({ detail }) }),
+    json: async () => ({ detail }),
+  };
+}
+
+describe('after the resume step was skipped', () => {
+  it('explains the cause instead of raising a red error', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes('/api/targets/suggest')) {
+        return Promise.resolve(
+          suggestFailure(422, 'No experience profile found')
+        );
+      }
+      if (String(url).includes('/api/career/experience/optimized')) {
+        // No profile — because the upload step was skipped.
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({}),
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({}) });
+    });
+
+    render(<TargetSuggestions onComplete={jest.fn()} onSkip={jest.fn()} />);
+
+    expect(
+      await screen.findByText(
+        /built from your resume, and that step was skipped/i
+      )
+    ).toBeInTheDocument();
+    // The server's internal wording must not be what the user reads.
+    expect(
+      screen.queryByText(/No experience profile found/i)
+    ).not.toBeInTheDocument();
+    // And creating one by hand is still offered — the step stays usable.
+    // Matched on the card's own heading, not a loose /create/i: the new
+    // explanation also contains "create", so a loose match finds several
+    // elements and throws for the wrong reason.
+    expect(screen.getByText(/create your first target/i)).toBeInTheDocument();
+  });
+
+  it('still shows a real error when the profile is NOT the problem', async () => {
+    // Guards against over-classifying: a budget refusal must keep saying so
+    // rather than being relabelled "you skipped the resume".
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes('/api/targets/suggest')) {
+        return Promise.resolve(
+          suggestFailure(429, 'LLM hourly budget reached')
+        );
+      }
+      if (String(url).includes('/api/career/experience/optimized')) {
+        // A profile DOES exist.
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            payload: { summary: 'x', roles: [], skills: [] },
+          }),
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({}) });
+    });
+
+    render(<TargetSuggestions onComplete={jest.fn()} onSkip={jest.fn()} />);
+
+    expect(
+      await screen.findByText(/LLM hourly budget reached/i)
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/built from your resume, and that step was skipped/i)
+    ).not.toBeInTheDocument();
+  });
+});
