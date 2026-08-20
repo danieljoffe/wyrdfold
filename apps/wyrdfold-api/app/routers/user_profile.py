@@ -11,6 +11,7 @@ row owner (#79 Phases 2 reads / 3 writes).
 """
 
 import asyncio
+import logging
 import os
 import tempfile
 from collections.abc import Iterator
@@ -41,6 +42,8 @@ from app.models.user_profile import (
     ResumeStyleSettings,
     ResumeStyleSettingsUpdate,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _email_channel_available() -> bool:
@@ -617,11 +620,41 @@ async def delete_account(
     logged-in user can erase their own account. The FE gates this behind
     an explicit confirmation step.
 
+    Cancels any live Stripe subscription **first** (#889). ``stripe_customer_id``
+    lives on ``user_profiles``, which the cascade deletes, so cancelling
+    afterwards is impossible — the link back to the customer is gone. Before
+    this, deleting an account left the subscription billing with nothing on our
+    side able to trace the charge.
+
+    Order matters in one more way: cancel-then-delete can fail having cancelled
+    a subscription for an account that still exists, which the user can fix by
+    resubscribing. Delete-then-cancel fails into an untraceable recurring
+    charge. We take the recoverable direction.
+
     Returns a per-resource count map for the user's records / audit log.
     """
+    from app.routers import billing
     from app.services import account_deletion
 
+    try:
+        cancelled = await billing.cancel_subscriptions_for_deletion(supabase, user_id)
+    except Exception as exc:
+        # Refuse the deletion rather than proceed. Erasure is a right with its
+        # own clock, so this must not become a permanent block — but a deletion
+        # the user can retry in a minute is strictly better than one that
+        # silently leaves them paying with no record connecting them to it.
+        logger.exception("subscription cancellation failed for user=%s; refusing deletion", user_id)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "We couldn't cancel your subscription just now, so we haven't "
+                "deleted your account — deleting it first would leave you being "
+                "billed with no way to stop it. Please try again shortly."
+            ),
+        ) from exc
+
     report = await account_deletion.delete_account(supabase, user_id=user_id)
+    report["stripe_subscriptions_cancelled"] = len(cancelled)
     return {"deleted": True, "report": report}
 
 

@@ -178,7 +178,12 @@ def _seeded() -> _FakeSupabase:
             {"id": "rj1", "user_id": _UID, "jd_text": "JD A"},
             {"id": "rj2", "user_id": "other", "jd_text": "someone else's JD"},
         ],
-        "user_profiles": [{"id": _PROFILE_ID, "user_id": _UID}],
+        # Carries stripe_customer_id because the deletion path READS it before
+        # deleting this row (#889). Without it the cancel-before-delete tests
+        # would pass by returning early, proving nothing.
+        "user_profiles": [
+            {"id": _PROFILE_ID, "user_id": _UID, "stripe_customer_id": "cus_seeded"}
+        ],
         # Keyed by the auth uid since R3 §2 (#557) — an ordinary user_id table.
         "notifications_sent": [
             {"user_id": _UID},
@@ -470,4 +475,181 @@ def test_delete_account_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     assert body["deleted"] is True
     assert body["report"]["auth_user"] == 1
     assert body["report"]["documents"] == 2
+    assert sb.auth.admin.deleted == [_UID]
+
+
+# ---- deletion cancels the subscription (#889) --------------------------------
+#
+# Deleting an account used to leave the Stripe subscription billing — and the
+# cascade removed ``user_profiles``, which held the only ``stripe_customer_id``,
+# so afterwards nothing could connect the recurring charge back to a person.
+
+
+def _delete_with_billing(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    subs: list[SimpleNamespace],
+    cancel_raises: Exception | None = None,
+) -> tuple[Any, Any, list[str]]:
+    """Drive DELETE /profile/account with a faked Stripe, recording call order."""
+    from fastapi.testclient import TestClient
+
+    from app.config import settings
+    from app.dependencies import (
+        get_async_service_supabase,
+        get_current_user_id,
+        verify_supabase_jwt,
+    )
+    from app.main import app
+    from app.routers import billing
+
+    monkeypatch.setattr(settings, "deployment_mode", "saas")
+    monkeypatch.setattr(settings, "stripe_secret_key", "sk_test_x")
+
+    order: list[str] = []
+    cancelled: list[str] = []
+
+    class _Subs:
+        def list(self, params: dict[str, Any]) -> SimpleNamespace:
+            order.append(f"stripe.list:{params.get('customer')}")
+            return SimpleNamespace(data=subs)
+
+        def cancel(self, sub_id: str) -> SimpleNamespace:
+            if cancel_raises is not None:
+                raise cancel_raises
+            order.append(f"stripe.cancel:{sub_id}")
+            cancelled.append(sub_id)
+            return SimpleNamespace(id=sub_id, status="canceled")
+
+    monkeypatch.setattr(billing, "_client", lambda: SimpleNamespace(subscriptions=_Subs()))
+
+    sb = _seeded()
+
+    # Mark where the erasure cascade BEGINS. Tracking raw table access would be
+    # wrong: reading `stripe_customer_id` off user_profiles is itself a table
+    # read, and it necessarily happens first. The property under test is that
+    # cancellation finishes before any row is destroyed.
+    real_cascade = account_deletion.delete_account
+
+    async def _tracked_cascade(*args: Any, **kwargs: Any) -> Any:
+        order.append("cascade:start")
+        return await real_cascade(*args, **kwargs)
+
+    monkeypatch.setattr(account_deletion, "delete_account", _tracked_cascade)
+
+    app.dependency_overrides[verify_supabase_jwt] = lambda: _UID
+    app.dependency_overrides[get_current_user_id] = lambda: _UID
+    app.dependency_overrides[get_async_service_supabase] = lambda: sb
+    try:
+        resp = TestClient(app).delete("/profile/account")
+    finally:
+        app.dependency_overrides.clear()
+    return resp, sb, order
+
+
+def test_deletion_cancels_the_subscription_before_touching_the_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ordering IS the bug (#889).
+
+    ``stripe_customer_id`` lives on ``user_profiles``. Cancel after the cascade
+    and there is no customer id left to cancel with — so this asserts the Stripe
+    calls happen before ANY table write, not merely that both happened.
+    """
+    resp, _sb, order = _delete_with_billing(
+        monkeypatch,
+        subs=[SimpleNamespace(id="sub_live", status="active")],
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["report"]["stripe_subscriptions_cancelled"] == 1
+
+    assert order.index("stripe.cancel:sub_live") < order.index("cascade:start"), order
+
+
+def test_deletion_is_refused_when_the_subscription_cannot_be_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail LOUD, and leave the account intact.
+
+    The alternative — delete anyway — recreates the exact state #889 is about:
+    a live subscription with nothing left to trace it to. A deletion the user
+    can retry in a minute is the recoverable direction.
+    """
+    resp, sb, order = _delete_with_billing(
+        monkeypatch,
+        subs=[SimpleNamespace(id="sub_live", status="active")],
+        cancel_raises=RuntimeError("stripe is down"),
+    )
+
+    assert resp.status_code == 503
+    assert "haven’t deleted your account" in resp.json()["detail"].replace("'", "’")
+    # The precondition that makes this meaningful: nothing was erased.
+    assert sb.auth.admin.deleted == []
+    assert "cascade:start" not in order
+    assert sb.tables["documents"], "rows were destroyed despite the refusal"
+
+
+@pytest.mark.parametrize(
+    ("status", "expect_cancelled"),
+    [
+        ("active", True),
+        ("trialing", True),
+        # Delinquent subscriptions still bill once the card recovers, so they
+        # must be cancelled too — listing only "active" would miss them.
+        ("past_due", True),
+        ("unpaid", True),
+        ("paused", True),
+        # Already terminal: cancelling again is a pointless API call.
+        ("canceled", False),
+        ("incomplete_expired", False),
+    ],
+)
+def test_only_billable_subscription_statuses_are_cancelled(
+    monkeypatch: pytest.MonkeyPatch, status: str, expect_cancelled: bool
+) -> None:
+    resp, _sb, order = _delete_with_billing(
+        monkeypatch, subs=[SimpleNamespace(id="sub_x", status=status)]
+    )
+
+    assert resp.status_code == 200
+    did_cancel = any(e.startswith("stripe.cancel") for e in order)
+    assert did_cancel is expect_cancelled
+    assert resp.json()["report"]["stripe_subscriptions_cancelled"] == int(expect_cancelled)
+
+
+def test_deletion_without_billing_configured_never_calls_stripe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Self-host has no Stripe. Deletion must not depend on it."""
+    from fastapi.testclient import TestClient
+
+    from app.config import settings
+    from app.dependencies import (
+        get_async_service_supabase,
+        get_current_user_id,
+        verify_supabase_jwt,
+    )
+    from app.main import app
+    from app.routers import billing
+
+    monkeypatch.setattr(settings, "deployment_mode", "self_host")
+    monkeypatch.setattr(settings, "stripe_secret_key", "")
+
+    def _boom() -> Any:  # pragma: no cover — must never be reached
+        raise AssertionError("Stripe client built on a non-billing instance")
+
+    monkeypatch.setattr(billing, "_client", _boom)
+
+    sb = _seeded()
+    app.dependency_overrides[verify_supabase_jwt] = lambda: _UID
+    app.dependency_overrides[get_current_user_id] = lambda: _UID
+    app.dependency_overrides[get_async_service_supabase] = lambda: sb
+    try:
+        resp = TestClient(app).delete("/profile/account")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert resp.json()["report"]["stripe_subscriptions_cancelled"] == 0
     assert sb.auth.admin.deleted == [_UID]

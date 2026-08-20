@@ -247,6 +247,65 @@ async def create_portal_session(
     return BillingUrlResponse(url=session.url)
 
 
+#: Subscription statuses that are still capable of billing someone, and so
+#: must be cancelled before an account goes away. Everything else
+#: (``canceled``, ``incomplete_expired``) is already terminal.
+_CANCELLABLE_STATUSES = frozenset({"active", "trialing", "past_due", "unpaid", "paused"})
+
+
+async def cancel_subscriptions_for_deletion(supabase: AsyncClient, user_id: str) -> list[str]:
+    """Cancel the user's live subscriptions ahead of account deletion (#889).
+
+    Returns the ids cancelled (empty when there was nothing to cancel, or when
+    this instance doesn't sell subscriptions at all).
+
+    **Call this BEFORE the deletion cascade.** ``stripe_customer_id`` lives on
+    ``user_profiles``, which the cascade deletes — so after it runs there is no
+    link left from the Stripe customer back to a person. That was the whole
+    defect: the subscription kept billing, the webhook ignored its events as an
+    unknown customer, and nobody could trace the charge afterwards.
+
+    Cancels **immediately** rather than at period end. The account is being
+    erased, so there is no access left to preserve for the remainder of the
+    period — leaving a subscription "active" for a user who no longer exists
+    would only produce another charge and another orphaned customer.
+
+    Stripe errors propagate deliberately. The caller must refuse the deletion
+    rather than swallow them: a deletion the user can retry is recoverable,
+    whereas deleting first and failing to cancel reproduces exactly the
+    untraceable-charge state this function exists to prevent.
+    """
+    if settings.deployment_mode != "saas" or not settings.stripe_secret_key:
+        return []
+    customer_id = await _get_stripe_customer_id(supabase, user_id)
+    if not customer_id:
+        return []
+
+    client = _client()
+    # ``status="all"`` so a past_due or paused subscription is caught too —
+    # listing only "active" would leave a delinquent subscription billing.
+    subs = await asyncio.to_thread(
+        lambda: client.subscriptions.list(
+            params={"customer": customer_id, "status": "all", "limit": 100}
+        )
+    )
+    cancelled: list[str] = []
+    for sub in subs.data or []:
+        status = cast(str, getattr(sub, "status", "") or "")
+        sub_id = cast(str, getattr(sub, "id", "") or "")
+        if status not in _CANCELLABLE_STATUSES or not sub_id:
+            continue
+        await asyncio.to_thread(lambda sid=sub_id: client.subscriptions.cancel(sid))  # type: ignore[misc]
+        cancelled.append(sub_id)
+    if cancelled:
+        logger.info(
+            "cancelled %d subscription(s) for user=%s ahead of account deletion",
+            len(cancelled),
+            user_id,
+        )
+    return cancelled
+
+
 async def _resolve_user_id(
     supabase: AsyncClient, *, metadata_user_id: str | None, customer_id: str | None
 ) -> str | None:

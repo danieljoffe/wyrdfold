@@ -252,14 +252,12 @@ const SECTIONS: LegalSection[] = [
           downloaded or already sent.
         </p>
         <p>
-          <b>
-            Deleting your account does not by itself cancel a paid subscription
-          </b>
-          . Cancel your subscription first if you want billing to stop — see our{' '}
+          Deleting your account also cancels any active subscription, so billing
+          stops — see our{' '}
           <Link className='underline underline-offset-2' href='/terms'>
             Terms of Service
-          </Link>
-          .
+          </Link>{' '}
+          for what that means for the period you have already paid for.
         </p>
       </>
     ),

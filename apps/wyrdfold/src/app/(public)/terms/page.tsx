@@ -302,18 +302,16 @@ const SECTIONS: LegalSection[] = [
           until then, and we do not pro-rate the remainder.
         </p>
         <p>
-          <b>Cancelling and deleting are separate actions.</b> Deleting your
-          WyrdFold account does not by itself cancel your subscription. If you
-          want to stop being billed, cancel your subscription first, then delete
-          your account. If you have already deleted an account with an active
-          subscription, email{' '}
-          <a
-            className='underline underline-offset-2'
-            href={`mailto:${LEGAL_EMAIL}`}
-          >
-            {LEGAL_EMAIL}
-          </a>{' '}
-          and we will cancel it and sort out any charges taken since.
+          <b>Deleting your account cancels your subscription.</b> If you delete
+          your account, we cancel any active subscription as part of the same
+          action, so you are not billed again. Deletion removes your account and
+          its data straight away, so access ends immediately rather than running
+          to the end of the period — and we do not refund the unused remainder.{' '}
+          <b>
+            If you want to keep using WyrdFold until the period you have paid
+            for runs out, cancel your subscription rather than deleting your
+            account.
+          </b>
         </p>
         <p>
           <b>Failed payments.</b> If a payment cannot be collected, Stripe may
