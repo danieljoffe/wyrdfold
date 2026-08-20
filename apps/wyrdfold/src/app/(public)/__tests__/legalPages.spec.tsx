@@ -16,11 +16,15 @@ import PrivacyPage from '../privacy/page';
 // to a published policy. Counsel's concern was that a build step might one day
 // concatenate the two — the repo disclaimer explains that the rendered pages
 // are authoritative, which is nonsense to serve *on* a rendered page.
+// `\s+` rather than literal spaces: the source file line-wraps these phrases,
+// and rendered textContent collapses whitespace differently again. A guard that
+// only matches one particular wrapping is a guard that quietly stops matching.
 const DISCLAIMER_ONLY = [
-  /not the operative agreement/i,
-  /the rendered pages govern/i,
-  /if you self-host or fork/i,
-  /provided for informational transparency/i,
+  /repository\s+copies\s+are\s+not\s+the\s+operative\s+policies/i,
+  /not\s+the\s+operative\s+agreement/i,
+  /the\s+rendered\s+pages\s+govern/i,
+  /if\s+you\s+self-host\s+or\s+fork/i,
+  /we\s+do\s+not\s+vet,\s+approve,\s+endorse/i,
 ];
 
 describe.each([
