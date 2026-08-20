@@ -14,6 +14,7 @@ import ConversationChat from '../_components/ConversationChat';
 import PathChooser from './PathChooser';
 import ResumeUploader from './ResumeUploader';
 import IdentityStep from './IdentityStep';
+import SubscribeStep from './SubscribeStep';
 import JobUrlInput, { type JobData } from './JobUrlInput';
 import TargetSuggestions from './TargetSuggestions';
 import CompletionScreen from './CompletionScreen';
@@ -23,6 +24,7 @@ export type OnboardingPath = 'A' | 'B' | 'C';
 type Step =
   | 'path-chooser'
   | 'identity'
+  | 'subscribe'
   | 'upload-resume'
   | 'add-job'
   | 'pick-targets'
@@ -34,10 +36,20 @@ type Step =
 // from #683 (Generate Resume / Cover Letter would 400 with "No
 // contact name on file" otherwise). Email auto-fills from the
 // Supabase auth session; name is the only required field.
+//
+// ``subscribe`` sits immediately after it, and its position is the whole
+// point of #887: WyrdFold is subscribe-to-use, and in every path the step
+// that follows is the first one requiring AI (`upload-resume` needs
+// `get_llm_client`, so does `conversation`). Before this step existed the
+// refusal arrived at step 3 — after the user had picked a path, typed their
+// name, and uploaded a resume. The ask now precedes the work it pays for.
+// It self-skips when the user is already entitled, so a returning subscriber
+// never sees it.
 const STEPS_BY_PATH: Record<OnboardingPath, Step[]> = {
   A: [
     'path-chooser',
     'identity',
+    'subscribe',
     'upload-resume',
     'add-job',
     'pick-targets',
@@ -46,11 +58,19 @@ const STEPS_BY_PATH: Record<OnboardingPath, Step[]> = {
   B: [
     'path-chooser',
     'identity',
+    'subscribe',
     'upload-resume',
     'pick-targets',
     'completion',
   ],
-  C: ['path-chooser', 'identity', 'conversation', 'pick-targets', 'completion'],
+  C: [
+    'path-chooser',
+    'identity',
+    'subscribe',
+    'conversation',
+    'pick-targets',
+    'completion',
+  ],
 };
 
 /**
@@ -287,6 +307,12 @@ export default function OnboardingWizard({
           {currentStep === 'identity' && (
             <IdentityStep onComplete={goNext} onSkip={goNext} />
           )}
+          {/* No step-level skip, deliberately. Every other step's skip
+              advances to something that still works without it; skipping
+              this one lands on a step that 402s, which is the dead end
+              #887 exists to remove. The global "Finish setup later" exit
+              below stays available, so the user is guided, not trapped. */}
+          {currentStep === 'subscribe' && <SubscribeStep onComplete={goNext} />}
           {currentStep === 'upload-resume' && (
             <ResumeUploader onComplete={goNext} onSkip={goNext} />
           )}

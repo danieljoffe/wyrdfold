@@ -171,6 +171,104 @@ def test_checkout_reuses_existing_customer(
     assert params["customer"] == "cus_old"
 
 
+def test_checkout_defaults_to_returning_to_settings(
+    saas_billing: None, sb: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A body without ``return_to`` keeps the pre-#887 destination.
+
+    Asserted explicitly because the settings card still posts the old body
+    shape — a default that drifted would silently reroute every purchase
+    made from Settings into the onboarding wizard.
+    """
+    stripe_client = MagicMock()
+    stripe_client.checkout.sessions.create.return_value = MagicMock(url="https://x")
+    monkeypatch.setattr(billing, "_client", lambda: stripe_client)
+
+    r = _client(sb).post("/billing/checkout-session", json={"plan": "starter"})
+
+    assert r.status_code == 200
+    params = stripe_client.checkout.sessions.create.call_args.kwargs["params"]
+    assert params["success_url"] == "https://app.example/settings?billing=success"
+    assert params["cancel_url"] == "https://app.example/settings?billing=cancelled"
+
+
+def test_checkout_returns_to_onboarding_when_asked(
+    saas_billing: None, sb: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#887: paying from the wizard hands the user back to the wizard.
+
+    Both URLs are checked. Only ``success_url`` moving would strand a user
+    who cancels on a Settings page they never chose to visit.
+    """
+    stripe_client = MagicMock()
+    stripe_client.checkout.sessions.create.return_value = MagicMock(url="https://x")
+    monkeypatch.setattr(billing, "_client", lambda: stripe_client)
+
+    r = _client(sb).post(
+        "/billing/checkout-session",
+        json={"plan": "starter", "return_to": "onboarding"},
+    )
+
+    assert r.status_code == 200
+    params = stripe_client.checkout.sessions.create.call_args.kwargs["params"]
+    assert params["success_url"] == "https://app.example/onboarding?billing=success"
+    assert params["cancel_url"] == "https://app.example/onboarding?billing=cancelled"
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "https://evil.example/phish",
+        "//evil.example",
+        "/settings/../../evil",
+        "Settings",  # a valid key in the wrong case is still not a key
+        "onboarding ",  # trailing space — no silent trim into a valid member
+        "",
+    ],
+)
+def test_checkout_refuses_a_caller_supplied_destination(
+    saas_billing: None,
+    sb: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    hostile: str,
+) -> None:
+    """The security property behind ``return_to`` being an enum (#887).
+
+    Stripe redirects to whatever ``success_url`` says, so a caller-supplied
+    destination is an open redirect wearing a payment confirmation — about
+    the most credible phishing hop available. The check that matters is that
+    NO Stripe session is created: a 422 that still charged someone would be
+    the worst of both.
+    """
+    stripe_client = MagicMock()
+    monkeypatch.setattr(billing, "_client", lambda: stripe_client)
+
+    r = _client(sb).post(
+        "/billing/checkout-session",
+        json={"plan": "starter", "return_to": hostile},
+    )
+
+    assert r.status_code == 422
+    stripe_client.checkout.sessions.create.assert_not_called()
+    stripe_client.customers.create.assert_not_called()
+
+
+def test_return_paths_are_relative_and_cannot_leave_the_app(
+    saas_billing: None,
+) -> None:
+    """Guards the lookup table itself, not just the request parsing.
+
+    The enum is only as safe as what it maps to: a future entry written as
+    a full URL, or one that starts with ``//``, would reintroduce the open
+    redirect from behind the validation rather than through it.
+    """
+    for key, path in billing._RETURN_PATHS.items():
+        assert path.startswith("/"), key
+        assert not path.startswith("//"), key
+        assert "://" not in path, key
+        assert ".." not in path, key
+
+
 def test_checkout_unconfigured_price_is_503(
     saas_billing: None, sb: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -232,6 +330,31 @@ def test_webhook_non_entitled_status_downgrades_to_free(saas_billing: None, sb: 
     r = _client(sb).post("/billing/webhook", content=body, headers={"stripe-signature": sig})
     assert r.status_code == 200
     assert _plan_updates(sb) == [{"plan": "free"}]
+
+
+def test_webhook_cancel_at_period_end_keeps_access_until_the_period_ends(
+    saas_billing: None, sb: MagicMock
+) -> None:
+    """The Terms promise it, so pin it (#439 legal review, flow A).
+
+    "Cancelling stops future charges and takes effect at the end of the billing
+    period you have already paid for — you keep access until then." Stripe
+    models that as ``cancel_at_period_end=true`` with the status STILL
+    ``active``; it only becomes ``canceled`` when the period actually ends.
+
+    So the property under test is that we key entitlement on **status**, not on
+    the cancellation flag. Reading ``cancel_at_period_end`` and downgrading on
+    it would revoke access the moment someone cancels — taking away time they
+    have already paid for, and contradicting the Terms.
+    """
+    event = _sub_event(status="active")
+    event["data"]["object"]["cancel_at_period_end"] = True
+
+    body, sig = _signed(event)
+    r = _client(sb).post("/billing/webhook", content=body, headers={"stripe-signature": sig})
+
+    assert r.status_code == 200
+    assert _plan_updates(sb) == [{"plan": "pro"}]
 
 
 def test_webhook_subscription_deleted_downgrades_to_free(saas_billing: None, sb: MagicMock) -> None:

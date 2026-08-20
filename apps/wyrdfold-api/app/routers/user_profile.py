@@ -11,11 +11,12 @@ row owner (#79 Phases 2 reads / 3 writes).
 """
 
 import asyncio
+import logging
 import os
 import tempfile
 from collections.abc import Iterator
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -36,11 +37,15 @@ from app.models.user_profile import (
     LlmUsageWindow,
     NotificationPreferences,
     NotificationPreferencesUpdate,
+    OnboardingPath,
     OnboardingStatus,
+    OnboardingStep,
     OnboardingStepUpdate,
     ResumeStyleSettings,
     ResumeStyleSettingsUpdate,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _email_channel_available() -> bool:
@@ -293,16 +298,18 @@ async def update_resume_style(
 # ---------------------------------------------------------------------------
 
 
-_KNOWN_STEPS = {
-    "path-chooser",
-    "identity",
-    "upload-resume",
-    "add-job",
-    "pick-targets",
-    "conversation",
-    "completion",
-}
-_KNOWN_PATHS = {"A", "B", "C"}
+# DERIVED from the response model's Literal, not restated (#887).
+#
+# These were two hand-maintained lists of the same vocabulary: this set gates
+# the READ (an unrecognised stored step is served as None) while
+# ``OnboardingStep`` gates the WRITE. Adding a step to only one half fails in a
+# way that reads like data loss rather than a missing enum member — the PATCH
+# 422s, or the value writes and then vanishes on the next read, restarting the
+# wizard at ``path-chooser``. The subscribe gate is where that stops being
+# survivable: a user returns to that step from Stripe Checkout, so a forgotten
+# member greets someone who just paid with a wizard that forgot them.
+_KNOWN_STEPS = frozenset(get_args(OnboardingStep))
+_KNOWN_PATHS = frozenset(get_args(OnboardingPath))
 
 
 def _read_onboarding(row: dict[str, Any]) -> OnboardingStatus:
@@ -617,11 +624,41 @@ async def delete_account(
     logged-in user can erase their own account. The FE gates this behind
     an explicit confirmation step.
 
+    Cancels any live Stripe subscription **first** (#889). ``stripe_customer_id``
+    lives on ``user_profiles``, which the cascade deletes, so cancelling
+    afterwards is impossible — the link back to the customer is gone. Before
+    this, deleting an account left the subscription billing with nothing on our
+    side able to trace the charge.
+
+    Order matters in one more way: cancel-then-delete can fail having cancelled
+    a subscription for an account that still exists, which the user can fix by
+    resubscribing. Delete-then-cancel fails into an untraceable recurring
+    charge. We take the recoverable direction.
+
     Returns a per-resource count map for the user's records / audit log.
     """
+    from app.routers import billing
     from app.services import account_deletion
 
+    try:
+        cancelled = await billing.cancel_subscriptions_for_deletion(supabase, user_id)
+    except Exception as exc:
+        # Refuse the deletion rather than proceed. Erasure is a right with its
+        # own clock, so this must not become a permanent block — but a deletion
+        # the user can retry in a minute is strictly better than one that
+        # silently leaves them paying with no record connecting them to it.
+        logger.exception("subscription cancellation failed for user=%s; refusing deletion", user_id)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "We couldn't cancel your subscription just now, so we haven't "
+                "deleted your account — deleting it first would leave you being "
+                "billed with no way to stop it. Please try again shortly."
+            ),
+        ) from exc
+
     report = await account_deletion.delete_account(supabase, user_id=user_id)
+    report["stripe_subscriptions_cancelled"] = len(cancelled)
     return {"deleted": True, "report": report}
 
 

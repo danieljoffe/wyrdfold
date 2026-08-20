@@ -44,7 +44,19 @@ gate, not a rubber stamp.
    backward-compatible); see `.claude/rules/api-validation.md` for the
    version-stamp gotcha and `docs/decisions.md` → "RLS policies never reached
    prod" for why.
-6. **After deploy, smoke the running prod app on the changed surface.** Env
+6. **If the release touches AI providers, sub-processors, or what leaves the
+   system, re-verify the privacy claims before shipping.** The Terms and
+   Privacy Policy make specific, checkable statements — Zero-Data-Retention and
+   training opt-out on the OpenRouter account, which sub-processors receive
+   what, that the embedding provider gets no contact details or account
+   identifier, that BYOK is not offered on the hosted service. These live in
+   third-party dashboards and in code paths that move; a published policy that
+   has drifted from the system is a misrepresentation, not a stale doc. Two of
+   these were found FALSE during the #439 legal review (`docs/decisions.md`),
+   which is why this step exists. `pytest tests/test_embedding_pii_boundary.py`
+   and the `legalPages.spec.tsx` guards cover the code side; the provider
+   account settings must be eyeballed by whoever holds them.
+7. **After deploy, smoke the running prod app on the changed surface.** Env
    vars and secrets drift independently of code; no pre-merge check sees them.
    Hit the changed prod endpoints (authed where it matters) and watch the
    logs. A version discriminator helps: probe something only the new code does

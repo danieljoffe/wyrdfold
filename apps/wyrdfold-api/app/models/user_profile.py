@@ -171,6 +171,7 @@ class ResumeStyleSettingsUpdate(BaseModel):
 OnboardingStep = Literal[
     "path-chooser",
     "identity",
+    "subscribe",
     "upload-resume",
     "add-job",
     "pick-targets",

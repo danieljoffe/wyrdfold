@@ -129,8 +129,26 @@ async def _ensure_customer(supabase: AsyncClient, user_id: str) -> str:
     return customer.id
 
 
+#: Where Checkout returns the user, keyed by ``CheckoutRequest.return_to``.
+#:
+#: Deliberately a server-side lookup off a closed enum rather than a path (or
+#: URL) taken from the request. Stripe redirects to whatever ``success_url``
+#: says, so honouring a caller-supplied value would hand an attacker an open
+#: redirect with a payment confirmation attached to it — the most credible
+#: possible landing page for a phishing hop. A caller can only name a key; it
+#: cannot describe a destination.
+_RETURN_PATHS: dict[str, str] = {
+    "settings": "/settings",
+    "onboarding": "/onboarding",
+}
+
+
 class CheckoutRequest(BaseModel):
     plan: Literal["starter", "pro"]
+    #: Which surface the purchase started from, so Checkout can hand the user
+    #: back to it (#887). Defaults to ``settings`` — the historical behaviour
+    #: and the only caller before onboarding gained a subscribe step.
+    return_to: Literal["settings", "onboarding"] = "settings"
 
 
 class BillingUrlResponse(BaseModel):
@@ -194,6 +212,10 @@ async def create_checkout_session(
     """Hosted-Checkout URL for subscribing to a managed tier."""
     price = _price_for_plan(body.plan)
     app_url = _app_url()
+    # Pydantic has already rejected anything outside the enum, so the lookup
+    # cannot miss; the default keeps a body without ``return_to`` on the old
+    # path rather than failing a request that used to work.
+    return_path = _RETURN_PATHS.get(body.return_to, _RETURN_PATHS["settings"])
     customer_id = await _ensure_customer(supabase, user_id)
     session = await asyncio.to_thread(
         lambda: _client().checkout.sessions.create(
@@ -201,8 +223,8 @@ async def create_checkout_session(
                 "mode": "subscription",
                 "customer": customer_id,
                 "line_items": [{"price": price, "quantity": 1}],
-                "success_url": f"{app_url}/settings?billing=success",
-                "cancel_url": f"{app_url}/settings?billing=cancelled",
+                "success_url": f"{app_url}{return_path}?billing=success",
+                "cancel_url": f"{app_url}{return_path}?billing=cancelled",
                 "client_reference_id": user_id,
                 # Stamped onto the subscription so every webhook event carries
                 # the user id — no reverse lookup needed on the hot path.
@@ -245,6 +267,65 @@ async def create_portal_session(
         )
     )
     return BillingUrlResponse(url=session.url)
+
+
+#: Subscription statuses that are still capable of billing someone, and so
+#: must be cancelled before an account goes away. Everything else
+#: (``canceled``, ``incomplete_expired``) is already terminal.
+_CANCELLABLE_STATUSES = frozenset({"active", "trialing", "past_due", "unpaid", "paused"})
+
+
+async def cancel_subscriptions_for_deletion(supabase: AsyncClient, user_id: str) -> list[str]:
+    """Cancel the user's live subscriptions ahead of account deletion (#889).
+
+    Returns the ids cancelled (empty when there was nothing to cancel, or when
+    this instance doesn't sell subscriptions at all).
+
+    **Call this BEFORE the deletion cascade.** ``stripe_customer_id`` lives on
+    ``user_profiles``, which the cascade deletes — so after it runs there is no
+    link left from the Stripe customer back to a person. That was the whole
+    defect: the subscription kept billing, the webhook ignored its events as an
+    unknown customer, and nobody could trace the charge afterwards.
+
+    Cancels **immediately** rather than at period end. The account is being
+    erased, so there is no access left to preserve for the remainder of the
+    period — leaving a subscription "active" for a user who no longer exists
+    would only produce another charge and another orphaned customer.
+
+    Stripe errors propagate deliberately. The caller must refuse the deletion
+    rather than swallow them: a deletion the user can retry is recoverable,
+    whereas deleting first and failing to cancel reproduces exactly the
+    untraceable-charge state this function exists to prevent.
+    """
+    if settings.deployment_mode != "saas" or not settings.stripe_secret_key:
+        return []
+    customer_id = await _get_stripe_customer_id(supabase, user_id)
+    if not customer_id:
+        return []
+
+    client = _client()
+    # ``status="all"`` so a past_due or paused subscription is caught too —
+    # listing only "active" would leave a delinquent subscription billing.
+    subs = await asyncio.to_thread(
+        lambda: client.subscriptions.list(
+            params={"customer": customer_id, "status": "all", "limit": 100}
+        )
+    )
+    cancelled: list[str] = []
+    for sub in subs.data or []:
+        status = cast(str, getattr(sub, "status", "") or "")
+        sub_id = cast(str, getattr(sub, "id", "") or "")
+        if status not in _CANCELLABLE_STATUSES or not sub_id:
+            continue
+        await asyncio.to_thread(lambda sid=sub_id: client.subscriptions.cancel(sid))  # type: ignore[misc]
+        cancelled.append(sub_id)
+    if cancelled:
+        logger.info(
+            "cancelled %d subscription(s) for user=%s ahead of account deletion",
+            len(cancelled),
+            user_id,
+        )
+    return cancelled
 
 
 async def _resolve_user_id(
