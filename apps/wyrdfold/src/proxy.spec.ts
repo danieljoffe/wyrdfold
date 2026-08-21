@@ -2,7 +2,7 @@
  * @jest-environment node
  */
 import { NextRequest } from 'next/server';
-import { proxy } from './proxy';
+import { config, proxy } from './proxy';
 
 // `auth.getUser()` is the only thing the CSP tests need from the Supabase
 // client — stub it so `proxy()` runs past the auth gate and reaches the header
@@ -335,4 +335,56 @@ describe('proxy middleware: public /search (auth-adaptive surface)', () => {
       expect(res.headers.get('location')).toContain('/login');
     }
   );
+});
+
+// ---- what the matcher lets through without auth (#899) ---------------------
+//
+// Anything NOT bypassed is redirected to /login when signed out. For an image
+// that means a BROKEN image, because an email client or a home-screen
+// installer is never authenticated.
+//
+// Not hypothetical: /logo.png is referenced by all three Supabase auth email
+// templates and was returning 307 -> /login in production, so the logo was
+// broken in every invite and sign-in email we sent.
+
+describe('proxy matcher', () => {
+  // Next compiles `source` as a path-to-regexp pattern; the negative lookahead
+  // inside is plain RegExp syntax, so testing it directly faithfully answers
+  // "is this path bypassed".
+  const matcher = new RegExp(`^${config.matcher[0].source}$`);
+  const requiresAuth = (path: string) => matcher.test(path);
+
+  it.each([
+    '/logo.png', // every auth email
+    '/logo.svg',
+    '/android-chrome-192x192.png', // site.webmanifest points here, and IS public
+    '/android-chrome-512x512.png',
+    '/apple-touch-icon.png', // iOS add-to-home-screen
+    '/mstile-150x150.png',
+    '/wyrdfold-mark.svg',
+    '/favicon.ico', // pre-existing bypasses, kept honest
+    '/favicon-32x32.png',
+    '/site.webmanifest',
+    '/images/hero.png',
+    '/_next/static/chunk.js',
+  ])('serves %s without auth', path => {
+    expect(requiresAuth(path)).toBe(false);
+  });
+
+  it.each([
+    '/dashboard',
+    '/jobs',
+    '/settings',
+    '/targets',
+    '/onboarding',
+    '/api/billing/account',
+  ])('still guards %s', path => {
+    expect(requiresAuth(path)).toBe(true);
+  });
+
+  it('does not bypass a route merely because it contains a dot', () => {
+    // Guards against "fixing" this with a blanket file-extension rule, which
+    // would quietly take real routes out of the auth check.
+    expect(requiresAuth('/jobs/some.id/resume')).toBe(true);
+  });
 });

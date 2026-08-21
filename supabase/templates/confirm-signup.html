@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width" />
     <meta name="color-scheme" content="dark" />
     <meta name="supported-color-schemes" content="dark" />
-    <title>Your WyrdFold sign-in link</title>
+    <title>Confirm your WyrdFold email</title>
   </head>
   <body
     style="
@@ -19,7 +19,7 @@
     "
   >
     <span style="display: none; max-height: 0; overflow: hidden; opacity: 0">
-      Tap to sign in to WyrdFold. Single-use link, expires in an hour.
+      Confirm your email to finish creating your WyrdFold account.
     </span>
 
     <table
@@ -81,7 +81,7 @@
                     letter-spacing: -0.02em;
                   "
                 >
-                  Tap to sign in
+                  Confirm your email
                 </h1>
                 <p
                   style="
@@ -91,7 +91,9 @@
                     color: #bdb8a8;
                   "
                 >
-                  Welcome back. Tap the button below to sign in to WyrdFold.
+                  Tap the button below to finish creating your WyrdFold account.
+                  After this, you'll sign in by emailed link any time you come
+                  back &mdash; there's no password to remember.
                 </p>
 
                 <table
@@ -99,12 +101,12 @@
                   cellspacing="0"
                   cellpadding="0"
                   border="0"
-                  style="margin: 0 0 24px"
+                  style="margin: 0 0 28px"
                 >
                   <tr>
                     <td bgcolor="#8FC900" style="border-radius: 8px">
                       <a
-                        href="{{ .RedirectTo }}?token_hash={{ .TokenHash }}&type=magiclink"
+                        href="{{ .SiteURL }}/auth/callback?token_hash={{ .TokenHash }}&type=email"
                         style="
                           display: inline-block;
                           padding: 14px 28px;
@@ -115,7 +117,7 @@
                           border-radius: 8px;
                         "
                       >
-                        Sign in to WyrdFold
+                        Confirm email address
                       </a>
                     </td>
                   </tr>
@@ -129,13 +131,13 @@
                     color: #928d7d;
                   "
                 >
-                  The link works once and expires in an hour. If it doesn't
-                  work, paste this into your browser:<br />
+                  If the button doesn't work, paste this link into your
+                  browser:<br />
                   <a
-                    href="{{ .RedirectTo }}?token_hash={{ .TokenHash }}&type=magiclink"
+                    href="{{ .SiteURL }}/auth/callback?token_hash={{ .TokenHash }}&type=email"
                     style="color: #bef264; word-break: break-all"
-                    >{{ .RedirectTo }}?token_hash={{ .TokenHash
-                    }}&type=magiclink</a
+                    >{{ .SiteURL }}/auth/callback?token_hash={{ .TokenHash
+                    }}&type=email</a
                   >
                 </p>
               </td>
@@ -157,8 +159,9 @@
                     color: #928d7d;
                   "
                 >
-                  Sent to {{ .Email }}. Didn't request this? Ignore the email
-                  &mdash; the link is single-use.
+                  Sent to {{ .Email }}. The link is single-use &mdash; if you
+                  didn't request this, you can ignore the email and no account
+                  will be created.
                 </p>
                 <p
                   style="
