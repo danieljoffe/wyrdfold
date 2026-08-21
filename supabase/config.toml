@@ -88,10 +88,20 @@ max_indexes = 5
 [auth]
 enabled = true
 # !!! LOCAL-ONLY !!! site_url is for ``supabase start`` (local dev). The
-# production value is pinned under ``[remotes.production.auth]`` below — always
-# push with ``--linked-to production`` so the localhost default never leaks into
-# prod. (Supabase silently rewrites unmatched ``emailRedirectTo`` to site_url,
-# so a bare ``config push`` would point every emailed magic link at localhost.)
+# production value is pinned under ``[remotes.production.auth]`` below.
+#
+# HOW THE OVERRIDE IS SELECTED (corrected 2026-08-20): the CLI matches
+# ``[remotes.<name>].project_id`` against the project being pushed to and
+# applies that block automatically — it prints ``Loading config override:
+# [remotes.production]`` when it does. A plain ``supabase config push`` against
+# the linked project is therefore CORRECT and safe.
+#
+# The old note here said to pass ``--linked-to production``. That flag does not
+# exist in the CLI (verified on 2.114.0) — following it just errors, and the
+# accompanying warning that a bare push leaks localhost into prod was wrong.
+# Left corrected rather than deleted because the failure it warned about would
+# be severe (every emailed link pointing at localhost), and someone hitting the
+# unknown-flag error might otherwise reach for a workaround instead.
 site_url = "http://localhost:3100"
 # Supabase silently substitutes ``site_url`` when ``emailRedirectTo`` is not an
 # EXACT match here. List every dev variant wyrdfold is served from.
@@ -152,7 +162,7 @@ otp_expiry = 3600
 # Free-tier preview projects reject ANY email-template API call (subject-only
 # edits included). The full configuration lives under
 # [remotes.production.auth.email.template.*] at the bottom of this file and is
-# applied only via ``supabase config push --linked-to production``. Local dev
+# applied only via ``supabase config push`` against the linked project. Local dev
 # uses Inbucket, which captures mail regardless of template overrides.
 
 [auth.sms]
@@ -230,8 +240,8 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 # Remote-specific overrides
 # ============================================================================
 # Everything above is LOCAL-DEV config. Push auth config to the hosted wyrdfold
-# project ONLY via ``supabase config push --linked-to production`` so the
-# localhost site_url/redirects never overwrite prod.
+# project via ``supabase config push``. The [remotes.production] block is
+# selected automatically by project_id (see the note at [auth] above).
 
 [remotes.production]
 # wyrdfold project ref (Supabase dashboard → Project Settings → Reference ID).
@@ -248,21 +258,62 @@ additional_redirect_urls = [
   "http://localhost:3100/auth/callback",
 ]
 
-# Email templates — DISABLED until the project is on a paid plan (or a custom
-# SMTP provider is configured). Supabase's free tier with the default email
-# provider rejects ANY email-template API call with HTTP 400, which fails
-# `supabase config push`. Magic-link/invite emails still send via Supabase's
-# default templates — this only affects WyrdFold branding. The HTML lives in
-# supabase/templates/. To re-enable: upgrade the plan (or set [auth.email.smtp]),
-# then uncomment the two blocks below and re-run `supabase config push`.
-# content_path is resolved relative to the repo root.
+# Email templates — ENABLED (#860). Previously commented out because Supabase's
+# free tier with the default email provider rejects ANY email-template API call
+# with HTTP 400, failing the whole `supabase config push`. The project is on a
+# paid plan now, so that restriction no longer applies.
 #
-# # Sent by ``auth.admin.inviteUserByEmail`` (apps/wyrdfold/scripts/invite-beta-tester.ts).
-# [remotes.production.auth.email.template.invite]
-# subject = "You're in — welcome to the WyrdFold beta"
-# content_path = "./supabase/templates/invite.html"
+# Why this matters beyond branding: while these were disabled the DASHBOARD was
+# the only source of truth for auth emails, so no review, test, or CI run could
+# catch a regression in them. That is exactly how #860 survived — "Confirm
+# signup" sat on the PKCE-only default while the invite template had already
+# been hand-fixed for #856. Templates belong in the repo for the same reason
+# the signup hook does.
 #
-# # Sent by ``signInWithOtp`` from apps/wyrdfold/src/app/login/MagicLinkForm.tsx.
-# [remotes.production.auth.email.template.magic_link]
-# subject = "Your WyrdFold sign-in link"
-# content_path = "./supabase/templates/magic-link.html"
+# Every template links via ``token_hash``, never ``{{ .ConfirmationURL }}``:
+# ConfirmationURL is a PKCE ``?code=`` that only the originating browser can
+# exchange, so it breaks cross-device — request on a laptop, open the mail on a
+# phone. See supabase/templates/confirm-signup.html for the full reasoning.
+#
+# content_path is resolved relative to the repo root. Apply with:
+#   supabase config push
+# Watch for ``Loading config override: [remotes.production]`` in the output —
+# that line is the proof the prod block was applied rather than the local one.
+#
+# NOTE: `config push` does NOT prompt. It applies immediately, and `--yes` is a
+# global flag that does not make it interactive. Treat it as a deploy.
+
+# Sent by ``auth.admin.inviteUserByEmail`` (apps/wyrdfold/scripts/invite-beta-tester.ts).
+[remotes.production.auth.email.template.invite]
+subject = "You're in — welcome to the WyrdFold beta"
+content_path = "./supabase/templates/invite.html"
+
+# Sent by ``signInWithOtp`` from apps/wyrdfold/src/app/login/MagicLinkForm.tsx
+# for an address that ALREADY exists.
+[remotes.production.auth.email.template.magic_link]
+subject = "Your WyrdFold sign-in link"
+content_path = "./supabase/templates/magic-link.html"
+
+# Sent by ``signInWithOtp({ shouldCreateUser: true })`` for an address that does
+# NOT yet exist — so this becomes the primary auth path the moment signup opens,
+# not "Magic Link" as the name suggests (#860).
+#
+# The template links via ``{{ .SiteURL }}/auth/callback?token_hash=…&type=email``:
+#  - NOT ``{{ .ConfirmationURL }}`` — that is a PKCE ``?code=`` only the
+#    originating browser can exchange, so it breaks for anyone who requests on
+#    a laptop and opens the mail on a phone. That was the #860 bug.
+#  - NOT ``{{ .RedirectTo }}`` — it falls back to the site ROOT when a caller
+#    omits emailRedirectTo, yielding wyrdfold.com?token_hash=… which no route
+#    handles. Nothing is lost by using SiteURL: the login form deliberately
+#    sends no query string and ``next`` rides the wyrdfold_login_next cookie.
+#  - ``type=email`` is what Supabase issues for Confirm signup, and
+#    auth/callback/route.ts accepts it.
+#
+# Keep this reasoning HERE, never inside the .html. Templates are rendered by
+# Go's engine, which interpolates inside HTML comments too — a ``{{ ... }}``
+# written as documentation becomes a real, live value in every email sent.
+# ``{{ .ConfirmationURL }}`` in a comment would embed a working auth URL in the
+# source of every message.
+[remotes.production.auth.email.template.confirmation]
+subject = "Confirm your email to start using WyrdFold"
+content_path = "./supabase/templates/confirm-signup.html"
