@@ -285,7 +285,7 @@ additional_redirect_urls = [
 
 # Sent by ``auth.admin.inviteUserByEmail`` (apps/wyrdfold/scripts/invite-beta-tester.ts).
 [remotes.production.auth.email.template.invite]
-subject = "You're in — welcome to the WyrdFold beta"
+subject = "You're in — welcome to WyrdFold"
 content_path = "./supabase/templates/invite.html"
 
 # Sent by ``signInWithOtp`` from apps/wyrdfold/src/app/login/MagicLinkForm.tsx
