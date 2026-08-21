@@ -302,9 +302,21 @@ export async function proxy(request: NextRequest) {
 export const config = {
   matcher: [
     {
-      // Bypass: Next internals, favicons, manifest/robots/sitemap, and the
-      // /public/images directory (public-page assets like the hero screenshot
-      // are served from here and must not require auth).
+      // Bypass: Next internals, favicons, manifest/robots/sitemap, brand
+      // assets at the public root, and the /public/images directory
+      // (public-page assets like the hero screenshot are served from here and
+      // must not require auth).
+      //
+      // The root-level brand assets are listed EXPLICITLY (#899). They live at
+      // /logo.png rather than under /images/, so the original pattern bounced
+      // them to /login — and an email client is never authenticated, so the
+      // logo was broken in every auth email we sent. Same for the touch/PWA
+      // icons: site.webmanifest is publicly readable and points at
+      // android-chrome-*.png, which was not.
+      //
+      // Listed by name rather than by "anything with a file extension" on
+      // purpose — a blanket extension bypass would take real routes out of the
+      // auth check the first time one ends in a dot.
       //
       // ``/api/*`` is intentionally NOT bypassed — the middleware's
       // ``auth.getUser()`` call is what refreshes the access token via the
@@ -313,7 +325,7 @@ export const config = {
       // TTL elapses. The handler for /api/* exits early in ``proxy()`` so
       // route handlers keep their own 401 contract.
       source:
-        '/((?!_next/static|_next/image|favicon|images/|site\\.webmanifest|robots\\.txt|sitemap\\.xml).*)',
+        '/((?!_next/static|_next/image|favicon|logo\\.|apple-touch-icon|android-chrome-|mstile-|wyrdfold-|images/|site\\.webmanifest|robots\\.txt|sitemap\\.xml).*)',
     },
   ],
 };
