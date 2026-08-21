@@ -135,6 +135,21 @@ def init_logging(log_format: str, log_level: str = "INFO") -> None:
     root.setLevel(resolved)
 
     if log_format != "json":
+        # LEVEL ALONE IS NOT ENOUGH. uvicorn attaches handlers to its OWN
+        # loggers (`uvicorn`, `uvicorn.access`, …) and never to root, so an
+        # application record that passes the level check finds no handler and
+        # falls through to ``logging.lastResort`` — which emits at WARNING and
+        # above only. That is precisely why app WARNING/ERROR lines have always
+        # reached Railway while INFO never did, and why raising the level in
+        # isolation changed nothing (#862, second pass).
+        #
+        # Only attach when root has nothing, so a host that configured its own
+        # handlers (Sentry, a dictConfig, a re-init under --reload) is left
+        # alone and records are not duplicated.
+        if not root.handlers:
+            plain = logging.StreamHandler(sys.stdout)
+            plain.setFormatter(logging.Formatter("%(levelname)s [%(name)s] %(message)s"))
+            root.addHandler(plain)
         return
 
     # Clear any prior JSON handler from a reload — keep other handlers
