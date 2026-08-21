@@ -297,6 +297,23 @@ content_path = "./supabase/templates/magic-link.html"
 # Sent by ``signInWithOtp({ shouldCreateUser: true })`` for an address that does
 # NOT yet exist — so this becomes the primary auth path the moment signup opens,
 # not "Magic Link" as the name suggests (#860).
+#
+# The template links via ``{{ .SiteURL }}/auth/callback?token_hash=…&type=email``:
+#  - NOT ``{{ .ConfirmationURL }}`` — that is a PKCE ``?code=`` only the
+#    originating browser can exchange, so it breaks for anyone who requests on
+#    a laptop and opens the mail on a phone. That was the #860 bug.
+#  - NOT ``{{ .RedirectTo }}`` — it falls back to the site ROOT when a caller
+#    omits emailRedirectTo, yielding wyrdfold.com?token_hash=… which no route
+#    handles. Nothing is lost by using SiteURL: the login form deliberately
+#    sends no query string and ``next`` rides the wyrdfold_login_next cookie.
+#  - ``type=email`` is what Supabase issues for Confirm signup, and
+#    auth/callback/route.ts accepts it.
+#
+# Keep this reasoning HERE, never inside the .html. Templates are rendered by
+# Go's engine, which interpolates inside HTML comments too — a ``{{ ... }}``
+# written as documentation becomes a real, live value in every email sent.
+# ``{{ .ConfirmationURL }}`` in a comment would embed a working auth URL in the
+# source of every message.
 [remotes.production.auth.email.template.confirmation]
 subject = "Confirm your email to start using WyrdFold"
 content_path = "./supabase/templates/confirm-signup.html"

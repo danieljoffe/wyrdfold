@@ -105,27 +105,6 @@
                 >
                   <tr>
                     <td bgcolor="#8FC900" style="border-radius: 8px">
-                      <!--
-                        {{ .SiteURL }}/auth/callback, NOT {{ .ConfirmationURL }}
-                        and NOT {{ .RedirectTo }} (#860).
-
-                        ConfirmationURL returns a PKCE ``?code=``, which can only
-                        be exchanged in the browser that started the sign-in —
-                        so it breaks whenever someone requests on a laptop and
-                        opens the mail on a phone. token_hash is
-                        device-independent by construction, which is what
-                        anything arriving by email needs.
-
-                        SiteURL rather than RedirectTo because RedirectTo falls
-                        back to the site ROOT when a caller omits
-                        emailRedirectTo, producing wyrdfold.com?token_hash=…
-                        which no route handles. Nothing is lost: the login form
-                        deliberately sends no query string, and ``next`` rides
-                        the wyrdfold_login_next cookie instead.
-
-                        type=email is what Supabase issues for Confirm signup;
-                        auth/callback/route.ts accepts it.
-                      -->
                       <a
                         href="{{ .SiteURL }}/auth/callback?token_hash={{ .TokenHash }}&type=email"
                         style="
