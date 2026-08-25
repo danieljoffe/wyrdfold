@@ -100,6 +100,18 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+#: Libraries that log one INFO line per outbound HTTP request, URL and all.
+#: Root carries a handler at INFO (see ``init_logging``), and these propagate,
+#: so without this they would put every request URL into the platform log —
+#: including PostgREST query strings, which embed ``user_id=eq.<uuid>`` on
+#: every authed route and ``email=eq.<address>`` on the two waitlist lookups
+#: in ``routers/admin.py``. Their WARNING/ERROR records still reach the log.
+#:
+#: ``httpx2`` is separate from ``httpx``: the anthropic SDK moved to it at
+#: 1.0.0, so both stacks are live in-process and both log this way.
+_PER_REQUEST_LOGGERS = ("httpx", "httpx2")
+
+
 def init_logging(log_format: str, log_level: str = "INFO") -> None:
     """Set the root log LEVEL, and wire the JSON formatter when opted in.
 
@@ -133,6 +145,14 @@ def init_logging(log_format: str, log_level: str = "INFO") -> None:
         )
         resolved = logging.INFO
     root.setLevel(resolved)
+
+    # Quiet the per-request URL chatter (see ``_PER_REQUEST_LOGGERS``). Only
+    # when the logger has no explicit level of its own, so an operator's
+    # dictConfig / ``--log-config`` stays authoritative.
+    for name in _PER_REQUEST_LOGGERS:
+        lg = logging.getLogger(name)
+        if lg.level == logging.NOTSET:
+            lg.setLevel(logging.WARNING)
 
     if log_format != "json":
         # LEVEL ALONE IS NOT ENOUGH. uvicorn attaches handlers to its OWN

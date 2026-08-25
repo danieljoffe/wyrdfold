@@ -6,10 +6,11 @@ import io
 import json
 import logging
 import sys
+from collections.abc import Iterator
 
 import pytest
 
-from app.logging_config import JsonFormatter, init_logging
+from app.logging_config import _PER_REQUEST_LOGGERS, JsonFormatter, init_logging
 
 
 def _record(
@@ -253,3 +254,90 @@ def test_existing_root_handlers_are_not_duplicated(
     logging.getLogger("app.scheduler").warning("once-only-sentinel")
 
     assert capsys.readouterr().out.count("once-only-sentinel") == 1
+
+
+@pytest.fixture
+def restore_per_request_levels() -> Iterator[None]:
+    """Undo the module-level side effect on the shared httpx/httpx2 loggers."""
+    saved = {n: logging.getLogger(n).level for n in _PER_REQUEST_LOGGERS}
+    yield
+    for name, level in saved.items():
+        logging.getLogger(name).setLevel(level)
+
+
+@pytest.mark.parametrize("fmt", ["text", "json"])
+@pytest.mark.parametrize("client", _PER_REQUEST_LOGGERS)
+def test_per_request_url_chatter_is_not_logged(
+    fmt: str,
+    client: str,
+    capsys: pytest.CaptureFixture[str],
+    restore_root_level: None,
+    restore_per_request_levels: None,
+) -> None:
+    """httpx logs one INFO line per request carrying the full URL.
+
+    Root gained a handler at INFO (#862/#885), and these propagate, so without
+    the quieting every PostgREST query string would land in the platform log —
+    ``user_id=eq.<uuid>`` on every authed route, ``email=eq.<address>`` on the
+    waitlist lookups in routers/admin.py.
+    """
+    _uvicorn_style_root()
+    logging.getLogger(client).setLevel(logging.NOTSET)
+
+    init_logging(fmt)
+
+    # The exact record httpx emits, with PII in the query string.
+    logging.getLogger(client).info(
+        'HTTP Request: GET https://db/rest/v1/waitlist_signups'
+        '?email=eq.jane%40example.com "HTTP/1.1 200 OK"'
+    )
+    out = capsys.readouterr().out
+    assert "jane%40example.com" not in out, (
+        f"LOG_FORMAT={fmt!r}: {client} per-request URL reached the log"
+    )
+
+
+@pytest.mark.parametrize("client", _PER_REQUEST_LOGGERS)
+def test_per_request_loggers_still_report_problems(
+    client: str,
+    capsys: pytest.CaptureFixture[str],
+    restore_root_level: None,
+    restore_per_request_levels: None,
+) -> None:
+    """Quieting is INFO-only — a real transport failure must still surface."""
+    _uvicorn_style_root()
+    logging.getLogger(client).setLevel(logging.NOTSET)
+
+    init_logging("text")
+    logging.getLogger(client).warning("connection pool is full")
+
+    assert "connection pool is full" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("client", _PER_REQUEST_LOGGERS)
+def test_explicit_per_request_level_is_left_alone(
+    client: str,
+    restore_root_level: None,
+    restore_per_request_levels: None,
+) -> None:
+    """An operator who deliberately set the level keeps it (dictConfig wins)."""
+    _uvicorn_style_root()
+    logging.getLogger(client).setLevel(logging.DEBUG)
+
+    init_logging("text")
+
+    assert logging.getLogger(client).level == logging.DEBUG
+
+
+def test_quieting_does_not_undo_the_app_info_fix(
+    capsys: pytest.CaptureFixture[str],
+    restore_root_level: None,
+    restore_per_request_levels: None,
+) -> None:
+    """Guard #862 from the other side: app INFO must still reach the log."""
+    _uvicorn_style_root()
+
+    init_logging("text")
+    logging.getLogger("app.scheduler").info("app-info-still-emitted")
+
+    assert "app-info-still-emitted" in capsys.readouterr().out
