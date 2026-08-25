@@ -728,7 +728,7 @@ class _RecordingScheduler:
 def _patch_discovery_deps(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    last_run: "datetime | None | Exception",
+    last_run: "datetime | Exception | None",
 ) -> list[int]:
     """Wire the catch-up's deps: a present pool client, a scripted
     ``_newest_discovery_at``, and a spy on the discovery run body."""
@@ -828,7 +828,7 @@ class TestDiscoveryCatchup:
 def _patch_ledger_read(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    last_run: "datetime | None | Exception",
+    last_run: "datetime | Exception | None",
 ) -> None:
     async def fake_last(_job_id: str) -> "datetime | None":
         if isinstance(last_run, Exception):
