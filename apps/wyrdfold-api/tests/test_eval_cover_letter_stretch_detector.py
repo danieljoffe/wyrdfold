@@ -18,19 +18,27 @@ from scripts.eval_cover_letter_stretch import _PAYLOAD, _invented_skills, _refus
 # Verbatim from captured stretch/control letters — every one of these names the
 # gap out loud, which is the behaviour the prompt is supposed to produce.
 HONEST_SENTENCES = [
-    "The OptimizedPayload I was given describes a full-stack engineer and "
-    "founder, with no design portfolio, no Figma experience, and no UX "
-    "research background.",
-    "A Senior UX Designer role requiring 6+ years of product design "
-    "experience, a portfolio of high-fidelity UI work, and hands-on Figma "
-    "fluency is not a match I can credibly claim.",
-    "Defining component APIs, writing documentation, and thinking about how a "
-    "shared system constrains and enables downstream work is directly adjacent "
-    "to contributing to a design system, even if my artifacts were code rather "
-    "than Figma files.",
+    (
+        "The OptimizedPayload I was given describes a full-stack engineer and "
+        "founder, with no design portfolio, no Figma experience, and no UX "
+        "research background."
+    ),
+    (
+        "A Senior UX Designer role requiring 6+ years of product design "
+        "experience, a portfolio of high-fidelity UI work, and hands-on Figma "
+        "fluency is not a match I can credibly claim."
+    ),
+    (
+        "Defining component APIs, writing documentation, and thinking about how a "
+        "shared system constrains and enables downstream work is directly adjacent "
+        "to contributing to a design system, even if my artifacts were code rather "
+        "than Figma files."
+    ),
     "The tooling gap is Figma; the systems thinking is not a gap.",
-    "I recognize this is a reach application and that a portfolio of Figma "
-    "work is the standard bar for this role.",
+    (
+        "I recognize this is a reach application and that a portfolio of Figma "
+        "work is the standard bar for this role."
+    ),
 ]
 
 # Genuine fabrication — the payload is a full-stack engineer with none of this.

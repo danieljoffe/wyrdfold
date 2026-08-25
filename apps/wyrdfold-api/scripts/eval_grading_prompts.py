@@ -478,19 +478,27 @@ def format_report(metrics: dict[str, Any], model: ModelId, prompt_label: str) ->
         f"  n graded: {metrics['n']}  (failed: {metrics['n_failed']})",
         "",
         "  RANKING (baseline vs new)",
-        f"    Spearman ρ: {metrics['spearman']:+.3f}  "
-        f"95% CI [{metrics['spearman_ci'][0]:+.3f}, {metrics['spearman_ci'][1]:+.3f}]  "
-        f"(1.00 = identical order)",
+        (
+            f"    Spearman ρ: {metrics['spearman']:+.3f}  "
+            f"95% CI [{metrics['spearman_ci'][0]:+.3f}, {metrics['spearman_ci'][1]:+.3f}]  "
+            f"(1.00 = identical order)"
+        ),
         f"    Pearson r:  {metrics['pearson']:+.3f}",
         f"    Top-{metrics['top_k']} overlap: {metrics['top_k_overlap']} / {metrics['top_k']}",
         "",
         "  SCORE DISTRIBUTION",
-        f"    baseline:  mean={metrics['baseline_mean']:.1f}  "
-        f"stdev={metrics['baseline_stdev']:.1f}  max={metrics['baseline_max']:.0f}",
-        f"    new:       mean={metrics['new_mean']:.1f}  "
-        f"stdev={metrics['new_stdev']:.1f}  max={metrics['new_max']:.0f}",
-        f"    delta:     mean {metrics['new_mean'] - metrics['baseline_mean']:+.1f}  "
-        f"max {metrics['new_max'] - metrics['baseline_max']:+.0f}",
+        (
+            f"    baseline:  mean={metrics['baseline_mean']:.1f}  "
+            f"stdev={metrics['baseline_stdev']:.1f}  max={metrics['baseline_max']:.0f}"
+        ),
+        (
+            f"    new:       mean={metrics['new_mean']:.1f}  "
+            f"stdev={metrics['new_stdev']:.1f}  max={metrics['new_max']:.0f}"
+        ),
+        (
+            f"    delta:     mean {metrics['new_mean'] - metrics['baseline_mean']:+.1f}  "
+            f"max {metrics['new_max'] - metrics['baseline_max']:+.0f}"
+        ),
         "",
         "  PER-AXIS RMSE (lower = closer to baseline)",
     ]
