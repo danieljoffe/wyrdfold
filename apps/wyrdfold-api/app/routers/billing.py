@@ -440,7 +440,7 @@ async def stripe_webhook(
     try:
         # Verification only — the handler below works on the (identical,
         # now-authenticated) raw JSON rather than stripe's typed objects.
-        stripe.Webhook.construct_event(  # type: ignore[no-untyped-call]
+        stripe.Webhook.construct_event(
             payload, signature, settings.stripe_webhook_secret
         )
     except (ValueError, stripe.SignatureVerificationError) as exc:
