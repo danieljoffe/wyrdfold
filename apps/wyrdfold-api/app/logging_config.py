@@ -100,6 +100,18 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+#: Libraries that log one INFO line per outbound HTTP request, URL and all.
+#: Root carries a handler at INFO (see ``init_logging``), and these propagate,
+#: so without this they would put every request URL into the platform log —
+#: including PostgREST query strings, which embed ``user_id=eq.<uuid>`` on
+#: every authed route and ``email=eq.<address>`` on the two waitlist lookups
+#: in ``routers/admin.py``. Their WARNING/ERROR records still reach the log.
+#:
+#: ``httpx2`` is separate from ``httpx``: the anthropic SDK moved to it at
+#: 1.0.0, so both stacks are live in-process and both log this way.
+_PER_REQUEST_LOGGERS = ("httpx", "httpx2")
+
+
 def init_logging(log_format: str, log_level: str = "INFO") -> None:
     """Set the root log LEVEL, and wire the JSON formatter when opted in.
 
@@ -134,7 +146,30 @@ def init_logging(log_format: str, log_level: str = "INFO") -> None:
         resolved = logging.INFO
     root.setLevel(resolved)
 
+    # Quiet the per-request URL chatter (see ``_PER_REQUEST_LOGGERS``). Only
+    # when the logger has no explicit level of its own, so an operator's
+    # dictConfig / ``--log-config`` stays authoritative.
+    for name in _PER_REQUEST_LOGGERS:
+        lg = logging.getLogger(name)
+        if lg.level == logging.NOTSET:
+            lg.setLevel(logging.WARNING)
+
     if log_format != "json":
+        # LEVEL ALONE IS NOT ENOUGH. uvicorn attaches handlers to its OWN
+        # loggers (`uvicorn`, `uvicorn.access`, …) and never to root, so an
+        # application record that passes the level check finds no handler and
+        # falls through to ``logging.lastResort`` — which emits at WARNING and
+        # above only. That is precisely why app WARNING/ERROR lines have always
+        # reached Railway while INFO never did, and why raising the level in
+        # isolation changed nothing (#862, second pass).
+        #
+        # Only attach when root has nothing, so a host that configured its own
+        # handlers (Sentry, a dictConfig, a re-init under --reload) is left
+        # alone and records are not duplicated.
+        if not root.handlers:
+            plain = logging.StreamHandler(sys.stdout)
+            plain.setFormatter(logging.Formatter("%(levelname)s [%(name)s] %(message)s"))
+            root.addHandler(plain)
         return
 
     # Clear any prior JSON handler from a reload — keep other handlers

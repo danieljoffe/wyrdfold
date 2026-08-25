@@ -112,8 +112,10 @@ def review_to_critique(review: FaithfulnessReview) -> str | None:
     if not flags:
         return None
     lines = [
-        "FAITHFULNESS FIXES — correct these without inventing anything; "
-        "use ONLY the source experience:"
+        (
+            "FAITHFULNESS FIXES — correct these without inventing anything; "
+            "use ONLY the source experience:"
+        )
     ]
     for f in flags:
         lines.append(f"- [{f.issue}] {f.claim!r} — {f.suggestion}")

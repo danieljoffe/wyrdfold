@@ -339,10 +339,12 @@ def _write_markdown_report(
             "",
             "## Correlation with baseline fit_score (Spearman ρ)",
             "",
-            "Production baseline = Sonnet 4.6 grades captured in the fixture. "
-            "High ρ = model's ranking aligns with production. Low ρ = model "
-            "scores the same cases differently than today's pipeline does — "
-            "not necessarily worse, just a different shape.",
+            (
+                "Production baseline = Sonnet 4.6 grades captured in the fixture. "
+                "High ρ = model's ranking aligns with production. Low ρ = model "
+                "scores the same cases differently than today's pipeline does — "
+                "not necessarily worse, just a different shape."
+            ),
             "",
         ]
     )
@@ -354,9 +356,11 @@ def _write_markdown_report(
             "",
             "## Highest-disagreement cases (top 10)",
             "",
-            "These are the cases where models diverge most on the overall "
-            "fit_score. They're the calibration edge cases — worth eyeballing "
-            "to understand which models are over- or under-scoring.",
+            (
+                "These are the cases where models diverge most on the overall "
+                "fit_score. They're the calibration edge cases — worth eyeballing "
+                "to understand which models are over- or under-scoring."
+            ),
             "",
             "| Spread | Band | Baseline | Title |" + "".join(f" {m} |" for m in models),
             "| --- | --- | --- | --- |" + "".join(" --- |" for _ in models),
