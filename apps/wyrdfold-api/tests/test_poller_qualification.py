@@ -28,6 +28,7 @@ from app.services import poller as poller_mod
 from app.services.llm import provider_breaker
 from app.services.llm.errors import LLMQuotaExhaustedError, LLMRateLimitedError
 from app.services.qualification import QualificationTags, qualification_hash
+from app.services.targets.payers import PayerBudgetGate
 
 _TAGS = QualificationTags(
     is_us=True,
@@ -903,3 +904,305 @@ class TestDefersToTheBoard:
         payload = rec["writes"][0]
         for key in ("is_us", "role_family", "seniority", "metro", "is_genuine_role"):
             assert key in payload, key
+
+
+class TestArchivedRowsAreNotTagged:
+    """Spend gate 1: an archived posting must never cost a tag.
+
+    A board that keeps LISTING a job we already archived re-upserts it on
+    every cycle. The description drifts, the content-hash cache MISSES, and
+    the tagger re-paid forever for a row that is off every serving surface —
+    on prod roughly a third of a day's tagger calls were rows archived
+    *before* the tag was bought, some archived weeks earlier. The hash cache
+    was the only skip and drift defeats it by construction.
+
+    ``_backfill_qualify_stale`` already selects ``archived_at IS NULL``; the
+    ingest path did not, which is why the guard sits at the shared
+    ``_qualify_one_job`` chokepoint and covers both callers.
+    """
+
+    @pytest.mark.asyncio
+    async def test_archived_row_is_skipped_but_the_same_live_row_is_tagged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Anti-vacuous by construction: the SAME fixture is driven twice.
+
+        The first pass proves the row reaches the tagger at all, so the
+        second pass's zero can only be the archived guard — not a fixture
+        that never spends anything in the first place.
+        """
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        # Precondition: LIVE, cache-missing → tagged and written.
+        await poller_mod._qualify_jobs(sb, [_row()])
+        assert rec["tag_calls"] == 1
+        assert len(rec["writes"]) == 1
+
+        # Identical content, now archived → no second call, no second write.
+        await poller_mod._qualify_jobs(sb, [_row(archived_at="2026-08-07T12:00:00Z")])
+        assert rec["tag_calls"] == 1
+        assert rec["cost_calls"] == 1
+        assert len(rec["writes"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_archived_row_skips_even_when_its_content_drifted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The exact prod shape: already tagged once, then the description
+        drifted, so the content-hash cache MISSES. Only the archived guard can
+        stop the re-spend."""
+        stale_hash = qualification_hash(
+            title="Staff Engineer",
+            company="Acme",
+            location="San Francisco, CA",
+            description="<p>OLD body.</p>",
+        )
+        live_hash = qualification_hash(
+            title="Staff Engineer",
+            company="Acme",
+            location="San Francisco, CA",
+            description="<p>Build things.</p>",
+        )
+        # Precondition: the cache genuinely misses, so the hash skip is NOT
+        # what makes this test pass.
+        assert stale_hash != live_hash
+
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(
+            sb,
+            [
+                _row(
+                    qualified_hash=stale_hash,
+                    qualified_at="2026-08-01T00:00:00Z",
+                    archived_at="2026-08-07T12:00:00Z",
+                )
+            ],
+        )
+
+        assert rec["tag_calls"] == 0
+        assert rec["cost_calls"] == 0
+        assert rec["writes"] == []
+
+    @pytest.mark.asyncio
+    async def test_explicit_null_archived_at_is_not_a_skip(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``upsert_resp.data`` returns FULL rows, so a live posting carries
+        ``archived_at: None`` — a presence check would silently stop tagging
+        the entire live catalog. Only a truthy timestamp skips."""
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row(archived_at=None)])
+
+        assert rec["tag_calls"] == 1
+        assert len(rec["writes"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_unarchiving_re_tags_on_the_next_cycle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard defers spend; it never strands a row. Skipping leaves the
+        stale hash in place, so clearing ``archived_at`` makes the very next
+        cycle miss the cache and re-tag. (The poller never un-archives — that
+        is an operator revival — but the re-entry path must stay clean.)"""
+        stale_hash = qualification_hash(
+            title="Staff Engineer",
+            company="Acme",
+            location="San Francisco, CA",
+            description="<p>OLD body.</p>",
+        )
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(
+            sb,
+            [_row(qualified_hash=stale_hash, archived_at="2026-08-07T12:00:00Z")],
+        )
+        assert rec["tag_calls"] == 0
+
+        # Un-archived on a later cycle: same stale hash, now live.
+        await poller_mod._qualify_jobs(sb, [_row(qualified_hash=stale_hash)])
+        assert rec["tag_calls"] == 1
+        assert len(rec["writes"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_all_archived_batch_still_runs_the_db_only_closers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard lives in ``_qualify_one_job``, so a batch of archived rows
+        still reaches the ``finally`` closers — they're DB-only and correct an
+        off-family ``promising`` verdict the tagger can't."""
+        calls: list[str] = []
+
+        async def _fake_refresh(_sb: Any, rows: list[dict[str, Any]]) -> None:
+            calls.append(f"refresh:{len(rows)}")
+
+        async def _fake_reconcile(_sb: Any, job_ids: list[str]) -> None:
+            calls.append(f"reconcile:{','.join(job_ids)}")
+
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        monkeypatch.setattr(poller_mod, "_refresh_job_tags", _fake_refresh)
+        monkeypatch.setattr(poller_mod, "_reconcile_offfamily_promising", _fake_reconcile)
+
+        await poller_mod._qualify_jobs(
+            _supabase_capturing_updates(rec),
+            [_row(id="job-9", archived_at="2026-08-07T12:00:00Z")],
+        )
+
+        assert rec["tag_calls"] == 0
+        assert calls == ["refresh:1", "reconcile:job-9"]
+
+
+class TestNoConsumerGate:
+    """Spend gate 2: skip tagging when NO active target could consume a tag.
+
+    The tagger is target-INDEPENDENT — it bills the INSTANCE key, so the
+    per-payer ``PayerBudgetGate`` that correctly stops Phase 1 and Phase 2
+    never saw it. With every active target blocked (catalog-only payers with
+    ``grade_catalog_targets`` off, plus payers over their monthly allowance)
+    grading sat at zero while the tagger kept buying tags nothing could read.
+
+    Suppression is LLM-ONLY. Nothing here may shrink the active set or stop a
+    source polling — that is the reverted mistake documented in
+    ``targets/payers.py`` (it starved the public corpus of INGESTION).
+    """
+
+    @pytest.mark.asyncio
+    async def test_fully_blocked_gate_skips_tagging_and_still_runs_the_closers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Prod's current shape: catalog-only targets (payer None,
+        ``grade_catalog_targets`` off) plus a target whose payer is over
+        allowance. Zero LLM calls, and BOTH DB-only closers still run."""
+        monkeypatch.setattr(live_settings, "grade_catalog_targets", False)
+        gate = PayerBudgetGate(
+            payer_by_target={"t-catalog": None, "t-user": "u-broke"},
+            over_budget_users=frozenset({"u-broke"}),
+        )
+        # Precondition: the gate really does consider everything blocked.
+        assert gate.all_targets_blocked()
+
+        calls: list[str] = []
+
+        async def _fake_refresh(_sb: Any, rows: list[dict[str, Any]]) -> None:
+            calls.append(f"refresh:{len(rows)}")
+
+        async def _fake_reconcile(_sb: Any, job_ids: list[str]) -> None:
+            calls.append(f"reconcile:{','.join(job_ids)}")
+
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        monkeypatch.setattr(poller_mod, "_refresh_job_tags", _fake_refresh)
+        monkeypatch.setattr(poller_mod, "_reconcile_offfamily_promising", _fake_reconcile)
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row(id="job-9")], gate)
+
+        assert rec["tag_calls"] == 0
+        assert rec["cost_calls"] == 0
+        assert rec["writes"] == []
+        # The closers are NOT collateral damage.
+        assert calls == ["refresh:1", "reconcile:job-9"]
+
+    @pytest.mark.asyncio
+    async def test_unblocked_target_still_tags(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Control. Same call, same fixture, one consumer that CAN read the
+        tag — without this the skip above could pass for any reason."""
+        gate = PayerBudgetGate(payer_by_target={"t-user": "u-ok"})
+        assert not gate.all_targets_blocked()
+
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row()], gate)
+
+        assert rec["tag_calls"] == 1
+        assert len(rec["writes"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_one_unblocked_target_is_enough(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The predicate is ALL-blocked, not ANY-blocked: a single live
+        consumer keeps the target-independent tagger running for everyone."""
+        monkeypatch.setattr(live_settings, "grade_catalog_targets", False)
+        gate = PayerBudgetGate(
+            payer_by_target={"t-catalog": None, "t-user": "u-ok"},
+            over_budget_users=frozenset({"u-broke"}),
+        )
+        assert gate.target_blocked("t-catalog")  # precondition: partially blocked
+
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row()], gate)
+
+        assert rec["tag_calls"] == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_gate_is_fail_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``PayerBudgetGate()`` is the breaker / build-failure sentinel — and
+        also "no active targets at all". Both mean skip: when we can't see
+        budgets, don't spend."""
+        gate = PayerBudgetGate()
+        assert gate.all_targets_blocked()
+
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, _unique_rows(3), gate)
+
+        assert rec["tag_calls"] == 0
+        assert rec["writes"] == []
+
+    @pytest.mark.asyncio
+    async def test_no_gate_supplied_tags_as_before(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``None`` means "no snapshot supplied" (direct callers, the backfill
+        sweep), NOT "blocked" — those paths keep their existing behaviour."""
+        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
+        sb = _supabase_capturing_updates(rec)
+
+        await poller_mod._qualify_jobs(sb, [_row()], None)
+
+        assert rec["tag_calls"] == 1
+
+
+class TestAllTargetsBlockedPredicate:
+    """``PayerBudgetGate.all_targets_blocked`` — the cycle-wide question
+    ``target_blocked`` can't answer. Unit-level so the poller tests above
+    aren't the only thing pinning the semantics."""
+
+    def test_empty_snapshot_is_blocked(self) -> None:
+        assert PayerBudgetGate().all_targets_blocked() is True
+
+    def test_catalog_only_snapshot_is_blocked_when_catalog_grading_is_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(live_settings, "grade_catalog_targets", False)
+        gate = PayerBudgetGate(payer_by_target={"t1": None, "t2": None})
+        assert gate.all_targets_blocked() is True
+
+    def test_catalog_only_snapshot_is_unblocked_when_catalog_grading_is_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The operator opt-in must survive: turning catalog grading ON means
+        catalog targets DO consume tags."""
+        monkeypatch.setattr(live_settings, "grade_catalog_targets", True)
+        gate = PayerBudgetGate(payer_by_target={"t1": None, "t2": None})
+        assert gate.all_targets_blocked() is False
+
+    def test_idle_or_disabled_payers_also_count_as_blocked(self) -> None:
+        gate = PayerBudgetGate(
+            payer_by_target={"t1": "u-idle", "t2": "u-off"},
+            idle_users=frozenset({"u-idle"}),
+            disabled_users=frozenset({"u-off"}),
+        )
+        assert gate.all_targets_blocked() is True
+
+    def test_a_single_healthy_payer_unblocks_the_cycle(self) -> None:
+        gate = PayerBudgetGate(
+            payer_by_target={"t1": "u-idle", "t2": "u-ok"},
+            idle_users=frozenset({"u-idle"}),
+        )
+        assert gate.all_targets_blocked() is False

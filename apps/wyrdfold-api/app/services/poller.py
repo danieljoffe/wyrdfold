@@ -855,7 +855,35 @@ async def _qualify_one_job(
     unchanged posting costs nothing. Fully best-effort: any error is logged
     and swallowed so the row simply stays NULL (not-yet-tagged) and a later
     cycle re-attempts it.
+
+    Archived rows never reach the model — see the guard below.
     """
+    # ARCHIVED ⇒ SPEND NOTHING. A board that keeps listing a posting we
+    # already archived re-upserts it on every cycle; its description drifts,
+    # the content-hash below MISSES, and we re-paid for a tag no serving
+    # surface can read (measured on prod: roughly a third of all tagger calls
+    # were rows archived before the tag was bought — some archived weeks
+    # earlier and still re-tagged today). The hash cache was the ONLY skip, and
+    # drift defeats it by construction.
+    #
+    # ``row`` is the upsert RESULT, so it carries ``archived_at`` even though
+    # the upsert payload never writes that column — exactly why the hash skip
+    # below can read ``qualified_hash``/``qualified_at`` off the same dict.
+    # Placed BEFORE the hash computation so an archived row costs neither the
+    # model call nor the hash work. ``_backfill_qualify_stale`` already selects
+    # ``archived_at IS NULL``; the ingest path was the odd one out, so this is
+    # the chokepoint that covers BOTH callers.
+    #
+    # Not a one-way door. Skipping leaves the row's existing tags AND its stale
+    # ``qualified_hash`` untouched, so if ``archived_at`` is ever cleared the
+    # very next cycle misses the content hash and re-tags normally — no
+    # backfill, no stranded row. (Nothing in the poller un-archives today:
+    # archival is sticky by design, so in practice this guard means "archived
+    # rows are done costing us". The clean re-entry path is for an operator
+    # revival.)
+    if row.get("archived_at"):
+        return
+
     new_hash = qualification_hash(
         title=row.get("title"),
         company=row.get("company_name"),
@@ -981,6 +1009,7 @@ async def _qualify_one_job(
 async def _qualify_jobs(
     supabase: AsyncClient,
     rows: list[dict[str, Any]],
+    budget_gate: PayerBudgetGate | None = None,
 ) -> None:
     """Run the #60 qualification tagger over ``rows`` (best-effort).
 
@@ -989,6 +1018,22 @@ async def _qualify_jobs(
     shared DB-write semaphore inside ``_qualify_one_job``; the tagger calls
     themselves fan out together. The whole step is wrapped so a tagger or
     client-resolution failure can never break the poll.
+
+    No-consumer gated: because the tagger is target-INDEPENDENT the
+    per-payer ``PayerBudgetGate`` cannot see it, so when EVERY active
+    target was blocked (catalog-only payers with ``grade_catalog_targets``
+    off, or payers over their monthly allowance) Phase 1 and Phase 2
+    correctly spent nothing while the tagger kept buying tags nothing
+    could read. ``budget_gate`` is that cycle snapshot; when
+    ``all_targets_blocked()`` we skip the model entirely. An empty gate —
+    the breaker / build-failure sentinel — counts as blocked ("when we
+    can't see budgets, don't spend"). ``None`` means "no snapshot
+    supplied" (direct callers, the backfill sweep) and stays ungated.
+
+    Suppression is LLM-ONLY: polling, ingest and the active-target set are
+    untouched (``payers.PayerBudgetGate.all_targets_blocked`` documents why
+    that boundary is load-bearing). Skipped rows stay NULL, which every
+    read gate treats permissively, and re-tag once a consumer unblocks.
 
     Global-budget gated (#60 overspend fix): the tagger bills the instance
     key, so the per-payer ``PayerBudgetGate`` that protects Phase-1/2 work
@@ -1013,6 +1058,21 @@ async def _qualify_jobs(
     if not rows:
         return
     try:
+        # Inside the try, so the DB-only closers below STILL run: they need no
+        # LLM, they're cheap id-scoped reads/writes, and the reconcile is the
+        # only chance to retract an off-family ``promising`` verdict written
+        # pre-tag. A skip here must cost tags, never correctness.
+        if budget_gate is not None and budget_gate.all_targets_blocked():
+            # DEBUG, not INFO: this is a per-source call and the "everything
+            # blocked" state persists for whole cycles, so an INFO line here
+            # is a log storm (#702).
+            logger.debug(
+                "Qualification tagger: every active target is blocked this "
+                "cycle — skipping tags for %d row(s) (they stay NULL and "
+                "re-tag once a consumer unblocks)",
+                len(rows),
+            )
+            return
         try:
             llm = await get_llm_client_async(_async_service_client(), None)
         except Exception:
@@ -2040,10 +2100,13 @@ async def _poll_one_source(
             # Best-effort and flag-gated: failures are swallowed so a tagger
             # outage never breaks polling, and nothing runs unless
             # ``qualification_enabled`` is set (no LLM spend by default).
+            # ``gate`` rides along so the step can skip the model when NO
+            # active target could consume a tag (see ``_qualify_jobs``).
             if settings.qualification_enabled and upsert_resp.data:
                 await _qualify_jobs(
                     supabase,
                     [cast(dict[str, Any], r) for r in upsert_resp.data],
+                    gate,
                 )
 
             # Job embeddings are LAZY now (Disk IO slim-down, 2026-07-30):
@@ -3102,6 +3165,7 @@ async def _poll_one_source_for_target(
     target: JobTarget,
     payer_user_id: str | None = None,
     payer_over_budget: bool = False,
+    budget_gate: PayerBudgetGate | None = None,
 ) -> dict[str, Any]:
     """Poll a single source for a specific target. Three-stage pipeline.
 
@@ -3109,6 +3173,13 @@ async def _poll_one_source_for_target(
     (the activator); ``payer_over_budget`` skips Phase 1 spend while
     still ingesting fail-open — both resolved once by
     ``poll_sources_for_target``.
+
+    ``budget_gate`` is the snapshot those two were derived from, threaded
+    on so the target-INDEPENDENT qualification tagger (which bills the
+    instance key and is invisible to the per-payer gate) can skip the
+    model when this target — the only consumer on this path — is blocked.
+    ``None`` leaves tagging ungated, preserving the behaviour of direct
+    callers that pass only the payer fields.
     """
     summary: dict[str, Any] = {
         "polled": False,
@@ -3433,11 +3504,15 @@ async def _poll_one_source_for_target(
 
             # Qualification firewall (#60): same target-INDEPENDENT tagging
             # as ``_poll_one_source`` — AFTER the US filter, BEFORE per-target
-            # scoring, flag-gated, best-effort.
+            # scoring, flag-gated, best-effort. ``budget_gate`` is the same
+            # snapshot ``payer_over_budget`` was read from; this path serves
+            # ONE target, so "that target is blocked" IS "nothing can consume
+            # these tags".
             if settings.qualification_enabled and upsert_resp.data:
                 await _qualify_jobs(
                     supabase,
                     [cast(dict[str, Any], r) for r in upsert_resp.data],
+                    budget_gate,
                 )
 
             # Job embeddings are LAZY (see _poll_one_source): the Phase-2
@@ -3730,6 +3805,7 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
                 target,
                 payer_user_id=payer,
                 payer_over_budget=over,
+                budget_gate=gate,
             )
 
     try:
