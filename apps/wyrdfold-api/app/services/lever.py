@@ -1,6 +1,11 @@
 import logging
 
-from app.http_client import FetchExhaustedError, json_or_none, request_with_retry
+from app.http_client import (
+    BoardFetchError,
+    FetchExhaustedError,
+    board_list_json,
+    request_with_retry,
+)
 from app.services.board_metadata import (
     normalize_country,
     normalize_employment_type,
@@ -15,23 +20,22 @@ LEVER_BASE = "https://api.lever.co/v0/postings"
 
 async def fetch_lever_jobs(company: str) -> list[StandardJob]:
     url = f"{LEVER_BASE}/{company}?mode=json"
+    source = f"lever {company}"
     try:
         resp = await request_with_retry("GET", url)
     except FetchExhaustedError as exc:
         logger.warning("lever fetch exhausted retries for %s: %s", company, exc)
-        return []
+        raise BoardFetchError(f"{source} exhausted retries", source=source) from exc
 
-    if resp.status_code == 404:
-        return []
-    if resp.status_code >= 400:
-        logger.warning("lever %s returned %d for %s", company, resp.status_code, url)
-        return []
-
-    data = json_or_none(resp, source=f"lever {company}")
-    if data is None:
-        return []
+    data = board_list_json(resp, source=source)
     if not isinstance(data, list):
-        return []
+        # Lever's list endpoint returns a bare JSON array. Anything else on a
+        # 200 is a malformed response, not an empty board.
+        raise BoardFetchError(
+            f"{source} returned 200 with a non-list body",
+            source=source,
+            status=resp.status_code,
+        )
 
     jobs: list[StandardJob] = []
     for item in data:

@@ -411,12 +411,14 @@ def json_or_none(resp: httpx.Response, *, source: str) -> Any | None:
     boards; it reads as a code bug in the traceback when it is really an
     upstream serving HTML.
 
-    Returning ``None`` lets each fetcher treat it exactly like the non-200 case
-    it already handles: warn, and yield no jobs. Yielding NOTHING (rather than a
-    partial harvest) is the load-bearing part — the poller's stale-archive pass
-    skips a source that returns zero rows while active rows exist, so a failed
-    fetch can't archive live listings. A partial result would sail straight
-    past that guard.
+    Returning ``None`` rather than a partial harvest is the load-bearing part —
+    a partial result would sail straight past the poller's stale-archive guard
+    and delist live rows.
+
+    This is the seam the PER-POSTING DETAIL fetchers use: they warn and drop
+    that one posting. LIST fetches go through ``board_list_json`` below, which
+    turns the same ``None`` into a ``BoardFetchError`` — an unparseable list
+    response is a failed fetch, not a board with no open roles.
     """
     try:
         return resp.json()
@@ -430,3 +432,57 @@ def json_or_none(resp: httpx.Response, *, source: str) -> Any | None:
             body,
         )
         return None
+
+
+class BoardFetchError(Exception):
+    """An ATS **list** fetch did not come back with a usable board listing.
+
+    Every list fetcher used to collapse every failure mode — 404, 410, 422, a
+    5xx that outlived its retries, a WAF challenge served as 200/text-html —
+    into ``return []``. The poller cannot tell that apart from "this board has
+    no open roles today", so it recorded a SUCCESSFUL poll and reset
+    ``consecutive_failures`` to 0. ``_record_source_failure`` only ever fires
+    from an exception handler, so ``source_failure_disable_threshold`` could
+    never fire for this failure class and a dead board was re-polled every
+    cycle forever (prod: comcast answering 410 Gone).
+
+    Raising instead routes the failure into the accounting the poller already
+    has. Deliberately NOT raised for a 200 that carries zero postings: that is
+    a legitimately empty board and must keep resetting the counter.
+
+    ``status`` is the HTTP status we saw, or ``None`` when the request never
+    produced a response (transport failure past its retries).
+    """
+
+    def __init__(self, message: str, *, source: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.source = source
+        self.status = status
+
+
+def board_list_json(resp: httpx.Response, *, source: str) -> Any:
+    """Decode an ATS **list** response, or raise ``BoardFetchError``.
+
+    The single gate every list fetcher runs its response through, so "the board
+    answered with a listing" is judged identically across providers.
+
+    Note what is NOT handled here: 408/425/429/5xx never reach this function on
+    their first occurrence — ``request_with_retry`` retries them with backoff
+    and only raises ``FetchExhaustedError`` once they are spent. That is the
+    transient-vs-sustained split; a blip costs no failure count at all, and a
+    sustained outage still has to clear the disable threshold on top.
+    """
+    if resp.status_code != 200:
+        raise BoardFetchError(
+            f"{source} returned {resp.status_code}",
+            source=source,
+            status=resp.status_code,
+        )
+    data = json_or_none(resp, source=source)
+    if data is None:
+        raise BoardFetchError(
+            f"{source} returned 200 with a non-JSON body",
+            source=source,
+            status=resp.status_code,
+        )
+    return data

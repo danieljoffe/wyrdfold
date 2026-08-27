@@ -7,7 +7,13 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
-from app.http_client import FetchExhaustedError, json_or_none, request_with_retry
+from app.http_client import (
+    BoardFetchError,
+    FetchExhaustedError,
+    board_list_json,
+    json_or_none,
+    request_with_retry,
+)
 from app.services.date_normalize import normalize_posted_at
 from app.services.standard_job import StandardJob
 
@@ -233,7 +239,13 @@ async def fetch_workday_jobs(
     """
     parts = board_token.split("|")
     if len(parts) != 3:
-        return []
+        # A source row we can't even build a URL from can never produce jobs.
+        # Returning [] made it look like a healthy-but-empty board forever;
+        # raising lets the failure backoff retire it.
+        raise BoardFetchError(
+            f"workday board_token is not '{{base_url}}|{{tenant}}|{{site}}': {board_token!r}",
+            source=f"workday {board_token}",
+        )
 
     base_url, tenant, site = parts
     list_url = f"{base_url}/wday/cxs/{tenant}/{site}/jobs"
@@ -266,20 +278,16 @@ async def fetch_workday_jobs(
                 offset,
                 exc,
             )
-            return []
+            raise BoardFetchError(
+                f"workday {board_token} exhausted retries at offset {offset}",
+                source=f"workday {board_token}",
+            ) from exc
 
-        if resp.status_code != 200:
-            logger.warning(
-                "workday %s returned %d at offset %d",
-                board_token,
-                resp.status_code,
-                offset,
-            )
-            return []
-
-        data = json_or_none(resp, source=f"workday {board_token}")
-        if data is None:
-            return []
+        # All-or-nothing per board: a page that fails mid-pagination aborts the
+        # whole fetch rather than yielding the pages we did get. A partial
+        # harvest would sail past the poller's stale-archive guard and delist
+        # every posting on the missing pages.
+        data = board_list_json(resp, source=f"workday {board_token} (offset {offset})")
         postings = data.get("jobPostings", [])
         if not postings:
             break

@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from app.http_client import BoardFetchError
 from app.services.smartrecruiters import fetch_smartrecruiters_jobs
 from app.services.standard_job import StandardJob
 
@@ -58,21 +59,37 @@ def _two_phase_handler(
     return _handler
 
 
+# The LIST call raises when the board doesn't answer with a listing; the
+# per-posting DETAIL call stays best-effort and drops just that posting (see
+# test_fetch_drops_posting_when_detail_fetch_404s below). Only the list
+# outcome speaks for the whole board, so only it feeds the failure counter —
+# tests/test_dead_board_failure_accounting.py.
+
+
 @pytest.mark.asyncio
-async def test_fetch_404_returns_empty(mock_http_client):
-    """List endpoint 404 → no detail calls, empty result."""
+async def test_fetch_404_raises(mock_http_client):
+    """List endpoint 404 → no detail calls, and the poll counts as failed."""
     list_resp = _mock_response(404)
     mock_http_client.get = AsyncMock(side_effect=_two_phase_handler(list_response=list_resp))
-    result = await fetch_smartrecruiters_jobs("missing-co")
-    assert result == []
+    with pytest.raises(BoardFetchError) as exc_info:
+        await fetch_smartrecruiters_jobs("missing-co")
+    assert exc_info.value.status == 404
 
 
 @pytest.mark.asyncio
-async def test_fetch_http_error_returns_empty(mock_http_client):
-    """A transport error on the list call short-circuits to []."""
+async def test_fetch_http_error_raises(mock_http_client):
+    """A transport error on the list call is a failed fetch, not an empty board."""
     mock_http_client.get = AsyncMock(side_effect=httpx.HTTPError("boom"))
-    result = await fetch_smartrecruiters_jobs("bad")
-    assert result == []
+    with pytest.raises(BoardFetchError):
+        await fetch_smartrecruiters_jobs("bad")
+
+
+@pytest.mark.asyncio
+async def test_empty_board_returns_empty_list(mock_http_client):
+    """CONTROL: 200 with no postings is a real, healthy, empty board."""
+    list_resp = _mock_response(200, {"content": []})
+    mock_http_client.get = AsyncMock(side_effect=_two_phase_handler(list_response=list_resp))
+    assert await fetch_smartrecruiters_jobs("quiet-co") == []
 
 
 @pytest.mark.asyncio
