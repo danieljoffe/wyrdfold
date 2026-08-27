@@ -105,7 +105,6 @@ def _open_gate() -> MagicMock:
     the wrong reason.
     """
     gate = MagicMock()
-    gate.all_targets_blocked.return_value = False
     gate.target_blocked.return_value = False
     gate.user_blocked.return_value = False
     return gate
