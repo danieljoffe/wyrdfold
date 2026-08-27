@@ -121,34 +121,6 @@ class PayerBudgetGate:
             return not settings.grade_catalog_targets  # catalog-only
         return self.user_blocked(payer)
 
-    def all_targets_blocked(self) -> bool:
-        """True when NOTHING in this snapshot can consume LLM output.
-
-        The cycle-wide question ``target_blocked`` cannot answer. The
-        qualification tagger is target-INDEPENDENT — it bills the INSTANCE
-        key, so the per-payer gate above never sees it, and it kept buying
-        tags at full rate while every consumer of those tags was blocked.
-        This is the predicate for "would ANY active target read a tag we
-        buy right now?".
-
-        Empty map ⇒ True, which covers both meanings at once: the
-        fail-closed sentinel (breaker / build failure — "when we can't see
-        budgets, don't spend") and a cycle with no active targets at all
-        (nothing to consume).
-
-        SAME NARROW SCOPE as ``target_blocked``: this suppresses LLM work
-        only. It must never be used to shrink the ACTIVE SET — re-read the
-        HISTORY note above; that is precisely the mistake that stopped
-        catalog sources polling and starved the public corpus of
-        INGESTION. Callers keep polling, ingesting, and writing rows; they
-        only skip the model call. Untagged rows stay NULL, which every
-        read gate treats permissively, and re-tag on a later cycle exactly
-        like a tagger outage.
-        """
-        if not self.payer_by_target:
-            return True  # fail-closed sentinel / no active targets
-        return all(self.target_blocked(t) for t in self.payer_by_target)
-
     def user_blocked(self, user_id: str) -> bool:
         return (
             user_id in self.over_budget_users
