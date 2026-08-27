@@ -80,13 +80,24 @@ def _promising_job_ids(supabase: Any, target_id: str) -> list[str]:
 
 
 def _fetch_jobs(supabase: Any, job_ids: list[str]) -> list[dict[str, Any]]:
-    """Fetch the job rows Phase 2 needs (id, title, JD, posted date)."""
+    """Fetch the job rows Phase 2 needs (id, title, JD, posted date, tags).
+
+    The tag columns are not decoration: Phase 2 materializes qualification tags
+    lazily for the set it is about to grade, and the tagger reads every column
+    in ``qualification.materialize.TAG_INPUT_COLUMNS`` off these dicts. A
+    partial projection degrades it silently — permanent content-hash misses and
+    an inference written over the board's own remote / employment answer.
+    """
     jobs: list[dict[str, Any]] = []
     for i in range(0, len(job_ids), _PAGE):
         chunk = job_ids[i : i + _PAGE]
         resp = (
             supabase.table("jobs")
-            .select("id, title, description_html, source_posted_at, cataloged_at")
+            .select(
+                "id, title, company_name, location, description_html, "
+                "source_posted_at, cataloged_at, archived_at, is_us, role_family, "
+                "is_remote, employment_type, qualified_hash, qualified_at"
+            )
             .in_("id", chunk)
             .execute()
         )

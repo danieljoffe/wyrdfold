@@ -1007,9 +1007,17 @@ async def _backfill_grade_stale(supabase: AsyncClient, limit: int) -> None:
                 supabase,
                 lambda c, tid=target.id: (
                     c.table("scores")
+                    # The embedded jobs projection must carry every column the
+                    # grade-time tagger reads (``TAG_INPUT_COLUMNS``) — the
+                    # content-hash inputs, the archived guard and #846's
+                    # board-defer keys. A partial projection degrades the
+                    # tagger silently (permanent cache miss, board answer
+                    # overwritten); ``test_grade_backfill`` pins it.
                     .select(
-                        "recency_score, jobs!inner(id, title, description_html, "
-                        "cataloged_at, archived_at, purged_at, is_us, role_family)"
+                        "recency_score, jobs!inner(id, title, company_name, location, "
+                        "description_html, cataloged_at, archived_at, purged_at, "
+                        "is_us, role_family, is_remote, employment_type, "
+                        "qualified_hash, qualified_at)"
                     )
                     .eq("target_id", tid)
                     .eq("promising", True)

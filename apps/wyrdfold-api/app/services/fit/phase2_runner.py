@@ -22,6 +22,11 @@ in what order:
   grade in one eager fan-out so the first list page fills fast; the rest
   catch up in ``PHASE2_BATCH_SIZE`` chunks. Concurrency inside a batch is
   bounded so we never open 50 Sonnet sockets at once.
+- **Lazy materialization.** Neither job vectors nor qualification tags are
+  written at ingest: this runner is their only serving reader, so it buys
+  them here for the set it is about to grade (``ensure_job_vectors`` for the
+  candidates it must rank, ``ensure_job_tags`` for the ≤ quota rows it will
+  actually spend on). Placement is a spend decision — see the tagging block.
 
 This is the single entry point both the poller and the backfill script
 call, so the gate / cap / batching policy lives in exactly one place.

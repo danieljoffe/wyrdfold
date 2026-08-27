@@ -1008,3 +1008,31 @@ async def test_budget_predicate_is_threaded_to_the_tagger(
         tag_budget_exhausted=_never,
     )
     assert seen == [_never]
+
+
+def test_manual_backfill_script_selects_every_tagger_input_column() -> None:
+    """The operator backfill hands ``run_phase2_for_jobs`` rows it selected
+    itself, so it inherits the tagger's input contract.
+
+    Missing columns degrade the tagger SILENTLY: a hash computed over different
+    inputs can never match the stored one (re-tagged on every run), and a
+    missing ``is_remote``/``employment_type`` lets the inference overwrite the
+    board's own answer (#846/#795). Pinned against the tagger's declared
+    contract, not a copy of the list.
+    """
+    from app.services.qualification.materialize import TAG_INPUT_COLUMNS
+    from scripts.backfill_phase2_fit import _fetch_jobs
+
+    captured: list[str] = []
+    chain = MagicMock()
+    chain.select.side_effect = lambda cols: (captured.append(cols), chain)[1]
+    chain.in_.return_value = chain
+    chain.execute.return_value = MagicMock(data=[])
+    sb = MagicMock()
+    sb.table.return_value = chain
+
+    _fetch_jobs(sb, ["j-1"])
+
+    assert captured, "precondition: the select was actually issued"
+    selected = {c.strip() for c in captured[0].split(",")}
+    assert selected >= TAG_INPUT_COLUMNS, TAG_INPUT_COLUMNS - selected

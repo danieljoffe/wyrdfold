@@ -83,6 +83,37 @@ QUALIFICATION_BUDGET_RECHECK_EVERY = 50
 # ≤150-200 UUIDs keeps the PostgREST URL under proxy limits).
 _IN_CHUNK = 150
 
+# The ``jobs`` columns ``_qualify_one_job`` READS off each row dict. A caller
+# that builds its rows from a PARTIAL select must include every one of them, or
+# the tagger degrades SILENTLY rather than failing:
+#
+#   * missing ``qualified_hash`` / ``qualified_at`` ⇒ the content-hash cache
+#     misses forever and the row is re-tagged on every pass;
+#   * missing ``company_name`` / ``location`` ⇒ the hash is computed over
+#     different inputs than the ingest-shaped one, so it can never match again
+#     (same permanent re-tag, plus a worse prompt);
+#   * missing ``archived_at`` ⇒ the archived guard cannot fire;
+#   * missing ``is_remote`` / ``employment_type`` ⇒ #846's defer-to-the-board
+#     rule reads "the board said nothing" and the inference overwrites the
+#     employer's own answer (this is #795's 229 prod contradictions).
+#
+# Ingest-shaped rows (an upsert RESULT) carry all of them for free; the
+# grade-backfill paths select explicitly and are pinned by tests.
+TAG_INPUT_COLUMNS = frozenset(
+    {
+        "id",
+        "title",
+        "company_name",
+        "location",
+        "description_html",
+        "qualified_hash",
+        "qualified_at",
+        "archived_at",
+        "is_remote",
+        "employment_type",
+    }
+)
+
 
 def _service_client() -> AsyncClient:
     """Pooled SERVICE-role async client, used ONLY to resolve the instance LLM
