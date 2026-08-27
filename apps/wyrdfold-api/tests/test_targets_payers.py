@@ -25,6 +25,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
+from app.config import settings as live_settings
 from app.services.poller import _resolve_user_targets_for_stage3
 from app.services.targets.payers import PayerBudgetGate
 
@@ -111,3 +114,50 @@ async def test_no_active_user_links_means_no_stage3_grading() -> None:
     primary_by_user, user_optimized = await _resolve_user_targets_for_stage3(sb, [target], "(test)")
     assert primary_by_user == {}
     assert user_optimized == {}
+
+
+class TestAllTargetsBlockedPredicate:
+    """``PayerBudgetGate.all_targets_blocked`` — the cycle-wide question
+    ``target_blocked`` can't answer.
+
+    Moved here when qualification tagging went LAZY: its one caller was the
+    ingest-time tagger's no-consumer skip, and grade-time tagging cannot reach
+    the "no consumer anywhere" state (a specific unblocked payer/target is a
+    precondition of being called). The predicate itself stays — it is the
+    documented boundary against the 2026-07-30 regression above, and these
+    tests keep its semantics pinned.
+    """
+
+    def test_empty_snapshot_is_blocked(self) -> None:
+        assert PayerBudgetGate().all_targets_blocked() is True
+
+    def test_catalog_only_snapshot_is_blocked_when_catalog_grading_is_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(live_settings, "grade_catalog_targets", False)
+        gate = PayerBudgetGate(payer_by_target={"t1": None, "t2": None})
+        assert gate.all_targets_blocked() is True
+
+    def test_catalog_only_snapshot_is_unblocked_when_catalog_grading_is_on(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The operator opt-in must survive: turning catalog grading ON means
+        catalog targets DO consume tags."""
+        monkeypatch.setattr(live_settings, "grade_catalog_targets", True)
+        gate = PayerBudgetGate(payer_by_target={"t1": None, "t2": None})
+        assert gate.all_targets_blocked() is False
+
+    def test_idle_or_disabled_payers_also_count_as_blocked(self) -> None:
+        gate = PayerBudgetGate(
+            payer_by_target={"t1": "u-idle", "t2": "u-off"},
+            idle_users=frozenset({"u-idle"}),
+            disabled_users=frozenset({"u-off"}),
+        )
+        assert gate.all_targets_blocked() is True
+
+    def test_a_single_healthy_payer_unblocks_the_cycle(self) -> None:
+        gate = PayerBudgetGate(
+            payer_by_target={"t1": "u-idle", "t2": "u-ok"},
+            idle_users=frozenset({"u-idle"}),
+        )
+        assert gate.all_targets_blocked() is False

@@ -34,31 +34,14 @@ from app.services.lever import fetch_lever_jobs
 from app.services.llm import MissingUserKeyError, TrialExpiredError
 from app.services.llm import get_client_async as get_llm_client_async
 from app.services.llm.client import LLMClient
-from app.services.llm.cost_log import enqueue as enqueue_llm_cost
 from app.services.llm.cost_log import record_async as record_llm_cost_async
 from app.services.llm.cost_log import total_spend_all_async as total_llm_spend_all_async
-from app.services.llm.errors import (
-    LLMQuotaExhaustedError,
-    LLMRateLimitedError,
-    LLMServiceError,
-)
 from app.services.llm.provider_breaker import (
     provider_fatal_active as _provider_fatal_active,
 )
-from app.services.llm.provider_breaker import (
-    trip_provider_fatal as _trip_provider_fatal,
-)
 from app.services.location_parse import parse_location
 from app.services.mock_board import fetch_mock_jobs
-from app.services.qualification import (
-    QUALIFICATION_PURPOSE,
-    extract_dictionary_skills,
-    is_us_location,
-    positively_us_location,
-    qualification_hash,
-    tag_job,
-)
-from app.services.qualification.family_gate import passes_family_gate
+from app.services.qualification import is_us_location
 from app.services.recency import refresh_recency_scores_poll
 from app.services.relevance.rejection_store import (
     fetch_rejected_titles,
@@ -135,26 +118,14 @@ POLL_CONCURRENCY = 6
 _ACTIVE_RECHECK_S = 60
 LLM_CONCURRENCY = 3
 
-# Cycle-wide caps for the two fan-outs that otherwise had none. Both
-# ``_qualify_jobs`` (LLM ``tag_job`` per row) and ``_validate_rows`` (URL
-# validation per row) gather over a whole source's rows, and POLL_CONCURRENCY
-# sources run at once — so without a *shared* bound the poll can open hundreds
-# of simultaneous OpenRouter calls (429s + cost bursts) or thousands of
-# simultaneous URL validations. One semaphore per event loop, keyed by the
-# running loop like ``db_write`` so a fresh test/worker loop gets its own.
-QUALIFY_LLM_CONCURRENCY = 12
+# Cycle-wide cap for ``_validate_rows`` (URL validation per row): it gathers
+# over a whole source's rows and POLL_CONCURRENCY sources run at once, so
+# without a *shared* bound the poll can open thousands of simultaneous URL
+# validations. One semaphore per event loop, keyed by the running loop like
+# ``db_write`` so a fresh test/worker loop gets its own. (The qualify-tagger
+# twin moved to ``qualification.materialize`` with the tagger itself.)
 VALIDATE_CONCURRENCY = 20
-_qualify_llm_sems: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
 _validate_sems: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
-
-
-def _qualify_llm_semaphore() -> asyncio.Semaphore:
-    loop = asyncio.get_running_loop()
-    sem = _qualify_llm_sems.get(loop)
-    if sem is None:
-        sem = asyncio.Semaphore(QUALIFY_LLM_CONCURRENCY)
-        _qualify_llm_sems[loop] = sem
-    return sem
 
 
 def _validate_semaphore() -> asyncio.Semaphore:
@@ -175,26 +146,16 @@ def _validate_semaphore() -> asyncio.Semaphore:
 # persistence) — a few calls per cycle, migrating with the request-handler
 # slice, not per-row fan-outs.
 
-# How many qualification-tagger jobs to fan out between global-budget
-# re-reads (#60 overspend fix). The tagger bills the instance key, so it is
-# invisible to the per-payer ``PayerBudgetGate``; left ungated it ground the
-# whole backlog past ``global_llm_daily_budget_usd`` (the June incident).
-# ``_qualify_jobs`` re-checks the live day-spend before each chunk and stops
-# once the cap is hit, so worst-case overshoot is bounded to ONE chunk's
-# spend (~this many Haiku calls) rather than the entire backlog. Smaller =
-# tighter cap, more meter reads; this balances the two.
-QUALIFICATION_BUDGET_RECHECK_EVERY = 50
-
 # --- Provider-fatal fast-fail breaker (audit PERF-M "402/429 fast-fail") -------
 # ``_global_budget_exhausted`` stops at our SELF-IMPOSED daily spend cap. The
 # provider-fatal breaker catches the *provider* rejecting every call — OpenRouter
 # out of credits (402) or sustained rate-limiting (429) — which can happen while
-# we're still UNDER budget. The first such error from the tagger latches it for a
-# cooldown so the qualify fan-out stops firing doomed calls; it auto-clears
-# (monotonic). It now lives in ``app.services.llm.provider_breaker`` (imported at
-# the top as ``_provider_fatal_active`` / ``_trip_provider_fatal``) so the E2 lazy
-# fit-score refresh shares the SAME latch — a credits outage caught by either
-# backs the other off too.
+# we're still UNDER budget. The first such error latches it for a cooldown so
+# dependent fan-outs stop firing doomed calls; it auto-clears (monotonic). It
+# lives in ``app.services.llm.provider_breaker`` (imported at the top as
+# ``_provider_fatal_active``) so the qualification tagger, the Phase-1 triage
+# gate below and the E2 lazy fit-score refresh share the SAME latch — a credits
+# outage caught by any one backs the others off too.
 
 
 # US-location detection (hint list + regexes + ``_is_us_location``) moved to
@@ -843,450 +804,56 @@ async def _resolve_user_targets_for_stage3(
     return primary_by_user, user_optimized
 
 
-async def _qualify_one_job(
-    llm: LLMClient,
-    supabase: AsyncClient,
-    row: dict[str, Any],
-) -> None:
-    """Tag ONE job row and persist its qualification columns (#60).
-
-    Content-hash cached: skips the LLM call when the row's current
-    ``qualified_hash`` already matches the freshly-computed hash over
-    (title, company, location, description) — so a re-poll that returns an
-    unchanged posting costs nothing. Fully best-effort: any error is logged
-    and swallowed so the row simply stays NULL (not-yet-tagged) and a later
-    cycle re-attempts it.
-
-    Archived rows never reach the model — see the guard below.
-    """
-    # ARCHIVED ⇒ SPEND NOTHING. A board that keeps listing a posting we
-    # already archived re-upserts it on every cycle; its description drifts,
-    # the content-hash below MISSES, and we re-paid for a tag no serving
-    # surface can read (measured on prod: roughly a third of all tagger calls
-    # were rows archived before the tag was bought — some archived weeks
-    # earlier and still re-tagged today). The hash cache was the ONLY skip, and
-    # drift defeats it by construction.
-    #
-    # ``row`` is the upsert RESULT, so it carries ``archived_at`` even though
-    # the upsert payload never writes that column — exactly why the hash skip
-    # below can read ``qualified_hash``/``qualified_at`` off the same dict.
-    # Placed BEFORE the hash computation so an archived row costs neither the
-    # model call nor the hash work. ``_backfill_qualify_stale`` already selects
-    # ``archived_at IS NULL``; the ingest path was the odd one out, so this is
-    # the chokepoint that covers BOTH callers.
-    #
-    # Not a one-way door. Skipping leaves the row's existing tags AND its stale
-    # ``qualified_hash`` untouched, so if ``archived_at`` is ever cleared the
-    # very next cycle misses the content hash and re-tags normally — no
-    # backfill, no stranded row. (Nothing in the poller un-archives today:
-    # archival is sticky by design, so in practice this guard means "archived
-    # rows are done costing us". The clean re-entry path is for an operator
-    # revival.)
-    if row.get("archived_at"):
-        return
-
-    new_hash = qualification_hash(
-        title=row.get("title"),
-        company=row.get("company_name"),
-        location=row.get("location"),
-        description=row.get("description_html"),
-    )
-    if row.get("qualified_hash") == new_hash and row.get("qualified_at"):
-        # Unchanged content already tagged — skip the spend.
-        return
-
-    # Fast-fail: once the provider has rejected a call this cooldown (402/429),
-    # skip the round-trip entirely — it would just fail too. (audit PERF-M)
-    if _provider_fatal_active():
-        return
-
-    # PERF-H2: bound the qualify LLM fan-out cycle-wide (see _qualify_llm_semaphore).
-    try:
-        async with _qualify_llm_semaphore():
-            # Re-check under the semaphore: the breaker may have latched while
-            # we waited for a slot behind an earlier row's 402 — don't fire the
-            # doomed call just because we passed the check before queuing.
-            if _provider_fatal_active():
-                return
-            tags, result = await tag_job(
-                llm,
-                title=row.get("title", ""),
-                company=row.get("company_name"),
-                location=row.get("location"),
-                description=row.get("description_html"),
-            )
-    except (LLMQuotaExhaustedError, LLMRateLimitedError) as exc:
-        # Provider-fatal (402 out-of-credits / sustained 429): latch the breaker
-        # so the rest of the cycle stops hammering it. Leave THIS row NULL
-        # (best-effort — it re-tags once the cooldown clears). (audit PERF-M)
-        _trip_provider_fatal(exc)
-        return
-    except LLMServiceError:
-        # Other provider error (auth/upstream) — transient / config, handled
-        # elsewhere; leave the row NULL like a row-level tagger failure.
-        return
-    if tags is None:
-        # Tagger failed on a row-specific error (logged inside tag_job). NULL.
-        return
-
-    if result is not None:
-        # System-driven spend → async buffered cost-log path, like the rest
-        # of the poller's background LLM work.
-        with contextlib.suppress(Exception):
-            enqueue_llm_cost(None, QUALIFICATION_PURPOSE, result)
-
-    # Free, deterministic, and independent of the LLM verdict above — see
-    # ``skill_dictionary``. Scans the FULL description because local regex
-    # costs nothing; the LLM path needed a truncated window only because
-    # reading was billed per token.
-    dict_skills = extract_dictionary_skills(row.get("title"), row.get("description_html"))
-
-    # DEFER TO THE BOARD (#846). ``row`` is the upsert RESULT, so it already
-    # carries whatever ``board_columns`` wrote moments ago — Ashby's
-    # ``isRemote``, Lever's ``workplaceType``, SmartRecruiters'
-    # ``location.remote``, or a board-stated "Remote" in the location string.
-    # Those are the employer's own answer; the tagger's are inferences from JD
-    # prose. Writing the inference on top is how #795 ended up with 229 prod
-    # contradictions, and it silently nullified #847/#848 — the board value was
-    # written and then overwritten within the same poll.
-    #
-    # So these two keys are omitted when the row already holds a value. Every
-    # other tag below is a fact NO board publishes (role_family, seniority,
-    # is_us, metro, is_genuine_role), so the tagger remains the only source and
-    # keeps writing them unconditionally. Board values re-derive on every poll,
-    # so a board that changes its mind still propagates.
-    payload: dict[str, Any] = {
-        "is_us": tags.is_us,
-        "role_family": tags.role_family,
-        "seniority": tags.seniority,
-        "metro": tags.metro,
-        "is_genuine_role": tags.is_genuine_role,
-        **({} if row.get("employment_type") else {"employment_type": tags.employment_type}),
-        **({} if row.get("is_remote") is not None else {"is_remote": tags.is_remote}),
-        "qualified_at": datetime.now(UTC).isoformat(),
-        "qualified_hash": new_hash,
-        # Catalog-wide skill facts (backs /search?skill=react), extracted by
-        # DICTIONARY — no LLM, no per-job cost, so it rides this write for free
-        # rather than buying a second read of text we already store. Written
-        # only when non-empty so a posting that names nothing recognizable
-        # never blanks a value the Phase-2 harvest's LLM read already found.
-        **({"skills_required": dict_skills} if dict_skills else {}),
-    }
-    # US-only corpus (#60 workstream B): a high-confidence non-US verdict
-    # archives the job in the SAME write. The poller's ingest gate already
-    # drops clearly-non-US locations, but its L1 heuristic is permissive
-    # (ambiguous / bare-foreign-city rows slip through) — the L2 tagger catches
-    # them here, so we close the loop to the ``archived_at`` gate instead of
-    # leaving non-US jobs live in a US-only catalog. Conf-gated + reversible;
-    # off by default so a global-catalog self-host is unaffected. The
-    # ``positively_us_location`` veto hedges a high-confidence tagger
-    # FALSE-negative on an unambiguously-US location (a real "New York, NY,
-    # United States" was seen tagged non-US at conf 95): never archive when the
-    # location plainly says US.
-    if (
-        settings.qualification_archive_non_us
-        and tags.is_us is False
-        and tags.us_confidence is not None
-        and tags.us_confidence >= settings.qualification_non_us_archive_min_confidence
-        and not positively_us_location(row.get("location"))
-    ):
-        payload["archived_at"] = datetime.now(UTC).isoformat()
-    # Non-postings (#60 wire-up): an explicit ``is_genuine_role=false``
-    # verdict ("join our talent community", evergreen collectors) archives in
-    # the same write — these aren't jobs, so they leave every serving surface
-    # via the standard liveness gate. Lenient: ``None`` never archives.
-    if settings.qualification_archive_non_genuine and tags.is_genuine_role is False:
-        payload["archived_at"] = datetime.now(UTC).isoformat()
-    try:
-        await poll_db_write(
-            supabase,
-            lambda c: c.table("jobs").update(payload).eq("id", row["id"]),
-            label="qualification tags update",
-        )
-    except Exception:
-        logger.exception("Qualification tag write failed for job %s", row.get("id"))
-
-
-async def _qualify_jobs(
-    supabase: AsyncClient,
-    rows: list[dict[str, Any]],
-    budget_gate: PayerBudgetGate | None = None,
-) -> None:
-    """Run the #60 qualification tagger over ``rows`` (best-effort).
-
-    Target-INDEPENDENT, so it bills the instance key (``get_client(..,
-    None)``) — never a per-target payer. Concurrency is bounded by the
-    shared DB-write semaphore inside ``_qualify_one_job``; the tagger calls
-    themselves fan out together. The whole step is wrapped so a tagger or
-    client-resolution failure can never break the poll.
-
-    No-consumer gated: because the tagger is target-INDEPENDENT the
-    per-payer ``PayerBudgetGate`` cannot see it, so when EVERY active
-    target was blocked (catalog-only payers with ``grade_catalog_targets``
-    off, or payers over their monthly allowance) Phase 1 and Phase 2
-    correctly spent nothing while the tagger kept buying tags nothing
-    could read. ``budget_gate`` is that cycle snapshot; when
-    ``all_targets_blocked()`` we skip the model entirely. An empty gate —
-    the breaker / build-failure sentinel — counts as blocked ("when we
-    can't see budgets, don't spend"). ``None`` means "no snapshot
-    supplied" (direct callers, the backfill sweep) and stays ungated.
-
-    Suppression is LLM-ONLY: polling, ingest and the active-target set are
-    untouched (``payers.PayerBudgetGate.all_targets_blocked`` documents why
-    that boundary is load-bearing). Skipped rows stay NULL, which every
-    read gate treats permissively, and re-tag once a consumer unblocks.
-
-    Global-budget gated (#60 overspend fix): the tagger bills the instance
-    key, so the per-payer ``PayerBudgetGate`` that protects Phase-1/2 work
-    can't see it. Left ungated it ground the backlog clean past
-    ``global_llm_daily_budget_usd``. We re-read the live day-spend before
-    each chunk and stop the moment the cap is reached — bounding overshoot
-    to one chunk instead of the whole backlog. Untagged rows simply stay
-    NULL (fail-soft, exactly like a tagger outage) and re-attempt next cycle
-    once the UTC day rolls over and the meter resets.
-
-    Whatever happens above — full tag pass, budget defer, provider trip, even
-    an unavailable LLM client — the ``finally`` step ALWAYS runs the two
-    DB-only closers: ``_refresh_job_tags`` (patch fresh tag columns back into
-    the caller's row dicts, which are upsert-time snapshots that predate this
-    cycle's tag writes) and ``_reconcile_offfamily_promising`` (retract
-    ``promising`` verdicts the now-known family hard-contradicts — Phase 1
-    triages titles pre-ingest, before any tag exists, and #517 deliberately
-    never demotes on re-poll, so a late-landing tag is the ONLY chance to
-    correct an off-family admit; prod 2026-07-30: 55% of promising rows).
-    Neither needs the LLM, and both are cheap id-scoped reads/writes.
-    """
-    if not rows:
-        return
-    try:
-        # Inside the try, so the DB-only closers below STILL run: they need no
-        # LLM, they're cheap id-scoped reads/writes, and the reconcile is the
-        # only chance to retract an off-family ``promising`` verdict written
-        # pre-tag. A skip here must cost tags, never correctness.
-        if budget_gate is not None and budget_gate.all_targets_blocked():
-            # DEBUG, not INFO: this is a per-source call and the "everything
-            # blocked" state persists for whole cycles, so an INFO line here
-            # is a log storm (#702).
-            logger.debug(
-                "Qualification tagger: every active target is blocked this "
-                "cycle — skipping tags for %d row(s) (they stay NULL and "
-                "re-tag once a consumer unblocks)",
-                len(rows),
-            )
-            return
-        try:
-            llm = await get_llm_client_async(_async_service_client(), None)
-        except Exception:
-            logger.exception("Qualification tagger: LLM client unavailable; skipping")
-            return
-        await _qualify_rows_with_budget(supabase, llm, rows)
-    finally:
-        await _refresh_job_tags(supabase, rows)
-        await _reconcile_offfamily_promising(
-            supabase, [cast(str, r["id"]) for r in rows if r.get("id")]
-        )
-
-
-async def _qualify_rows_with_budget(
-    supabase: AsyncClient,
-    llm: LLMClient,
-    rows: list[dict[str, Any]],
-) -> None:
-    """The budget-gated tagger fan-out (see ``_qualify_jobs`` docstring)."""
-    for start in range(0, len(rows), QUALIFICATION_BUDGET_RECHECK_EVERY):
-        # Provider fast-fail (audit PERF-M): if a prior chunk already hit a
-        # 402/429, the provider is rejecting every call — defer the rest of the
-        # backlog this cycle instead of firing hundreds of doomed round-trips.
-        if _provider_fatal_active():
-            logger.warning(
-                "Qualification tagger: LLM provider fast-fail active — deferring "
-                "%d remaining job(s) this cycle (they re-tag after the cooldown).",
-                len(rows) - start,
-            )
-            return
-        # Re-read the meter between chunks so a long backlog can't blow past
-        # the cap. A meter-read failure fails CLOSED (skip the rest) —
-        # refuse to spend when we can't see the budget, matching the cycle
-        # gate's posture.
-        try:
-            exhausted = await _global_budget_exhausted(
-                _async_service_client(),
-                reserve_usd=settings.grading_budget_reserve_usd,
-            )
-        except Exception:
-            logger.exception(
-                "Qualification tagger: global-budget read failed — "
-                "deferring remaining %d job(s) this cycle",
-                len(rows) - start,
-            )
-            return
-        if exhausted:
-            logger.warning(
-                "Qualification tagger: tagger LLM budget reached "
-                "($%.2f cap − $%.2f grading reserve) — deferring %d remaining "
-                "job(s); they re-tag next cycle (rows stay NULL). The reserve "
-                "stays available for Phase-1/Phase-2 grading.",
-                settings.global_llm_daily_budget_usd,
-                settings.grading_budget_reserve_usd,
-                len(rows) - start,
-            )
-            return
-        chunk = rows[start : start + QUALIFICATION_BUDGET_RECHECK_EVERY]
-        await asyncio.gather(
-            *(_qualify_one_job(llm, supabase, row) for row in chunk),
-            return_exceptions=True,
-        )
-
-
-# in_() id-chunk bound for the tag-refresh / reconcile reads (#57 lesson:
-# ≤150-200 UUIDs keeps the PostgREST URL under proxy limits).
-_IN_CHUNK = 150
-
-
-async def _refresh_job_tags(supabase: AsyncClient, rows: list[dict[str, Any]]) -> None:
-    """Patch fresh tag columns back into ``rows`` (in place, best-effort).
-
-    The dicts the poll cycle threads into Phase 2 (``upsert_resp.data``) are
-    snapshots from BEFORE the tagger's UPDATE, so on a job's first cycle
-    ``role_family``/``is_us`` read as NULL downstream even though the row is
-    tagged — the Phase-2 family and US gates then fail open on exactly the
-    cycle that grades most jobs. One chunked read closes that window; a read
-    failure leaves the snapshots as they were (the pre-existing behavior).
-    """
-    ids = [cast(str, r["id"]) for r in rows if r.get("id")]
-    if not ids:
-        return
-    by_id = {cast(str, r["id"]): r for r in rows if r.get("id")}
-    try:
-        for start in range(0, len(ids), _IN_CHUNK):
-            chunk = ids[start : start + _IN_CHUNK]
-            resp = await poll_db_read(
-                supabase,
-                lambda c, _chunk=chunk: (
-                    c.table("jobs").select("id, role_family, is_us").in_("id", _chunk)
-                ),
-                label="qualify tag refresh",
-            )
-            for raw in cast(list[dict[str, Any]], resp.data or []):
-                row = by_id.get(cast(str, raw.get("id")))
-                if row is not None:
-                    row["role_family"] = raw.get("role_family")
-                    row["is_us"] = raw.get("is_us")
-    except Exception:
-        logger.exception("Qualification tag refresh failed (best-effort; dicts stay stale)")
-
-
-async def _reconcile_offfamily_promising(supabase: AsyncClient, job_ids: list[str]) -> None:
-    """Retract ``promising`` verdicts that the (now-landed) family tag
-    hard-contradicts (best-effort).
-
-    Phase 1 triages titles PRE-ingest — no jobs row, no tag — and #517's
-    floor deliberately never demotes a persisted verdict on re-poll, so an
-    off-family admit would otherwise stand forever (the 2026-07-30 audit:
-    55% of all promising rows were hard off-family; the one-off
-    ``backfill_offfamily_promising.py`` cleaned the stock, this closes the
-    flow). Mismatch test = the shared ``passes_family_gate`` over the
-    trigger-synced ``scores.job_role_family`` denorm vs the target's family;
-    keep-null on either side, exactly like every read gate. ``excluded`` is
-    never touched (user-preference semantics).
-    """
-    if not job_ids:
-        return
-    try:
-        tresp = await poll_db_read(
-            supabase,
-            lambda c: c.table("targets").select("id, role_family"),
-            label="reconcile target families",
-        )
-        target_family = {
-            cast(str, r["id"]): cast("str | None", r.get("role_family"))
-            for r in cast(list[dict[str, Any]], tresp.data or [])
-        }
-        if not any(target_family.values()):
-            return  # no classified targets — nothing can mismatch
-
-        to_retract: list[str] = []
-        # Third-size chunks: this read returns up to one row per (job, target)
-        # pair, and a full 150-job chunk on a many-target install could cross
-        # PostgREST's 1000-row response cap (silent truncation).
-        scan_chunk = _IN_CHUNK // 3
-        for start in range(0, len(job_ids), scan_chunk):
-            chunk = job_ids[start : start + scan_chunk]
-            sresp = await poll_db_read(
-                supabase,
-                lambda c, _chunk=chunk: (
-                    c.table("scores")
-                    .select("id, target_id, job_role_family")
-                    .eq("promising", True)
-                    .in_("job_posting_id", _chunk)
-                ),
-                label="reconcile promising read",
-            )
-            for s in cast(list[dict[str, Any]], sresp.data or []):
-                tfam = target_family.get(cast(str, s.get("target_id")))
-                if not passes_family_gate(tfam, cast("str | None", s.get("job_role_family"))):
-                    to_retract.append(cast(str, s["id"]))
-
-        for start in range(0, len(to_retract), _IN_CHUNK):
-            chunk = to_retract[start : start + _IN_CHUNK]
-            await poll_db_write(
-                supabase,
-                lambda c, _chunk=chunk: (
-                    c.table("scores").update({"promising": False}).in_("id", _chunk)
-                ),
-                label="reconcile promising retract",
-            )
-        if to_retract:
-            logger.info(
-                "Family reconcile: retracted %d off-family promising verdict(s) across %d job(s)",
-                len(to_retract),
-                len(job_ids),
-            )
-    except Exception:
-        logger.exception("Family reconcile failed (best-effort; next cycle retries)")
+# Rotating cursor for the liveness sweep below (in-process, like
+# ``_LIFECYCLE_LAST_RUN``; a restart simply re-starts the walk at the oldest
+# row). Under LAZY tagging "untagged" is the NORMAL state, so the sweep's
+# ``role_family IS NULL`` selection no longer shrinks as it runs the way it did
+# when the sweep itself filled ``role_family`` — ordered oldest-first with a
+# plain LIMIT it would re-check the SAME oldest batch every cycle forever and
+# never reach the row after it. The offset walks one batch per cycle and wraps
+# at the end.
+_QUALIFY_BACKFILL_OFFSET = 0
 
 
 async def _backfill_qualify_stale(supabase: AsyncClient, limit: int) -> None:
-    """Liveness-check + tag a bounded batch of the OLDEST untagged, unarchived
-    jobs (#285); archive the ones whose listing is gone.
+    """Liveness-check a rotating batch of untagged, unarchived jobs (#285) and
+    archive the ones whose listing is gone. NO LLM SPEND.
 
-    ``_qualify_jobs`` only sees jobs re-upserted THIS cycle. A job that fell
-    off its source's feed without being archived is never re-visited, so it
-    stays untagged forever and slips through the is_us (#257) / role_family
-    (#278) read gates on the NULL benefit-of-the-doubt (~half the unarchived
-    catalog on prod when this landed). This sweep re-selects the oldest such
-    rows, cheaply checks each listing is still live (SSRF-safe, via
-    ``validate_job_url``), then:
+    This sweep used to TAG the live rows it found. That half is gone: tagging
+    is LAZY now (``qualification.materialize.ensure_job_tags`` buys a listing's
+    tags at grade time, when something is about to read them), so "untagged" is
+    the normal state of the catalog rather than a backlog to drain. Left as it
+    was — ``role_family IS NULL``, oldest first, every cycle — this sweep would
+    have quietly re-bought the entire catalog's tags a batch at a time and
+    re-introduced exactly the spend lazy tagging removes. Tags are no longer
+    its job; a row nobody grades simply stays NULL, which every read gate
+    treats permissively.
 
-    * LIVE  → tag through the SAME budget-gated ``_qualify_jobs`` (it stops the
-      instant the global LLM meter minus the grading reserve is reached, so the
-      backlog drains over cycles without overspending or starving grading).
-    * DEAD  → archive: a 4xx (a confident "gone") shouldn't linger in the gates
-      OR cost a tag (also clears the stale-but-shown postings #285 found).
-    * UNKNOWN (a 200 that isn't a job, timeout, 5xx) → left untouched, retried
-      next cycle — archival is sticky, so it needs the hard 4xx signal.
+    The liveness half stays, because it is free and nothing else covers it on
+    this path: a job that fell off its source's feed without being archived is
+    never re-visited, so a dead listing lingers on every serving surface (the
+    stale-but-shown postings #285 found). Each selected row gets a cheap check
+    (SSRF-safe, via ``validate_job_url``), then:
 
-    Oldest-first, and every selected row is genuinely never-tagged
-    (``role_family`` NULL ⇒ no ``qualified_hash``/``qualified_at`` on prod), so
-    the content-hash skip inside ``_qualify_one_job`` can't turn the batch into
-    a no-op. A row the tagger can't parse stays NULL and is re-selected next
-    cycle — wasting at most a couple of slots, never blocking the rest.
+    * DEAD  → archive: a hard 4xx is a confident "gone".
+    * LIVE / UNKNOWN (a 200 that isn't a job, timeout, 5xx) → left untouched
+      and re-checked on a later rotation — archival is sticky, so it needs the
+      hard 4xx signal.
     """
+    global _QUALIFY_BACKFILL_OFFSET
     if limit <= 0:
         return
+    offset = _QUALIFY_BACKFILL_OFFSET
     try:
         resp = await poll_db_read(
             supabase,
             lambda c: (
                 c.table("jobs")
-                .select(
-                    "id, absolute_url, title, company_name, location, "
-                    "description_html, qualified_hash, qualified_at"
-                )
+                .select("id, absolute_url")
                 .is_("role_family", "null")
                 .is_("archived_at", "null")
                 .order("cataloged_at", desc=False)
-                .limit(limit)
+                .range(offset, offset + limit - 1)
             ),
             label="poll qualify-backfill select",
         )
@@ -1294,29 +861,28 @@ async def _backfill_qualify_stale(supabase: AsyncClient, limit: int) -> None:
         logger.exception("Qualification backfill: select failed; skipping this cycle")
         return
     rows = cast(list[dict[str, Any]], resp.data or [])
+    # Advance the walk; a short (or empty) page means we reached the end of the
+    # untagged set, so wrap back to the oldest.
+    _QUALIFY_BACKFILL_OFFSET = offset + len(rows) if len(rows) == limit else 0
     if not rows:
         return
 
-    # Liveness gate before spending a tag. A fresh semaphore (sized like the
-    # DB-write cap) bounds the HTTP fan-out; each check is timeout-capped inside
-    # ``validate_job_url`` — also the ONLY SSRF-safe way to fetch these
-    # arbitrary posting URLs.
+    # A fresh semaphore (sized like the DB-write cap) bounds the HTTP fan-out;
+    # each check is timeout-capped inside ``validate_job_url`` — also the ONLY
+    # SSRF-safe way to fetch these arbitrary posting URLs.
     sem = asyncio.Semaphore(DB_WRITE_CONCURRENCY)
-    live: list[dict[str, Any]] = []
     dead: list[str] = []
 
     async def _check(row: dict[str, Any]) -> None:
         url = row.get("absolute_url")
         if not url:
-            return  # no URL to verify — leave untagged, spend nothing
+            return  # no URL to verify — leave it alone
         async with sem:
             try:
                 verdict = liveness_verdict(await validate_job_url(cast(str, url)))
             except Exception:
-                return  # transient — retry next cycle
-        if verdict == "live":
-            live.append(row)
-        elif verdict == "dead":
+                return  # transient — retry on a later rotation
+        if verdict == "dead":
             dead.append(cast(str, row["id"]))
 
     await asyncio.gather(*(_check(r) for r in rows), return_exceptions=True)
@@ -1333,9 +899,6 @@ async def _backfill_qualify_stale(supabase: AsyncClient, limit: int) -> None:
                 ),
                 label="poll qualify-backfill archive",
             )
-    if live:
-        logger.info("Qualification backfill: tagging %d live job(s)", len(live))
-        await _qualify_jobs(supabase, live)
 
 
 async def _drop_purged_rows(
@@ -1444,9 +1007,17 @@ async def _backfill_grade_stale(supabase: AsyncClient, limit: int) -> None:
                 supabase,
                 lambda c, tid=target.id: (
                     c.table("scores")
+                    # The embedded jobs projection must carry every column the
+                    # grade-time tagger reads (``TAG_INPUT_COLUMNS``) — the
+                    # content-hash inputs, the archived guard and #846's
+                    # board-defer keys. A partial projection degrades the
+                    # tagger silently (permanent cache miss, board answer
+                    # overwritten); ``test_grade_backfill`` pins it.
                     .select(
-                        "recency_score, jobs!inner(id, title, description_html, "
-                        "cataloged_at, archived_at, purged_at, is_us, role_family)"
+                        "recency_score, jobs!inner(id, title, company_name, location, "
+                        "description_html, cataloged_at, archived_at, purged_at, "
+                        "is_us, role_family, is_remote, employment_type, "
+                        "qualified_hash, qualified_at)"
                     )
                     .eq("target_id", tid)
                     .eq("promising", True)
@@ -1481,6 +1052,7 @@ async def _backfill_grade_stale(supabase: AsyncClient, limit: int) -> None:
                 payload=user_optimized[uid].payload,
                 jobs=stale_jobs,
                 user_id=uid,
+                tag_budget_exhausted=_tagger_budget_exhausted,
             )
         except Exception:
             logger.exception("Grade backfill failed for target %s", target.id)
@@ -1538,7 +1110,6 @@ async def _resolve_payer_client(
     return cache[payer_user_id]
 
 
-
 async def _call_fetcher(
     fetcher: Any,
     board_token: str,
@@ -1559,6 +1130,7 @@ async def _call_fetcher(
     if "admissible" in params:
         extra["admissible"] = admissible
     return cast(list[StandardJob], await fetcher(board_token, **extra))
+
 
 async def _poll_one_source(
     source: dict[str, Any],
@@ -2093,24 +1665,14 @@ async def _poll_one_source(
                     summary["new"] += 1
                     new_rows.append(data)
 
-            # ---- Qualification firewall (#60) ----
-            # Target-INDEPENDENT tagging: classify each upserted job ONCE and
-            # write the intrinsic tags onto its row, so per-target scoring
-            # below can pre-filter cheaply. Runs AFTER the US filter (every
-            # row here is a free-gate survivor) and BEFORE per-target scoring.
-            # Best-effort and flag-gated: failures are swallowed so a tagger
-            # outage never breaks polling, and nothing runs unless
-            # ``qualification_enabled`` is set (no LLM spend by default).
-            # ``gate`` rides along so the step can skip the model when NO
-            # active target could consume a tag (see ``_qualify_jobs``).
-            if settings.qualification_enabled and upsert_resp.data:
-                await _qualify_jobs(
-                    supabase,
-                    [cast(dict[str, Any], r) for r in upsert_resp.data],
-                    gate,
-                )
+            # Qualification tags are LAZY now, exactly like embeddings below:
+            # ingest is $0 LLM. ``ensure_job_tags`` in the Phase-2 runner buys
+            # a listing's tags at grade time, for the trimmed candidate set
+            # about to consume them. What ingest still writes is FREE and
+            # unchanged: ``board_columns`` (the board's own remote /
+            # employment-type answer, #846) and the deterministic parses.
 
-            # Job embeddings are LAZY now (Disk IO slim-down, 2026-07-30):
+            # Job embeddings are LAZY too (Disk IO slim-down, 2026-07-30):
             # no embed-on-ingest — ``ensure_job_vectors`` in the Phase-2
             # runner materializes vectors for exactly the candidate set
             # about to be read ("only a few will ever be read").
@@ -2289,6 +1851,7 @@ async def _poll_one_source(
                             payload=user_optimized[uid].payload,
                             jobs=cycle_rows,
                             user_id=uid,
+                            tag_budget_exhausted=_tagger_budget_exhausted,
                         )
                     except Exception:
                         logger.exception(
@@ -2603,8 +2166,10 @@ async def _global_budget_exhausted(supabase: AsyncClient, *, reserve_usd: float 
 
     The lean predicate behind both the once-per-cycle circuit breaker
     (:func:`_global_circuit_breaker_tripped`) and the mid-run re-checks
-    in long per-job LLM loops (:func:`_qualify_jobs`, the Phase-1 triage
-    batch loops). One implementation so every LLM-spending path reads the
+    in long per-job LLM loops (the Phase-1 triage batch loops, and the
+    qualification tagger via :func:`_tagger_budget_exhausted` — the tagger
+    lives outside this module now and takes the check as an injected
+    callable). One implementation so every LLM-spending path reads the
     SAME meter against the SAME cap — no parallel budget logic. Carries no
     side effects (warnings/Sentry live in the breaker) so it's safe to
     call repeatedly inside a loop.
@@ -2641,6 +2206,24 @@ async def _memoized_total_spend(supabase: AsyncClient, midnight: datetime) -> fl
     return value
 
 
+async def _tagger_budget_exhausted() -> bool:
+    """The grade-time qualification tagger's self-imposed-cap check.
+
+    ``qualification.materialize.ensure_job_tags`` lives outside this module (the
+    poller imports ``app.services.fit``, so the Phase-2 runner cannot import the
+    poller back), and the spend meter stays HERE with the triage loops and the
+    cycle breaker — so the poller injects this bound predicate into
+    ``run_phase2_for_jobs`` instead of the tagger re-deriving one. Same meter,
+    same cap, same grading reserve the tagger has always yielded: it stops at
+    ``cap - grading_budget_reserve_usd`` so the top slice stays available for
+    the Phase-1/Phase-2 grades themselves. Raising is meaningful — the tagger
+    fails CLOSED on a meter-read error.
+    """
+    return await _global_budget_exhausted(
+        _async_service_client(), reserve_usd=settings.grading_budget_reserve_usd
+    )
+
+
 async def _triage_budget_blocks(supabase: AsyncClient) -> bool:
     """Async, fail-OPEN global-budget check for the Phase-1 triage loops.
 
@@ -2650,7 +2233,8 @@ async def _triage_budget_blocks(supabase: AsyncClient) -> bool:
     by the once-per-cycle ``gate.target_blocked`` breaker, so this per-batch
     check is a best-effort tightening — a transient read blip must not break
     a poll or silently drop the precision filter. (Qualification, which has
-    NO other gate, instead fails CLOSED in :func:`_qualify_jobs`.)
+    NO other gate, instead fails CLOSED — see
+    ``qualification.materialize.ensure_job_tags``.)
 
     Also honors the provider fast-fail breaker (audit PERF-M): if the tagger
     already tripped it on a 402/429 this cooldown, triage stops too — the same
@@ -3097,12 +2681,12 @@ async def poll_due_sources(
 
     due = filter_due_sources(all_enabled)
 
-    # Drain a slice of the untagged backlog (#285) EVERY cycle — jobs orphaned
-    # when a source stopped re-appearing in its feed never re-enter
-    # ``_qualify_jobs`` below, so they'd bypass the read gates forever. Runs
-    # independent of whether any source is due (a quiet cycle still drains it),
-    # and BEFORE the ``not due`` early-exit so it isn't skipped. Self-budget-
-    # gated (respects the grading reserve); best-effort.
+    # Liveness-check a rotating slice of the untagged catalog (#285) EVERY
+    # cycle — a job orphaned when its source stopped listing it is never
+    # re-polled, so a dead listing lingers on every serving surface. Runs
+    # independent of whether any source is due (a quiet cycle still rotates
+    # it), and BEFORE the ``not due`` early-exit so it isn't skipped. Costs NO
+    # LLM (its tagging half is gone — tags are lazy now); best-effort.
     if settings.qualification_enabled and settings.qualification_backfill_batch > 0:
         await _backfill_qualify_stale(supabase, settings.qualification_backfill_batch)
 
@@ -3191,7 +2775,6 @@ async def _poll_one_source_for_target(
     target: JobTarget,
     payer_user_id: str | None = None,
     payer_over_budget: bool = False,
-    budget_gate: PayerBudgetGate | None = None,
 ) -> dict[str, Any]:
     """Poll a single source for a specific target. Three-stage pipeline.
 
@@ -3200,12 +2783,9 @@ async def _poll_one_source_for_target(
     still ingesting fail-open — both resolved once by
     ``poll_sources_for_target``.
 
-    ``budget_gate`` is the snapshot those two were derived from, threaded
-    on so the target-INDEPENDENT qualification tagger (which bills the
-    instance key and is invisible to the per-payer gate) can skip the
-    model when this target — the only consumer on this path — is blocked.
-    ``None`` leaves tagging ungated, preserving the behaviour of direct
-    callers that pass only the payer fields.
+    (The ``budget_gate`` snapshot this used to take was only ever read by the
+    ingest-time qualification tagger, which is gone: tagging happens at grade
+    time now, where a live consumer is a precondition of being called at all.)
     """
     summary: dict[str, Any] = {
         "polled": False,
@@ -3528,21 +3108,10 @@ async def _poll_one_source_for_target(
                 else:
                     summary["new"] += 1
 
-            # Qualification firewall (#60): same target-INDEPENDENT tagging
-            # as ``_poll_one_source`` — AFTER the US filter, BEFORE per-target
-            # scoring, flag-gated, best-effort. ``budget_gate`` is the same
-            # snapshot ``payer_over_budget`` was read from; this path serves
-            # ONE target, so "that target is blocked" IS "nothing can consume
-            # these tags".
-            if settings.qualification_enabled and upsert_resp.data:
-                await _qualify_jobs(
-                    supabase,
-                    [cast(dict[str, Any], r) for r in upsert_resp.data],
-                    budget_gate,
-                )
-
-            # Job embeddings are LAZY (see _poll_one_source): the Phase-2
-            # runner's ensure_job_vectors materializes exactly the read set.
+            # Qualification tags are LAZY (see _poll_one_source): the Phase-2
+            # runner's ensure_job_tags buys them for the trimmed grade set.
+            # Job embeddings likewise: ensure_job_vectors materializes exactly
+            # the read set.
 
             # Stage 1: Title scoring
             async def _title_score_one(row_data: dict[str, Any]) -> None:
@@ -3683,6 +3252,7 @@ async def _poll_one_source_for_target(
                                 payload=user_optimized[uid].payload,
                                 jobs=cycle_rows,
                                 user_id=payer_user_id,
+                                tag_budget_exhausted=_tagger_budget_exhausted,
                             )
                         except Exception:
                             logger.exception(
@@ -3839,7 +3409,6 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
                 target,
                 payer_user_id=payer,
                 payer_over_budget=over,
-                budget_gate=gate,
             )
 
     try:

@@ -783,3 +783,256 @@ async def test_family_gate_unclassified_target_is_ungated(
     )
     assert graded == ["j-cx"]
     assert n == 1
+
+
+# ---- lazy qualification tagging (grade-time materialization) ---------------
+#
+# Ingest is $0 LLM: a listing's tags are bought HERE, for exactly the rows
+# about to be graded. The cost-critical property is PLACEMENT — after the
+# ordering and the daily-cap trim, never before the pre-gates — because the
+# candidate set can be orders of magnitude larger than the quota.
+
+
+def _patch_tagger(monkeypatch: pytest.MonkeyPatch, effect: Any = None) -> list[list[str]]:
+    """Spy on ``ensure_job_tags`` and record the id set it was handed.
+
+    ``effect(row)`` (when given) mutates each row dict the way the real tagger
+    does through its in-place refresh, so the gates re-applied after it see the
+    fresh verdicts.
+    """
+    tagged: list[list[str]] = []
+
+    async def fake_ensure(_sb: Any, rows: list[dict[str, Any]], **_kw: Any) -> None:
+        tagged.append([r["id"] for r in rows])
+        if effect is not None:
+            for r in rows:
+                effect(r)
+
+    monkeypatch.setattr(f"{_RUNNER}.ensure_job_tags", fake_ensure)
+    return tagged
+
+
+@pytest.fixture
+def _tagging_on(monkeypatch: pytest.MonkeyPatch) -> Any:
+    from app.config import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "qualification_enabled", True)
+    return live_settings
+
+
+async def test_tags_materialized_for_exactly_the_trimmed_grade_set(
+    monkeypatch: pytest.MonkeyPatch, _tagging_on: Any
+) -> None:
+    """The cost contract: tag the ≤ quota rows about to be graded, not the
+    whole candidate set.
+
+    Anti-vacuous by construction — the SAME five candidates are driven twice.
+    With quota 100 all five are tagged (proving nothing else filters them);
+    with quota 2 only the two survivors of the trim are.
+    """
+    ids = ["j0", "j1", "j2", "j3", "j4"]
+    jobs = [
+        {"id": j, "title": "x", "description_html": "", "cataloged_at": f"2026-0{i + 1}-01"}
+        for i, j in enumerate(ids)
+    ]
+
+    _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    tagged = _patch_tagger(monkeypatch)
+    await run_phase2_for_jobs(
+        _supabase(_prom_rows(ids)),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=[dict(j) for j in jobs],
+    )
+    # Precondition: all five ARE candidates (order is the priority sort).
+    assert len(tagged) == 1
+    assert sorted(tagged[0]) == ids
+
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 2)
+    tagged = _patch_tagger(monkeypatch)
+    await run_phase2_for_jobs(
+        _supabase(_prom_rows(ids)),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=[dict(j) for j in jobs],
+    )
+    # Trimmed first (the two newest), tagged second — never the other way round.
+    assert len(tagged) == 1
+    assert sorted(tagged[0]) == ["j3", "j4"]
+    assert sorted(graded) == ["j3", "j4"]
+
+
+async def test_freshly_tagged_non_us_row_is_dropped_before_grading(
+    monkeypatch: pytest.MonkeyPatch, _tagging_on: Any
+) -> None:
+    """A row untagged at trim time passes the PRE-gate on NULL, gets a
+    confirmed non-US verdict from the grade-time tagger, and must then be
+    dropped by the RE-APPLIED gate instead of burning a Sonnet grade.
+
+    Control: the identical row with a no-op tagger IS graded, so the skip can
+    only be the re-applied gate.
+    """
+    job = {"id": "j-nonus", "title": "x", "description_html": "", "is_us": None}
+
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    _patch_tagger(monkeypatch)  # tagger lands nothing
+    await run_phase2_for_jobs(
+        _supabase(_prom_rows(["j-nonus"])),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=[dict(job)],
+    )
+    assert graded == ["j-nonus"]  # precondition: nothing else drops it
+
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    tagged = _patch_tagger(monkeypatch, effect=lambda r: r.update({"is_us": False}))
+    n = await run_phase2_for_jobs(
+        _supabase(_prom_rows(["j-nonus"])),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=[dict(job)],
+    )
+    assert tagged == [["j-nonus"]]  # it WAS tagged (the tag spend happened once)
+    assert graded == []  # ...and then skipped, not graded
+    assert n == 0
+
+
+async def test_freshly_tagged_offfamily_row_is_dropped_before_grading(
+    monkeypatch: pytest.MonkeyPatch, _tagging_on: Any
+) -> None:
+    """Same shape for the family gate: an untagged row admits pre-trim on the
+    keep-null rule, and a landed contradicting family must stop the grade."""
+    target = _target(1).model_copy(update={"role_family": "engineering"})
+    job = {"id": "j-cx", "title": "x", "description_html": "", "role_family": None}
+
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    _patch_tagger(monkeypatch)
+    await run_phase2_for_jobs(
+        _supabase(_prom_rows(["j-cx"])),
+        MagicMock(),
+        target=target,
+        payload=_payload(),
+        jobs=[dict(job)],
+    )
+    assert graded == ["j-cx"]  # precondition: keep-null admitted it
+
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    _patch_tagger(monkeypatch, effect=lambda r: r.update({"role_family": "customer_experience"}))
+    n = await run_phase2_for_jobs(
+        _supabase(_prom_rows(["j-cx"])),
+        MagicMock(),
+        target=target,
+        payload=_payload(),
+        jobs=[dict(job)],
+    )
+    assert graded == []
+    assert n == 0
+
+
+async def test_untaggable_row_still_grades(
+    monkeypatch: pytest.MonkeyPatch, _tagging_on: Any
+) -> None:
+    """Fail-soft: a row the tagger couldn't tag (budget, provider outage, parse
+    failure) stays NULL and passes both re-applied gates — the same benefit of
+    the doubt an untagged row has always had. Lazy tagging must not turn a
+    tagger outage into a grading outage."""
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    _patch_tagger(monkeypatch)  # leaves is_us / role_family NULL
+
+    n = await run_phase2_for_jobs(
+        _supabase(_prom_rows(["j1"])),
+        MagicMock(),
+        target=_target(1).model_copy(update={"role_family": "engineering"}),
+        payload=_payload(),
+        jobs=[{"id": "j1", "title": "x", "description_html": ""}],
+    )
+    assert graded == ["j1"]
+    assert n == 1
+
+
+async def test_tagging_skipped_when_flag_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``qualification_enabled`` off ⇒ no tagger call at all (a self-host that
+    never wanted the LLM firewall keeps grading, untagged)."""
+    from app.config import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "qualification_enabled", False)
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    tagged = _patch_tagger(monkeypatch)
+
+    await run_phase2_for_jobs(
+        _supabase(_prom_rows(["j1"])),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=[{"id": "j1", "title": "x", "description_html": ""}],
+    )
+    assert tagged == []
+    assert graded == ["j1"]
+
+
+async def test_budget_predicate_is_threaded_to_the_tagger(
+    monkeypatch: pytest.MonkeyPatch, _tagging_on: Any
+) -> None:
+    """The tagger's spend gate lives in the poller (it owns the meter), so the
+    caller injects it. Losing this thread silently un-gates the tagger."""
+    seen: list[Any] = []
+
+    async def fake_ensure(_sb: Any, _rows: list[dict[str, Any]], **kw: Any) -> None:
+        seen.append(kw.get("budget_exhausted"))
+
+    monkeypatch.setattr(f"{_RUNNER}.ensure_job_tags", fake_ensure)
+    _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+
+    async def _never() -> bool:
+        return False
+
+    await run_phase2_for_jobs(
+        _supabase(_prom_rows(["j1"])),
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=[{"id": "j1", "title": "x", "description_html": ""}],
+        tag_budget_exhausted=_never,
+    )
+    assert seen == [_never]
+
+
+def test_manual_backfill_script_selects_every_tagger_input_column() -> None:
+    """The operator backfill hands ``run_phase2_for_jobs`` rows it selected
+    itself, so it inherits the tagger's input contract.
+
+    Missing columns degrade the tagger SILENTLY: a hash computed over different
+    inputs can never match the stored one (re-tagged on every run), and a
+    missing ``is_remote``/``employment_type`` lets the inference overwrite the
+    board's own answer (#846/#795). Pinned against the tagger's declared
+    contract, not a copy of the list.
+    """
+    from app.services.qualification.materialize import TAG_INPUT_COLUMNS
+    from scripts.backfill_phase2_fit import _fetch_jobs
+
+    captured: list[str] = []
+    chain = MagicMock()
+    chain.select.side_effect = lambda cols: (captured.append(cols), chain)[1]
+    chain.in_.return_value = chain
+    chain.execute.return_value = MagicMock(data=[])
+    sb = MagicMock()
+    sb.table.return_value = chain
+
+    _fetch_jobs(sb, ["j-1"])
+
+    assert captured, "precondition: the select was actually issued"
+    selected = {c.strip() for c in captured[0].split(",")}
+    assert selected >= TAG_INPUT_COLUMNS, TAG_INPUT_COLUMNS - selected

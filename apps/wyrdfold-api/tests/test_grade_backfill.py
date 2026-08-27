@@ -247,3 +247,36 @@ async def test_poll_due_sources_runs_sweep_before_early_exit(
 
     assert swept["n"] == 1
     assert result.sources_polled == 0
+
+
+def _selected_job_columns(ops: list[tuple[Any, ...]]) -> set[str]:
+    """Parse the ``jobs!inner(...)`` projection out of the recorded select."""
+    projection = next(o[1][0] for o in ops if o[0] == "select")
+    inner = projection.split("jobs!inner(", 1)[1].rsplit(")", 1)[0]
+    return {c.strip() for c in inner.split(",")}
+
+
+@pytest.mark.asyncio
+async def test_backfill_projection_carries_every_tagger_input_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Grading materializes qualification tags lazily, so these rows are the
+    tagger's INPUT — and a missing column degrades it SILENTLY, never loudly:
+    no ``qualified_hash``/``company_name``/``location`` means the content-hash
+    can never match and the row is re-tagged on every sweep; no ``is_remote``/
+    ``employment_type`` means #846's defer-to-the-board rule reads "the board
+    said nothing" and writes an inference over the employer's own answer
+    (#795's 229 prod contradictions).
+
+    Pinned against the tagger's own declared contract rather than a copy of the
+    column list, so adding a read there fails HERE instead of on prod.
+    """
+    from app.services.qualification.materialize import TAG_INPUT_COLUMNS
+
+    rec = _wire(monkeypatch, gate=_OpenGate(), stale_rows=_rows(1), graded=1)
+    await poller_mod._backfill_grade_stale(MagicMock(), 25)
+
+    selected = _selected_job_columns(rec["query_ops"])
+    # Precondition: the parse actually found a projection.
+    assert "id" in selected
+    assert selected >= TAG_INPUT_COLUMNS, TAG_INPUT_COLUMNS - selected
