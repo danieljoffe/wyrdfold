@@ -3,6 +3,47 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-08-26 — Work bought at ingest, read at grade time (qualification tags go lazy)
+
+The qualification tagger ran on every newly-upserted or content-changed job at
+ingest. Nothing at ingest reads its output: the only consumers are the Phase-2
+runner's US and family gates and its ordering, and grading is bounded by a
+per-target daily cap, so most of what ingest classified was never looked at.
+**Decision:** tag a listing when something is about to read the tags, exactly
+as job embeddings went lazy in the 2026-07-30 Disk IO slim-down — `a job is
+materialized exactly when first needed`. The tagger core moved to
+`services/qualification/materialize.py` (`ensure_job_tags`); the poller calls
+nothing at ingest.
+
+Three things this taught, each now pinned by a test:
+
+**Placement inside the consumer is a spend decision.** The Phase-2 runner's
+`is_us` and family gates run *before* its ordering and daily-cap trim. Calling
+the tagger there would tag the whole candidate set to grade at most the quota —
+the same "buy for everything, read a few" shape we were removing, one layer
+down. It runs *after* the trim, and the two gates are then re-applied to the
+freshly tagged rows. A row the post-trim gate rejects is not backfilled from the
+next candidate: refilling means tagging a second tranche, which re-opens the
+hole.
+
+**A sweep that consumed its own output stops advancing when you remove the
+output.** `_backfill_qualify_stale` selected `role_family IS NULL`
+oldest-first each cycle; the tagging it did is what made the set shrink. With
+tagging removed, "untagged" is the *normal* state of the catalog, so it would
+have (a) re-bought the entire catalog's tags a batch at a time had the tagging
+call been left in, and (b) re-checked the same oldest batch forever once it was
+taken out. Kept the free liveness half, gave it a rotating cursor.
+
+**Moving a reader onto a new call path revives every partial `SELECT` upstream
+of it.** Two grade-path callers built job dicts from narrow projections. Missing
+columns did not fail — they degraded silently: the content hash computed over
+different inputs can never match the stored one (re-tagged every pass), and a
+missing `is_remote`/`employment_type` made #846's defer-to-the-board rule read
+"the board said nothing" and write the inference over the employer's own answer
+(#795's contradictions, re-introduced). The columns the tagger reads are now a
+declared contract, `materialize.TAG_INPUT_COLUMNS`, asserted against each
+caller's projection.
+
 ## 2026-08-18 — reading config is not tracing the path (#841 was backwards)
 
 #841 was filed claiming free accounts drain the operator's LLM credit with no
