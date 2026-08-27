@@ -330,7 +330,7 @@ async def tag_job(
     **propagates** instead of being swallowed, letting the poller latch its
     fast-fail breaker and stop hammering a provider that's rejecting calls
     (audit PERF-M "402/429 fast-fail"). This function's sole caller
-    (``poller._qualify_one_job``) handles it.
+    (``qualification.materialize._qualify_one_job``) handles it.
 
     ``model`` defaults to the configured ``settings.qualification_model``
     (Haiku, or deepseek-v3-2 when QUALIFICATION_MODEL selects it) — resolved

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from app.http_client import BoardFetchError
 from app.services.ashby import fetch_ashby_jobs
 from app.services.standard_job import StandardJob
 
@@ -21,19 +22,33 @@ def _mock_response(status_code: int, json_data: dict[str, Any] | None = None) ->
     return resp
 
 
+# A board that doesn't answer with a listing RAISES; a board that answers with
+# an empty listing returns []. Collapsing both into [] is what let a dead board
+# reset its own failure counter forever — see
+# tests/test_dead_board_failure_accounting.py.
+
+
 @pytest.mark.asyncio
-async def test_fetch_404_returns_empty(mock_http_client):
+async def test_fetch_404_raises(mock_http_client):
     resp = _mock_response(404)
     mock_http_client.get = AsyncMock(return_value=resp)
-    result = await fetch_ashby_jobs("missing")
-    assert result == []
+    with pytest.raises(BoardFetchError) as exc_info:
+        await fetch_ashby_jobs("missing")
+    assert exc_info.value.status == 404
 
 
 @pytest.mark.asyncio
-async def test_fetch_http_error_returns_empty(mock_http_client):
+async def test_fetch_http_error_raises(mock_http_client):
     mock_http_client.get = AsyncMock(side_effect=httpx.HTTPError("boom"))
-    result = await fetch_ashby_jobs("bad")
-    assert result == []
+    with pytest.raises(BoardFetchError):
+        await fetch_ashby_jobs("bad")
+
+
+@pytest.mark.asyncio
+async def test_empty_board_returns_empty_list(mock_http_client):
+    """CONTROL: 200 with no postings is a real, healthy, empty board."""
+    mock_http_client.get = AsyncMock(return_value=_mock_response(200, {"jobs": []}))
+    assert await fetch_ashby_jobs("quiet") == []
 
 
 @pytest.mark.asyncio

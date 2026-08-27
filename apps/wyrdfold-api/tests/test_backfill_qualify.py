@@ -1,13 +1,19 @@
-"""#285 backfill sweep: liveness-gated tagging + archival of dead listings.
+"""#285 sweep: liveness check + archival of dead listings. NO LLM SPEND.
 
 Covers:
 - ``validate.liveness_verdict`` — the live/dead/unknown classifier over a
   ``ValidationResult``. A 404 is ``is_valid=True`` (that flag only guards
   format/SSRF/banned), so deadness is read from ``final_status`` /
   ``looks_like_job``.
-- ``poller._backfill_qualify_stale`` — selects the oldest untagged, unarchived
-  jobs, TAGS the live ones through the budget-gated tagger, ARCHIVES the dead
-  ones, and leaves UNKNOWN (transient) / URL-less rows untouched.
+- ``poller._backfill_qualify_stale`` — walks a rotating batch of untagged,
+  unarchived jobs, ARCHIVES the dead ones, and leaves LIVE / UNKNOWN
+  (transient) / URL-less rows untouched.
+
+The sweep's TAGGING half is gone (lazy tagging): "untagged" is the normal
+state of the catalog now, so a sweep that tagged what it selected would have
+re-bought the whole catalog's tags 50 rows a cycle — exactly the spend lazy
+tagging removes. ``test_sweep_performs_no_llm_tagging`` is the regression, and
+the rotating cursor keeps the (now non-shrinking) selection advancing.
 """
 
 from __future__ import annotations
@@ -18,7 +24,17 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.services import poller as poller_mod
+from app.services.qualification import materialize
 from app.services.validate import ValidationResult, liveness_verdict
+
+
+@pytest.fixture(autouse=True)
+def _reset_sweep_cursor() -> Any:
+    """The rotation cursor is a module global — reset it so tests can't leak
+    an offset into each other."""
+    poller_mod._QUALIFY_BACKFILL_OFFSET = 0
+    yield
+    poller_mod._QUALIFY_BACKFILL_OFFSET = 0
 
 
 def _vr(**kw: Any) -> ValidationResult:
@@ -59,14 +75,23 @@ class TestLivenessVerdict:
         assert liveness_verdict(_vr(final_status=200, looks_like_job=None)) == "live"
 
 
-def _backfill_supabase(rows: list[dict[str, Any]], archived: list[str]) -> MagicMock:
+def _backfill_supabase(
+    rows: list[dict[str, Any]], archived: list[str], ranges: list[tuple[int, int]] | None = None
+) -> MagicMock:
     """Fake supabase: the select chain returns ``rows``; a
     ``jobs.update(...).in_('id', ids)`` records the archived ids into
-    ``archived``."""
+    ``archived``. ``ranges`` (when given) records the ``.range(start, end)``
+    window each call asked for."""
     select_chain = MagicMock()
     select_chain.is_.return_value = select_chain
     select_chain.order.return_value = select_chain
-    select_chain.limit.return_value = select_chain
+
+    def _range(start: int, end: int) -> MagicMock:
+        if ranges is not None:
+            ranges.append((start, end))
+        return select_chain
+
+    select_chain.range.side_effect = _range
     select_chain.execute = MagicMock(return_value=MagicMock(data=rows))
 
     def _in(_col: str, ids: list[str]) -> MagicMock:
@@ -90,9 +115,15 @@ def _backfill_supabase(rows: list[dict[str, Any]], archived: list[str]) -> Magic
 
 
 def _patch_backfill(monkeypatch: pytest.MonkeyPatch, verdicts: dict[str, str]) -> dict[str, Any]:
-    """Patch ``validate_job_url`` (verdict keyed by url) + ``_qualify_jobs``
-    (capture the rows it was asked to tag)."""
-    rec: dict[str, Any] = {"tagged": []}
+    """Patch ``validate_job_url`` (verdict keyed by url) and spy on the TAGGER.
+
+    The spy sits on ``materialize.tag_job`` — the module global every route
+    into the tagger resolves at call time — so it fires no matter how a future
+    change reaches the model (``ensure_job_tags``, ``_qualify_one_job``, a
+    re-added direct call). ``rec['tag_calls']`` is therefore a real "did this
+    sweep spend?" measurement, not a stub nobody consults.
+    """
+    rec: dict[str, Any] = {"tag_calls": 0}
 
     async def fake_validate(url: str) -> ValidationResult:
         v = verdicts.get(url, "unknown")
@@ -104,19 +135,27 @@ def _patch_backfill(monkeypatch: pytest.MonkeyPatch, verdicts: dict[str, str]) -
             return ValidationResult(is_valid=True, final_url=url, final_status=404)
         return ValidationResult(is_valid=True, final_url=url, final_status=503)
 
-    async def fake_qualify(_supabase: object, rows: list[dict[str, Any]]) -> None:
-        rec["tagged"].extend(r["id"] for r in rows)
+    async def spy_tag_job(*_a: object, **_kw: object) -> Any:
+        rec["tag_calls"] += 1
+        raise AssertionError("the #285 sweep must not call the tagger")
 
     monkeypatch.setattr(poller_mod, "validate_job_url", fake_validate)
-    monkeypatch.setattr(poller_mod, "_qualify_jobs", fake_qualify)
+    monkeypatch.setattr(materialize, "tag_job", spy_tag_job)
     return rec
 
 
 class TestBackfillQualifyStale:
     @pytest.mark.asyncio
-    async def test_tags_live_archives_dead_skips_unknown_and_urlless(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_sweep_performs_no_llm_tagging(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The regression that keeps lazy tagging lazy.
+
+        Under lazy tagging ``role_family IS NULL`` is the NORMAL state, so this
+        sweep — which selects exactly that, every cycle — would re-buy the whole
+        catalog's tags a batch at a time if it still tagged what it found. Its
+        liveness half must still work, which is the anti-vacuous control: the
+        dead row IS archived in the same run, so the zero below is the tagging
+        half being gone rather than a sweep that did nothing.
+        """
         rows: list[dict[str, Any]] = [
             {"id": "live-1", "absolute_url": "https://x/live1"},
             {"id": "dead-1", "absolute_url": "https://x/dead1"},
@@ -136,9 +175,36 @@ class TestBackfillQualifyStale:
 
         await poller_mod._backfill_qualify_stale(sb, limit=10)
 
-        assert rec["tagged"] == ["live-1"]  # only the live one is tagged (spend)
-        assert archived == ["dead-1"]  # only the dead one is archived
-        # unk-1 (transient 5xx) and nourl-1 (no URL) touch neither path.
+        assert rec["tag_calls"] == 0  # ZERO LLM spend — the whole point
+        assert archived == ["dead-1"]  # ...and the sweep genuinely ran
+        # live-1 (still listed), unk-1 (transient 5xx) and nourl-1 (no URL)
+        # touch neither path.
+
+    @pytest.mark.asyncio
+    async def test_rotates_so_a_never_shrinking_selection_still_advances(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing fills ``role_family`` for these rows anymore, so an
+        oldest-first LIMIT would re-check the SAME batch forever and never
+        reach the row after it. The cursor walks a batch per cycle and wraps on
+        a short page."""
+        _patch_backfill(monkeypatch, {})
+        archived: list[str] = []
+        ranges: list[tuple[int, int]] = []
+        full_page = [{"id": f"j-{i}", "absolute_url": None} for i in range(3)]
+        sb = _backfill_supabase(full_page, archived, ranges)
+
+        await poller_mod._backfill_qualify_stale(sb, limit=3)
+        await poller_mod._backfill_qualify_stale(sb, limit=3)
+        # Precondition: a FULL page each time, so the cursor must advance.
+        assert ranges == [(0, 2), (3, 5)]
+
+        # A short page means the end of the untagged set → wrap to the oldest.
+        short = _backfill_supabase([{"id": "j-9", "absolute_url": None}], archived, ranges)
+        await poller_mod._backfill_qualify_stale(short, limit=3)
+        assert ranges[-1] == (6, 8)
+        await poller_mod._backfill_qualify_stale(short, limit=3)
+        assert ranges[-1] == (0, 2)
 
     @pytest.mark.asyncio
     async def test_limit_zero_is_noop_no_query(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -149,7 +215,7 @@ class TestBackfillQualifyStale:
 
         await poller_mod._backfill_qualify_stale(sb, limit=0)
 
-        assert rec["tagged"] == []
+        assert rec["tag_calls"] == 0
         assert archived == []
         sb.table.assert_not_called()  # returns before it even queries
 
@@ -161,5 +227,5 @@ class TestBackfillQualifyStale:
 
         await poller_mod._backfill_qualify_stale(sb, limit=10)
 
-        assert rec["tagged"] == []
+        assert rec["tag_calls"] == 0
         assert archived == []

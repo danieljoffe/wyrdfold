@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from app.http_client import BoardFetchError
 from app.services.lever import fetch_lever_jobs
 from app.services.standard_job import StandardJob
 
@@ -21,19 +22,34 @@ def _mock_response(status_code: int, json_data: Any = None) -> MagicMock:
     return resp
 
 
+# A board that doesn't answer with a listing RAISES; a board that answers with
+# an empty listing returns []. Collapsing both into [] is what let a dead board
+# reset its own failure counter forever — see
+# tests/test_dead_board_failure_accounting.py.
+
+
 @pytest.mark.asyncio
-async def test_fetch_404_returns_empty(mock_http_client):
+async def test_fetch_404_raises(mock_http_client):
     resp = _mock_response(404)
     mock_http_client.get = AsyncMock(return_value=resp)
-    result = await fetch_lever_jobs("missing")
-    assert result == []
+    with pytest.raises(BoardFetchError) as exc_info:
+        await fetch_lever_jobs("missing")
+    assert exc_info.value.status == 404
 
 
 @pytest.mark.asyncio
-async def test_fetch_http_error_returns_empty(mock_http_client):
+async def test_fetch_http_error_raises(mock_http_client):
     mock_http_client.get = AsyncMock(side_effect=httpx.HTTPError("boom"))
-    result = await fetch_lever_jobs("bad")
-    assert result == []
+    with pytest.raises(BoardFetchError):
+        await fetch_lever_jobs("bad")
+
+
+@pytest.mark.asyncio
+async def test_empty_board_returns_empty_list(mock_http_client):
+    """CONTROL: Lever answers with a bare array — an empty one is a real,
+    healthy board with nothing open."""
+    mock_http_client.get = AsyncMock(return_value=_mock_response(200, []))
+    assert await fetch_lever_jobs("quiet") == []
 
 
 @pytest.mark.asyncio
@@ -61,11 +77,13 @@ async def test_fetch_valid_json_maps_jobs(mock_http_client):
 
 
 @pytest.mark.asyncio
-async def test_fetch_non_list_response_returns_empty(mock_http_client):
+async def test_fetch_non_list_response_raises(mock_http_client):
+    """A 200 whose body isn't the expected array is a malformed response, not
+    a board with nothing open — it must not look like a clean poll."""
     resp = _mock_response(200, {"error": "not found"})
     mock_http_client.get = AsyncMock(return_value=resp)
-    result = await fetch_lever_jobs("bad")
-    assert result == []
+    with pytest.raises(BoardFetchError):
+        await fetch_lever_jobs("bad")
 
 
 @pytest.mark.asyncio

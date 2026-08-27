@@ -2,7 +2,13 @@ import asyncio
 import logging
 from typing import Any
 
-from app.http_client import FetchExhaustedError, json_or_none, request_with_retry
+from app.http_client import (
+    BoardFetchError,
+    FetchExhaustedError,
+    board_list_json,
+    json_or_none,
+    request_with_retry,
+)
 from app.services.board_metadata import (
     normalize_country,
     normalize_employment_type,
@@ -89,6 +95,7 @@ async def fetch_smartrecruiters_jobs(company_id: str) -> list[StandardJob]:
     and the next poll cycle will retry.
     """
     list_url = f"{SMARTRECRUITERS_BASE}/{company_id}/postings"
+    source = f"smartrecruiters {company_id}"
     try:
         resp = await request_with_retry("GET", list_url)
     except FetchExhaustedError as exc:
@@ -97,25 +104,18 @@ async def fetch_smartrecruiters_jobs(company_id: str) -> list[StandardJob]:
             company_id,
             exc,
         )
-        return []
+        raise BoardFetchError(f"{source} exhausted retries", source=source) from exc
 
-    if resp.status_code == 404:
-        return []
-    if resp.status_code >= 400:
-        logger.warning(
-            "smartrecruiters %s returned %d for %s",
-            company_id,
-            resp.status_code,
-            list_url,
-        )
-        return []
-
-    data = json_or_none(resp, source=f"smartrecruiters {company_id}")
-    if data is None:
-        return []
+    data = board_list_json(resp, source=source)
     items = data.get("content", [])
     if not isinstance(items, list):
-        return []
+        # A 200 whose ``content`` is not a list is a malformed response, not a
+        # board with nothing open.
+        raise BoardFetchError(
+            f"{source} returned 200 with a non-list 'content'",
+            source=source,
+            status=resp.status_code,
+        )
 
     # Phase 2: fan out detail fetches under a concurrency cap.
     semaphore = asyncio.Semaphore(_DETAIL_CONCURRENCY)
