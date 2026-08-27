@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from app.http_client import BoardFetchError
 from app.services.workday import fetch_workday_jobs
 
 
@@ -28,9 +29,12 @@ def _make_resp(status: int, json_data: dict[str, Any] | None = None) -> MagicMoc
 
 
 @pytest.mark.asyncio
-async def test_invalid_token_format() -> None:
-    result = await fetch_workday_jobs("bad-token")
-    assert result == []
+async def test_invalid_token_format_raises() -> None:
+    """A source row we can't build a URL from can never produce jobs. Returning
+    [] made it look like a healthy-but-empty board forever; raising lets the
+    failure backoff retire it."""
+    with pytest.raises(BoardFetchError):
+        await fetch_workday_jobs("bad-token")
 
 
 @pytest.mark.asyncio
@@ -230,20 +234,40 @@ async def test_fetch_drops_posting_when_detail_fetch_404s(
     assert jobs[0].external_id == "/job/Kept_JR5"
 
 
+# A board that doesn't answer with a listing RAISES; a board that answers with
+# an empty listing returns []. Collapsing both into [] is what let comcast's
+# 410-Gone board reset its own failure counter forever — see
+# tests/test_dead_board_failure_accounting.py.
+
+
 @pytest.mark.asyncio
-async def test_404_on_list_returns_empty(mock_http_client: Any) -> None:
-    """A 404 on the list endpoint short-circuits — no detail calls fire."""
-    mock_http_client.post = AsyncMock(return_value=_make_resp(404))
+@pytest.mark.parametrize("status", [404, 410, 422])
+async def test_non_200_on_list_raises(mock_http_client: Any, status: int) -> None:
+    """A non-200 on the list endpoint short-circuits — no detail calls fire —
+    and surfaces as a failed fetch rather than an empty board."""
+    mock_http_client.post = AsyncMock(return_value=_make_resp(status))
     mock_http_client.get = AsyncMock(side_effect=AssertionError("detail must not be called"))
     token = "https://example.wd5.myworkdayjobs.com|example|Site"
-    jobs = await fetch_workday_jobs(token)
-    assert jobs == []
+    with pytest.raises(BoardFetchError) as exc_info:
+        await fetch_workday_jobs(token)
+    assert exc_info.value.status == status
 
 
 @pytest.mark.asyncio
-async def test_network_error_on_list_returns_empty(mock_http_client: Any) -> None:
+async def test_network_error_on_list_raises(mock_http_client: Any) -> None:
     mock_http_client.post = AsyncMock(side_effect=httpx.HTTPError("timeout"))
     mock_http_client.get = AsyncMock(side_effect=AssertionError("detail must not be called"))
     token = "https://example.wd5.myworkdayjobs.com|example|Site"
-    jobs = await fetch_workday_jobs(token)
-    assert jobs == []
+    with pytest.raises(BoardFetchError):
+        await fetch_workday_jobs(token)
+
+
+@pytest.mark.asyncio
+async def test_empty_board_returns_empty_list(mock_http_client: Any) -> None:
+    """CONTROL: a 200 whose first page carries no postings is a real, healthy
+    board with nothing open — no detail calls, no failure."""
+    empty_page = _make_resp(200, {"total": 0, "jobPostings": []})
+    mock_http_client.post = AsyncMock(return_value=empty_page)
+    mock_http_client.get = AsyncMock(side_effect=AssertionError("detail must not be called"))
+    token = "https://example.wd5.myworkdayjobs.com|example|Site"
+    assert await fetch_workday_jobs(token) == []

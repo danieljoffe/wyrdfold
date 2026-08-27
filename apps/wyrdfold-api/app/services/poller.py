@@ -14,6 +14,7 @@ from supabase import AsyncClient
 
 from app.config import settings
 from app.constants import resolve_owner
+from app.http_client import BoardFetchError
 from app.models.experience import OptimizedDoc
 from app.models.schemas import PollResult
 from app.models.targets import JobTarget
@@ -2315,9 +2316,11 @@ async def _poll_one_source(
         # Identify stale jobs no longer on the board
         stale_ids: list[str] = []
         if not jobs and existing_rows:
-            # Mass-archive guard: several fetchers (workday in particular)
-            # swallow API errors and return [] instead of raising, which is
-            # indistinguishable from "the board emptied out". Archiving
+            # Mass-archive guard. The five ATS list fetchers now raise
+            # ``BoardFetchError`` instead of swallowing an API error into [],
+            # so a failed fetch never reaches this line — but the guard stays
+            # as defence in depth: the jsonld / crawl / mock fetchers still
+            # return [] on failure, and any future fetcher might. Archiving
             # everything on a zero-job fetch turns a transient upstream
             # hiccup into a wiped source, so we skip the stale pass and
             # leave the rows for a cycle where the fetch returns data.
@@ -2429,6 +2432,18 @@ async def _poll_one_source(
             per_target_phase1_no or "{}",
         )
 
+    except BoardFetchError as exc:
+        # The board did not answer with a listing (404/410/422, a 5xx that
+        # outlived its retries, a WAF page served as 200). Routine upstream
+        # weather rather than a code bug, so it gets one WARNING line instead
+        # of a traceback — but it is still a FAILED poll, so it counts toward
+        # ``source_failure_disable_threshold``. Before this the fetchers
+        # returned [], the poll looked successful, and the counter below was
+        # reset to 0 every cycle — the threshold could never fire and a dead
+        # board was re-polled forever.
+        logger.warning("Poll failed for %s: %s", company_name, exc)
+        summary["error"] = f"{company_name}: board fetch failed"
+        await _record_source_failure(supabase, source, error=str(exc))
     except Exception as exc:
         logger.exception("Poll failed for %s", company_name)
         summary["error"] = f"{company_name}: poll failed"
@@ -2455,6 +2470,15 @@ async def _record_source_failure(
     stamps ``disabled_at`` (drives auto-recovery) and fires a Sentry alert.
     Successful polls clear ``last_error``/``last_error_at`` and reset the
     counter via the ``last_polled_at`` update. Best-effort — never raises.
+
+    ``last_polled_at`` is stamped here too, same as the per-source
+    budget-timeout path: the cycle takes the ``poll_max_sources_per_cycle``
+    MOST OVERDUE sources, ordered by ``last_polled_at``, so a source that
+    never gets stamped pins itself to the FRONT of that queue and re-hogs a
+    slot every tick — crowding out healthy sources. A failing source has to
+    rotate to the back like any other. The stamp deliberately touches nothing
+    else: no ``job_count``, and emphatically no counter reset — this was not a
+    clean poll.
     """
     threshold = settings.source_failure_disable_threshold
     if threshold <= 0:
@@ -2469,6 +2493,8 @@ async def _record_source_failure(
         updates: dict[str, Any] = {
             "consecutive_failures": failures,
             "last_error_at": now_iso,
+            # Rotate to the back of the most-overdue-first queue (see docstring).
+            "last_polled_at": now_iso,
         }
         if error:
             updates["last_error"] = error[:_SOURCE_LAST_ERROR_MAX_LEN]
@@ -3665,6 +3691,14 @@ async def _poll_one_source_for_target(
                                 target.id,
                             )
 
+    except BoardFetchError as exc:
+        # Same quiet treatment as the shared path: an upstream board that
+        # didn't answer with a listing is not a code bug. No failure counting
+        # here — this path is the per-target fan-out and never touched
+        # ``consecutive_failures`` in either direction, so the shared poll
+        # cycle stays the single writer of the backoff.
+        logger.warning("Poll failed for %s (target %s): %s", company_name, target.label, exc)
+        summary["error"] = f"{company_name}: board fetch failed"
     except Exception:
         logger.exception("Poll failed for %s (target %s)", company_name, target.label)
         summary["error"] = f"{company_name}: poll failed"
