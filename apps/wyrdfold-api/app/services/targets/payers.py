@@ -23,13 +23,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from supabase import AsyncClient
 
 from app.config import settings
 from app.services.llm import cost_log
 from app.services.llm.budget import MONTHLY_WINDOW_DAYS
+
+# Why LLM work was skipped, as a stable token the defer logs interpolate.
+# These are log/diagnostic values, not a wire contract — but keep them stable,
+# because grepping one out of Railway is how an operator answers "why did
+# grading stop?" without a DB pass.
+BlockReason = Literal[
+    "llm_disabled",  # operator kill-switch on the profile
+    "idle",  # unseen past settings.idle_defer_days
+    "over_allowance",  # spend in the rolling window reached the cap
+    "catalog_ungraded",  # no payer + grade_catalog_targets off
+    "no_budget_snapshot",  # empty gate: breaker / build failure, fail-closed
+]
 
 
 async def resolve_target_payers(
@@ -109,24 +121,59 @@ class PayerBudgetGate:
         the build-failure fallback construct to refuse ALL spend for the
         cycle ("when we can't see budgets, don't spend"). Catalog
         semantics apply only within a healthy snapshot.
+
+        Delegates to ``target_block_reason`` so the "is it blocked" and "why"
+        answers are ONE branch set, not two that can drift apart. The branches
+        (empty sentinel, post-snapshot activation, catalog-only, payer) live
+        there.
         """
-        if not self.payer_by_target:
-            return True  # fail-closed sentinel (breaker / build failure)
-        if target_id not in self.payer_by_target:
-            # Activated after this snapshot was taken — unchanged fail-open,
-            # so a mid-cycle activation isn't punished for arriving late.
-            return False
-        payer = self.payer_by_target[target_id]
-        if payer is None:
-            return not settings.grade_catalog_targets  # catalog-only
-        return self.user_blocked(payer)
+        return self.target_block_reason(target_id) is not None
 
     def user_blocked(self, user_id: str) -> bool:
-        return (
-            user_id in self.over_budget_users
-            or user_id in self.idle_users
-            or user_id in self.disabled_users
-        )
+        return self.user_block_reason(user_id) is not None
+
+    def user_block_reason(self, user_id: str) -> BlockReason | None:
+        """WHY this payer is blocked, or ``None`` when they are not.
+
+        ``user_blocked`` answers *whether*; the defer logs need *which*. They
+        used to hardcode one of the three reasons — "over monthly allowance" —
+        onto a predicate that is also true for idle and operator-disabled
+        payers, so an idle account was reported as out of budget and anyone
+        reading the logs went hunting for a spend problem that did not exist.
+        (Observed: a payer at 15% of cap, deferred purely for being unseen past
+        ``idle_defer_days``, logged as over allowance.)
+
+        Precedence mirrors ``build_budget_gate``'s own short-circuits exactly:
+        disabled wins over idle, idle wins over spend — the builder skips the
+        idle check for a disabled payer and skips the spend query for an idle
+        one, so at most one set can hold a given user. Stated explicitly here
+        so the two can't drift apart if that ever changes.
+        """
+        if user_id in self.disabled_users:
+            return "llm_disabled"
+        if user_id in self.idle_users:
+            return "idle"
+        if user_id in self.over_budget_users:
+            return "over_allowance"
+        return None
+
+    def target_block_reason(self, target_id: str) -> BlockReason | None:
+        """WHY this target's LLM work is skipped, or ``None`` when it is not.
+
+        The reporting twin of ``target_blocked`` — same branches, in the same
+        order, so the two cannot disagree about whether work is skipped. The
+        two target-level reasons have no user-level equivalent: a catalog-only
+        target (no payer) suppressed by ``grade_catalog_targets``, and the
+        empty fail-closed sentinel the breaker / build-failure path constructs.
+        """
+        if not self.payer_by_target:
+            return "no_budget_snapshot"
+        if target_id not in self.payer_by_target:
+            return None  # activated after the snapshot — unchanged fail-open
+        payer = self.payer_by_target[target_id]
+        if payer is None:
+            return None if settings.grade_catalog_targets else "catalog_ungraded"
+        return self.user_block_reason(payer)
 
 
 async def build_budget_gate(supabase: AsyncClient, target_ids: list[str]) -> PayerBudgetGate:

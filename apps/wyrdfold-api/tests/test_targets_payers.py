@@ -25,6 +25,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
+from app.config import settings as live_settings
 from app.services.poller import _resolve_user_targets_for_stage3
 from app.services.targets.payers import PayerBudgetGate
 
@@ -111,3 +114,75 @@ async def test_no_active_user_links_means_no_stage3_grading() -> None:
     primary_by_user, user_optimized = await _resolve_user_targets_for_stage3(sb, [target], "(test)")
     assert primary_by_user == {}
     assert user_optimized == {}
+
+
+class TestBlockReasonNamesTheRealCause:
+    """``user_block_reason`` / ``target_block_reason`` — WHY work was skipped.
+
+    These exist because the defer logs used to hardcode "over monthly
+    allowance" onto a predicate that is also true for idle and
+    operator-disabled payers. Observed in prod: an account at 15% of its cap,
+    deferred purely for being unseen past ``idle_defer_days``, reported as out
+    of budget — sending the reader hunting for a spend problem that did not
+    exist.
+    """
+
+    def test_each_cause_reports_itself(self) -> None:
+        assert _gate(over_budget_users=frozenset({"u"})).user_block_reason("u") == (
+            "over_allowance"
+        )
+        assert _gate(idle_users=frozenset({"u"})).user_block_reason("u") == "idle"
+        assert _gate(disabled_users=frozenset({"u"})).user_block_reason("u") == "llm_disabled"
+
+    def test_healthy_payer_has_no_reason(self) -> None:
+        # Control: without this the predicates could report a cause always.
+        gate = _gate(payer_by_target={"t": "u"})
+        assert gate.user_block_reason("u") is None
+        assert gate.target_block_reason("t") is None
+        assert gate.user_blocked("u") is False
+
+    def test_precedence_matches_the_builder_short_circuits(self) -> None:
+        """``build_budget_gate`` skips the idle check for a disabled payer and
+        the spend query for an idle one, so the sets are disjoint by
+        construction. If that ever changes, the reported cause must still be
+        the one the builder would have decided on."""
+        gate = _gate(
+            over_budget_users=frozenset({"u"}),
+            idle_users=frozenset({"u"}),
+            disabled_users=frozenset({"u"}),
+        )
+        assert gate.user_block_reason("u") == "llm_disabled"
+        assert _gate(
+            over_budget_users=frozenset({"u"}), idle_users=frozenset({"u"})
+        ).user_block_reason("u") == "idle"
+
+    def test_target_level_causes(self, monkeypatch) -> None:
+        monkeypatch.setattr(live_settings, "grade_catalog_targets", False)
+        assert _gate(payer_by_target={"t": None}).target_block_reason("t") == "catalog_ungraded"
+        # The empty sentinel the breaker / build-failure path constructs.
+        assert _gate().target_block_reason("t") == "no_budget_snapshot"
+        # Activated after the snapshot — unchanged fail-open, so no cause.
+        assert _gate(payer_by_target={"other": "u"}).target_block_reason("t") is None
+
+    def test_catalog_cause_clears_when_catalog_grading_is_on(self, monkeypatch) -> None:
+        monkeypatch.setattr(live_settings, "grade_catalog_targets", True)
+        assert _gate(payer_by_target={"t": None}).target_block_reason("t") is None
+
+    @pytest.mark.parametrize(
+        "kw",
+        [
+            {},
+            {"over_budget_users": frozenset({"u"})},
+            {"idle_users": frozenset({"u"})},
+            {"disabled_users": frozenset({"u"})},
+            {"over_budget_users": frozenset({"u"}), "idle_users": frozenset({"u"})},
+        ],
+    )
+    def test_reason_and_boolean_can_never_disagree(self, kw: dict[str, object]) -> None:
+        """The anti-drift invariant. ``user_blocked`` is a shim over
+        ``user_block_reason`` and ``target_blocked`` over
+        ``target_block_reason`` — a divergence would be worse than the vague
+        logs this replaced, because callers gate real spend on the boolean."""
+        gate = _gate(payer_by_target={"t": "u"}, **kw)  # type: ignore[arg-type]
+        assert gate.user_blocked("u") is (gate.user_block_reason("u") is not None)
+        assert gate.target_blocked("t") is (gate.target_block_reason("t") is not None)

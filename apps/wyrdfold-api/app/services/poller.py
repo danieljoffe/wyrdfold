@@ -66,7 +66,7 @@ from app.services.target_scoring import (
     score_title_and_upsert as target_title_score_and_upsert,
 )
 from app.services.targets import crud
-from app.services.targets.payers import PayerBudgetGate, build_budget_gate
+from app.services.targets.payers import BlockReason, PayerBudgetGate, build_budget_gate
 from app.services.titles import clean_title_display
 from app.services.validate import liveness_verdict, validate_job_url
 from app.services.workday import KnownPosting, fetch_workday_jobs
@@ -992,11 +992,13 @@ async def _backfill_grade_stale(supabase: AsyncClient, limit: int) -> None:
 
     payer_clients: dict[str | None, LLMClient | None] = {}
     for uid, target in primary_by_user.items():
-        if gate.user_blocked(uid):
+        backfill_reason = gate.user_block_reason(uid)
+        if backfill_reason is not None:
             logger.info(
-                "Grade backfill deferred for user %s / target %s (over allowance)",
+                "Grade backfill deferred for user %s / target %s (%s)",
                 uid,
                 target.id,
+                backfill_reason,
             )
             continue
         llm = await _resolve_payer_client(payer_clients, _async_service_client(), uid)
@@ -1366,10 +1368,10 @@ async def _poll_one_source(
                     phase1_verdicts[active_target.id] = {}
                     phase1_attempted[active_target.id] = set()  # nothing triaged → all defer
                     logger.info(
-                        "Phase 1 deferred for target %s (payer %s blocked: "
-                        "over allowance / idle / disabled)",
+                        "Phase 1 deferred for target %s (payer %s blocked: %s)",
                         active_target.id,
                         gate.payer_for(active_target.id),
+                        gate.target_block_reason(active_target.id),
                     )
                     continue
                 # BYOK (#5 P3): grade on the payer's own key. No key in
@@ -1823,14 +1825,17 @@ async def _poll_one_source(
                 # placeholder until graded).
                 cycle_rows = [cast(dict[str, Any], r) for r in upsert_resp.data or []]
                 for uid, p2_target in primary_by_user.items():
-                    if gate.user_blocked(uid):
-                        # Over monthly allowance — defer. Jobs keep
-                        # promising=True/score=NULL and get graded when
-                        # the rolling window frees up.
+                    p2_reason = gate.user_block_reason(uid)
+                    if p2_reason is not None:
+                        # Defer. Jobs keep promising=True/score=NULL and get
+                        # graded once the payer unblocks — which is NOT always
+                        # a budget window: an idle or operator-disabled payer
+                        # lands here too, so the reason is logged, not assumed.
                         logger.info(
-                            "Phase 2 deferred for user %s / target %s (over monthly allowance)",
+                            "Phase 2 deferred for user %s / target %s (%s)",
                             uid,
                             p2_target.id,
+                            p2_reason,
                         )
                         continue
                     # BYOK (#5 P3): grade on this user's own key; no key in
@@ -2774,14 +2779,17 @@ async def _poll_one_source_for_target(
     supabase: AsyncClient,
     target: JobTarget,
     payer_user_id: str | None = None,
-    payer_over_budget: bool = False,
+    payer_block_reason: BlockReason | None = None,
 ) -> dict[str, Any]:
     """Poll a single source for a specific target. Three-stage pipeline.
 
     ``payer_user_id`` is the user charged for this target's LLM work
-    (the activator); ``payer_over_budget`` skips Phase 1 spend while
-    still ingesting fail-open — both resolved once by
-    ``poll_sources_for_target``.
+    (the activator); ``payer_block_reason`` is WHY that payer's LLM work is
+    skipped this cycle (``None`` = not skipped) and suppresses Phase 1 spend
+    while still ingesting fail-open — both resolved once by
+    ``poll_sources_for_target``. It carries the reason rather than a bare
+    bool so the defer log can name it: this path is reached by an idle or
+    operator-disabled payer too, not only one over allowance.
 
     (The ``budget_gate`` snapshot this used to take was only ever read by the
     ingest-time qualification tagger, which is gone: tagging happens at grade
@@ -2911,7 +2919,7 @@ async def _poll_one_source_for_target(
         # leave verdicts empty → fail-open ingest, grade on a later cycle.
         llm = (
             await _resolve_payer_client(payer_clients, _async_service_client(), payer_user_id)
-            if settings.phase1_triage_enabled and triage_candidates and not payer_over_budget
+            if settings.phase1_triage_enabled and triage_candidates and payer_block_reason is None
             else None
         )
         if llm is not None:
@@ -3215,11 +3223,12 @@ async def _poll_one_source_for_target(
             primary_by_user, user_optimized = await _resolve_user_targets_for_stage3(
                 supabase, [target], company_name
             )
-            if primary_by_user and payer_over_budget:
+            if primary_by_user and payer_block_reason is not None:
                 logger.info(
-                    "Stage 3 deferred for target %s (payer %s over monthly allowance)",
+                    "Stage 3 deferred for target %s (payer %s blocked: %s)",
                     target.id,
                     payer_user_id,
+                    payer_block_reason,
                 )
             elif settings.phase2_enabled and primary_by_user:
                 # ---- Phase 2: LLM job-fit grading (#6) ----
@@ -3346,13 +3355,15 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
         )
         gate = PayerBudgetGate()
     payer = gate.payer_for(target.id)
-    over = gate.target_blocked(target.id)
+    block_reason = gate.target_block_reason(target.id)
+    over = block_reason is not None
     if over:
         logger.info(
             "poll_sources_for_target: Phase 1 deferred for target %s "
-            "(payer %s blocked: over allowance / idle / disabled)",
+            "(payer %s blocked: %s)",
             target.id,
             payer,
+            block_reason,
         )
 
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
@@ -3408,7 +3419,7 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
                 supabase,
                 target,
                 payer_user_id=payer,
-                payer_over_budget=over,
+                payer_block_reason=block_reason,
             )
 
     try:
