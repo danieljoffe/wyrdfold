@@ -1,6 +1,7 @@
 """MockLLMClient behavior."""
 
 import json
+from typing import Any
 
 import pydantic
 import pytest
@@ -861,3 +862,70 @@ async def test_mock_refuses_a_partial_prose_json_object() -> None:
             tool_input_schema=_TRIAGE_SCHEMA,
             purpose="triage",
         )
+
+
+# ---- qualification tagger (now on the GRADE path — lazy tagging) -----------
+
+
+async def _tag_with(scripted: str) -> tuple[Any, Any]:
+    """Drive the REAL ``tag_job`` against a scripted mock response."""
+    from app.services.qualification import QUALIFICATION_PURPOSE, tag_job
+
+    client = MockLLMClient(scripted={QUALIFICATION_PURPOSE: scripted})
+    return await tag_job(
+        client,
+        title="Staff Frontend Engineer",
+        company="Acme",
+        location="San Francisco, CA",
+        description="<p>Build things.</p>",
+    )
+
+
+async def test_qualification_field_soup_degrades_per_field_not_the_whole_tag() -> None:
+    """Every tag field arrives the wrong type at once. Each must degrade on its
+    own so the job is still tagged — one bad field may not cost the verdict.
+
+    Driven through the real ``complete_json`` + ``QualificationTags`` path,
+    because the degradation lives in a model validator: asserting on the model
+    alone would not prove the tagger's parse step applies it.
+    """
+    from app.services.llm.mock import malformed_qualification_tags_json
+
+    tags, result = await _tag_with(malformed_qualification_tags_json("field_soup"))
+
+    assert tags is not None, "a malformed FIELD must not cost the whole tag"
+    assert result is not None  # billable — the call happened
+    # Bools and the confidence degrade to None ("couldn't determine"), which
+    # every read gate passes; the enums fall back to their catch-all.
+    assert tags.is_us is None
+    assert tags.us_confidence is None
+    assert tags.is_remote is None
+    assert tags.is_genuine_role is None
+    assert tags.role_family == "other"
+    assert tags.seniority == "unknown"
+    assert tags.employment_type == "unknown"
+    # And the degraded values are SAFE at the gates the grade path re-applies:
+    # ``is_us`` None passes the US gate (only `is False` drops), and the
+    # ``other`` catch-all is not a hard contradiction of any target family.
+    from app.services.qualification.family_gate import passes_family_gate
+
+    assert tags.is_us is not False
+    assert passes_family_gate("engineering", tags.role_family) is True
+
+
+async def test_qualification_non_object_payload_leaves_the_row_untagged() -> None:
+    """No field to degrade → fail-soft the row: NULL tags, no cost logged, and
+    (because every read gate is keep-null) the job still grades.
+
+    Anti-vacuous: the SAME verdict, unwrapped, parses fine — so the None below
+    is the array wrapper, not a fixture the tagger could never accept.
+    """
+    from app.services.llm.mock import malformed_qualification_tags_json
+
+    wrapped = malformed_qualification_tags_json("not_an_object")
+    ok_tags, _ = await _tag_with(json.dumps(json.loads(wrapped)[0]))
+    assert ok_tags is not None and ok_tags.role_family == "engineering"  # precondition
+
+    tags, result = await _tag_with(wrapped)
+    assert tags is None
+    assert result is None  # nothing to bill a verdict for

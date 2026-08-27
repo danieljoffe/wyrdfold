@@ -497,6 +497,56 @@ def prose_skills_extraction_json() -> str:
     )
 
 
+def malformed_qualification_tags_json(variant: str = "field_soup") -> str:
+    """A #60 qualification-tagger response that misbehaves.
+
+    Corpus entry added when tagging went LAZY (2026-08-26): the tagger used to
+    run at ingest, where a NULL verdict cost only a missing tag. It now runs
+    inside the GRADE path, so its failure modes sit directly upstream of Sonnet
+    spend — a payload that raised instead of degrading would take a grading run
+    with it, and a payload that "succeeded" into a confidently wrong verdict
+    would archive a live US job or gate it off-family.
+
+    Variants:
+    - ``field_soup`` — every field the wrong TYPE at once (a bool as prose, a
+      confidence as a word, an out-of-enum family, an int seniority, a null
+      employment type). ``QualificationTags._tolerate_malformed`` must degrade
+      each offending field on its own (None for bools/confidence, the enum's
+      catch-all otherwise) rather than reject the payload, so one bad field
+      never leaves a job untagged.
+    - ``not_an_object`` — the verdict wrapped in a JSON ARRAY (the "here is
+      your list of one" shape). There is no field to degrade, so this one must
+      fail-soft the whole row: NULL tags, keep-null gates, grade anyway.
+    """
+    if variant == "not_an_object":
+        return json.dumps(
+            [
+                {
+                    "is_us": True,
+                    "us_confidence": 90,
+                    "role_family": "engineering",
+                    "seniority": "senior_ic",
+                    "employment_type": "full_time",
+                    "metro": "San Francisco",
+                    "is_remote": False,
+                    "is_genuine_role": True,
+                }
+            ]
+        )
+    return json.dumps(
+        {
+            "is_us": "yes, primarily",
+            "us_confidence": "high",
+            "role_family": "wizardry",
+            "seniority": 7,
+            "employment_type": None,
+            "metro": "San Francisco",
+            "is_remote": "hybrid",
+            "is_genuine_role": "probably",
+        }
+    )
+
+
 def prose_xml_tool_call(tool_name: str, **params: Any) -> str:
     """Script the deepseek failure from #821: the forced tool call written as
     Anthropic XML inside ``content`` instead of a structured ``tool_calls``.

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
 from supabase import AsyncClient
@@ -46,6 +47,7 @@ from app.services.fit.score_persistence import score_with_phase2_and_persist
 from app.services.fit.seniority_gate import passes_seniority_gate
 from app.services.llm.client import LLMClient
 from app.services.qualification.family_gate import passes_family_gate
+from app.services.qualification.materialize import ensure_job_tags
 from app.services.scoring import strip_html
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,22 @@ PHASE2_CONCURRENCY = 3
 # URL-safe bound and 414s (the previous value, 500, did — despite this
 # comment's claim that it stayed under the limit).
 _STATE_CHUNK_SIZE = 100
+
+
+def _passes_us_gate(job: dict[str, Any]) -> bool:
+    """US-only corpus (#60), write side of the display read gate (``jobs.py``
+    ``_gate_live_us``: is_us IS NOT FALSE). Keep true + null; drop only a
+    CONFIRMED non-US verdict."""
+    return job.get("is_us") is not False
+
+
+def _passes_target_family_gate(target: JobTarget, job: dict[str, Any]) -> bool:
+    """Family gate (#277/#278), write side. Same shared predicate as the read
+    gates, keep-null both ways: an untagged job and an unclassified target both
+    admit."""
+    return not target.role_family or passes_family_gate(
+        target.role_family, cast("str | None", job.get("role_family"))
+    )
 
 
 def _needs_phase2(
@@ -149,6 +167,7 @@ async def run_phase2_for_jobs(
     first_batch_size: int = PHASE2_FIRST_BATCH,
     batch_size: int = PHASE2_BATCH_SIZE,
     concurrency: int = PHASE2_CONCURRENCY,
+    tag_budget_exhausted: Callable[[], Awaitable[bool]] | None = None,
 ) -> int:
     """Grade the promising, not-yet-current jobs in ``jobs`` for ``target``.
 
@@ -156,25 +175,34 @@ async def run_phase2_for_jobs(
     ``description_html`` for the JD context; the posted date is used for
     ordering when present). Returns the number of jobs actually graded.
 
-    Order of operations: gate + re-grade filter → order newest-first →
-    trim to the remaining daily quota → progressive batches with bounded
+    Order of operations: gate + re-grade filter → order by fit-probability →
+    trim to the remaining daily quota → materialize tags + vectors for the
+    trimmed set → re-apply the tag gates → progressive batches with bounded
     concurrency. Per-job failures inside ``score_with_phase2_and_persist``
     are swallowed there (return ``None``), so one bad grade never sinks
     the batch.
+
+    ``tag_budget_exhausted`` is the caller's global-spend predicate, handed to
+    the lazy qualification tagger below (the poller owns the meter; this module
+    can't import it — see ``qualification.materialize``). ``None`` leaves the
+    tagger relying on the caller's own gating.
     """
     if not jobs:
         return 0
 
     # US-only corpus (#60): never (re-)grade a CONFIRMED non-US job — the write
     # side of the display read gate (``jobs.py`` ``_gate_live_us``: is_us IS NOT
-    # FALSE). The poller's post-tagger ``_refresh_job_tags`` patches this
-    # cycle's verdicts into the job dicts, so a first-cycle confirmed-non-US
-    # job is skipped here too; a still-untagged job (is_us NULL) passes.
+    # FALSE). This PRE-trim pass filters on tags from EARLIER passes (tagging is
+    # lazy now, so most first-time candidates are still NULL here and pass, as
+    # they always did). The same gate is RE-APPLIED after the quota trim, once
+    # ``ensure_job_tags`` has bought this run's verdicts — that is where a
+    # first-time non-US job is caught. Running it here too is what keeps a
+    # known-non-US job from consuming a quota slot in the first place.
     # Without this a re-polled non-US job burns a fresh LLM grade every cycle —
     # ``archived_at`` does NOT gate grading (134 non-US jobs were graded
     # *after* being archived in one 7-day window). Keep true + null (``is not
     # False``); drop only confirmed-false.
-    us_jobs = [j for j in jobs if j.get("is_us") is not False]
+    us_jobs = [j for j in jobs if _passes_us_gate(j)]
     non_us_skipped = len(jobs) - len(us_jobs)
     if non_us_skipped:
         logger.info(
@@ -189,16 +217,16 @@ async def run_phase2_for_jobs(
     # Family gate (#277/#278, write side): never spend a grade on a pair the
     # read gates (`get_target_jobs` / `_gate_off_family` / the membership
     # badge) will hide from every surface anyway. Same shared predicate,
-    # keep-null both ways: an untagged job (role_family NULL — the tagger is
-    # async and may not have landed) and an unclassified target both admit.
+    # keep-null both ways: an untagged job (role_family NULL — lazily tagged,
+    # so this is the normal state pre-trim) and an unclassified target both
+    # admit. Like the US gate above, this runs BEFORE the trim on prior-pass
+    # tags and is RE-APPLIED after it on the freshly-bought ones.
     # Before this gate, hard off-family pairs burned full grades — the
     # 2026-07-30 prod audit found 55% of all promising rows were off-family,
     # each graded one pure waste (e.g. a customer_experience listing graded
     # against a frontend-engineer target, scored 0).
     if target.role_family:
-        in_family = [
-            j for j in jobs if passes_family_gate(target.role_family, j.get("role_family"))
-        ]
+        in_family = [j for j in jobs if _passes_target_family_gate(target, j)]
         family_skipped = len(jobs) - len(in_family)
         if family_skipped:
             logger.info(
@@ -321,6 +349,52 @@ async def run_phase2_for_jobs(
             len(candidates),
         )
         candidates = candidates[:quota]
+
+    # ---- Lazy qualification tagging (the ingest tagger's replacement) -------
+    # Ingest is $0 LLM now: a listing's intrinsic tags are bought HERE, for
+    # exactly the rows about to be graded, because grade time is the only place
+    # anything consumes them ("a job is tagged exactly when first needed" — the
+    # same contract ``ensure_job_vectors`` above got in the 2026-07-30 Disk IO
+    # slim-down).
+    #
+    # PLACEMENT IS THE WHOLE POINT: this sits AFTER the ordering and the daily-
+    # cap trim. Tagging before the two pre-gates would tag the FULL candidate
+    # set — up to thousands of rows — to grade at most ``cap`` of them. Here the
+    # set is already ≤ quota.
+    #
+    # ``ensure_job_tags`` patches the fresh values back into these very dicts,
+    # so the gates re-applied just below see this run's verdicts. Rows the
+    # tagger couldn't tag (budget, provider outage, parse failure) stay NULL and
+    # pass both gates, exactly as an untagged row always has.
+    if settings.qualification_enabled and candidates:
+        await ensure_job_tags(
+            supabase,
+            [job_by_id[jid] for jid in candidates],
+            budget_exhausted=tag_budget_exhausted,
+        )
+        # Re-apply the tag gates to the now-tagged set. A row rejected here is
+        # NOT backfilled from the next candidate, so a run can grade fewer than
+        # the quota — deliberate: the alternative is tagging a second tranche to
+        # refill the first, which re-opens the "tag more than we grade" hole
+        # this change closes.
+        tagged_ok = [
+            jid
+            for jid in candidates
+            if _passes_us_gate(job_by_id[jid])
+            and _passes_target_family_gate(target, job_by_id[jid])
+        ]
+        dropped = len(candidates) - len(tagged_ok)
+        if dropped:
+            logger.info(
+                "Phase 2 post-tag gates: dropped %d/%d freshly-tagged candidate(s) "
+                "for target %s (confirmed non-US or off-family)",
+                dropped,
+                len(candidates),
+                target.id,
+            )
+        candidates = tagged_ok
+        if not candidates:
+            return 0
 
     sem = asyncio.Semaphore(concurrency)
 

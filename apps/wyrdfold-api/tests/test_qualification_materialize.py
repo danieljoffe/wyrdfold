@@ -1,18 +1,27 @@
-"""Poller wiring for the #60 qualification firewall.
+"""The #60 qualification tagger, now the LAZY materializer.
 
-Covers ``poller._qualify_one_job`` / ``_qualify_jobs``:
+Covers ``qualification.materialize._qualify_one_job`` / ``ensure_job_tags``
+(these bodies moved out of ``poller.py`` unchanged — the tests moved with
+them, so every semantic below is pinned exactly where it was):
 
 - A new row (no ``qualified_hash``) is tagged: the LLM is called, cost is
   enqueued, and the full tag payload (+ ``qualified_at`` / ``qualified_hash``)
   is written back to the row.
 - An unchanged row (``qualified_hash`` already matches its content + a prior
   ``qualified_at``) is skipped: no LLM call, no DB write — the content-hash
-  cache makes a re-poll free.
+  cache makes a re-read free.
 - A changed row (content differs from the stored hash) is re-tagged.
 - The step is best-effort: a tagger failure (tags=None) writes nothing and
   never raises; a write failure is swallowed.
 - It bills the instance key (``get_llm_client_async(service_client, None)``), never a
   per-target payer.
+- The spend gates: the archived guard, the provider fast-fail breaker, and the
+  budget re-check — which is now an INJECTED predicate (the poller owns the
+  meter), driven here through the real ``poller._tagger_budget_exhausted``.
+
+Where the tagger is CALLED from (grade time, after the daily-cap trim) is
+covered in ``test_phase2_runner.py``; that ingest no longer calls it at all is
+covered in ``test_poller_lazy_tagging.py``.
 """
 
 from __future__ import annotations
@@ -27,8 +36,7 @@ from app.config import settings as live_settings
 from app.services import poller as poller_mod
 from app.services.llm import provider_breaker
 from app.services.llm.errors import LLMQuotaExhaustedError, LLMRateLimitedError
-from app.services.qualification import QualificationTags, qualification_hash
-from app.services.targets.payers import PayerBudgetGate
+from app.services.qualification import QualificationTags, materialize, qualification_hash
 
 _TAGS = QualificationTags(
     is_us=True,
@@ -86,18 +94,20 @@ def _patch_common(
     # the flag off it builds + executes the update on the MagicMock supabase
     # directly (the ``update`` side_effect below records the payload), so no
     # retry-helper patch is needed anymore.
-    monkeypatch.setattr(poller_mod, "get_llm_client_async", fake_get_client)
-    monkeypatch.setattr(poller_mod, "tag_job", fake_tag_job)
-    monkeypatch.setattr(poller_mod, "enqueue_llm_cost", fake_enqueue)
-    # The qualification budget re-check reads the global spend meter on the ASYNC
-    # service client (``_async_service_client`` → ``get_async_supabase``, #57
-    # PR-G2e-1) rather than the client threaded into the cycle. Hand it a client
-    # whose meter RPC resolves under cap so the default (non-budget) path tags
-    # normally; budget-specific tests patch ``total_llm_spend_all_async`` (the
-    # meter fn), which short-circuits this client entirely.
+    monkeypatch.setattr(materialize, "get_llm_client_async", fake_get_client)
+    monkeypatch.setattr(materialize, "tag_job", fake_tag_job)
+    monkeypatch.setattr(materialize, "enqueue_llm_cost", fake_enqueue)
+    # The instance-key lookup resolves on the pooled SERVICE-role client, not
+    # the client threaded in by the caller (a user-scoped client on the
+    # target-activation path would fail the cross-user read). The budget
+    # predicate the poller injects reads the global spend meter on the same
+    # pool. Hand both a client whose meter RPC resolves under cap so the
+    # default path tags normally; budget-specific tests patch
+    # ``total_llm_spend_all_async`` (the meter fn), which short-circuits it.
     meter_client = MagicMock()
     meter_client.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=1.0))
     monkeypatch.setattr(poller_mod, "_async_service_client", lambda: meter_client)
+    monkeypatch.setattr(materialize, "_service_client", lambda: meter_client)
     return rec
 
 
@@ -122,7 +132,7 @@ class TestQualifyOneJob:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, [_row()])
+        await materialize.ensure_job_tags(sb, [_row()])
 
         assert rec["tag_calls"] == 1
         assert rec["cost_calls"] == 1
@@ -158,7 +168,7 @@ class TestQualifyOneJob:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(
+        await materialize.ensure_job_tags(
             sb,
             [_row(description_html="<p>Build with React, TypeScript and k8s.</p>")],
         )
@@ -181,7 +191,7 @@ class TestQualifyOneJob:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(
+        await materialize.ensure_job_tags(
             sb, [_row(description_html="<p>Make coffee. Be friendly.</p>")]
         )
 
@@ -201,7 +211,7 @@ class TestQualifyOneJob:
         )
         row = _row(qualified_hash=existing_hash, qualified_at="2026-06-24T00:00:00Z")
 
-        await poller_mod._qualify_jobs(sb, [row])
+        await materialize.ensure_job_tags(sb, [row])
 
         # Cache hit: no LLM call, no cost, no write.
         assert rec["tag_calls"] == 0
@@ -223,7 +233,7 @@ class TestQualifyOneJob:
         )
         row = _row(qualified_hash=stale_hash, qualified_at="2026-06-24T00:00:00Z")
 
-        await poller_mod._qualify_jobs(sb, [row])
+        await materialize.ensure_job_tags(sb, [row])
 
         assert rec["tag_calls"] == 1
         assert len(rec["writes"]) == 1
@@ -236,7 +246,7 @@ class TestQualifyOneJob:
         rec = _patch_common(monkeypatch, tag_result=(None, None))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, [_row()])
+        await materialize.ensure_job_tags(sb, [_row()])
 
         assert rec["tag_calls"] == 1
         assert rec["cost_calls"] == 0
@@ -249,7 +259,7 @@ class TestQualifyOneJob:
         async def boom(_sb: object, _uid: str | None) -> object:
             raise RuntimeError("no client")
 
-        monkeypatch.setattr(poller_mod, "get_llm_client_async", boom)
+        monkeypatch.setattr(materialize, "get_llm_client_async", boom)
         # tag_job should never be reached.
         called = {"n": 0}
 
@@ -257,11 +267,23 @@ class TestQualifyOneJob:
             called["n"] += 1
             return None, None
 
-        monkeypatch.setattr(poller_mod, "tag_job", fake_tag_job)
+        monkeypatch.setattr(materialize, "tag_job", fake_tag_job)
 
         # Must not raise even though the client can't be resolved.
-        await poller_mod._qualify_jobs(MagicMock(), [_row()])
+        await materialize.ensure_job_tags(MagicMock(), [_row()])
         assert called["n"] == 0
+
+
+def _injected_check() -> materialize.BudgetCheck:
+    """The budget predicate the PRODUCTION caller injects.
+
+    Not a stub: ``poller._tagger_budget_exhausted`` is exactly what the poller
+    hands ``run_phase2_for_jobs`` → ``ensure_job_tags``, so these tests drive
+    the real meter + cap + grading reserve through the real seam. (The meter
+    itself stays in the poller — the tagger can't import it, which is why it is
+    injected at all.)
+    """
+    return poller_mod._tagger_budget_exhausted
 
 
 def _unique_rows(n: int) -> list[dict[str, Any]]:
@@ -313,7 +335,7 @@ class TestNonUsArchive:
         rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(95), object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, [_row(location="London, UK")])
+        await materialize.ensure_job_tags(sb, [_row(location="London, UK")])
 
         assert len(rec["writes"]) == 1
         payload = rec["writes"][0]
@@ -329,7 +351,7 @@ class TestNonUsArchive:
         rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(95), object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, [_row(location="London, UK")])
+        await materialize.ensure_job_tags(sb, [_row(location="London, UK")])
 
         payload = rec["writes"][0]
         assert payload["is_us"] is False
@@ -341,7 +363,7 @@ class TestNonUsArchive:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))  # is_us=True
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, [_row()])
+        await materialize.ensure_job_tags(sb, [_row()])
 
         assert "archived_at" not in rec["writes"][0]
 
@@ -356,7 +378,7 @@ class TestNonUsArchive:
         rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(50), object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, [_row(location="Remote")])
+        await materialize.ensure_job_tags(sb, [_row(location="Remote")])
 
         payload = rec["writes"][0]
         assert payload["is_us"] is False
@@ -374,7 +396,7 @@ class TestNonUsArchive:
         rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(None), object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, [_row(location="London, UK")])
+        await materialize.ensure_job_tags(sb, [_row(location="London, UK")])
 
         payload = rec["writes"][0]
         assert payload["is_us"] is False
@@ -392,7 +414,7 @@ class TestNonUsArchive:
         rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(95), object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, [_row(location="New York, NY, United States")])
+        await materialize.ensure_job_tags(sb, [_row(location="New York, NY, United States")])
 
         payload = rec["writes"][0]
         assert payload["is_us"] is False  # the (wrong) tag is still recorded
@@ -406,7 +428,7 @@ class TestNonUsArchive:
         rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(80), object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, [_row(location="Toronto, Canada")])
+        await materialize.ensure_job_tags(sb, [_row(location="Toronto, Canada")])
 
         assert rec["writes"][0]["archived_at"] is not None
 
@@ -418,7 +440,8 @@ class TestQualifyBudgetGate:
     re-check runs between chunks, so a backlog can't grind past the cap.
 
     These are the regression that would have prevented the June overspend:
-    delete the gate in ``_qualify_jobs`` and ``test_*over_budget*`` fail."""
+    delete the injected check in ``_qualify_rows_with_budget`` (or stop passing
+    it from the poller) and ``test_*over_budget*`` fail."""
 
     @pytest.mark.asyncio
     async def test_stops_when_over_budget_via_real_meter(
@@ -435,8 +458,8 @@ class TestQualifyBudgetGate:
 
         # A full chunk-plus of unique rows: absent the gate every one would
         # be tagged. With the gate, NONE are.
-        rows = _unique_rows(poller_mod.QUALIFICATION_BUDGET_RECHECK_EVERY + 5)
-        await poller_mod._qualify_jobs(sb, rows)
+        rows = _unique_rows(materialize.QUALIFICATION_BUDGET_RECHECK_EVERY + 5)
+        await materialize.ensure_job_tags(sb, rows, budget_exhausted=_injected_check())
 
         assert rec["tag_calls"] == 0
         assert rec["cost_calls"] == 0
@@ -452,7 +475,7 @@ class TestQualifyBudgetGate:
         sb = _supabase_capturing_updates(rec)
 
         rows = _unique_rows(3)
-        await poller_mod._qualify_jobs(sb, rows)
+        await materialize.ensure_job_tags(sb, rows, budget_exhausted=_injected_check())
 
         assert rec["tag_calls"] == 3
         assert len(rec["writes"]) == 3
@@ -467,7 +490,7 @@ class TestQualifyBudgetGate:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, _unique_rows(2))
+        await materialize.ensure_job_tags(sb, _unique_rows(2), budget_exhausted=_injected_check())
 
         assert rec["tag_calls"] == 2
         # cap<=0 short-circuits before the meter is read.
@@ -489,9 +512,9 @@ class TestQualifyBudgetGate:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
-        chunk = poller_mod.QUALIFICATION_BUDGET_RECHECK_EVERY
+        chunk = materialize.QUALIFICATION_BUDGET_RECHECK_EVERY
         rows = _unique_rows(chunk * 3)  # three chunks' worth
-        await poller_mod._qualify_jobs(sb, rows)
+        await materialize.ensure_job_tags(sb, rows, budget_exhausted=_injected_check())
 
         # Exactly one chunk got tagged before the gate tripped.
         assert rec["tag_calls"] == chunk
@@ -511,7 +534,7 @@ class TestQualifyBudgetGate:
         sb = _supabase_capturing_updates(rec)
 
         # Must not raise.
-        await poller_mod._qualify_jobs(sb, _unique_rows(3))
+        await materialize.ensure_job_tags(sb, _unique_rows(3), budget_exhausted=_injected_check())
 
         assert rec["tag_calls"] == 0
         assert rec["writes"] == []
@@ -568,7 +591,7 @@ class TestGradingReserve:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, _unique_rows(3))
+        await materialize.ensure_job_tags(sb, _unique_rows(3), budget_exhausted=_injected_check())
 
         assert rec["tag_calls"] == 0  # tagger yields the reserved slice
         assert rec["writes"] == []
@@ -599,13 +622,13 @@ class TestProviderFastFail:
             rec["tag_calls"] += 1
             raise LLMQuotaExhaustedError(upstream_status=402)
 
-        monkeypatch.setattr(poller_mod, "tag_job", raising_tag_job)
+        monkeypatch.setattr(materialize, "tag_job", raising_tag_job)
         sb = _supabase_capturing_updates(rec)
 
-        assert not poller_mod._provider_fatal_active()
-        await poller_mod._qualify_one_job(MagicMock(), sb, _row())
+        assert not materialize._provider_fatal_active()
+        await materialize._qualify_one_job(MagicMock(), sb, _row())
 
-        assert poller_mod._provider_fatal_active()  # breaker latched
+        assert materialize._provider_fatal_active()  # breaker latched
         assert rec["writes"] == []  # row left NULL (best-effort, re-tags later)
 
     @pytest.mark.asyncio
@@ -615,9 +638,9 @@ class TestProviderFastFail:
         async def raising_tag_job(_llm: object, **_kw: Any) -> Any:
             raise LLMRateLimitedError(upstream_status=429)
 
-        monkeypatch.setattr(poller_mod, "tag_job", raising_tag_job)
-        await poller_mod._qualify_one_job(MagicMock(), _supabase_capturing_updates(rec), _row())
-        assert poller_mod._provider_fatal_active()
+        monkeypatch.setattr(materialize, "tag_job", raising_tag_job)
+        await materialize._qualify_one_job(MagicMock(), _supabase_capturing_updates(rec), _row())
+        assert materialize._provider_fatal_active()
 
     @pytest.mark.asyncio
     async def test_active_breaker_skips_the_llm_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -625,7 +648,7 @@ class TestProviderFastFail:
         provider_breaker._provider_fatal_until = time.monotonic() + 300.0  # latched
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_one_job(MagicMock(), sb, _row())
+        await materialize._qualify_one_job(MagicMock(), sb, _row())
 
         assert rec["tag_calls"] == 0  # never hit the provider
         assert rec["writes"] == []
@@ -643,13 +666,13 @@ class TestProviderFastFail:
             rec["tag_calls"] += 1
             raise LLMQuotaExhaustedError(upstream_status=402)
 
-        monkeypatch.setattr(poller_mod, "tag_job", raising_tag_job)
-        n = poller_mod.QUALIFICATION_BUDGET_RECHECK_EVERY + 5  # spans 2 chunks
+        monkeypatch.setattr(materialize, "tag_job", raising_tag_job)
+        n = materialize.QUALIFICATION_BUDGET_RECHECK_EVERY + 5  # spans 2 chunks
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, _unique_rows(n))
+        await materialize.ensure_job_tags(sb, _unique_rows(n))
 
-        assert poller_mod._provider_fatal_active()
+        assert materialize._provider_fatal_active()
         assert rec["tag_calls"] < n  # deferred the rest instead of firing all N
         assert rec["writes"] == []
 
@@ -660,7 +683,7 @@ class TestProviderFastFail:
 
     def test_breaker_auto_clears_after_cooldown(self) -> None:
         provider_breaker._provider_fatal_until = time.monotonic() - 1.0  # in the past
-        assert not poller_mod._provider_fatal_active()
+        assert not materialize._provider_fatal_active()
 
 
 # ---- family reconcile + tag refresh (the _qualify_jobs closers) ------------
@@ -721,7 +744,7 @@ async def test_reconcile_retracts_offfamily_promising() -> None:
             {"id": "s-null", "target_id": "t-eng", "job_role_family": None},
         ],
     )
-    await poller_mod._reconcile_offfamily_promising(sb, ["job-1"])
+    await materialize._reconcile_offfamily_promising(sb, ["job-1"])
 
     assert writes == [("scores", {"promising": False}, "id", ["s-cx"])]
 
@@ -732,7 +755,7 @@ async def test_reconcile_noop_when_no_target_is_classified() -> None:
         targets=[{"id": "t-any", "role_family": None}],
         scores=[{"id": "s-1", "target_id": "t-any", "job_role_family": "sales"}],
     )
-    await poller_mod._reconcile_offfamily_promising(sb, ["job-1"])
+    await materialize._reconcile_offfamily_promising(sb, ["job-1"])
     assert writes == []
 
 
@@ -745,7 +768,7 @@ async def test_refresh_job_tags_patches_stale_row_dicts() -> None:
         jobs=[{"id": "job-1", "role_family": "customer_experience", "is_us": True}]
     )
     rows: list[dict[str, Any]] = [{"id": "job-1", "title": "Support Specialist"}]
-    await poller_mod._refresh_job_tags(sb, rows)
+    await materialize._refresh_job_tags(sb, rows)
 
     assert rows[0]["role_family"] == "customer_experience"
     assert rows[0]["is_us"] is True
@@ -769,11 +792,11 @@ async def test_qualify_jobs_runs_closers_even_when_llm_client_unavailable(
     async def _fake_reconcile(_sb: Any, job_ids: list[str]) -> None:
         calls.append(f"reconcile:{','.join(job_ids)}")
 
-    monkeypatch.setattr(poller_mod, "get_llm_client_async", _raise)
-    monkeypatch.setattr(poller_mod, "_refresh_job_tags", _fake_refresh)
-    monkeypatch.setattr(poller_mod, "_reconcile_offfamily_promising", _fake_reconcile)
+    monkeypatch.setattr(materialize, "get_llm_client_async", _raise)
+    monkeypatch.setattr(materialize, "_refresh_job_tags", _fake_refresh)
+    monkeypatch.setattr(materialize, "_reconcile_offfamily_promising", _fake_reconcile)
 
-    await poller_mod._qualify_jobs(MagicMock(), [_row(id="job-9")])
+    await materialize.ensure_job_tags(MagicMock(), [_row(id="job-9")])
 
     assert calls == ["refresh:1", "reconcile:job-9"]
 
@@ -793,7 +816,7 @@ class TestNonGenuineArchive:
         rec = _patch_common(monkeypatch, tag_result=(tags, object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, [_row()])
+        await materialize.ensure_job_tags(sb, [_row()])
 
         payload = rec["writes"][0]
         assert payload["is_genuine_role"] is False
@@ -809,7 +832,7 @@ class TestNonGenuineArchive:
         rec = _patch_common(monkeypatch, tag_result=(tags, object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, [_row()])
+        await materialize.ensure_job_tags(sb, [_row()])
 
         assert "archived_at" not in rec["writes"][0]
 
@@ -822,7 +845,7 @@ class TestNonGenuineArchive:
         rec = _patch_common(monkeypatch, tag_result=(tags, object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, [_row()])
+        await materialize.ensure_job_tags(sb, [_row()])
 
         payload = rec["writes"][0]
         assert payload["is_genuine_role"] is False
@@ -840,12 +863,10 @@ class TestDefersToTheBoard:
     """
 
     @pytest.mark.asyncio
-    async def test_board_remote_is_not_overwritten(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_board_remote_is_not_overwritten(self, monkeypatch: pytest.MonkeyPatch) -> None:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         # Board said REMOTE; the tagger's inference says False (_TAGS).
-        await poller_mod._qualify_one_job(
+        await materialize._qualify_one_job(
             MagicMock(), _supabase_capturing_updates(rec), _row(is_remote=True)
         )
         payload = rec["writes"][0]
@@ -856,7 +877,7 @@ class TestDefersToTheBoard:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
-        await poller_mod._qualify_one_job(
+        await materialize._qualify_one_job(
             MagicMock(), _supabase_capturing_updates(rec), _row(employment_type="contract")
         )
         payload = rec["writes"][0]
@@ -870,7 +891,7 @@ class TestDefersToTheBoard:
         check here would let the tagger clobber every on-site posting — the
         exact bug the board-columns spread was written to avoid."""
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
-        await poller_mod._qualify_one_job(
+        await materialize._qualify_one_job(
             MagicMock(), _supabase_capturing_updates(rec), _row(is_remote=False)
         )
         assert "is_remote" not in rec["writes"][0]
@@ -883,7 +904,7 @@ class TestDefersToTheBoard:
         tagger remains the source, so coverage is not lost for the 61% of
         sources whose boards say nothing."""
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
-        await poller_mod._qualify_one_job(MagicMock(), _supabase_capturing_updates(rec), _row())
+        await materialize._qualify_one_job(MagicMock(), _supabase_capturing_updates(rec), _row())
         payload = rec["writes"][0]
         assert payload["is_remote"] is False
         assert payload["employment_type"] == "full_time"
@@ -896,7 +917,7 @@ class TestDefersToTheBoard:
         board source, so the tagger stays their only writer — unconditionally,
         even when the board answered the other two."""
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
-        await poller_mod._qualify_one_job(
+        await materialize._qualify_one_job(
             MagicMock(),
             _supabase_capturing_updates(rec),
             _row(is_remote=True, employment_type="contract"),
@@ -935,12 +956,12 @@ class TestArchivedRowsAreNotTagged:
         sb = _supabase_capturing_updates(rec)
 
         # Precondition: LIVE, cache-missing → tagged and written.
-        await poller_mod._qualify_jobs(sb, [_row()])
+        await materialize.ensure_job_tags(sb, [_row()])
         assert rec["tag_calls"] == 1
         assert len(rec["writes"]) == 1
 
         # Identical content, now archived → no second call, no second write.
-        await poller_mod._qualify_jobs(sb, [_row(archived_at="2026-08-07T12:00:00Z")])
+        await materialize.ensure_job_tags(sb, [_row(archived_at="2026-08-07T12:00:00Z")])
         assert rec["tag_calls"] == 1
         assert rec["cost_calls"] == 1
         assert len(rec["writes"]) == 1
@@ -971,7 +992,7 @@ class TestArchivedRowsAreNotTagged:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(
+        await materialize.ensure_job_tags(
             sb,
             [
                 _row(
@@ -996,7 +1017,7 @@ class TestArchivedRowsAreNotTagged:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(sb, [_row(archived_at=None)])
+        await materialize.ensure_job_tags(sb, [_row(archived_at=None)])
 
         assert rec["tag_calls"] == 1
         assert len(rec["writes"]) == 1
@@ -1018,14 +1039,14 @@ class TestArchivedRowsAreNotTagged:
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         sb = _supabase_capturing_updates(rec)
 
-        await poller_mod._qualify_jobs(
+        await materialize.ensure_job_tags(
             sb,
             [_row(qualified_hash=stale_hash, archived_at="2026-08-07T12:00:00Z")],
         )
         assert rec["tag_calls"] == 0
 
         # Un-archived on a later cycle: same stale hash, now live.
-        await poller_mod._qualify_jobs(sb, [_row(qualified_hash=stale_hash)])
+        await materialize.ensure_job_tags(sb, [_row(qualified_hash=stale_hash)])
         assert rec["tag_calls"] == 1
         assert len(rec["writes"]) == 1
 
@@ -1045,164 +1066,13 @@ class TestArchivedRowsAreNotTagged:
             calls.append(f"reconcile:{','.join(job_ids)}")
 
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
-        monkeypatch.setattr(poller_mod, "_refresh_job_tags", _fake_refresh)
-        monkeypatch.setattr(poller_mod, "_reconcile_offfamily_promising", _fake_reconcile)
+        monkeypatch.setattr(materialize, "_refresh_job_tags", _fake_refresh)
+        monkeypatch.setattr(materialize, "_reconcile_offfamily_promising", _fake_reconcile)
 
-        await poller_mod._qualify_jobs(
+        await materialize.ensure_job_tags(
             _supabase_capturing_updates(rec),
             [_row(id="job-9", archived_at="2026-08-07T12:00:00Z")],
         )
 
         assert rec["tag_calls"] == 0
         assert calls == ["refresh:1", "reconcile:job-9"]
-
-
-class TestNoConsumerGate:
-    """Spend gate 2: skip tagging when NO active target could consume a tag.
-
-    The tagger is target-INDEPENDENT — it bills the INSTANCE key, so the
-    per-payer ``PayerBudgetGate`` that correctly stops Phase 1 and Phase 2
-    never saw it. With every active target blocked (catalog-only payers with
-    ``grade_catalog_targets`` off, plus payers over their monthly allowance)
-    grading sat at zero while the tagger kept buying tags nothing could read.
-
-    Suppression is LLM-ONLY. Nothing here may shrink the active set or stop a
-    source polling — that is the reverted mistake documented in
-    ``targets/payers.py`` (it starved the public corpus of INGESTION).
-    """
-
-    @pytest.mark.asyncio
-    async def test_fully_blocked_gate_skips_tagging_and_still_runs_the_closers(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Prod's current shape: catalog-only targets (payer None,
-        ``grade_catalog_targets`` off) plus a target whose payer is over
-        allowance. Zero LLM calls, and BOTH DB-only closers still run."""
-        monkeypatch.setattr(live_settings, "grade_catalog_targets", False)
-        gate = PayerBudgetGate(
-            payer_by_target={"t-catalog": None, "t-user": "u-broke"},
-            over_budget_users=frozenset({"u-broke"}),
-        )
-        # Precondition: the gate really does consider everything blocked.
-        assert gate.all_targets_blocked()
-
-        calls: list[str] = []
-
-        async def _fake_refresh(_sb: Any, rows: list[dict[str, Any]]) -> None:
-            calls.append(f"refresh:{len(rows)}")
-
-        async def _fake_reconcile(_sb: Any, job_ids: list[str]) -> None:
-            calls.append(f"reconcile:{','.join(job_ids)}")
-
-        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
-        monkeypatch.setattr(poller_mod, "_refresh_job_tags", _fake_refresh)
-        monkeypatch.setattr(poller_mod, "_reconcile_offfamily_promising", _fake_reconcile)
-        sb = _supabase_capturing_updates(rec)
-
-        await poller_mod._qualify_jobs(sb, [_row(id="job-9")], gate)
-
-        assert rec["tag_calls"] == 0
-        assert rec["cost_calls"] == 0
-        assert rec["writes"] == []
-        # The closers are NOT collateral damage.
-        assert calls == ["refresh:1", "reconcile:job-9"]
-
-    @pytest.mark.asyncio
-    async def test_unblocked_target_still_tags(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Control. Same call, same fixture, one consumer that CAN read the
-        tag — without this the skip above could pass for any reason."""
-        gate = PayerBudgetGate(payer_by_target={"t-user": "u-ok"})
-        assert not gate.all_targets_blocked()
-
-        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
-        sb = _supabase_capturing_updates(rec)
-
-        await poller_mod._qualify_jobs(sb, [_row()], gate)
-
-        assert rec["tag_calls"] == 1
-        assert len(rec["writes"]) == 1
-
-    @pytest.mark.asyncio
-    async def test_one_unblocked_target_is_enough(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The predicate is ALL-blocked, not ANY-blocked: a single live
-        consumer keeps the target-independent tagger running for everyone."""
-        monkeypatch.setattr(live_settings, "grade_catalog_targets", False)
-        gate = PayerBudgetGate(
-            payer_by_target={"t-catalog": None, "t-user": "u-ok"},
-            over_budget_users=frozenset({"u-broke"}),
-        )
-        assert gate.target_blocked("t-catalog")  # precondition: partially blocked
-
-        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
-        sb = _supabase_capturing_updates(rec)
-
-        await poller_mod._qualify_jobs(sb, [_row()], gate)
-
-        assert rec["tag_calls"] == 1
-
-    @pytest.mark.asyncio
-    async def test_empty_gate_is_fail_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """``PayerBudgetGate()`` is the breaker / build-failure sentinel — and
-        also "no active targets at all". Both mean skip: when we can't see
-        budgets, don't spend."""
-        gate = PayerBudgetGate()
-        assert gate.all_targets_blocked()
-
-        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
-        sb = _supabase_capturing_updates(rec)
-
-        await poller_mod._qualify_jobs(sb, _unique_rows(3), gate)
-
-        assert rec["tag_calls"] == 0
-        assert rec["writes"] == []
-
-    @pytest.mark.asyncio
-    async def test_no_gate_supplied_tags_as_before(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """``None`` means "no snapshot supplied" (direct callers, the backfill
-        sweep), NOT "blocked" — those paths keep their existing behaviour."""
-        rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
-        sb = _supabase_capturing_updates(rec)
-
-        await poller_mod._qualify_jobs(sb, [_row()], None)
-
-        assert rec["tag_calls"] == 1
-
-
-class TestAllTargetsBlockedPredicate:
-    """``PayerBudgetGate.all_targets_blocked`` — the cycle-wide question
-    ``target_blocked`` can't answer. Unit-level so the poller tests above
-    aren't the only thing pinning the semantics."""
-
-    def test_empty_snapshot_is_blocked(self) -> None:
-        assert PayerBudgetGate().all_targets_blocked() is True
-
-    def test_catalog_only_snapshot_is_blocked_when_catalog_grading_is_off(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(live_settings, "grade_catalog_targets", False)
-        gate = PayerBudgetGate(payer_by_target={"t1": None, "t2": None})
-        assert gate.all_targets_blocked() is True
-
-    def test_catalog_only_snapshot_is_unblocked_when_catalog_grading_is_on(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The operator opt-in must survive: turning catalog grading ON means
-        catalog targets DO consume tags."""
-        monkeypatch.setattr(live_settings, "grade_catalog_targets", True)
-        gate = PayerBudgetGate(payer_by_target={"t1": None, "t2": None})
-        assert gate.all_targets_blocked() is False
-
-    def test_idle_or_disabled_payers_also_count_as_blocked(self) -> None:
-        gate = PayerBudgetGate(
-            payer_by_target={"t1": "u-idle", "t2": "u-off"},
-            idle_users=frozenset({"u-idle"}),
-            disabled_users=frozenset({"u-off"}),
-        )
-        assert gate.all_targets_blocked() is True
-
-    def test_a_single_healthy_payer_unblocks_the_cycle(self) -> None:
-        gate = PayerBudgetGate(
-            payer_by_target={"t1": "u-idle", "t2": "u-ok"},
-            idle_users=frozenset({"u-idle"}),
-        )
-        assert gate.all_targets_blocked() is False
