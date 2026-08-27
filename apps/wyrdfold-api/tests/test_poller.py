@@ -1779,7 +1779,7 @@ async def test_targeted_poll_ingests_fail_open_when_payer_over_budget(monkeypatc
         supabase,
         target,
         payer_user_id="payer-1",
-        payer_over_budget=True,
+        payer_block_reason="over_allowance",
     )
 
     assert summary["error"] is None

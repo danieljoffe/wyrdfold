@@ -11,6 +11,7 @@ allowance / BYOK defers here, the per-target daily quota inside
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -19,7 +20,7 @@ import pytest
 
 from app.models.targets import CategoryProfile, JobTarget, ScoringProfile, SeniorityProfile
 from app.services import poller as poller_mod
-from app.services.targets.payers import PayerBudgetGate
+from app.services.targets.payers import BlockReason, PayerBudgetGate
 
 
 def _target(tid: str = "t-1") -> JobTarget:
@@ -37,14 +38,18 @@ def _target(tid: str = "t-1") -> JobTarget:
     )
 
 
+# Override ``user_block_reason``, NOT ``user_blocked``: the reason is now the
+# source of truth and ``user_blocked`` is a thin ``is not None`` shim over it.
+# Stubbing the shim would leave the real reason lookup underneath and the fake
+# would silently stop closing the gate.
 class _OpenGate(PayerBudgetGate):
-    def user_blocked(self, _uid: str | None) -> bool:  # type: ignore[override]
-        return False
+    def user_block_reason(self, _uid: str | None) -> BlockReason | None:  # type: ignore[override]
+        return None
 
 
 class _ClosedGate(PayerBudgetGate):
-    def user_blocked(self, _uid: str | None) -> bool:  # type: ignore[override]
-        return True
+    def user_block_reason(self, _uid: str | None) -> BlockReason | None:  # type: ignore[override]
+        return "over_allowance"
 
 
 def _wire(
@@ -280,3 +285,36 @@ async def test_backfill_projection_carries_every_tagger_input_column(
     # Precondition: the parse actually found a projection.
     assert "id" in selected
     assert selected >= TAG_INPUT_COLUMNS, TAG_INPUT_COLUMNS - selected
+
+
+class _IdleGate(PayerBudgetGate):
+    def user_block_reason(self, _uid: str | None) -> BlockReason | None:  # type: ignore[override]
+        return "idle"
+
+
+@pytest.mark.asyncio
+async def test_defer_log_names_the_real_cause_not_the_assumed_one(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The defer log must report WHICH cause fired.
+
+    It used to hardcode "over allowance" onto ``user_blocked``, which is also
+    true for idle and operator-disabled payers. Prod hit exactly that: an
+    account at 15% of its cap, deferred for being unseen past
+    ``idle_defer_days``, logged as over allowance — so the logs actively
+    misdirected anyone diagnosing why grading had stopped.
+    """
+    rec = _wire(monkeypatch, gate=_IdleGate(), stale_rows=_rows(3))
+    with caplog.at_level(logging.INFO, logger="app.services.poller"):
+        await poller_mod._backfill_grade_stale(MagicMock(), 25)
+
+    # Precondition: it really did defer (otherwise the assertions below are
+    # vacuous — no defer line means nothing to get wrong).
+    assert rec["selects"] == []
+    assert rec["phase2_calls"] == []
+
+    deferred = [r.getMessage() for r in caplog.records if "deferred" in r.getMessage()]
+    assert len(deferred) == 1, deferred
+    assert "idle" in deferred[0]
+    assert "allowance" not in deferred[0]
