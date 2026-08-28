@@ -537,7 +537,11 @@ async def _apply_board_us_verdicts(
     """Stamp ``jobs.is_us`` from the country the BOARD published, and archive
     the non-US rows when the operator asked for a US-only catalog.
 
-    Returns ``(marked, archived)`` for the cycle's funnel log.
+    Returns ``(marked, archived)`` for the cycle's funnel log — rows ACTUALLY
+    written, read back off each UPDATE's response, never the candidate count.
+    These counters are the only operational evidence for a mechanism that
+    archives irreversibly, so they have to report outcomes; a partial write
+    that reported its intent would look exactly like a clean one.
 
     WHY THIS EXISTS. Qualification tagging went lazy (2026-08-26): nothing
     tags at ingest, so a fresh listing carries ``is_us = NULL``, which the read
@@ -598,7 +602,21 @@ async def _apply_board_us_verdicts(
 
     async def _update(
         rows: list[dict[str, Any]], payload: dict[str, Any], *, unarchived: bool
-    ) -> None:
+    ) -> int:
+        """Write ``payload`` to ``rows``; return how many rows ACTUALLY changed.
+
+        Not ``len(rows)``. The archive write re-asserts ``archived_at IS NULL``,
+        so a row another task archived between the upsert snapshot and this
+        write matches nothing — counting the candidate would report an archive
+        that never happened. PostgREST answers an UPDATE with the rows it
+        changed (verified against the local stack: 3 ids in, one concurrently
+        archived, 2 rows back, and the untouched row keeps its original
+        timestamp), so ``.data`` is the outcome rather than the intent.
+
+        The same set drives the patch-back, for the same reason: a row the
+        WHERE clause skipped must not be told it was archived.
+        """
+        written = 0
         for start in range(0, len(rows), _BOARD_US_CHUNK):
             chunk = rows[start : start + _BOARD_US_CHUNK]
             ids = [r["id"] for r in chunk]
@@ -610,22 +628,31 @@ async def _apply_board_us_verdicts(
                 # timestamp moved.
                 return q.is_("archived_at", "null") if unarchived else q
 
-            await poll_db_write(supabase, _build, label="board country is_us")
+            resp = await poll_db_write(supabase, _build, label="board country is_us")
+            changed = {
+                r["id"]
+                for r in (getattr(resp, "data", None) or [])
+                if isinstance(r, dict) and r.get("id")
+            }
+            written += len(changed)
             for row in chunk:
-                row.update(payload)
+                if row["id"] in changed:
+                    row.update(payload)
+        return written
 
+    marked = archived = 0
     try:
         if to_us:
-            await _update(to_us, {"is_us": True}, unarchived=False)
+            marked += await _update(to_us, {"is_us": True}, unarchived=False)
         if to_non_us:
-            await _update(to_non_us, {"is_us": False}, unarchived=False)
+            marked += await _update(to_non_us, {"is_us": False}, unarchived=False)
         if to_archive:
-            await _update(
+            archived += await _update(
                 to_archive, {"archived_at": datetime.now(UTC).isoformat()}, unarchived=True
             )
     except Exception:
         logger.exception("Board-country is_us write failed; leaving the rows untagged")
-    return len(to_us) + len(to_non_us), len(to_archive)
+    return marked, archived
 
 
 def _dedupe_by_content(

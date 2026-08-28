@@ -25,6 +25,8 @@ these rows would surface as a failing precondition rather than a green test.
 
 from __future__ import annotations
 
+import logging
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -100,19 +102,28 @@ def _control_row() -> dict[str, Any]:
 
 
 class _UpdateCall:
-    """One recorded ``jobs.update(...)`` chain, WHOLE.
+    """One recorded ``jobs.update(...)`` chain, WHOLE — and it APPLIES the WHERE.
 
-    A bare ``MagicMock`` records ``update()`` args and ``in_()`` args on
-    separate mocks and drops the link between them — so an assertion built on
-    it cannot see the ``.is_("archived_at", "null")`` filter at all, and
-    deleting that filter passes every test. This records the chain as one
-    object so the WHERE clause is assertable.
+    Two things a bare ``MagicMock`` gets wrong here.
+
+    It records ``update()`` args and ``in_()`` args on separate mocks and drops
+    the link between them, so an assertion built on it cannot see the
+    ``.is_("archived_at", "null")`` filter at all and deleting that filter
+    passes every test. This records the chain as one object.
+
+    And it answers ``execute()`` with whatever you told it to, so a caller that
+    counts the rows PostgREST actually changed can be tested against a fake
+    that never changes anything. So this evaluates the recorded filters against
+    ``db`` — the row state the WHERE clause would see — and returns exactly the
+    rows it matched, which is what a real UPDATE returns (verified against the
+    local stack: 3 ids in, one concurrently archived, 2 rows back).
     """
 
-    def __init__(self, payload: dict[str, Any]) -> None:
+    def __init__(self, payload: dict[str, Any], db: dict[str, dict[str, Any]]) -> None:
         self.payload = payload
         self.ids: list[str] = []
         self.filters: list[tuple[str, Any]] = []
+        self._db = db
 
     def in_(self, column: str, values: list[str]) -> _UpdateCall:
         assert column == "id", column
@@ -123,15 +134,28 @@ class _UpdateCall:
         self.filters.append((column, value))
         return self
 
-    def execute(self) -> MagicMock:
-        return MagicMock(data=[])
+    def _matches(self, stored: dict[str, Any]) -> bool:
+        return all(
+            stored.get(column) is None if value == "null" else stored.get(column) == value
+            for column, value in self.filters
+        )
+
+    def execute(self) -> SimpleNamespace:
+        matched: list[dict[str, Any]] = []
+        for job_id in self.ids:
+            stored = self._db.setdefault(job_id, {"archived_at": None})
+            if not self._matches(stored):
+                continue
+            stored.update(self.payload)
+            matched.append({"id": job_id, **stored})
+        return SimpleNamespace(data=matched)
 
 
-def _record_updates(jobs_table: MagicMock) -> list[_UpdateCall]:
+def _record_updates(jobs_table: MagicMock, db: dict[str, dict[str, Any]]) -> list[_UpdateCall]:
     calls: list[_UpdateCall] = []
 
     def _update(payload: dict[str, Any]) -> _UpdateCall:
-        call = _UpdateCall(payload)
+        call = _UpdateCall(payload, db)
         calls.append(call)
         return call
 
@@ -146,6 +170,7 @@ async def _run_poll(
     upserted: list[dict[str, Any]],
     archive_non_us: bool = True,
     target_path: bool = False,
+    db: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[_UpdateCall], MagicMock, dict[str, Any]]:
     """Drive a real poll cycle through ONE of the two ingest paths.
 
@@ -164,7 +189,11 @@ async def _run_poll(
     else:
         supabase, jobs_table, _sources = _make_poll_supabase([])
     jobs_table.upsert.return_value.execute.return_value.data = upserted
-    updates = _record_updates(jobs_table)
+    # Default DB state agrees with the upsert snapshot; a test that wants the
+    # snapshot-vs-DB race passes an explicit ``db``.
+    if db is None:
+        db = {r["id"]: {"archived_at": r.get("archived_at")} for r in upserted}
+    updates = _record_updates(jobs_table, db)
 
     async def _fetch(_token: str) -> list[StandardJob]:
         return list(jobs)
@@ -362,6 +391,55 @@ async def test_the_archive_write_re_asserts_that_the_row_is_still_unarchived(
     assert archive[0].filters == [("archived_at", "null")]
     verdicts = [u for u in updates if "is_us" in u.payload]
     assert verdicts and all(u.filters == [] for u in verdicts), verdicts
+
+
+def _funnel_line(caplog: pytest.LogCaptureFixture) -> str:
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("poll_funnel ")]
+    assert lines, "precondition: the cycle emitted its funnel line"
+    return lines[0]
+
+
+async def test_the_counters_report_rows_written_not_rows_attempted(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A row archived by another task BETWEEN the upsert snapshot and this write
+    matches nothing, so it must not be counted as archived here.
+
+    The write is already correct — ``.is_("archived_at", "null")`` sees to that.
+    The counter is the thing at risk, and it is the only operational evidence
+    for a mechanism that archives irreversibly: reporting attempts while being
+    read as outcomes is how a partial write looks identical to a clean one.
+    """
+    row = _upserted_row()  # snapshot says live...
+    with caplog.at_level(logging.INFO, logger="app.services.poller"):
+        updates, _jobs_table, summary = await _run_poll(
+            monkeypatch,
+            [_board_job(country="DE")],
+            upserted=[row],
+            db={"j1": {"archived_at": "2026-01-02T00:00:00Z"}},  # ...the DB disagrees
+        )
+
+    # Preconditions: the row ingested, and the archive WAS attempted — otherwise
+    # "archived=0" would be true for the boring reason.
+    assert summary["new"] == 1
+    attempted = [u for u in updates if "archived_at" in u.payload]
+    assert len(attempted) == 1 and attempted[0].ids == ["j1"], updates
+
+    assert "board_us_marked=1 board_us_archived=0" in _funnel_line(caplog)
+    # ...and the row dict the grader reads is not told it was archived either.
+    assert row["archived_at"] is None
+    assert row["is_us"] is False  # the unfiltered verdict write DID land
+
+
+async def test_the_counters_report_the_write_that_did_land(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control for the test above: with no concurrent archive, both counters
+    report 1. Without it, a counter hard-wired to zero would pass."""
+    with caplog.at_level(logging.INFO, logger="app.services.poller"):
+        await _run_poll(monkeypatch, [_board_job(country="DE")], upserted=[_upserted_row()])
+
+    assert "board_us_marked=1 board_us_archived=1" in _funnel_line(caplog)
 
 
 async def test_the_target_activation_path_prunes_too(
