@@ -1395,7 +1395,10 @@ async def _poll_one_source(
                     # stays empty and ``_any_target_admits`` falls back to the
                     # deterministic free gates that already passed.
                     reason = gate.target_block_reason(active_target.id)
-                    if not block_is_persistent(reason):
+                    admits = settings.persistent_block_admits_ingestion and block_is_persistent(
+                        reason
+                    )
+                    if not admits:
                         phase1_verdicts[active_target.id] = {}
                         phase1_attempted[active_target.id] = set()  # → all defer
                     logger.info(
@@ -1403,9 +1406,7 @@ async def _poll_one_source(
                         active_target.id,
                         gate.payer_for(active_target.id),
                         reason,
-                        "not vetoing ingestion"
-                        if block_is_persistent(reason)
-                        else "deferring, will re-triage",
+                        "not vetoing ingestion" if admits else "deferring, will re-triage",
                     )
                     continue
                 # BYOK (#5 P3): grade on the payer's own key. No key in

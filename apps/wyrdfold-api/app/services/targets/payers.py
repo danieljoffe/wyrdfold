@@ -43,22 +43,32 @@ BlockReason = Literal[
     "no_budget_snapshot",  # empty gate: breaker / build failure, fail-closed
 ]
 
-# Which of those clear on their own, and which do not.
+# Which of these clear on their own, and which do not.
 #
-# TRANSIENT: the payer's rolling 30-day window frees up without anyone doing
-# anything, so "skip it now, retry next cycle" is a real plan.
+# TRANSIENT — the block lifts without anyone doing anything, so "skip it now,
+# retry next cycle" is a real plan and a pipeline step may safely DROP work
+# while it waits:
+#   * ``over_allowance`` — the payer's rolling 30-day window frees up.
+#   * ``no_budget_snapshot`` — an infrastructure failure, NOT a business state.
+#     The gate is rebuilt from scratch every cycle, so the next one very likely
+#     succeeds. Classifying it as persistent (an earlier draft of this did)
+#     would make INGESTION fail OPEN precisely while the budget-control plane
+#     is unhealthy, quietly contradicting the fail-closed doctrine the empty
+#     ``PayerBudgetGate()`` sentinel exists to enforce ("when we can't see
+#     budgets, don't spend"). If the snapshot fails cycle after cycle that is a
+#     real outage and should surface as one — via the ingestion-health alert —
+#     not be absorbed by opening admission.
 #
-# PERSISTENT: nothing in the poll cycle will change these. An idle payer stays
+# PERSISTENT — nothing in the poll cycle changes these. An idle payer stays
 # idle until they sign in; a catalog target stays unsponsored until an operator
 # flips ``grade_catalog_targets``; a disabled account stays disabled. "Retry
-# next cycle" is not a plan for these — it is an infinite loop, and any pipeline
-# step that DROPS work while waiting for the block to lift drops it forever.
-#
-# The empty sentinel counts as persistent: we could not read budgets at all, so
-# we cannot claim the block is about to clear.
-TRANSIENT_BLOCK_REASONS: frozenset[str] = frozenset({"over_allowance"})
+# next cycle" is not a plan here, it is an infinite loop — and a step that drops
+# work while waiting drops it forever (prod: 50h of zero ingestion).
+TRANSIENT_BLOCK_REASONS: frozenset[str] = frozenset(
+    {"over_allowance", "no_budget_snapshot"}
+)
 PERSISTENT_BLOCK_REASONS: frozenset[str] = frozenset(
-    {"idle", "llm_disabled", "catalog_ungraded", "no_budget_snapshot"}
+    {"idle", "llm_disabled", "catalog_ungraded"}
 )
 
 

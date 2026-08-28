@@ -2232,7 +2232,9 @@ def test_poll_sources_for_target_aborts_when_deactivated_mid_fanout(
 # ---------------------------------------------------------------------------
 
 
-async def _run_poll_with_blocked_gate(monkeypatch, *, reason: str) -> tuple[dict, MagicMock]:
+async def _run_poll_with_blocked_gate(
+    monkeypatch, *, reason: str, admits: bool = True
+) -> tuple[dict, MagicMock]:
     """Drive ``_poll_one_source`` with every active target blocked for
     ``reason``. Returns the poll summary and the fake ``jobs`` table, so a test
     can assert whether the NEW listing was upserted or discarded."""
@@ -2240,6 +2242,7 @@ async def _run_poll_with_blocked_gate(monkeypatch, *, reason: str) -> tuple[dict
     from app.services import poller as poller_mod
 
     monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "persistent_block_admits_ingestion", admits)
     supabase, _jobs, _sources = _make_poll_supabase([])
 
     async def one_new_job(_token: str) -> list[StandardJob]:
@@ -2307,6 +2310,36 @@ async def test_transient_block_still_defers_the_listing(monkeypatch) -> None:
     jobs_table.upsert.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_budget_snapshot_failure_still_defers(monkeypatch) -> None:
+    """``no_budget_snapshot`` is the empty fail-closed sentinel — an
+    INFRASTRUCTURE failure, not a business state. The gate is rebuilt every
+    cycle so the next one likely succeeds, and treating it as persistent would
+    open ingestion exactly while the budget-control plane is unhealthy,
+    contradicting the doctrine that sentinel exists to enforce. A sustained
+    failure should surface as an outage via the ingestion-health alert."""
+    summary, jobs_table = await _run_poll_with_blocked_gate(
+        monkeypatch, reason="no_budget_snapshot"
+    )
+
+    assert summary["error"] is None
+    jobs_table.upsert.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_persistent_block_still_vetoes_while_the_flag_is_off(monkeypatch) -> None:
+    """Ships dark. Flipping the flag roughly DOUBLES the live catalog on the
+    first pass (~14,800 unadmitted free-gate survivors measured in prod), so it
+    is an operator decision taken after the admission ramp lands — not
+    something a deploy does on its own."""
+    summary, jobs_table = await _run_poll_with_blocked_gate(
+        monkeypatch, reason="idle", admits=False
+    )
+
+    assert summary["error"] is None
+    jobs_table.upsert.assert_not_called()
+
+
 def test_block_persistence_classification() -> None:
     from app.services.targets.payers import (
         PERSISTENT_BLOCK_REASONS,
@@ -2317,9 +2350,11 @@ def test_block_persistence_classification() -> None:
     assert block_is_persistent("idle")
     assert block_is_persistent("catalog_ungraded")
     assert block_is_persistent("llm_disabled")
-    # We could not read budgets at all, so we cannot claim the block will clear.
-    assert block_is_persistent("no_budget_snapshot")
-    # The only self-clearing one.
+    # An infra failure, NOT a business state: the gate is rebuilt every cycle,
+    # so the next one likely succeeds. Treating it as persistent would open
+    # ingestion exactly while the budget-control plane is unhealthy, against
+    # the fail-closed doctrine the empty-gate sentinel enforces.
+    assert not block_is_persistent("no_budget_snapshot")
     assert not block_is_persistent("over_allowance")
     # Not blocked at all is not "persistent".
     assert not block_is_persistent(None)
