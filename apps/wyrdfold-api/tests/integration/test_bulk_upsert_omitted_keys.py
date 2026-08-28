@@ -115,6 +115,43 @@ def test_raw_bulk_upsert_blanks_a_key_a_sibling_supplies(
     )
 
 
+def test_raw_bulk_upsert_rejects_a_duplicate_conflict_key(
+    service_client: Client, source_id: str
+) -> None:
+    """The behaviour ``poll_db_upsert``'s uniqueness guard exists to PRESERVE.
+
+    Two rows sharing ``(source_id, external_id)`` in one statement are a
+    cardinality error. Grouping would split them across statements when their
+    key-sets differ, and both would then succeed — so the guard has to reproduce
+    this failure itself. Pinning it here proves the guard isn't inventing a
+    restriction Postgres doesn't have."""
+    with pytest.raises(Exception) as exc:
+        service_client.table("jobs").upsert(
+            [_row(source_id, "dup", is_remote=True), _row(source_id, "dup")],
+            on_conflict=ON_CONFLICT,
+        ).execute()
+    assert "second time" in str(exc.value).lower(), str(exc.value)
+
+
+async def test_grouped_upsert_rejects_a_duplicate_conflict_key(
+    service_client: Client, source_id: str, _sync_only: None
+) -> None:
+    """End to end against the live stack: the helper raises before writing, so
+    the split can't turn that cardinality error into last-write-wins."""
+    rows = [
+        _row(source_id, "dup", is_remote=True),
+        _row(source_id, "dup"),  # same conflict key, different key-set
+    ]
+    assert len({frozenset(r) for r in rows}) == 2  # PRECONDITION: would split
+
+    with pytest.raises(ValueError, match="duplicate"):
+        await poll_db_upsert(
+            service_client, table="jobs", rows=rows, on_conflict=ON_CONFLICT, label="t"
+        )
+    # And nothing landed — the guard runs before the first statement.
+    assert _stored(service_client, source_id) == {}
+
+
 @pytest.mark.parametrize("silent_first", [True, False])
 async def test_grouped_upsert_leaves_an_omitted_is_remote_alone(
     service_client: Client, source_id: str, _sync_only: None, silent_first: bool

@@ -124,15 +124,23 @@ async def poll_db_upsert(
     the number of optional keys (2**k, k tiny: a board either publishes a field
     or it doesn't), so in practice this is one or two round trips, not N.
 
-    ONE behaviour this does change, deliberately noted: two rows sharing a
-    conflict key but NOT a key-set land in different statements, where a single
-    payload would have raised Postgres' "cannot affect row a second time". They
-    now both apply, last group wins. Partitioning can only hide such a pair,
-    never create one. For the poller it would take a board listing one
-    ``external_id`` twice with differing metadata; ``_poll_one_source``
-    additionally collapses same-(company, title) rows through
-    ``_dedupe_by_content`` before the write, though the per-target path does
-    not.
+    GUARDED, because splitting would otherwise LOSE a failure. Two rows sharing
+    a conflict key raise Postgres' "cannot affect row a second time" when they
+    are in one statement — but if their key-sets differ, grouping puts them in
+    DIFFERENT statements, both succeed, and whichever group runs later silently
+    wins. That would make this helper strictly LESS fail-fast than the plain
+    bulk upsert it replaces, in exactly the heterogeneous case it exists for. So
+    the uniqueness invariant is enforced here, before splitting and regardless
+    of how the key-sets fall, and a duplicate raises ``ValueError``.
+
+    Nothing upstream guarantees it. The poller's ``_dedupe_by_content`` is a
+    CONTENT dedupe, not a conflict-key dedupe: it keys on
+    ``_content_dedupe_key(company_name, title)``, so a source returning two
+    postings that share an ``external_id`` under DIFFERENT titles yields two
+    distinct dedupe keys, both rows survive, and the duplicate conflict key
+    reaches the write. The per-target path does not dedupe at all. Neither path
+    is protected — hence the guard lives in the helper, so every caller
+    inherits it rather than each having to know.
 
     Returns the ``RETURNING`` rows across the groups — the same ``resp.data``
     the callers iterate — RE-SORTED into the caller's input order, keyed on the
@@ -155,6 +163,35 @@ async def poll_db_upsert(
     """
     if not rows:
         return []
+    key_cols = tuple(c.strip() for c in on_conflict.split(",") if c.strip())
+
+    def _conflict_key(row: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(row.get(c) for c in key_cols)
+
+    # Enforce conflict-key uniqueness BEFORE splitting, so the failure mode is
+    # the same whichever way the key-sets happen to partition. Rows missing a
+    # conflict column are skipped: they can't match the conflict target on a
+    # value visible here, so Postgres would INSERT both rather than error, and
+    # flagging them would be a false positive.
+    #
+    # The message names the columns but NOT their values: this helper is
+    # generic, a conflict key elsewhere could be an email or a user id, and an
+    # exception string ends up in the platform log (the #885 lesson). The
+    # caller's ``label`` already identifies the batch.
+    seen: set[tuple[Any, ...]] = set()
+    for row in rows:
+        if not all(c in row for c in key_cols):
+            continue
+        key = _conflict_key(row)
+        if key in seen:
+            raise ValueError(
+                f"poll_db_upsert: duplicate ({on_conflict}) key within one batch "
+                f"for table {table!r} [{label}]. A single statement would raise "
+                "a cardinality error; split across key-set groups it would "
+                "silently last-write-wins. Deduplicate before calling."
+            )
+        seen.add(key)
+
     groups: dict[frozenset[str], list[dict[str, Any]]] = {}
     for row in rows:
         groups.setdefault(frozenset(row), []).append(row)
@@ -169,11 +206,6 @@ async def poll_db_upsert(
         upserted.extend(cast(list[dict[str, Any]], resp.data or []))
 
     if len(groups) > 1:
-        key_cols = tuple(c.strip() for c in on_conflict.split(",") if c.strip())
-
-        def _conflict_key(row: dict[str, Any]) -> tuple[Any, ...]:
-            return tuple(row.get(c) for c in key_cols)
-
         position = {_conflict_key(r): i for i, r in enumerate(rows)}
         unmatched = len(rows)
         # Stable, so anything unkeyable keeps its relative order at the end.
