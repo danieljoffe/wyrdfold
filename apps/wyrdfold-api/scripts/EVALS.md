@@ -73,6 +73,50 @@ Run this when you change a scoring prompt/model and want the true
 quality delta — attach the before/after summary to the PR (see
 `CONTRIBUTING.md` → "Touching prompts or scoring code").
 
+## Phase-1 model bake-off on the UNADMITTED stack — committed corpus, on-demand
+
+`eval_phase1_triage.py` grades whatever fixture you point it at. For a *model
+swap* decision the fixture matters more than the harness, and the obvious one is
+wrong: `jobs` holds only postings that already cleared admission, so a corpus
+drawn from it flatters every model. The postings Phase 1 actually has to judge —
+the ones it drops — were never persisted.
+
+`build_phase1_unadmitted_corpus.py` rebuilds that stack: re-fetch live ATS
+boards, subtract what `jobs` already holds, and run the survivors through the
+poller's own `_passes_free_gates` (imported, not restated). ~3 survivors per
+source-poll, so the fleet carries a five-figure un-triaged backlog.
+
+```bash
+cd apps/wyrdfold-api
+railway run -- uv run python -m scripts.build_phase1_unadmitted_corpus --dry-run
+railway run -- uv run python -m scripts.build_phase1_unadmitted_corpus \
+    --output tests/fixtures/phase1_unadmitted_corpus.json
+# ~$1 for 8 models over ~960 (target, title) pairs
+railway run -- uv run python scripts/eval_phase1_triage.py \
+    --fixture tests/fixtures/phase1_unadmitted_corpus.json \
+    --reference sonnet-4.6 --batch-size 150 --temperature 0 --min-confidence 40
+```
+
+Three things to know before reading the output:
+
+- **FN is the metric.** A false negative is a posting dropped at ingestion — it
+  never enters the catalog and is never re-triaged. A false positive costs one
+  Phase-2 grade. Never rank on headline agreement.
+- **`--min-confidence 40` matters.** Production admits on `promising AND
+  confidence >= PHASE1_MIN_CONFIDENCE`, not on `promising`. A model that hedges
+  its promising calls low drops postings a raw-verdict eval scores as catches.
+  The flag replays the same responses under the real rule — no extra spend.
+- **`--temperature 0` matters.** Production's `complete_json` sends 0.0. The flag
+  defaults to unset (provider picks, ~1.0) only so older runs stay comparable.
+
+Run it under `railway run`: the key lives in Railway and in the API's
+`.env.local`, and a **git worktree has neither** — `_openrouter.get_api_key`
+then falls through to `~/.zshrc` and every call 401s (cost $0, coverage 0%,
+which reads exactly like eight models failing at once).
+
+Fixture-shape guards + the report-math tests are free in CI
+(`tests/test_eval_phase1_unadmitted_corpus.py`).
+
 ## Qualification-tagger correctness — committed golden (part CI, part on-demand)
 
 `eval_qualification_correctness.py` (#193) scores the L2 qualification tagger's
@@ -150,3 +194,11 @@ Never paste keys into chat, commits, or `eval_results/`. Use env vars (or
 `~/.zshrc`, which `scripts/_openrouter.py` reads as a fallback). `eval_results/`
 and the snapshot fixture are gitignored; the snapshot is real PII — delete it
 after a tier-3 run.
+
+That default is right for raw run output, which can carry résumé/job text. A
+write-up that informs a **decision** is worth keeping in the repo, so it is
+committed with `git add -f <path>` after reading it for PII — the directory stays
+ignored, so it is one deliberate file at a time, never a blanket un-ignore. The
+same PII bar applies to committed fixtures: `phase1_unadmitted_corpus.json` holds
+public job-board titles and target labels only, and drops `targets.description`
+(second-person prose naming employers, #868) — this repo is public.
