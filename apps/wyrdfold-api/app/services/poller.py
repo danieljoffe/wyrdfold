@@ -66,7 +66,12 @@ from app.services.target_scoring import (
     score_title_and_upsert as target_title_score_and_upsert,
 )
 from app.services.targets import crud
-from app.services.targets.payers import PayerBudgetGate, build_budget_gate
+from app.services.targets.payers import (
+    BlockReason,
+    PayerBudgetGate,
+    block_is_persistent,
+    build_budget_gate,
+)
 from app.services.titles import clean_title_display
 from app.services.validate import liveness_verdict, validate_job_url
 from app.services.workday import KnownPosting, fetch_workday_jobs
@@ -804,15 +809,33 @@ async def _resolve_user_targets_for_stage3(
     return primary_by_user, user_optimized
 
 
-# Rotating cursor for the liveness sweep below (in-process, like
-# ``_LIFECYCLE_LAST_RUN``; a restart simply re-starts the walk at the oldest
-# row). Under LAZY tagging "untagged" is the NORMAL state, so the sweep's
+# Rotating KEYSET cursor for the liveness sweep below — the last
+# ``(cataloged_at, id)`` pair it handed out, or None to (re)start at the oldest.
+#
+# Under LAZY tagging "untagged" is the NORMAL state, so the sweep's
 # ``role_family IS NULL`` selection no longer shrinks as it runs the way it did
 # when the sweep itself filled ``role_family`` — ordered oldest-first with a
 # plain LIMIT it would re-check the SAME oldest batch every cycle forever and
-# never reach the row after it. The offset walks one batch per cycle and wraps
-# at the end.
-_QUALIFY_BACKFILL_OFFSET = 0
+# never reach the row after it. So it has to walk.
+#
+# It walks by KEYSET, not OFFSET. An offset over this predicate silently SKIPS
+# rows: the set is unstable (a row leaves it the moment this sweep archives it),
+# so when earlier rows drop out the later ones shift backward underneath a
+# cursor that only moves forward, and whatever slid past the offset is never
+# checked. ``(cataloged_at, id)`` is a total order — ``cataloged_at`` is NOT
+# NULL across the table — so "everything after this pair" is exact regardless of
+# what left the set in between.
+#
+# STILL IN-PROCESS, deliberately: a restart re-starts the walk at the oldest
+# row. That costs coverage of the tail on a deploy-heavy day, but it is a
+# fairness question, not a correctness one, and the check it repeats is a bounded
+# HTTP validate — no LLM spend. ``url_health`` is the mechanism that solves this
+# properly, with a real persisted cursor column (``last_url_check_at``) and a
+# consecutive-failure threshold; consolidating onto it is the follow-up if tail
+# coverage ever proves inadequate. It cannot simply replace this sweep today:
+# at ``url_health_batch_size`` 250/24h it needs ~7 weeks for one pass of the
+# live corpus, where this sweep covers a batch every cycle.
+_QUALIFY_BACKFILL_CURSOR: tuple[str, str] | None = None
 
 
 async def _backfill_qualify_stale(supabase: AsyncClient, limit: int) -> None:
@@ -840,30 +863,46 @@ async def _backfill_qualify_stale(supabase: AsyncClient, limit: int) -> None:
       and re-checked on a later rotation — archival is sticky, so it needs the
       hard 4xx signal.
     """
-    global _QUALIFY_BACKFILL_OFFSET
+    global _QUALIFY_BACKFILL_CURSOR
     if limit <= 0:
         return
-    offset = _QUALIFY_BACKFILL_OFFSET
+    cursor = _QUALIFY_BACKFILL_CURSOR
+
+    def _select(c: Any) -> Any:
+        q = (
+            c.table("jobs")
+            .select("id, absolute_url, cataloged_at")
+            .is_("role_family", "null")
+            .is_("archived_at", "null")
+        )
+        if cursor is not None:
+            seen_at, seen_id = cursor
+            # (cataloged_at, id) > (seen_at, seen_id). Values are quoted because
+            # a timestamptz carries '+' and ':' which PostgREST would otherwise
+            # read as filter syntax.
+            q = q.or_(
+                f'cataloged_at.gt."{seen_at}",'
+                f'and(cataloged_at.eq."{seen_at}",id.gt."{seen_id}")'
+            )
+        return q.order("cataloged_at", desc=False).order("id", desc=False).limit(limit)
+
     try:
         resp = await poll_db_read(
-            supabase,
-            lambda c: (
-                c.table("jobs")
-                .select("id, absolute_url")
-                .is_("role_family", "null")
-                .is_("archived_at", "null")
-                .order("cataloged_at", desc=False)
-                .range(offset, offset + limit - 1)
-            ),
-            label="poll qualify-backfill select",
+            supabase, _select, label="poll qualify-backfill select"
         )
     except Exception:
         logger.exception("Qualification backfill: select failed; skipping this cycle")
         return
     rows = cast(list[dict[str, Any]], resp.data or [])
-    # Advance the walk; a short (or empty) page means we reached the end of the
-    # untagged set, so wrap back to the oldest.
-    _QUALIFY_BACKFILL_OFFSET = offset + len(rows) if len(rows) == limit else 0
+    # Advance to the last pair handed out. A short (or empty) page means we
+    # reached the end of the untagged set, so wrap back to the oldest.
+    if len(rows) == limit and rows[-1].get("cataloged_at") and rows[-1].get("id"):
+        _QUALIFY_BACKFILL_CURSOR = (
+            str(rows[-1]["cataloged_at"]),
+            str(rows[-1]["id"]),
+        )
+    else:
+        _QUALIFY_BACKFILL_CURSOR = None
     if not rows:
         return
 
@@ -992,11 +1031,13 @@ async def _backfill_grade_stale(supabase: AsyncClient, limit: int) -> None:
 
     payer_clients: dict[str | None, LLMClient | None] = {}
     for uid, target in primary_by_user.items():
-        if gate.user_blocked(uid):
+        backfill_reason = gate.user_block_reason(uid)
+        if backfill_reason is not None:
             logger.info(
-                "Grade backfill deferred for user %s / target %s (over allowance)",
+                "Grade backfill deferred for user %s / target %s (%s)",
                 uid,
                 target.id,
+                backfill_reason,
             )
             continue
         llm = await _resolve_payer_client(payer_clients, _async_service_client(), uid)
@@ -1353,23 +1394,53 @@ async def _poll_one_source(
                     # idle / disabled, or (default) a CATALOG-ONLY target
                     # nobody is pursuing — see ``grade_catalog_targets``.
                     #
-                    # Empty verdicts + empty ``attempted`` means every
-                    # title takes the NOT-attempted arm of
-                    # ``_phase1_promising`` → ``None`` = DEFER: excluded
-                    # from scores now, re-triaged when the block lifts.
-                    # (This comment previously claimed "fail-open admit,
-                    # jobs still ingest as promising" — that was the
-                    # pre-#285 blanket fail-open and is no longer true.)
-                    # The JOB row itself is unaffected either way: it is
-                    # already ingested before scoring, and public /search
-                    # reads ``jobs`` without consulting ``scores``.
-                    phase1_verdicts[active_target.id] = {}
-                    phase1_attempted[active_target.id] = set()  # nothing triaged → all defer
+                    # A blocked target casts no verdict. Whether it still gets
+                    # a VOTE at the admission gate depends on whether the block
+                    # can clear on its own.
+                    #
+                    # TRANSIENT (over allowance): registering empty verdicts +
+                    # empty ``attempted`` makes every title take the
+                    # NOT-attempted arm of ``_phase1_promising`` → DEFER:
+                    # excluded from scores now, re-triaged next cycle when the
+                    # rolling window frees up. That is #285's rule and it is
+                    # correct here, because "next cycle" genuinely arrives.
+                    #
+                    # PERSISTENT (idle / catalog-ungraded / disabled / no
+                    # snapshot): "next cycle" never arrives, so registering the
+                    # target would let it veto ingestion FOREVER. And it does
+                    # veto ingestion — the comment that used to sit here
+                    # claimed "the JOB row itself is unaffected... already
+                    # ingested before scoring", which is false:
+                    # ``_any_target_admits`` runs AT the upsert gate, before
+                    # the row is written. Prod proved it — one idle account put
+                    # every active target into a persistent block and new-job
+                    # ingestion stopped dead for 50 hours (~287 free-gate
+                    # survivors discarded per log window, `new=0` every cycle)
+                    # while `updated=N` kept flowing, because known rows bypass
+                    # the gate. This is the ingestion-starvation class
+                    # ``payers.target_blocked``'s HISTORY note exists to
+                    # prevent, reached by a path that note does not cover:
+                    # the gate suppresses only LLM work, but ADMISSION DEPENDS
+                    # ON AN LLM VERDICT, so suppressing the LLM suppressed
+                    # admission anyway.
+                    #
+                    # So a persistently-blocked target simply does not
+                    # participate. If it was the only one, ``phase1_verdicts``
+                    # stays empty and ``_any_target_admits`` falls back to the
+                    # deterministic free gates that already passed.
+                    reason = gate.target_block_reason(active_target.id)
+                    admits = settings.persistent_block_admits_ingestion and block_is_persistent(
+                        reason
+                    )
+                    if not admits:
+                        phase1_verdicts[active_target.id] = {}
+                        phase1_attempted[active_target.id] = set()  # → all defer
                     logger.info(
-                        "Phase 1 deferred for target %s (payer %s blocked: "
-                        "over allowance / idle / disabled)",
+                        "Phase 1 deferred for target %s (payer %s blocked: %s; %s)",
                         active_target.id,
                         gate.payer_for(active_target.id),
+                        reason,
+                        "not vetoing ingestion" if admits else "deferring, will re-triage",
                     )
                     continue
                 # BYOK (#5 P3): grade on the payer's own key. No key in
@@ -1823,14 +1894,17 @@ async def _poll_one_source(
                 # placeholder until graded).
                 cycle_rows = [cast(dict[str, Any], r) for r in upsert_resp.data or []]
                 for uid, p2_target in primary_by_user.items():
-                    if gate.user_blocked(uid):
-                        # Over monthly allowance — defer. Jobs keep
-                        # promising=True/score=NULL and get graded when
-                        # the rolling window frees up.
+                    p2_reason = gate.user_block_reason(uid)
+                    if p2_reason is not None:
+                        # Defer. Jobs keep promising=True/score=NULL and get
+                        # graded once the payer unblocks — which is NOT always
+                        # a budget window: an idle or operator-disabled payer
+                        # lands here too, so the reason is logged, not assumed.
                         logger.info(
-                            "Phase 2 deferred for user %s / target %s (over monthly allowance)",
+                            "Phase 2 deferred for user %s / target %s (%s)",
                             uid,
                             p2_target.id,
+                            p2_reason,
                         )
                         continue
                     # BYOK (#5 P3): grade on this user's own key; no key in
@@ -2774,14 +2848,17 @@ async def _poll_one_source_for_target(
     supabase: AsyncClient,
     target: JobTarget,
     payer_user_id: str | None = None,
-    payer_over_budget: bool = False,
+    payer_block_reason: BlockReason | None = None,
 ) -> dict[str, Any]:
     """Poll a single source for a specific target. Three-stage pipeline.
 
     ``payer_user_id`` is the user charged for this target's LLM work
-    (the activator); ``payer_over_budget`` skips Phase 1 spend while
-    still ingesting fail-open — both resolved once by
-    ``poll_sources_for_target``.
+    (the activator); ``payer_block_reason`` is WHY that payer's LLM work is
+    skipped this cycle (``None`` = not skipped) and suppresses Phase 1 spend
+    while still ingesting fail-open — both resolved once by
+    ``poll_sources_for_target``. It carries the reason rather than a bare
+    bool so the defer log can name it: this path is reached by an idle or
+    operator-disabled payer too, not only one over allowance.
 
     (The ``budget_gate`` snapshot this used to take was only ever read by the
     ingest-time qualification tagger, which is gone: tagging happens at grade
@@ -2911,7 +2988,7 @@ async def _poll_one_source_for_target(
         # leave verdicts empty → fail-open ingest, grade on a later cycle.
         llm = (
             await _resolve_payer_client(payer_clients, _async_service_client(), payer_user_id)
-            if settings.phase1_triage_enabled and triage_candidates and not payer_over_budget
+            if settings.phase1_triage_enabled and triage_candidates and payer_block_reason is None
             else None
         )
         if llm is not None:
@@ -3215,11 +3292,12 @@ async def _poll_one_source_for_target(
             primary_by_user, user_optimized = await _resolve_user_targets_for_stage3(
                 supabase, [target], company_name
             )
-            if primary_by_user and payer_over_budget:
+            if primary_by_user and payer_block_reason is not None:
                 logger.info(
-                    "Stage 3 deferred for target %s (payer %s over monthly allowance)",
+                    "Stage 3 deferred for target %s (payer %s blocked: %s)",
                     target.id,
                     payer_user_id,
+                    payer_block_reason,
                 )
             elif settings.phase2_enabled and primary_by_user:
                 # ---- Phase 2: LLM job-fit grading (#6) ----
@@ -3346,13 +3424,15 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
         )
         gate = PayerBudgetGate()
     payer = gate.payer_for(target.id)
-    over = gate.target_blocked(target.id)
+    block_reason = gate.target_block_reason(target.id)
+    over = block_reason is not None
     if over:
         logger.info(
             "poll_sources_for_target: Phase 1 deferred for target %s "
-            "(payer %s blocked: over allowance / idle / disabled)",
+            "(payer %s blocked: %s)",
             target.id,
             payer,
+            block_reason,
         )
 
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
@@ -3408,7 +3488,7 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
                 supabase,
                 target,
                 payer_user_id=payer,
-                payer_over_budget=over,
+                payer_block_reason=block_reason,
             )
 
     try:

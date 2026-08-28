@@ -116,48 +116,73 @@ async def test_no_active_user_links_means_no_stage3_grading() -> None:
     assert user_optimized == {}
 
 
-class TestAllTargetsBlockedPredicate:
-    """``PayerBudgetGate.all_targets_blocked`` — the cycle-wide question
-    ``target_blocked`` can't answer.
+class TestBlockReasonNamesTheRealCause:
+    """``user_block_reason`` / ``target_block_reason`` — WHY work was skipped.
 
-    Moved here when qualification tagging went LAZY: its one caller was the
-    ingest-time tagger's no-consumer skip, and grade-time tagging cannot reach
-    the "no consumer anywhere" state (a specific unblocked payer/target is a
-    precondition of being called). The predicate itself stays — it is the
-    documented boundary against the 2026-07-30 regression above, and these
-    tests keep its semantics pinned.
+    These exist because the defer logs used to hardcode "over monthly
+    allowance" onto a predicate that is also true for idle and
+    operator-disabled payers. Observed in prod: an account at 15% of its cap,
+    deferred purely for being unseen past ``idle_defer_days``, reported as out
+    of budget — sending the reader hunting for a spend problem that did not
+    exist.
     """
 
-    def test_empty_snapshot_is_blocked(self) -> None:
-        assert PayerBudgetGate().all_targets_blocked() is True
+    def test_each_cause_reports_itself(self) -> None:
+        assert _gate(over_budget_users=frozenset({"u"})).user_block_reason("u") == (
+            "over_allowance"
+        )
+        assert _gate(idle_users=frozenset({"u"})).user_block_reason("u") == "idle"
+        assert _gate(disabled_users=frozenset({"u"})).user_block_reason("u") == "llm_disabled"
 
-    def test_catalog_only_snapshot_is_blocked_when_catalog_grading_is_off(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_healthy_payer_has_no_reason(self) -> None:
+        # Control: without this the predicates could report a cause always.
+        gate = _gate(payer_by_target={"t": "u"})
+        assert gate.user_block_reason("u") is None
+        assert gate.target_block_reason("t") is None
+        assert gate.user_blocked("u") is False
+
+    def test_precedence_matches_the_builder_short_circuits(self) -> None:
+        """``build_budget_gate`` skips the idle check for a disabled payer and
+        the spend query for an idle one, so the sets are disjoint by
+        construction. If that ever changes, the reported cause must still be
+        the one the builder would have decided on."""
+        gate = _gate(
+            over_budget_users=frozenset({"u"}),
+            idle_users=frozenset({"u"}),
+            disabled_users=frozenset({"u"}),
+        )
+        assert gate.user_block_reason("u") == "llm_disabled"
+        assert _gate(
+            over_budget_users=frozenset({"u"}), idle_users=frozenset({"u"})
+        ).user_block_reason("u") == "idle"
+
+    def test_target_level_causes(self, monkeypatch) -> None:
         monkeypatch.setattr(live_settings, "grade_catalog_targets", False)
-        gate = PayerBudgetGate(payer_by_target={"t1": None, "t2": None})
-        assert gate.all_targets_blocked() is True
+        assert _gate(payer_by_target={"t": None}).target_block_reason("t") == "catalog_ungraded"
+        # The empty sentinel the breaker / build-failure path constructs.
+        assert _gate().target_block_reason("t") == "no_budget_snapshot"
+        # Activated after the snapshot — unchanged fail-open, so no cause.
+        assert _gate(payer_by_target={"other": "u"}).target_block_reason("t") is None
 
-    def test_catalog_only_snapshot_is_unblocked_when_catalog_grading_is_on(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The operator opt-in must survive: turning catalog grading ON means
-        catalog targets DO consume tags."""
+    def test_catalog_cause_clears_when_catalog_grading_is_on(self, monkeypatch) -> None:
         monkeypatch.setattr(live_settings, "grade_catalog_targets", True)
-        gate = PayerBudgetGate(payer_by_target={"t1": None, "t2": None})
-        assert gate.all_targets_blocked() is False
+        assert _gate(payer_by_target={"t": None}).target_block_reason("t") is None
 
-    def test_idle_or_disabled_payers_also_count_as_blocked(self) -> None:
-        gate = PayerBudgetGate(
-            payer_by_target={"t1": "u-idle", "t2": "u-off"},
-            idle_users=frozenset({"u-idle"}),
-            disabled_users=frozenset({"u-off"}),
-        )
-        assert gate.all_targets_blocked() is True
-
-    def test_a_single_healthy_payer_unblocks_the_cycle(self) -> None:
-        gate = PayerBudgetGate(
-            payer_by_target={"t1": "u-idle", "t2": "u-ok"},
-            idle_users=frozenset({"u-idle"}),
-        )
-        assert gate.all_targets_blocked() is False
+    @pytest.mark.parametrize(
+        "kw",
+        [
+            {},
+            {"over_budget_users": frozenset({"u"})},
+            {"idle_users": frozenset({"u"})},
+            {"disabled_users": frozenset({"u"})},
+            {"over_budget_users": frozenset({"u"}), "idle_users": frozenset({"u"})},
+        ],
+    )
+    def test_reason_and_boolean_can_never_disagree(self, kw: dict[str, object]) -> None:
+        """The anti-drift invariant. ``user_blocked`` is a shim over
+        ``user_block_reason`` and ``target_blocked`` over
+        ``target_block_reason`` — a divergence would be worse than the vague
+        logs this replaced, because callers gate real spend on the boolean."""
+        gate = _gate(payer_by_target={"t": "u"}, **kw)  # type: ignore[arg-type]
+        assert gate.user_blocked("u") is (gate.user_block_reason("u") is not None)
+        assert gate.target_blocked("t") is (gate.target_block_reason("t") is not None)

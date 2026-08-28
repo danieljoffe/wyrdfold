@@ -23,13 +23,58 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from supabase import AsyncClient
 
 from app.config import settings
 from app.services.llm import cost_log
 from app.services.llm.budget import MONTHLY_WINDOW_DAYS
+
+# Why LLM work was skipped, as a stable token the defer logs interpolate.
+# These are log/diagnostic values, not a wire contract — but keep them stable,
+# because grepping one out of Railway is how an operator answers "why did
+# grading stop?" without a DB pass.
+BlockReason = Literal[
+    "llm_disabled",  # operator kill-switch on the profile
+    "idle",  # unseen past settings.idle_defer_days
+    "over_allowance",  # spend in the rolling window reached the cap
+    "catalog_ungraded",  # no payer + grade_catalog_targets off
+    "no_budget_snapshot",  # empty gate: breaker / build failure, fail-closed
+]
+
+# Which of these clear on their own, and which do not.
+#
+# TRANSIENT — the block lifts without anyone doing anything, so "skip it now,
+# retry next cycle" is a real plan and a pipeline step may safely DROP work
+# while it waits:
+#   * ``over_allowance`` — the payer's rolling 30-day window frees up.
+#   * ``no_budget_snapshot`` — an infrastructure failure, NOT a business state.
+#     The gate is rebuilt from scratch every cycle, so the next one very likely
+#     succeeds. Classifying it as persistent (an earlier draft of this did)
+#     would make INGESTION fail OPEN precisely while the budget-control plane
+#     is unhealthy, quietly contradicting the fail-closed doctrine the empty
+#     ``PayerBudgetGate()`` sentinel exists to enforce ("when we can't see
+#     budgets, don't spend"). If the snapshot fails cycle after cycle that is a
+#     real outage and should surface as one — via the ingestion-health alert —
+#     not be absorbed by opening admission.
+#
+# PERSISTENT — nothing in the poll cycle changes these. An idle payer stays
+# idle until they sign in; a catalog target stays unsponsored until an operator
+# flips ``grade_catalog_targets``; a disabled account stays disabled. "Retry
+# next cycle" is not a plan here, it is an infinite loop — and a step that drops
+# work while waiting drops it forever (prod: 50h of zero ingestion).
+TRANSIENT_BLOCK_REASONS: frozenset[str] = frozenset(
+    {"over_allowance", "no_budget_snapshot"}
+)
+PERSISTENT_BLOCK_REASONS: frozenset[str] = frozenset(
+    {"idle", "llm_disabled", "catalog_ungraded"}
+)
+
+
+def block_is_persistent(reason: BlockReason | None) -> bool:
+    """True when ``reason`` will not clear on its own within the poll cycle."""
+    return reason in PERSISTENT_BLOCK_REASONS
 
 
 async def resolve_target_payers(
@@ -109,52 +154,59 @@ class PayerBudgetGate:
         the build-failure fallback construct to refuse ALL spend for the
         cycle ("when we can't see budgets, don't spend"). Catalog
         semantics apply only within a healthy snapshot.
+
+        Delegates to ``target_block_reason`` so the "is it blocked" and "why"
+        answers are ONE branch set, not two that can drift apart. The branches
+        (empty sentinel, post-snapshot activation, catalog-only, payer) live
+        there.
         """
-        if not self.payer_by_target:
-            return True  # fail-closed sentinel (breaker / build failure)
-        if target_id not in self.payer_by_target:
-            # Activated after this snapshot was taken — unchanged fail-open,
-            # so a mid-cycle activation isn't punished for arriving late.
-            return False
-        payer = self.payer_by_target[target_id]
-        if payer is None:
-            return not settings.grade_catalog_targets  # catalog-only
-        return self.user_blocked(payer)
-
-    def all_targets_blocked(self) -> bool:
-        """True when NOTHING in this snapshot can consume LLM output.
-
-        The cycle-wide question ``target_blocked`` cannot answer. The
-        qualification tagger is target-INDEPENDENT — it bills the INSTANCE
-        key, so the per-payer gate above never sees it, and it kept buying
-        tags at full rate while every consumer of those tags was blocked.
-        This is the predicate for "would ANY active target read a tag we
-        buy right now?".
-
-        Empty map ⇒ True, which covers both meanings at once: the
-        fail-closed sentinel (breaker / build failure — "when we can't see
-        budgets, don't spend") and a cycle with no active targets at all
-        (nothing to consume).
-
-        SAME NARROW SCOPE as ``target_blocked``: this suppresses LLM work
-        only. It must never be used to shrink the ACTIVE SET — re-read the
-        HISTORY note above; that is precisely the mistake that stopped
-        catalog sources polling and starved the public corpus of
-        INGESTION. Callers keep polling, ingesting, and writing rows; they
-        only skip the model call. Untagged rows stay NULL, which every
-        read gate treats permissively, and re-tag on a later cycle exactly
-        like a tagger outage.
-        """
-        if not self.payer_by_target:
-            return True  # fail-closed sentinel / no active targets
-        return all(self.target_blocked(t) for t in self.payer_by_target)
+        return self.target_block_reason(target_id) is not None
 
     def user_blocked(self, user_id: str) -> bool:
-        return (
-            user_id in self.over_budget_users
-            or user_id in self.idle_users
-            or user_id in self.disabled_users
-        )
+        return self.user_block_reason(user_id) is not None
+
+    def user_block_reason(self, user_id: str) -> BlockReason | None:
+        """WHY this payer is blocked, or ``None`` when they are not.
+
+        ``user_blocked`` answers *whether*; the defer logs need *which*. They
+        used to hardcode one of the three reasons — "over monthly allowance" —
+        onto a predicate that is also true for idle and operator-disabled
+        payers, so an idle account was reported as out of budget and anyone
+        reading the logs went hunting for a spend problem that did not exist.
+        (Observed: a payer at 15% of cap, deferred purely for being unseen past
+        ``idle_defer_days``, logged as over allowance.)
+
+        Precedence mirrors ``build_budget_gate``'s own short-circuits exactly:
+        disabled wins over idle, idle wins over spend — the builder skips the
+        idle check for a disabled payer and skips the spend query for an idle
+        one, so at most one set can hold a given user. Stated explicitly here
+        so the two can't drift apart if that ever changes.
+        """
+        if user_id in self.disabled_users:
+            return "llm_disabled"
+        if user_id in self.idle_users:
+            return "idle"
+        if user_id in self.over_budget_users:
+            return "over_allowance"
+        return None
+
+    def target_block_reason(self, target_id: str) -> BlockReason | None:
+        """WHY this target's LLM work is skipped, or ``None`` when it is not.
+
+        The reporting twin of ``target_blocked`` — same branches, in the same
+        order, so the two cannot disagree about whether work is skipped. The
+        two target-level reasons have no user-level equivalent: a catalog-only
+        target (no payer) suppressed by ``grade_catalog_targets``, and the
+        empty fail-closed sentinel the breaker / build-failure path constructs.
+        """
+        if not self.payer_by_target:
+            return "no_budget_snapshot"
+        if target_id not in self.payer_by_target:
+            return None  # activated after the snapshot — unchanged fail-open
+        payer = self.payer_by_target[target_id]
+        if payer is None:
+            return None if settings.grade_catalog_targets else "catalog_ungraded"
+        return self.user_block_reason(payer)
 
 
 async def build_budget_gate(supabase: AsyncClient, target_ids: list[str]) -> PayerBudgetGate:

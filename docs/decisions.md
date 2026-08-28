@@ -15,13 +15,30 @@ materialized exactly when first needed`. The tagger core moved to
 `services/qualification/materialize.py` (`ensure_job_tags`); the poller calls
 nothing at ingest.
 
-Three things this taught, each now pinned by a test:
+**CORRECTION (2026-08-27), and the important part of this entry.** The release
+claimed public `/search` was unaffected, on the grounds that `_SEARCH_COLS`
+selects no tag column and the one tag predicate, `is_us IS NOT FALSE`, admits
+`NULL`. That is true of the _query_ and false of the _population_, which is what
+matters. Tagging at ingest is what produced `is_us = false` and, with
+`QUALIFICATION_ARCHIVE_NON_US` on in prod (a `False` default, overridden),
+stamped `archived_at` on high-confidence non-US rows before they were ever
+served; `qualification_archive_non_genuine` did the same for talent-pool
+non-postings. Lazily tagged rows reach neither rule, and `NULL` sails through
+every read gate. Measured over the 7 days before the switch: **13.4% of tagged
+rows were archived by the tagger's own rules at tag time** (133 of 134 non-US).
+That share of new intake now stays publicly visible until something grades it.
+The deterministic `is_us_location()` L1 gate still drops the obvious cases at
+ingest, so the exposure is the ambiguous residue — but it is a real exchange of
+catalog precision for lower ingest cost, and the release described it as no
+change at all. Validating query shape is not validating the visible corpus.
+
+Four things this taught, each now pinned by a test:
 
 **Placement inside the consumer is a spend decision.** The Phase-2 runner's
-`is_us` and family gates run *before* its ordering and daily-cap trim. Calling
+`is_us` and family gates run _before_ its ordering and daily-cap trim. Calling
 the tagger there would tag the whole candidate set to grade at most the quota —
 the same "buy for everything, read a few" shape we were removing, one layer
-down. It runs *after* the trim, and the two gates are then re-applied to the
+down. It runs _after_ the trim, and the two gates are then re-applied to the
 freshly tagged rows. A row the post-trim gate rejects is not backfilled from the
 next candidate: refilling means tagging a second tranche, which re-opens the
 hole.
@@ -29,10 +46,18 @@ hole.
 **A sweep that consumed its own output stops advancing when you remove the
 output.** `_backfill_qualify_stale` selected `role_family IS NULL`
 oldest-first each cycle; the tagging it did is what made the set shrink. With
-tagging removed, "untagged" is the *normal* state of the catalog, so it would
+tagging removed, "untagged" is the _normal_ state of the catalog, so it would
 have (a) re-bought the entire catalog's tags a batch at a time had the tagging
 call been left in, and (b) re-checked the same oldest batch forever once it was
-taken out. Kept the free liveness half, gave it a rotating cursor.
+taken out. Kept the free liveness half, gave it a rotating cursor — and then had
+to fix that cursor, because the first version walked by OFFSET. An offset over
+this predicate silently SKIPS rows: the set is unstable (a row leaves it the
+moment the sweep archives it), so surviving rows shift backward underneath a
+cursor that only moves forward. It walks by keyset on `(cataloged_at, id)` now.
+The lesson is narrower than "use keyset": the instability was _introduced by the
+same change_ — before this, the sweep's own tagging is what removed rows, and
+nobody had asked what happens to a paginated walk when the thing removing rows
+becomes something else.
 
 **Moving a reader onto a new call path revives every partial `SELECT` upstream
 of it.** Two grade-path callers built job dicts from narrow projections. Missing

@@ -76,23 +76,29 @@ class TestLivenessVerdict:
 
 
 def _backfill_supabase(
-    rows: list[dict[str, Any]], archived: list[str], ranges: list[tuple[int, int]] | None = None
+    rows: list[dict[str, Any]], archived: list[str], keysets: list[str | None] | None = None
 ) -> MagicMock:
     """Fake supabase: the select chain returns ``rows``; a
     ``jobs.update(...).in_('id', ids)`` records the archived ids into
-    ``archived``. ``ranges`` (when given) records the ``.range(start, end)``
-    window each call asked for."""
+    ``archived``. ``keysets`` (when given) records the ``.or_(...)`` keyset
+    predicate each call asked for — ``None`` when it asked for the oldest page
+    with no cursor."""
     select_chain = MagicMock()
     select_chain.is_.return_value = select_chain
     select_chain.order.return_value = select_chain
+    select_chain.limit.return_value = select_chain
 
-    def _range(start: int, end: int) -> MagicMock:
-        if ranges is not None:
-            ranges.append((start, end))
+    def _or(expr: str) -> MagicMock:
+        if keysets is not None:
+            keysets[-1] = expr
         return select_chain
 
-    select_chain.range.side_effect = _range
-    select_chain.execute = MagicMock(return_value=MagicMock(data=rows))
+    select_chain.or_.side_effect = _or
+
+    def _execute() -> MagicMock:
+        return MagicMock(data=rows)
+
+    select_chain.execute = MagicMock(side_effect=_execute)
 
     def _in(_col: str, ids: list[str]) -> MagicMock:
         archived.extend(ids)
@@ -105,7 +111,13 @@ def _backfill_supabase(
 
     def _table(_name: str) -> MagicMock:
         t = MagicMock()
-        t.select.return_value = select_chain
+
+        def _select(*_a: object, **_k: object) -> MagicMock:
+            if keysets is not None:
+                keysets.append(None)  # replaced by _or if a cursor was applied
+            return select_chain
+
+        t.select.side_effect = _select
         t.update.return_value = update_chain
         return t
 
@@ -142,6 +154,62 @@ def _patch_backfill(monkeypatch: pytest.MonkeyPatch, verdicts: dict[str, str]) -
     monkeypatch.setattr(poller_mod, "validate_job_url", fake_validate)
     monkeypatch.setattr(materialize, "tag_job", spy_tag_job)
     return rec
+
+
+
+def _keyset_supabase(table: list[dict[str, Any]], seen: list[str]) -> MagicMock:
+    """Fake supabase backed by a REAL list, honouring the keyset predicate.
+
+    Lets a test mutate ``table`` between pages and assert on coverage, which is
+    what distinguishes a keyset walk from an offset one.
+    """
+    state: dict[str, tuple[str, str] | None] = {"after": None}
+    limits: dict[str, int] = {"n": 0}
+
+    select_chain = MagicMock()
+    select_chain.is_.return_value = select_chain
+    select_chain.order.return_value = select_chain
+
+    def _or(expr: str) -> MagicMock:
+        at = expr.split('cataloged_at.gt."')[1].split('"')[0]
+        rid = expr.split('id.gt."')[1].split('"')[0]
+        state["after"] = (at, rid)
+        return select_chain
+
+    def _limit(n: int) -> MagicMock:
+        limits["n"] = n
+        return select_chain
+
+    select_chain.or_.side_effect = _or
+    select_chain.limit.side_effect = _limit
+
+    def _execute() -> MagicMock:
+        rows = sorted(table, key=lambda r: (r["cataloged_at"], r["id"]))
+        after = state["after"]
+        if after is not None:
+            rows = [r for r in rows if (r["cataloged_at"], r["id"]) > after]
+        page = rows[: limits["n"]]
+        seen.extend(str(r["id"]) for r in page)
+        return MagicMock(data=page)
+
+    select_chain.execute = MagicMock(side_effect=_execute)
+
+    def _table(_name: str) -> MagicMock:
+        t = MagicMock()
+
+        def _select(*_a: object, **_k: object) -> MagicMock:
+            state["after"] = None  # a fresh query; _or re-applies any cursor
+            return select_chain
+
+        t.select.side_effect = _select
+        upd = MagicMock()
+        upd.in_.return_value = MagicMock(execute=MagicMock(return_value=MagicMock(data=[])))
+        t.update.return_value = upd
+        return t
+
+    sb = MagicMock()
+    sb.table.side_effect = _table
+    return sb
 
 
 class TestBackfillQualifyStale:
@@ -181,30 +249,76 @@ class TestBackfillQualifyStale:
         # touch neither path.
 
     @pytest.mark.asyncio
-    async def test_rotates_so_a_never_shrinking_selection_still_advances(
+    async def test_walks_by_keyset_and_wraps_on_a_short_page(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Nothing fills ``role_family`` for these rows anymore, so an
-        oldest-first LIMIT would re-check the SAME batch forever and never
-        reach the row after it. The cursor walks a batch per cycle and wraps on
-        a short page."""
+        oldest-first LIMIT would re-check the SAME batch forever. The cursor
+        walks a batch per cycle and wraps on a short page."""
         _patch_backfill(monkeypatch, {})
         archived: list[str] = []
-        ranges: list[tuple[int, int]] = []
-        full_page = [{"id": f"j-{i}", "absolute_url": None} for i in range(3)]
-        sb = _backfill_supabase(full_page, archived, ranges)
+        keysets: list[str | None] = []
+        full_page = [
+            {"id": f"j-{i}", "absolute_url": None, "cataloged_at": f"2026-01-0{i}T00:00:00+00:00"}
+            for i in range(3)
+        ]
+        sb = _backfill_supabase(full_page, archived, keysets)
 
         await poller_mod._backfill_qualify_stale(sb, limit=3)
+        # Precondition: the first pass has no cursor — it starts at the oldest.
+        assert keysets == [None]
+
         await poller_mod._backfill_qualify_stale(sb, limit=3)
-        # Precondition: a FULL page each time, so the cursor must advance.
-        assert ranges == [(0, 2), (3, 5)]
+        # A FULL page, so the cursor advanced to the LAST pair of that page and
+        # asks for everything strictly after it — by key, never by offset.
+        assert keysets[-1] is not None
+        assert 'cataloged_at.gt."2026-01-02T00:00:00+00:00"' in keysets[-1]
+        assert 'id.gt."j-2"' in keysets[-1]
 
         # A short page means the end of the untagged set → wrap to the oldest.
-        short = _backfill_supabase([{"id": "j-9", "absolute_url": None}], archived, ranges)
+        short = _backfill_supabase(
+            [{"id": "j-9", "absolute_url": None, "cataloged_at": "2026-01-09T00:00:00+00:00"}],
+            archived,
+            keysets,
+        )
         await poller_mod._backfill_qualify_stale(short, limit=3)
-        assert ranges[-1] == (6, 8)
         await poller_mod._backfill_qualify_stale(short, limit=3)
-        assert ranges[-1] == (0, 2)
+        assert keysets[-1] is None
+
+    @pytest.mark.asyncio
+    async def test_an_unstable_selection_cannot_skip_rows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """THE regression this cursor exists for.
+
+        The selection is unstable: a row LEAVES it the moment this sweep
+        archives it. Under an OFFSET walk the surviving rows shift backward
+        while the cursor only moves forward, so rows slide past unchecked and
+        are never visited. Modelled here with a real table the fake filters:
+        every page archives its first row, and every row must still be seen.
+        """
+        _patch_backfill(monkeypatch, {})
+        table = [
+            {
+                "id": f"j-{i:02d}",
+                "absolute_url": None,
+                "cataloged_at": f"2026-01-01T00:00:{i:02d}+00:00",
+            }
+            for i in range(9)
+        ]
+        seen: list[str] = []
+        sb = _keyset_supabase(table, seen)
+
+        for _ in range(3):
+            await poller_mod._backfill_qualify_stale(sb, limit=3)
+            # Simulate the sweep's own archival removing the page's first row.
+            if seen:
+                table[:] = [r for r in table if r["id"] != seen[-3]]
+
+        # Precondition: the set really did shrink underneath the walk.
+        assert len(table) == 6, table
+        # Every row visited, none skipped, none re-visited within the pass.
+        assert seen == [f"j-{i:02d}" for i in range(9)], seen
 
     @pytest.mark.asyncio
     async def test_limit_zero_is_noop_no_query(self, monkeypatch: pytest.MonkeyPatch) -> None:

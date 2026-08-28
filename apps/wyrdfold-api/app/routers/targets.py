@@ -77,7 +77,7 @@ from app.services.extract import (
 )
 from app.services.llm import cost_log
 from app.services.llm.client import LLMClient
-from app.services.poller import poll_sources_for_target
+from app.services.poller import _global_budget_exhausted, poll_sources_for_target
 from app.services.scoring import strip_html
 from app.services.source_discovery import (
     DiscoveryRunStats,
@@ -1082,7 +1082,17 @@ async def _activate_pipeline(
         # database. ``score_title_and_upsert`` returns ``None`` (no row
         # written) when no keywords match, so this only creates rows where
         # the title actually scores against the new profile.
-        retro_scored = await bulk_title_score_for_target(supabase, target)
+        # Inject the GLOBAL daily-spend meter so the activation-time tagger
+        # reads the same one every other LLM path does (poller owns it; this
+        # router already imports poller, and ``target_scoring`` cannot without a
+        # cycle). No second budget implementation.
+        retro_scored = await bulk_title_score_for_target(
+            supabase,
+            target,
+            budget_exhausted=lambda: _global_budget_exhausted(
+                supabase, reserve_usd=settings.grading_budget_reserve_usd
+            ),
+        )
         logger.info(
             "Activation pipeline for target %s: retro-scored %d existing jobs",
             target_id,

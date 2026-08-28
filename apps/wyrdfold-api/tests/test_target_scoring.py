@@ -6,6 +6,7 @@ poller integration, list endpoint overlay, re-score endpoint.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -955,6 +956,7 @@ class _RetroSupabase:
     def __init__(self, jobs: list[dict[str, Any]]) -> None:
         self._jobs = sorted(jobs, key=lambda j: j["id"])
         self.upsert_calls: list[list[dict[str, Any]]] = []
+        self.selected: list[str] = []
         self._after: str | None = None
         self._limit: int | None = None
 
@@ -963,7 +965,9 @@ class _RetroSupabase:
         self._limit = None
         return self
 
-    def select(self, *_a: object, **_k: object) -> _RetroSupabase:
+    def select(self, *a: object, **_k: object) -> _RetroSupabase:
+        if a:
+            self.selected.append(str(a[0]))
         return self
 
     def order(self, col: str, **_k: object) -> _RetroSupabase:
@@ -1062,3 +1066,206 @@ async def test_bulk_title_score_async_empty_catalog_writes_nothing() -> None:
 
     assert written == 0
     assert supabase.upsert_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Tag-at-activation: re-arming the off-family gate for a newly activated target
+# ---------------------------------------------------------------------------
+
+
+def _tag_spy(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Record every ``ensure_job_tags`` call made by the activation scorer."""
+    import app.services.target_scoring as ts
+
+    calls: list[dict[str, Any]] = []
+
+    async def _fake(
+        _sb: object, rows: list[dict[str, Any]], *, budget_exhausted: object = None
+    ) -> None:
+        calls.append({"ids": [r.get("id") for r in rows], "budget": budget_exhausted})
+
+    monkeypatch.setattr(ts, "ensure_job_tags", _fake)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_activation_projection_covers_the_tagger_contract() -> None:
+    """A PARTIAL projection would not fail — it would degrade the tagger
+    silently (permanent hash miss, archived guard blind, #846's board-defer
+    inverted). Same pin as the grade-path callers.
+
+    Asserts the projection the code ACTUALLY issues, not the constant: pinning
+    the constant alone still passes if the query stops using it (which is how
+    this test first shipped, and a sabotage run caught it).
+    """
+    from app.services.qualification.materialize import TAG_INPUT_COLUMNS
+
+    supabase = _AsyncRetroSupabase(_retro_jobs())
+    await bulk_title_score_for_target(supabase, _target(core={"React": 3}))  # type: ignore[arg-type]
+
+    assert supabase.selected, "precondition: the jobs read happened"
+    selected = {c.strip() for c in supabase.selected[0].split(",")}
+    assert selected >= TAG_INPUT_COLUMNS, TAG_INPUT_COLUMNS - selected
+
+
+@pytest.mark.asyncio
+async def test_activation_tags_the_rows_it_will_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard against a health-clinician posting under a software-engineer
+    target is ``_gate_off_family``, which compares ``jobs.role_family`` and is
+    KEEP-NULL — an untagged job admits. Lazy tagging leaves that column NULL, so
+    activation has to fill it for the rows it is about to surface."""
+    import app.services.target_scoring as ts
+
+    monkeypatch.setattr(ts, "_RETRO_TITLE_BATCH_SIZE", 2)
+    calls = _tag_spy(monkeypatch)
+    supabase = _AsyncRetroSupabase(_retro_jobs())
+    target = _target(core={"React": 3})
+
+    written = await bulk_title_score_for_target(supabase, target)  # type: ignore[arg-type]
+
+    # Precondition: this activation really did write score rows, and j05 among
+    # them is EXCLUDED — otherwise the assertions below prove nothing.
+    assert written == 3
+    upserted = {r["job_posting_id"]: r for c in supabase.upsert_calls for r in c}
+    assert upserted["j05"]["excluded"] is True
+
+    tagged = [i for c in calls for i in c["ids"]]
+    # Matched and surfacing → tagged. j05 matched but is EXCLUDED (never shown,
+    # so tagging it is pure waste); j02/j03/j04 never matched at all.
+    assert sorted(tagged) == ["j01", "j06"]
+
+
+@pytest.mark.asyncio
+async def test_activation_threads_the_budget_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Activation can tag thousands of rows on a user action, so it must read
+    the same global meter every other LLM path reads."""
+    calls = _tag_spy(monkeypatch)
+    supabase = _AsyncRetroSupabase(_retro_jobs())
+
+    async def _predicate() -> bool:
+        return False
+
+    await bulk_title_score_for_target(  # type: ignore[arg-type]
+        supabase, _target(core={"React": 3}), budget_exhausted=_predicate
+    )
+
+    assert calls, "precondition: something was tagged"
+    assert all(c["budget"] is _predicate for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_activation_writes_excluded_rows_but_buys_no_tags_for_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control, and the sharper one: a target matching NO core keyword still
+    writes a score row for a NEGATIVE-keyword hit (so the UI can explain the
+    rejection). That row is excluded, never surfaces, and must not be tagged —
+    which proves the tag set is scoped by ``excluded``, not merely by "did
+    anything match"."""
+    calls = _tag_spy(monkeypatch)
+    supabase = _AsyncRetroSupabase(_retro_jobs())
+
+    written = await bulk_title_score_for_target(  # type: ignore[arg-type]
+        supabase, _target(core={"Kubernetes": 3})
+    )
+
+    # Precondition: a row WAS written, via the negative-keyword path.
+    upserted = [r for c in supabase.upsert_calls for r in c]
+    assert written == 1
+    assert [r["job_posting_id"] for r in upserted] == ["j05"]
+    assert upserted[0]["excluded"] is True
+    # ...and it bought no tag.
+    assert calls == []
+
+
+def _classified_target(family: str = "engineering") -> JobTarget:
+    """A target the family gate can actually enforce against."""
+    t = _target(core={"React": 3})
+    return t.model_copy(update={"role_family": family})
+
+
+def _tag_spy_that_tags(monkeypatch: pytest.MonkeyPatch, *, tags: bool) -> list[list[str]]:
+    """Spy on ``ensure_job_tags``. When ``tags`` is True it patches
+    ``role_family`` into the caller's dicts the way the real one does via its
+    ``finally`` refresh; when False it returns having tagged nothing, which is
+    what budget exhaustion / a latched breaker actually look like."""
+    import app.services.target_scoring as ts
+
+    calls: list[list[str]] = []
+
+    async def _fake(
+        _sb: object, rows: list[dict[str, Any]], *, budget_exhausted: object = None
+    ) -> None:
+        calls.append([r.get("id") for r in rows])
+        if tags:
+            for r in rows:
+                r["role_family"] = "engineering"
+
+    monkeypatch.setattr(ts, "ensure_job_tags", _fake)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_untagged_rows_are_withheld_when_the_target_is_classified(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``ensure_job_tags`` is best-effort — it returns early on budget
+    exhaustion, a budget-read failure, or a latched provider breaker. Writing
+    the score rows anyway would surface untagged jobs past the KEEP-NULL family
+    gate, which is the exact failure this whole path exists to prevent, and the
+    target would still go ``ready`` with no sign anything was missed."""
+    _tag_spy_that_tags(monkeypatch, tags=False)  # tagging bought nothing
+    supabase = _AsyncRetroSupabase(_retro_jobs())
+
+    with caplog.at_level(logging.WARNING, logger="app.services.target_scoring"):
+        written = await bulk_title_score_for_target(  # type: ignore[arg-type]
+            supabase, _classified_target()
+        )
+
+    upserted = [r["job_posting_id"] for c in supabase.upsert_calls for r in c]
+    # j01/j06 matched and would surface — withheld. j05 matched but is EXCLUDED,
+    # so it never surfaces and is written as before (it explains the rejection).
+    assert "j01" not in upserted and "j06" not in upserted
+    assert upserted == ["j05"]
+    assert written == 1
+    assert any("could not be tagged" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_successfully_tagged_rows_are_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control. Without this the withholding above could pass by writing
+    nothing ever."""
+    _tag_spy_that_tags(monkeypatch, tags=True)
+    supabase = _AsyncRetroSupabase(_retro_jobs())
+
+    written = await bulk_title_score_for_target(  # type: ignore[arg-type]
+        supabase, _classified_target()
+    )
+
+    upserted = {r["job_posting_id"] for c in supabase.upsert_calls for r in c}
+    assert {"j01", "j06"} <= upserted
+    assert written == 3
+
+
+@pytest.mark.asyncio
+async def test_unclassified_target_withholds_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unclassified target gates nothing — ``passes_family_gate`` keeps null
+    on BOTH sides — so withholding would be pure loss with no guard served."""
+    _tag_spy_that_tags(monkeypatch, tags=False)
+    supabase = _AsyncRetroSupabase(_retro_jobs())
+
+    written = await bulk_title_score_for_target(  # type: ignore[arg-type]
+        supabase, _target(core={"React": 3})
+    )
+
+    upserted = {r["job_posting_id"] for c in supabase.upsert_calls for r in c}
+    assert {"j01", "j05", "j06"} == upserted
+    assert written == 3
