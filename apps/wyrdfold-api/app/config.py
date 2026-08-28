@@ -912,6 +912,21 @@ class Settings(BaseSettings):
     idle_deactivate_days: int = Field(default=30, ge=0)
     # Auto-disable a source after this many consecutive fetch failures
     # (0 disables the backoff).
+    # When every active target is blocked for a PERSISTENT reason (idle payer,
+    # unsponsored catalog target, disabled account), should new listings still
+    # be admitted on the deterministic free gates alone?
+    #
+    # FALSE (default) ships the fix dark. Flipping it to True is a STEP CHANGE,
+    # not a gradual one: prod measured ~14,800 free-gate survivors currently
+    # unadmitted, which roughly DOUBLES the live catalog on the first pass or
+    # two before settling to the ordinary intake rate. Land the admission ramp
+    # first, then flip this per-deploy and watch — same shape as
+    # ``phase1_triage_enabled`` and ``qualification_enabled``.
+    #
+    # While False, a persistent block still stalls new-job ingestion, which the
+    # ingestion-health alert reports honestly rather than hiding.
+    persistent_block_admits_ingestion: bool = False
+
     source_failure_disable_threshold: int = Field(default=10, ge=0)
     # Adaptive source cadence. Sources whose ``last_candidate_at`` is
     # older than this many days get their poll interval stretched to
