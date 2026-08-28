@@ -37,7 +37,7 @@ from app.config import settings
 from app.models.schemas import PollResult
 from app.services.ingestion_health import _newest_discovery_at, check_ingestion_health
 from app.services.poll_lock import poll_advisory_lock
-from app.services.poller import admission_ramp_report, poll_all_sources, poll_due_sources
+from app.services.poller import poll_all_sources, poll_due_sources
 from app.services.recency import refresh_all_recency_scores
 from app.services.retention import purge_expired_records
 from app.services.source_discovery import run_discovery_all_targets_locked
@@ -122,14 +122,12 @@ async def _run_scheduled_poll() -> None:
                     )
                 else:
                     logger.info(
-                        "scheduled poll: polled=%d new=%d updated=%d archived=%d "
-                        "errors=%d %s",
+                        "scheduled poll: polled=%d new=%d updated=%d archived=%d errors=%d",
                         result.sources_polled,
                         result.new_jobs,
                         result.updated_jobs,
                         result.archived_jobs,
                         len(result.errors),
-                        admission_ramp_report(),
                     )
                 finally:
                     # An aborted cycle has still ingested rows for every

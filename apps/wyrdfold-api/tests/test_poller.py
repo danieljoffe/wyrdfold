@@ -2381,7 +2381,7 @@ async def _run_blocked_poll_with_jobs(
     monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
     monkeypatch.setattr(live_settings, "persistent_block_admits_ingestion", True)
     monkeypatch.setattr(live_settings, "persistent_block_admission_cap_per_cycle", cap)
-    poller_mod.reset_admission_budget()
+    budget = poller_mod.new_admission_budget()
 
     supabase, _jobs, _sources = _make_poll_supabase([])
 
@@ -2409,7 +2409,9 @@ async def _run_blocked_poll_with_jobs(
     gate.target_blocked.return_value = True
     gate.target_block_reason.return_value = "idle"
     gate.payer_for.return_value = "u1"
-    summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase, budget_gate=gate)
+    summary = await poller_mod._poll_one_source(
+        dict(_GUARD_SOURCE), supabase, budget_gate=gate, admission_budget=budget
+    )
     return summary, _jobs
 
 
@@ -2428,12 +2430,11 @@ async def test_ramp_bounds_the_backlog_drain(monkeypatch) -> None:
 async def test_ramp_resets_each_cycle(monkeypatch) -> None:
     """Rows that lose the race are dropped exactly as before and re-offered next
     cycle — nothing is lost, only slowed."""
-    from app.services import poller as poller_mod
-
     _s, first = await _run_blocked_poll_with_jobs(monkeypatch, n_jobs=5, cap=2)
     assert len([r for c in first.upsert.call_args_list for r in c.args[0]]) == 2
 
-    poller_mod.reset_admission_budget()  # what the next cycle entry point does
+    # The harness builds a FRESH budget per run, which is what a cycle entry
+    # point does — so the next cycle gets its own full allowance.
     _s2, second = await _run_blocked_poll_with_jobs(monkeypatch, n_jobs=5, cap=2)
     assert len([r for c in second.upsert.call_args_list for r in c.args[0]]) == 2
 
@@ -2459,10 +2460,10 @@ async def test_ordinary_admits_are_never_rate_limited(monkeypatch) -> None:
     from app.services.relevance.title_triage import TitleVerdict
 
     monkeypatch.setattr(live_settings, "persistent_block_admission_cap_per_cycle", 1)
-    poller_mod.reset_admission_budget()
-    assert poller_mod._take_admission_budget() is True
+    spent = poller_mod.new_admission_budget()
+    assert spent.take() is True
     # Precondition: the ramp is now SPENT.
-    assert poller_mod._take_admission_budget() is False
+    assert spent.take() is False
 
     ok = LLMResult(
         content="{}", model="claude-haiku-4-5", usage=LLMUsage(), cost_usd=0.0, latency_ms=1
@@ -2481,14 +2482,54 @@ def test_admission_ramp_report(monkeypatch) -> None:
     from app.services import poller as poller_mod
 
     monkeypatch.setattr(live_settings, "persistent_block_admission_cap_per_cycle", 3)
-    poller_mod.reset_admission_budget()
-    assert poller_mod.admission_ramp_report() == "admission_ramp=0/3"
-    poller_mod._take_admission_budget()
-    assert poller_mod.admission_ramp_report() == "admission_ramp=1/3"
-    poller_mod._take_admission_budget()
-    poller_mod._take_admission_budget()
-    assert "EXHAUSTED" in poller_mod.admission_ramp_report()
+    b = poller_mod.new_admission_budget()
+    assert b.report() == "admission_ramp=0/3"
+    b.take()
+    assert b.report() == "admission_ramp=1/3"
+    b.take()
+    b.take()
+    assert "EXHAUSTED" in b.report()
 
     monkeypatch.setattr(live_settings, "persistent_block_admission_cap_per_cycle", 0)
-    poller_mod.reset_admission_budget()
-    assert poller_mod.admission_ramp_report() == "admission_ramp=uncapped"
+    assert poller_mod.new_admission_budget().report() == "admission_ramp=uncapped"
+
+
+def test_overlapping_cycles_hold_independent_ramps(monkeypatch) -> None:
+    """Cycles can genuinely overlap: the scheduler polls under a Postgres
+    advisory lock, but ``POST /poll/due`` calls ``poll_due_sources`` DIRECTLY
+    without it — that endpoint exists for external cron callers (pg_cron,
+    GitHub Actions). A module-global counter would let the second cycle's reset
+    wipe the first cycle's remaining allowance mid-drain, and the per-cycle
+    guarantee would quietly stop holding."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "persistent_block_admission_cap_per_cycle", 2)
+    a = poller_mod.new_admission_budget()
+    b = poller_mod.new_admission_budget()
+
+    assert a.take() is True
+    assert a.take() is True
+    assert a.take() is False  # A is spent...
+    assert b.take() is True  # ...and B still holds its own full allowance
+    assert b.report() == "admission_ramp=1/2"
+    assert "EXHAUSTED" in a.report()
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_cycles_each_respect_their_own_cap(monkeypatch) -> None:
+    """The same guarantee through the real call graph rather than the object:
+    two cycles running at once must each admit at most their OWN cap, not race
+    over one shared counter."""
+    import asyncio as _asyncio
+
+    (_s1, first), (_s2, second) = await _asyncio.gather(
+        _run_blocked_poll_with_jobs(monkeypatch, n_jobs=5, cap=2),
+        _run_blocked_poll_with_jobs(monkeypatch, n_jobs=5, cap=2),
+    )
+
+    n1 = len([r for c in first.upsert.call_args_list for r in c.args[0]])
+    n2 = len([r for c in second.upsert.call_args_list for r in c.args[0]])
+    # Precondition: both cycles really did work (a no-op cycle proves nothing).
+    assert n1 > 0 and n2 > 0
+    assert n1 == 2 and n2 == 2, (n1, n2)
