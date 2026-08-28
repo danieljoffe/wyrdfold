@@ -133,6 +133,44 @@ VALIDATE_CONCURRENCY = 20
 _validate_sems: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
 
 
+# Per-CYCLE budget for the persistent-block admission fallback (#923). Reset by
+# the cycle entry points; ``None`` means uncapped. In-process like the
+# semaphores above and correct for the same reason: one uvicorn worker, one
+# event loop, and every take happens between awaits.
+#
+# Only the FALLBACK draws on it. A job a target actually triaged and admitted is
+# never rate-limited, so a healthy pipeline never sees this at all.
+_ADMISSION_BUDGET_REMAINING: int | None = None
+
+
+def reset_admission_budget() -> None:
+    """Start-of-cycle reset. Called by the poll entry points."""
+    global _ADMISSION_BUDGET_REMAINING
+    cap = settings.persistent_block_admission_cap_per_cycle
+    _ADMISSION_BUDGET_REMAINING = cap if cap > 0 else None
+
+
+def _take_admission_budget() -> bool:
+    """Consume one slot, or report the cycle's ramp is spent."""
+    global _ADMISSION_BUDGET_REMAINING
+    if _ADMISSION_BUDGET_REMAINING is None:
+        return True  # uncapped
+    if _ADMISSION_BUDGET_REMAINING <= 0:
+        return False
+    _ADMISSION_BUDGET_REMAINING -= 1
+    return True
+
+
+def admission_ramp_report() -> str:
+    """One-line ramp state for the cycle log. "uncapped" when the cap is 0."""
+    cap = settings.persistent_block_admission_cap_per_cycle
+    if cap <= 0 or _ADMISSION_BUDGET_REMAINING is None:
+        return "admission_ramp=uncapped"
+    used = cap - _ADMISSION_BUDGET_REMAINING
+    spent = " EXHAUSTED (backlog continues next cycle)" if _ADMISSION_BUDGET_REMAINING <= 0 else ""
+    return f"admission_ramp={used}/{cap}{spent}"
+
+
 def _validate_semaphore() -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
     sem = _validate_sems.get(loop)
@@ -1374,6 +1412,10 @@ async def _poll_one_source(
         # missing verdict for an attempted job fail-opens (LLM hiccup); a
         # missing verdict for a NON-attempted job was budget-deferred → defer.
         phase1_attempted: dict[str, set[int]] = {}
+        # How many targets abstained because their block is PERSISTENT. Non-zero
+        # means an empty ``phase1_verdicts`` is the ramped fallback, not the
+        # ordinary "triage off / no targets" admit — see ``_any_target_admits``.
+        persistent_skips = 0
         triage_candidates = [
             (idx, job)
             for idx, job in enumerate(jobs)
@@ -1432,6 +1474,8 @@ async def _poll_one_source(
                     admits = settings.persistent_block_admits_ingestion and block_is_persistent(
                         reason
                     )
+                    if admits:
+                        persistent_skips += 1
                     if not admits:
                         phase1_verdicts[active_target.id] = {}
                         phase1_attempted[active_target.id] = set()  # → all defer
@@ -1569,6 +1613,16 @@ async def _poll_one_source(
             and re-triaged next cycle rather than admitted blind (#285 f/u).
             """
             if not phase1_verdicts:
+                if persistent_skips:
+                    # Every target abstained on a PERSISTENT block, so this
+                    # admit is the fallback to the deterministic free gates —
+                    # the path that drains the backlog. Ramp it: the untouched
+                    # backlog is ~14,800 rows, and admitting it in one tick
+                    # drags a burst of score rows, activation tagging and
+                    # archival behind it. A job that loses the race is dropped
+                    # exactly as before and re-offered next cycle, so nothing is
+                    # lost — only slowed.
+                    return _take_admission_budget()
                 return True  # gate disabled or no targets — admit
             for tid, target_verdicts in phase1_verdicts.items():
                 if global_job_idx not in phase1_attempted.get(tid, set()):
@@ -2642,6 +2696,7 @@ async def poll_all_sources(
     scheduler's watchdog) still exposes partial progress. When provided, the
     return value is that same object.
     """
+    reset_admission_budget()
     result = (
         progress
         if progress is not None
@@ -2753,6 +2808,7 @@ async def poll_due_sources(
     # piggyback/throttle shape, flag-gated.
     await _maybe_run_archival_sweep(_async_service_client())
 
+    reset_admission_budget()
     due = filter_due_sources(all_enabled)
 
     # Liveness-check a rotating slice of the untagged catalog (#285) EVERY
