@@ -94,7 +94,7 @@ def _fetch_jobs(supabase: Any, job_ids: list[str]) -> list[dict[str, Any]]:
         resp = (
             supabase.table("jobs")
             .select(
-                "id, title, company_name, location, description_html, "
+                "id, title, company_name, location, country, description_html, "
                 "source_posted_at, cataloged_at, archived_at, is_us, role_family, "
                 "is_remote, employment_type, qualified_hash, qualified_at"
             )

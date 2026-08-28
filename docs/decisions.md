@@ -3,6 +3,54 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-08-28 — The board already knew the country (and a bulk upsert is not a per-row upsert)
+
+The 2026-08-27 correction below left a hole: lazily tagged rows never reach
+`QUALIFICATION_ARCHIVE_NON_US`, so 13.4% of new intake — 133 of 134 of it non-US
+— now stays publicly visible until something grades it. The obvious fix, running
+the deterministic `is_us_location()` parser at ingest and persisting its verdict,
+is worth **nothing**, and the reason is worth remembering: the poller already
+runs that parser as an L1 gate, and it drops a listing only when the location
+carries a non-US hint AND no US marker. Every row it ADMITS is, by construction,
+one the same parser cannot call non-US. A gate and a classifier built from one
+predicate cannot disagree. **Decision:** use a different, stronger fact — the
+country Ashby / Lever / SmartRecruiters publish as a structured field, which
+`board_metadata` was already normalizing to ISO alpha-2 and then discarding.
+Measured on 23,908 live postings across 35 real boards: 27.0% of the postings the
+L1 gate admits carry a board-stated non-US country. Against rows we hold and had
+already tagged, the board and the model agreed 257/267 on non-US and 1,283/1,285
+on US.
+
+**A key present on ANY row of a PostgREST bulk upsert is written to EVERY row.**
+The rows that omitted it get NULL. #846's entire design — "omit the key and the
+stored column is untouched" — is true only when _no_ row in the batch supplies
+it, which is not the case for a heterogeneous board batch. Proved on the local
+stack, not assumed: two rows, one carrying `is_remote`, the other not; the second
+row's stored `is_remote` came back NULL, in both input orders. That is why the
+board's `is_us` verdict is a targeted post-upsert UPDATE and not an upsert key,
+and it means `is_remote` / `employment_type` have a live blanking bug of their own
+(filed separately). `country` was safe to add to `board_columns` only because
+every poller payload already carries that key unconditionally.
+
+**No migration.** `jobs.country` holds a display vocabulary (`US`, `UK` — never
+`GB`; #805 was a filter sending alpha-2 at it and matching nothing), so the
+board's ISO code is TRANSLATED on the way in through a map composed from
+`location_parse`'s own token table — a country appears there only when both
+modules already know it, so the two spellings cannot drift. A code with no
+display spelling (`CH`) writes nothing to the column but still produces a
+verdict: not being able to spell Switzerland says nothing about whether the role
+is in the United States. The parser and the board agreed 15,439 times and
+disagreed 22, and the board was right in every sampled disagreement — "CA -
+Toronto" parses as California, "IN - Bangalore" as Indiana, "London, ON" as the
+UK.
+
+**Scope, stated honestly.** Greenhouse and Workday publish no country in their
+cheap path, and they are 60% of the live corpus, so this removes roughly 38% of
+the non-US pollution — the share attributable to boards that answer the question.
+Within that share it is near-complete (93.9% of admitted postings carry a
+country). Rows skipped as byte-identical (#642) are deliberately not revisited:
+back-filling history is the per-cycle full rewrite that change removed.
+
 ## 2026-08-26 — Work bought at ingest, read at grade time (qualification tags go lazy)
 
 The qualification tagger ran on every newly-upserted or content-changed job at

@@ -21,7 +21,7 @@ from app.models.schemas import PollResult
 from app.models.targets import JobTarget
 from app.services import notify
 from app.services.ashby import fetch_ashby_jobs
-from app.services.board_metadata import board_columns
+from app.services.board_metadata import board_columns, board_us_verdict
 from app.services.date_normalize import normalize_posted_at
 from app.services.db_write import (
     DB_WRITE_CONCURRENCY,
@@ -522,6 +522,110 @@ def _partition_unchanged(
         row["content_hash"] = digest
         to_write.append(row)
     return to_write, skipped
+
+
+# in_() id-chunk bound for the board-verdict writes (#57 lesson: ≤150-200 UUIDs
+# keeps the PostgREST URL under proxy limits).
+_BOARD_US_CHUNK = 150
+
+
+async def _apply_board_us_verdicts(
+    supabase: AsyncClient,
+    jobs: list[StandardJob],
+    upserted: list[dict[str, Any]],
+) -> tuple[int, int]:
+    """Stamp ``jobs.is_us`` from the country the BOARD published, and archive
+    the non-US rows when the operator asked for a US-only catalog.
+
+    Returns ``(marked, archived)`` for the cycle's funnel log.
+
+    WHY THIS EXISTS. Qualification tagging went lazy (2026-08-26): nothing
+    tags at ingest, so a fresh listing carries ``is_us = NULL``, which the read
+    gates admit (``is_us IS NOT FALSE``) and which ``QUALIFICATION_ARCHIVE_NON_US``
+    never sees. Tag-time archiving used to remove 13.4% of newly tagged rows,
+    133 of 134 of them non-US. The L1 ``is_us_location`` gate above cannot take
+    that job back: it drops a listing only when the location string carries a
+    non-US hint AND no US marker, so every row it ADMITS is by construction one
+    the same parser cannot call non-US. Ashby / Lever / SmartRecruiters publish
+    the country as a structured field — the employer's own answer, free, and
+    deterministic. That is what this writes.
+
+    WHY IT IS A SEPARATE UPDATE rather than an upsert key. A PostgREST bulk
+    upsert builds ONE column list for the whole batch: a key present on any row
+    is written to every row, and rows that omitted it get NULL (verified
+    against the local stack). ``is_us`` is decided per row, so putting it in
+    the payload would blank the tagger's verdict on every board-silent sibling
+    in the same batch — the exact class of bug #846 was written to prevent.
+
+    Scoped to ``upserted`` — the rows this cycle actually wrote. Rows skipped
+    as byte-identical (#642) are deliberately NOT revisited: back-filling the
+    whole known corpus is the per-cycle full rewrite that change removed. This
+    fixes intake going forward, not history.
+
+    PATCHES THE VERDICT BACK into the upsert-result dicts, like
+    ``ensure_job_tags`` does with the tags it buys. Those same dicts become
+    ``cycle_rows`` for this cycle's Phase-2 grading, and ``run_phase2_for_jobs``
+    gates on ``is_us`` — without the patch it would spend a grade on a row this
+    function had just archived, which is precisely the waste being removed.
+
+    BEST-EFFORT: a write failure is logged and swallowed. The verdict re-derives
+    from the board on the next poll that touches the row, and the lazy tagger
+    remains the backstop, so a transient blip must not fail a poll whose upsert
+    already succeeded (a failed poll counts toward the source's auto-disable
+    threshold).
+    """
+    verdicts = {j.external_id: v for j in jobs if (v := board_us_verdict(j)) is not None}
+    if not verdicts:
+        return 0, 0
+    to_us: list[dict[str, Any]] = []
+    to_non_us: list[dict[str, Any]] = []
+    to_archive: list[dict[str, Any]] = []
+    for row in upserted:
+        external_id = row.get("external_id")
+        verdict = verdicts.get(external_id) if isinstance(external_id, str) else None
+        if verdict is None:
+            continue
+        # The upsert RETURNING carries the STORED ``is_us`` (the payload never
+        # sets it), so a row that already agrees costs no write.
+        if verdict is True:
+            if row.get("is_us") is not True:
+                to_us.append(row)
+        else:
+            if row.get("is_us") is not False:
+                to_non_us.append(row)
+            if settings.qualification_archive_non_us and row.get("archived_at") is None:
+                to_archive.append(row)
+
+    async def _update(
+        rows: list[dict[str, Any]], payload: dict[str, Any], *, unarchived: bool
+    ) -> None:
+        for start in range(0, len(rows), _BOARD_US_CHUNK):
+            chunk = rows[start : start + _BOARD_US_CHUNK]
+            ids = [r["id"] for r in chunk]
+
+            def _build(c: Any, ids: list[str] = ids) -> Any:
+                q = c.table("jobs").update(payload).in_("id", ids)
+                # Re-assert the precondition in the WHERE clause: a concurrent
+                # archive between the upsert and this write must not have its
+                # timestamp moved.
+                return q.is_("archived_at", "null") if unarchived else q
+
+            await poll_db_write(supabase, _build, label="board country is_us")
+            for row in chunk:
+                row.update(payload)
+
+    try:
+        if to_us:
+            await _update(to_us, {"is_us": True}, unarchived=False)
+        if to_non_us:
+            await _update(to_non_us, {"is_us": False}, unarchived=False)
+        if to_archive:
+            await _update(
+                to_archive, {"archived_at": datetime.now(UTC).isoformat()}, unarchived=True
+            )
+    except Exception:
+        logger.exception("Board-country is_us write failed; leaving the rows untagged")
+    return len(to_us) + len(to_non_us), len(to_archive)
 
 
 def _dedupe_by_content(
@@ -1109,7 +1213,7 @@ async def _backfill_grade_stale(supabase: AsyncClient, limit: int) -> None:
                     # overwritten); ``test_grade_backfill`` pins it.
                     .select(
                         "recency_score, jobs!inner(id, title, company_name, location, "
-                        "description_html, cataloged_at, archived_at, purged_at, "
+                        "country, description_html, cataloged_at, archived_at, purged_at, "
                         "is_us, role_family, is_remote, employment_type, "
                         "qualified_hash, qualified_at)"
                     )
@@ -1755,6 +1859,8 @@ async def _poll_one_source(
             await _fill_jsonld_salaries(rows_to_upsert, known_external_ids)
 
         new_rows: list[dict[str, Any]] = []
+        board_us_marked = 0
+        board_us_archived = 0
         if rows_to_upsert:
             # Dedupe rows_to_upsert by (company, title). Both within
             # the current batch and against existing rows that have a
@@ -1824,6 +1930,13 @@ async def _poll_one_source(
                 else:
                     summary["new"] += 1
                     new_rows.append(data)
+
+            # The board's own US verdict — free, deterministic, no LLM. This is
+            # what restores the pruning lazy tagging took away for the
+            # providers that publish a structured country.
+            board_us_marked, board_us_archived = await _apply_board_us_verdicts(
+                supabase, jobs, upsert_resp.data or []
+            )
 
             # Qualification tags are LAZY now, exactly like embeddings below:
             # ingest is $0 LLM. ``ensure_job_tags`` in the Phase-2 runner buys
@@ -2140,6 +2253,7 @@ async def _poll_one_source(
             "poll_funnel source=%s fetched=%d dropped_phase1=%d "
             "dropped_title_prematch=%d dropped_non_us=%d candidates=%d "
             "upserted_new=%d upserted_updated=%d archived=%d "
+            "board_us_marked=%d board_us_archived=%d "
             "phase1_no_by_target=%s",
             company_name,
             len(jobs),
@@ -2150,6 +2264,8 @@ async def _poll_one_source(
             summary["new"],
             summary["updated"],
             summary["archived"],
+            board_us_marked,
+            board_us_archived,
             per_target_phase1_no or "{}",
         )
 
@@ -3280,6 +3396,11 @@ async def _poll_one_source_for_target(
                     known_upserted_ids.append(data["id"])
                 else:
                     summary["new"] += 1
+
+            # The board's own US verdict (see _poll_one_source) — free,
+            # deterministic, and the half of the tag-time pruning that lazy
+            # tagging can give straight back.
+            await _apply_board_us_verdicts(supabase, jobs, upsert_resp.data or [])
 
             # Qualification tags are LAZY (see _poll_one_source): the Phase-2
             # runner's ensure_job_tags buys them for the trimmed grade set.

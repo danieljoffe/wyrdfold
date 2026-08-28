@@ -95,7 +95,9 @@ _IN_CHUNK = 150
 #   * missing ``archived_at`` ⇒ the archived guard cannot fire;
 #   * missing ``is_remote`` / ``employment_type`` ⇒ #846's defer-to-the-board
 #     rule reads "the board said nothing" and the inference overwrites the
-#     employer's own answer (this is #795's 229 prod contradictions).
+#     employer's own answer (this is #795's 229 prod contradictions);
+#   * missing ``country`` ⇒ the deterministic-US veto below cannot fire, so an
+#     LLM false-negative can archive a job whose country column plainly says US.
 #
 # Ingest-shaped rows (an upsert RESULT) carry all of them for free; the
 # grade-backfill paths select explicitly and are pinned by tests.
@@ -111,6 +113,7 @@ TAG_INPUT_COLUMNS = frozenset(
         "archived_at",
         "is_remote",
         "employment_type",
+        "country",
     }
 )
 
@@ -244,11 +247,25 @@ async def _qualify_one_job(
     #
     # So these two keys are omitted when the row already holds a value. Every
     # other tag below is a fact NO board publishes (role_family, seniority,
-    # is_us, metro, is_genuine_role), so the tagger remains the only source and
-    # keeps writing them unconditionally. Board values re-derive on every poll,
-    # so a board that changes its mind still propagates.
+    # metro, is_genuine_role), so the tagger remains the only source and keeps
+    # writing them unconditionally. Board values re-derive on every poll, so a
+    # board that changes its mind still propagates.
+    #
+    # ``is_us`` is the one that stopped being tagger-only. ``jobs.country`` is
+    # written by exactly two DETERMINISTIC writers — the board's structured
+    # country field (#846) and ``location_parse`` over the board's own location
+    # string — and never by an inference. When it says ``US``, that beats a
+    # verdict the model read out of JD prose, so the tag is forced True and the
+    # non-US archive below cannot fire. ONE-SIDED on purpose, like
+    # ``positively_us_location``, which this generalizes: a US country vetoes a
+    # non-US inference, but a non-US country never suppresses one. Losing a
+    # non-US finding un-hides a row; losing a US one only costs a grade.
+    # Measured against prod before adopting it: of 29,585 tagged rows with
+    # ``country = 'US'``, the model disagreed on 123 — 0.42%.
+    deterministic_us = row.get("country") == "US"
+    effective_is_us = True if deterministic_us else tags.is_us
     payload: dict[str, Any] = {
-        "is_us": tags.is_us,
+        "is_us": effective_is_us,
         "role_family": tags.role_family,
         "seniority": tags.seniority,
         "metro": tags.metro,
@@ -274,10 +291,13 @@ async def _qualify_one_job(
     # ``positively_us_location`` veto hedges a high-confidence tagger
     # FALSE-negative on an unambiguously-US location (a real "New York, NY,
     # United States" was seen tagged non-US at conf 95): never archive when the
-    # location plainly says US.
+    # location plainly says US. ``effective_is_us`` carries the second veto —
+    # a deterministic ``country = 'US'`` — for the same reason: archiving is
+    # the one-way door here, so both deterministic US signals outrank the
+    # inference.
     if (
         settings.qualification_archive_non_us
-        and tags.is_us is False
+        and effective_is_us is False
         and tags.us_confidence is not None
         and tags.us_confidence >= settings.qualification_non_us_archive_min_confidence
         and not positively_us_location(row.get("location"))
