@@ -6,6 +6,7 @@ poller integration, list endpoint overlay, re-score endpoint.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -1179,3 +1180,92 @@ async def test_activation_writes_excluded_rows_but_buys_no_tags_for_them(
     assert upserted[0]["excluded"] is True
     # ...and it bought no tag.
     assert calls == []
+
+
+def _classified_target(family: str = "engineering") -> JobTarget:
+    """A target the family gate can actually enforce against."""
+    t = _target(core={"React": 3})
+    return t.model_copy(update={"role_family": family})
+
+
+def _tag_spy_that_tags(monkeypatch: pytest.MonkeyPatch, *, tags: bool) -> list[list[str]]:
+    """Spy on ``ensure_job_tags``. When ``tags`` is True it patches
+    ``role_family`` into the caller's dicts the way the real one does via its
+    ``finally`` refresh; when False it returns having tagged nothing, which is
+    what budget exhaustion / a latched breaker actually look like."""
+    import app.services.target_scoring as ts
+
+    calls: list[list[str]] = []
+
+    async def _fake(
+        _sb: object, rows: list[dict[str, Any]], *, budget_exhausted: object = None
+    ) -> None:
+        calls.append([r.get("id") for r in rows])
+        if tags:
+            for r in rows:
+                r["role_family"] = "engineering"
+
+    monkeypatch.setattr(ts, "ensure_job_tags", _fake)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_untagged_rows_are_withheld_when_the_target_is_classified(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``ensure_job_tags`` is best-effort — it returns early on budget
+    exhaustion, a budget-read failure, or a latched provider breaker. Writing
+    the score rows anyway would surface untagged jobs past the KEEP-NULL family
+    gate, which is the exact failure this whole path exists to prevent, and the
+    target would still go ``ready`` with no sign anything was missed."""
+    _tag_spy_that_tags(monkeypatch, tags=False)  # tagging bought nothing
+    supabase = _AsyncRetroSupabase(_retro_jobs())
+
+    with caplog.at_level(logging.WARNING, logger="app.services.target_scoring"):
+        written = await bulk_title_score_for_target(  # type: ignore[arg-type]
+            supabase, _classified_target()
+        )
+
+    upserted = [r["job_posting_id"] for c in supabase.upsert_calls for r in c]
+    # j01/j06 matched and would surface — withheld. j05 matched but is EXCLUDED,
+    # so it never surfaces and is written as before (it explains the rejection).
+    assert "j01" not in upserted and "j06" not in upserted
+    assert upserted == ["j05"]
+    assert written == 1
+    assert any("could not be tagged" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_successfully_tagged_rows_are_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control. Without this the withholding above could pass by writing
+    nothing ever."""
+    _tag_spy_that_tags(monkeypatch, tags=True)
+    supabase = _AsyncRetroSupabase(_retro_jobs())
+
+    written = await bulk_title_score_for_target(  # type: ignore[arg-type]
+        supabase, _classified_target()
+    )
+
+    upserted = {r["job_posting_id"] for c in supabase.upsert_calls for r in c}
+    assert {"j01", "j06"} <= upserted
+    assert written == 3
+
+
+@pytest.mark.asyncio
+async def test_unclassified_target_withholds_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unclassified target gates nothing — ``passes_family_gate`` keeps null
+    on BOTH sides — so withholding would be pure loss with no guard served."""
+    _tag_spy_that_tags(monkeypatch, tags=False)
+    supabase = _AsyncRetroSupabase(_retro_jobs())
+
+    written = await bulk_title_score_for_target(  # type: ignore[arg-type]
+        supabase, _target(core={"React": 3})
+    )
+
+    upserted = {r["job_posting_id"] for c in supabase.upsert_calls for r in c}
+    assert {"j01", "j05", "j06"} == upserted
+    assert written == 3

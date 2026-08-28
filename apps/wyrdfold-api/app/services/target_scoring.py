@@ -627,6 +627,42 @@ async def bulk_title_score_for_target(
                 [r for r in rows if r.get("id") in surfacing],
                 budget_exhausted=budget_exhausted,
             )
+            # ``ensure_job_tags`` is BEST-EFFORT: it returns early on budget
+            # exhaustion, a budget-read failure, or a latched provider breaker,
+            # so an activation can finish with part of its set still untagged.
+            # Its ``finally`` always re-reads the tag columns into these dicts,
+            # so what is still NULL here really is untagged.
+            #
+            # Writing those score rows anyway would defeat the point of tagging
+            # here at all: ``_gate_off_family`` is KEEP-NULL, so an untagged row
+            # sails past the very guard this call exists to arm, and the target
+            # goes ``ready`` with no sign anything was missed. A budget blip
+            # would silently reproduce the failure mode.
+            #
+            # So when the target IS classified — the only case where the family
+            # gate has anything to enforce — untagged rows are WITHHELD rather
+            # than surfaced unguarded. Withholding is the recoverable error
+            # (re-activation re-runs this pass, and grade-time tagging fills the
+            # column meanwhile); surfacing an unjudged row is not. An
+            # unclassified target gates nothing, so nothing is withheld.
+            if target.role_family:
+                untagged = {
+                    cast(str, r["id"])
+                    for r in rows
+                    if r.get("id") in surfacing and not r.get("role_family")
+                }
+                if untagged:
+                    logger.warning(
+                        "Activation for target %s: %d of %d surfacing job(s) could not be "
+                        "tagged (budget/provider); withholding their score rows rather than "
+                        "surfacing them past the keep-null family gate",
+                        target.id,
+                        len(untagged),
+                        len(surfacing),
+                    )
+                    rows_to_upsert = [
+                        r for r in rows_to_upsert if r["job_posting_id"] not in untagged
+                    ]
 
         if rows_to_upsert:
             await (
