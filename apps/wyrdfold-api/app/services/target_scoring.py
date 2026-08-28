@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -30,6 +31,7 @@ from app.models.schemas import JobTargetScore, ScoreBreakdown, ScoreResult, Scor
 from app.models.targets import JobTarget
 from app.services.db_write import poll_db_write
 from app.services.jd_parser import ParsedJD, parse_jd
+from app.services.qualification.materialize import ensure_job_tags
 from app.services.scoring import score_job_with_profile, score_title_against_profile
 from app.services.supabase_retry import execute_with_retry
 
@@ -549,7 +551,25 @@ def _title_score_page_rows(rows: list[dict[str, Any]], target: JobTarget) -> lis
     return rows_to_upsert
 
 
-async def bulk_title_score_for_target(supabase: AsyncClient, target: JobTarget) -> int:
+# Every column ``qualification.materialize.TAG_INPUT_COLUMNS`` reads, plus the
+# ``title`` the scorer needs. A PARTIAL projection here would not fail — it would
+# degrade the tagger SILENTLY: the content hash computed over missing inputs can
+# never match the stored one (re-tagged every activation), the archived guard
+# cannot fire, and a missing ``is_remote``/``employment_type`` inverts #846's
+# defer-to-the-board rule and writes the inference over the employer's own
+# answer. ``test_target_scoring`` pins this against the contract.
+_ACTIVATION_JOB_COLUMNS = (
+    "id, title, company_name, location, description_html, "
+    "qualified_hash, qualified_at, archived_at, is_remote, employment_type"
+)
+
+
+async def bulk_title_score_for_target(
+    supabase: AsyncClient,
+    target: JobTarget,
+    *,
+    budget_exhausted: Callable[[], Awaitable[bool]] | None = None,
+) -> int:
     """Stage-1 title-score every posting in ``jobs`` against ``target`` on the
     pooled async service client, writing matches in bulk. Returns the number of
     score rows written.
@@ -568,7 +588,10 @@ async def bulk_title_score_for_target(supabase: AsyncClient, target: JobTarget) 
     after_id: str | None = None
     while True:
         query = (
-            supabase.table("jobs").select("id, title").order("id").limit(_RETRO_TITLE_BATCH_SIZE)
+            supabase.table("jobs")
+            .select(_ACTIVATION_JOB_COLUMNS)
+            .order("id")
+            .limit(_RETRO_TITLE_BATCH_SIZE)
         )
         if after_id is not None:
             query = query.gt("id", after_id)
@@ -578,6 +601,69 @@ async def bulk_title_score_for_target(supabase: AsyncClient, target: JobTarget) 
             break
 
         rows_to_upsert = await asyncio.to_thread(_title_score_page_rows, rows, target)
+
+        # Tag the rows this activation will actually SURFACE, before their score
+        # rows go in. ``_gate_off_family`` (the guard against a health-clinician
+        # posting landing under a software-engineer target) compares
+        # ``jobs.role_family`` to the target's, and ``passes_family_gate`` is
+        # KEEP-NULL — an untagged job admits. Tagging on ingest used to keep
+        # that column populated; lazy tagging leaves it NULL until something
+        # grades the row, which disarms the gate exactly when a newly activated
+        # target pulls the whole back-catalogue into its list.
+        #
+        # Target activation IS a consumer appearing, so this is the lazy
+        # contract, not an exception to it. Scoped to matched, NON-excluded rows
+        # only: an excluded row never surfaces, so tagging it would be waste.
+        # Tags are target-INDEPENDENT, so this cost is paid once per job across
+        # every activation that ever matches it. Budget-gated through the
+        # injected predicate and chunked inside ``ensure_job_tags``; anything it
+        # cannot reach stays NULL and is no worse off than before.
+        surfacing = {
+            r["job_posting_id"] for r in rows_to_upsert if not r.get("excluded")
+        }
+        if surfacing:
+            await ensure_job_tags(
+                supabase,
+                [r for r in rows if r.get("id") in surfacing],
+                budget_exhausted=budget_exhausted,
+            )
+            # ``ensure_job_tags`` is BEST-EFFORT: it returns early on budget
+            # exhaustion, a budget-read failure, or a latched provider breaker,
+            # so an activation can finish with part of its set still untagged.
+            # Its ``finally`` always re-reads the tag columns into these dicts,
+            # so what is still NULL here really is untagged.
+            #
+            # Writing those score rows anyway would defeat the point of tagging
+            # here at all: ``_gate_off_family`` is KEEP-NULL, so an untagged row
+            # sails past the very guard this call exists to arm, and the target
+            # goes ``ready`` with no sign anything was missed. A budget blip
+            # would silently reproduce the failure mode.
+            #
+            # So when the target IS classified — the only case where the family
+            # gate has anything to enforce — untagged rows are WITHHELD rather
+            # than surfaced unguarded. Withholding is the recoverable error
+            # (re-activation re-runs this pass, and grade-time tagging fills the
+            # column meanwhile); surfacing an unjudged row is not. An
+            # unclassified target gates nothing, so nothing is withheld.
+            if target.role_family:
+                untagged = {
+                    cast(str, r["id"])
+                    for r in rows
+                    if r.get("id") in surfacing and not r.get("role_family")
+                }
+                if untagged:
+                    logger.warning(
+                        "Activation for target %s: %d of %d surfacing job(s) could not be "
+                        "tagged (budget/provider); withholding their score rows rather than "
+                        "surfacing them past the keep-null family gate",
+                        target.id,
+                        len(untagged),
+                        len(surfacing),
+                    )
+                    rows_to_upsert = [
+                        r for r in rows_to_upsert if r["job_posting_id"] not in untagged
+                    ]
+
         if rows_to_upsert:
             await (
                 supabase.table(TABLE)
