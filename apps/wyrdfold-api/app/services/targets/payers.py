@@ -43,6 +43,29 @@ BlockReason = Literal[
     "no_budget_snapshot",  # empty gate: breaker / build failure, fail-closed
 ]
 
+# Which of those clear on their own, and which do not.
+#
+# TRANSIENT: the payer's rolling 30-day window frees up without anyone doing
+# anything, so "skip it now, retry next cycle" is a real plan.
+#
+# PERSISTENT: nothing in the poll cycle will change these. An idle payer stays
+# idle until they sign in; a catalog target stays unsponsored until an operator
+# flips ``grade_catalog_targets``; a disabled account stays disabled. "Retry
+# next cycle" is not a plan for these — it is an infinite loop, and any pipeline
+# step that DROPS work while waiting for the block to lift drops it forever.
+#
+# The empty sentinel counts as persistent: we could not read budgets at all, so
+# we cannot claim the block is about to clear.
+TRANSIENT_BLOCK_REASONS: frozenset[str] = frozenset({"over_allowance"})
+PERSISTENT_BLOCK_REASONS: frozenset[str] = frozenset(
+    {"idle", "llm_disabled", "catalog_ungraded", "no_budget_snapshot"}
+)
+
+
+def block_is_persistent(reason: BlockReason | None) -> bool:
+    """True when ``reason`` will not clear on its own within the poll cycle."""
+    return reason in PERSISTENT_BLOCK_REASONS
+
 
 async def resolve_target_payers(
     supabase: AsyncClient, target_ids: list[str]

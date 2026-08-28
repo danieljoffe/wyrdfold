@@ -2225,3 +2225,106 @@ def test_poll_sources_for_target_aborts_when_deactivated_mid_fanout(
     assert result.sources_polled < 40, "fan-out never aborted"
     assert len(polled) < 40
     assert any("deactivated mid-run" in e for e in result.errors)
+
+
+# ---------------------------------------------------------------------------
+# A persistent block must not veto INGESTION (prod: 50h ingestion stall)
+# ---------------------------------------------------------------------------
+
+
+async def _run_poll_with_blocked_gate(monkeypatch, *, reason: str) -> tuple[dict, MagicMock]:
+    """Drive ``_poll_one_source`` with every active target blocked for
+    ``reason``. Returns the poll summary and the fake ``jobs`` table, so a test
+    can assert whether the NEW listing was upserted or discarded."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    supabase, _jobs, _sources = _make_poll_supabase([])
+
+    async def one_new_job(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id="new-1",
+                title="Brand New Role",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-01",
+                absolute_url="https://example.com/j/2",
+            )
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one_new_job)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "triage_titles", AsyncMock())  # must never be awaited
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+
+    gate = MagicMock()
+    gate.target_blocked.return_value = True
+    gate.target_block_reason.return_value = reason
+    gate.payer_for.return_value = "u1"
+    summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase, budget_gate=gate)
+    return summary, _jobs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["idle", "catalog_ungraded", "llm_disabled"])
+async def test_persistent_block_still_ingests_new_listings(monkeypatch, reason: str) -> None:
+    """THE 50-hour prod stall.
+
+    One idle account put every active target into a persistent block. Phase 1
+    registered empty verdicts for each, ``_any_target_admits`` found no target
+    that had attempted the job, and every NEW listing was discarded at the
+    upsert gate — ``new=0`` on every cycle for 50 hours while ``updated=N`` kept
+    flowing (known rows bypass the gate). "Re-triaged next cycle" is not a plan
+    when nothing about the block changes per cycle.
+
+    A persistently-blocked target casts no vote, so admission falls back to the
+    deterministic free gates the job already passed.
+    """
+    summary, jobs_table = await _run_poll_with_blocked_gate(monkeypatch, reason=reason)
+
+    assert summary["error"] is None
+    jobs_table.upsert.assert_called()  # the listing reached the catalog
+
+
+@pytest.mark.asyncio
+async def test_transient_block_still_defers_the_listing(monkeypatch) -> None:
+    """Control, and #285's rule preserved. An over-allowance payer's rolling
+    window frees up on its own, so "skip now, re-triage next cycle" is a real
+    plan — and dropping is right, because next cycle genuinely arrives.
+
+    Without this the fix would be indiscriminate: it would also stop deferring
+    for the one block that legitimately clears itself.
+    """
+    summary, jobs_table = await _run_poll_with_blocked_gate(
+        monkeypatch, reason="over_allowance"
+    )
+
+    assert summary["error"] is None
+    jobs_table.upsert.assert_not_called()
+
+
+def test_block_persistence_classification() -> None:
+    from app.services.targets.payers import (
+        PERSISTENT_BLOCK_REASONS,
+        TRANSIENT_BLOCK_REASONS,
+        block_is_persistent,
+    )
+
+    assert block_is_persistent("idle")
+    assert block_is_persistent("catalog_ungraded")
+    assert block_is_persistent("llm_disabled")
+    # We could not read budgets at all, so we cannot claim the block will clear.
+    assert block_is_persistent("no_budget_snapshot")
+    # The only self-clearing one.
+    assert not block_is_persistent("over_allowance")
+    # Not blocked at all is not "persistent".
+    assert not block_is_persistent(None)
+    # The two sets partition BlockReason with no overlap and no gaps.
+    assert not (PERSISTENT_BLOCK_REASONS & TRANSIENT_BLOCK_REASONS)
+    from app.services.targets.payers import BlockReason
+
+    assert set(BlockReason.__args__) == PERSISTENT_BLOCK_REASONS | TRANSIENT_BLOCK_REASONS

@@ -66,7 +66,12 @@ from app.services.target_scoring import (
     score_title_and_upsert as target_title_score_and_upsert,
 )
 from app.services.targets import crud
-from app.services.targets.payers import BlockReason, PayerBudgetGate, build_budget_gate
+from app.services.targets.payers import (
+    BlockReason,
+    PayerBudgetGate,
+    block_is_persistent,
+    build_budget_gate,
+)
 from app.services.titles import clean_title_display
 from app.services.validate import liveness_verdict, validate_job_url
 from app.services.workday import KnownPosting, fetch_workday_jobs
@@ -1355,23 +1360,52 @@ async def _poll_one_source(
                     # idle / disabled, or (default) a CATALOG-ONLY target
                     # nobody is pursuing — see ``grade_catalog_targets``.
                     #
-                    # Empty verdicts + empty ``attempted`` means every
-                    # title takes the NOT-attempted arm of
-                    # ``_phase1_promising`` → ``None`` = DEFER: excluded
-                    # from scores now, re-triaged when the block lifts.
-                    # (This comment previously claimed "fail-open admit,
-                    # jobs still ingest as promising" — that was the
-                    # pre-#285 blanket fail-open and is no longer true.)
-                    # The JOB row itself is unaffected either way: it is
-                    # already ingested before scoring, and public /search
-                    # reads ``jobs`` without consulting ``scores``.
-                    phase1_verdicts[active_target.id] = {}
-                    phase1_attempted[active_target.id] = set()  # nothing triaged → all defer
+                    # A blocked target casts no verdict. Whether it still gets
+                    # a VOTE at the admission gate depends on whether the block
+                    # can clear on its own.
+                    #
+                    # TRANSIENT (over allowance): registering empty verdicts +
+                    # empty ``attempted`` makes every title take the
+                    # NOT-attempted arm of ``_phase1_promising`` → DEFER:
+                    # excluded from scores now, re-triaged next cycle when the
+                    # rolling window frees up. That is #285's rule and it is
+                    # correct here, because "next cycle" genuinely arrives.
+                    #
+                    # PERSISTENT (idle / catalog-ungraded / disabled / no
+                    # snapshot): "next cycle" never arrives, so registering the
+                    # target would let it veto ingestion FOREVER. And it does
+                    # veto ingestion — the comment that used to sit here
+                    # claimed "the JOB row itself is unaffected... already
+                    # ingested before scoring", which is false:
+                    # ``_any_target_admits`` runs AT the upsert gate, before
+                    # the row is written. Prod proved it — one idle account put
+                    # every active target into a persistent block and new-job
+                    # ingestion stopped dead for 50 hours (~287 free-gate
+                    # survivors discarded per log window, `new=0` every cycle)
+                    # while `updated=N` kept flowing, because known rows bypass
+                    # the gate. This is the ingestion-starvation class
+                    # ``payers.target_blocked``'s HISTORY note exists to
+                    # prevent, reached by a path that note does not cover:
+                    # the gate suppresses only LLM work, but ADMISSION DEPENDS
+                    # ON AN LLM VERDICT, so suppressing the LLM suppressed
+                    # admission anyway.
+                    #
+                    # So a persistently-blocked target simply does not
+                    # participate. If it was the only one, ``phase1_verdicts``
+                    # stays empty and ``_any_target_admits`` falls back to the
+                    # deterministic free gates that already passed.
+                    reason = gate.target_block_reason(active_target.id)
+                    if not block_is_persistent(reason):
+                        phase1_verdicts[active_target.id] = {}
+                        phase1_attempted[active_target.id] = set()  # → all defer
                     logger.info(
-                        "Phase 1 deferred for target %s (payer %s blocked: %s)",
+                        "Phase 1 deferred for target %s (payer %s blocked: %s; %s)",
                         active_target.id,
                         gate.payer_for(active_target.id),
-                        gate.target_block_reason(active_target.id),
+                        reason,
+                        "not vetoing ingestion"
+                        if block_is_persistent(reason)
+                        else "deferring, will re-triage",
                     )
                     continue
                 # BYOK (#5 P3): grade on the payer's own key. No key in
