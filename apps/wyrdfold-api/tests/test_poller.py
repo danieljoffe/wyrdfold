@@ -1461,15 +1461,18 @@ async def test_flag_on_full_source_poll_runs_entirely_on_async_client(monkeypatc
     assert summary["polled"] is True
     assert summary["new"] == 2
 
-    # The jobs upsert ran on the async client with both rows.
+    # The jobs upsert ran on the async client with both rows. The count is not
+    # pinned to 1: these two fixtures ("Remote, USA" and "New York, NY") are a
+    # heterogeneous batch, so #928's key-set grouping splits them across two
+    # statements. What this test is about is WHICH CLIENT they ran on.
     jobs_upserts = [
         ops
         for ops in async_client.chains("table", "jobs")
         if any(o[0] == "upsert" for o in ops[1:])
     ]
-    assert len(jobs_upserts) == 1
-    upserted = next(o[1][0] for o in jobs_upserts[0][1:] if o[0] == "upsert")
-    assert [r["external_id"] for r in upserted] == ["a-1", "a-2"]
+    assert jobs_upserts
+    upserted = [r for ops in jobs_upserts for o in ops[1:] if o[0] == "upsert" for r in o[1][0]]
+    assert sorted(r["external_id"] for r in upserted) == ["a-1", "a-2"]
 
     # Stage 1 + Stage 2 score upserts (2 jobs x 1 target x 2 stages).
     score_upserts = [
@@ -2533,3 +2536,83 @@ async def test_two_concurrent_cycles_each_respect_their_own_cap(monkeypatch) -> 
     # Precondition: both cycles really did work (a no-op cycle proves nothing).
     assert n1 > 0 and n2 > 0
     assert n1 == 2 and n2 == 2, (n1, n2)
+
+
+# ---- #928: heterogeneous batches must not blank the keys some rows omit -----
+
+
+@pytest.mark.asyncio
+async def test_poll_upserts_a_heterogeneous_batch_in_key_homogeneous_groups(monkeypatch):
+    """#928: a bulk upsert is ONE ``INSERT … ON CONFLICT DO UPDATE`` built from
+    the union of the batch's keys, so a key one row supplies is written — as
+    NULL — to the rows that omitted it. ``board_columns`` omits ``is_remote``
+    for a board-silent posting precisely so the stored value survives, and a
+    board-speaking sibling in the same batch was blanking it anyway.
+
+    The blanking happens inside Postgres, so no assertion on the payload can
+    see it (the integration test does the real round trip). What IS assertable
+    here is the property that makes it impossible: every statement the poller
+    issues carries exactly one key-set. The old single bulk upsert fails this —
+    one call, two key-sets.
+    """
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "validate_poll_urls", False)
+
+    supabase, jobs_table, _sources = _make_poll_supabase([])
+
+    async def fetch(_token: str) -> list[StandardJob]:
+        return [
+            # The board states remote in its location string → board_columns
+            # supplies ``is_remote``.
+            StandardJob(
+                external_id="speaks-1",
+                title="Remote Brand Manager",
+                location_name="Remote - US",
+                content="<p>jd</p>",
+                posted_at="2026-01-01",
+                absolute_url="https://example.com/j/1",
+            ),
+            # Says nothing about remoteness → board_columns omits the key, and
+            # the tagger is the writer for exactly this row.
+            StandardJob(
+                external_id="silent-1",
+                title="Brand Strategist",
+                location_name="New York, NY",
+                content="<p>jd</p>",
+                posted_at="2026-01-01",
+                absolute_url="https://example.com/j/2",
+            ),
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand"])
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", fetch)
+
+    open_gate = MagicMock()
+    open_gate.target_blocked.return_value = False
+    summary = await poller_mod._poll_one_source(
+        dict(_GUARD_SOURCE),
+        supabase,
+        budget_gate=open_gate,
+        active_targets=[target],
+        stage3_users=({}, {}),
+    )
+
+    assert summary["error"] is None
+    payloads = [c.args[0] for c in jobs_table.upsert.call_args_list]
+    rows = [r for p in payloads for r in p]
+
+    # PRECONDITIONS — without these the homogeneity assertion is vacuous.
+    assert {r["external_id"] for r in rows} == {"speaks-1", "silent-1"}
+    by_id = {r["external_id"]: r for r in rows}
+    assert by_id["speaks-1"]["is_remote"] is True  # the board really did speak
+    assert "is_remote" not in by_id["silent-1"]  # and the sibling really is silent
+    assert len({frozenset(r) for r in rows}) == 2  # the batch really is heterogeneous
+
+    # THE fix: no single statement carries both key-sets.
+    for payload in payloads:
+        assert len({frozenset(r) for r in payload}) == 1, (
+            "one statement mixed key-sets — PostgREST will NULL the omitted key"
+        )
+    assert len(payloads) == 2

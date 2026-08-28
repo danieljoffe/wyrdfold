@@ -94,6 +94,11 @@ def _score_row_payload(
         "recency_score": score,
         "updated_at": datetime.now(UTC).isoformat(),
     }
+    # Optional keys. Safe against #928 (a bulk upsert writes the union of the
+    # batch's keys to every row) because the only BULK caller,
+    # ``_title_score_page_rows``, passes neither — so both stay out of every row
+    # in the page and the column list never mentions them. The other caller
+    # (``_upsert_score``) writes one row, where the key-set IS the union.
     if promising is not None:
         row["promising"] = promising
     if phase1_confidence is not None:
@@ -407,9 +412,13 @@ def _rescore_page_rows(
             "recency_score": result.score,
             "updated_at": now,
         }
-        # Pass-through ``promising`` only when it's set on the
-        # existing row; ``None`` leaves the column unchanged on
-        # this upsert (preserving the legacy/null state).
+        # Pass-through ``promising`` only when it's set on the existing row.
+        # NOT because omitting it leaves the column alone — this is a BULK
+        # upsert, and PostgREST writes the union of the batch's keys to every
+        # row, so an omitting row gets NULL (#928). It is a no-op here only
+        # because ``existing_promising is None`` means the stored value ALREADY
+        # is NULL: it was read from these same score rows moments ago. Do not
+        # copy this shape to a column whose omitted value isn't the stored one.
         if existing_promising is not None:
             row["promising"] = existing_promising
         rows_to_upsert.append(row)

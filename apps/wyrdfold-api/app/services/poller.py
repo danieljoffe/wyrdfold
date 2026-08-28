@@ -23,7 +23,12 @@ from app.services import notify
 from app.services.ashby import fetch_ashby_jobs
 from app.services.board_metadata import board_columns
 from app.services.date_normalize import normalize_posted_at
-from app.services.db_write import DB_WRITE_CONCURRENCY, poll_db_read, poll_db_write
+from app.services.db_write import (
+    DB_WRITE_CONCURRENCY,
+    poll_db_read,
+    poll_db_upsert,
+    poll_db_write,
+)
 from app.services.experience import optimized
 from app.services.extract import extract_salary_from_html, salary_columns
 from app.services.firecrawl import fetch_firecrawl_jobs
@@ -1788,11 +1793,17 @@ async def _poll_one_source(
         # ``source_failure_disable_threshold`` consecutive empties — would
         # auto-disable a perfectly healthy source. Skip the write instead.
         if rows_to_upsert:
-            upsert_resp = await poll_db_write(
+            # #928: grouped by key-set, NOT one bulk upsert. PostgREST builds a
+            # single statement from the union of the batch's keys, so a row that
+            # omits ``is_remote`` / ``employment_type`` was being sent NULL for
+            # it whenever a sibling in the same batch supplied one — blanking
+            # exactly the board-silent postings ``board_columns`` promises to
+            # leave alone. See ``poll_db_upsert``.
+            upserted_rows = await poll_db_upsert(
                 supabase,
-                lambda c: c.table("jobs").upsert(
-                    rows_to_upsert, on_conflict="source_id,external_id"
-                ),
+                table="jobs",
+                rows=rows_to_upsert,
+                on_conflict="source_id,external_id",
                 label=f"poll upsert {company_name}",
             )
             # #514: a row is a REFRESH iff its external_id was known BEFORE
@@ -1806,8 +1817,7 @@ async def _poll_one_source(
             # verdict for refreshed rows instead of re-litigating admission
             # with this cycle's (absent) verdict.
             known_upserted_ids: list[str] = []
-            for raw_row in upsert_resp.data or []:
-                data = cast(dict[str, Any], raw_row)
+            for data in upserted_rows:
                 if data.get("external_id") in known_external_ids:
                     summary["updated"] += 1
                     known_upserted_ids.append(data["id"])
@@ -1843,21 +1853,18 @@ async def _poll_one_source(
                     except Exception:
                         logger.exception("Stage 1 scoring failed for job %s", row_data.get("id"))
 
-                await asyncio.gather(
-                    *(_title_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
-                )
+                await asyncio.gather(*(_title_score_one(r) for r in upserted_rows))
 
             # ---- Stage 2: Full JD scoring per target (async) ----
             # Pre-parse each JD once, reuse across all targets
             jd_cache: dict[str, Any] = {}
-            for raw_row in upsert_resp.data or []:
-                rd = cast(dict[str, Any], raw_row)
+            for rd in upserted_rows:
                 jd_cache[rd["id"]] = parse_jd(rd.get("description_html") or "")
 
             for active_target in active_targets:
                 # Per-target Phase 1 verdicts (None when flag off): keyed by
                 # the 1-based job idx assigned during the candidate-build
-                # loop above. Each row in upsert_resp carries an
+                # loop above. Each upserted row carries an
                 # ``external_id`` we look up to get the idx, then to get the
                 # verdict. Missing entries are fail-open (admit).
                 target_verdicts = phase1_verdicts.get(active_target.id, {})
@@ -1938,9 +1945,7 @@ async def _poll_one_source(
                     except Exception:
                         logger.exception("Stage 2 scoring failed for job %s", row_data.get("id"))
 
-                await asyncio.gather(
-                    *(_full_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
-                )
+                await asyncio.gather(*(_full_score_one(r) for r in upserted_rows))
 
             # ---- Stage 3: LLM scoring for qualified jobs (concurrent) ----
             # Each user with an active target gets one LLM analysis per
@@ -1971,7 +1976,7 @@ async def _poll_one_source(
                 # ``jobs.score`` afterwards because Phase 2 rewrites
                 # ``scores.score`` (Stage 2's keyword value was a
                 # placeholder until graded).
-                cycle_rows = [cast(dict[str, Any], r) for r in upsert_resp.data or []]
+                cycle_rows = list(upserted_rows)
                 for uid, p2_target in primary_by_user.items():
                     p2_reason = gate.user_block_reason(uid)
                     if p2_reason is not None:
@@ -2015,7 +2020,7 @@ async def _poll_one_source(
             # Ids of every row touched this cycle — feeds the recency
             # refresh (the legacy global-score recompute that shared this
             # list was retired in R2, schema audit Group A).
-            stage2_ids = [cast(dict[str, Any], r)["id"] for r in upsert_resp.data or []]
+            stage2_ids = [r["id"] for r in upserted_rows]
 
             # ---- Recency decay refresh (#5) ----
             # Re-derive ``scores.recency_score`` for every row touched
@@ -3252,11 +3257,15 @@ async def _poll_one_source_for_target(
             # Routing through the seam also gives this upsert the transient-
             # blip retry the all-sources path already had (idempotent upsert,
             # so a re-issue after a dropped stream is safe).
-            upsert_resp = await poll_db_write(
+            # Grouped by key-set (#928) — same reason as _poll_one_source: a
+            # single bulk upsert writes the union of the batch's keys to every
+            # row, blanking the board-silent postings' is_remote /
+            # employment_type. See ``poll_db_upsert``.
+            upserted_rows = await poll_db_upsert(
                 supabase,
-                lambda c: c.table("jobs").upsert(
-                    rows_to_upsert, on_conflict="source_id,external_id"
-                ),
+                table="jobs",
+                rows=rows_to_upsert,
+                on_conflict="source_id,external_id",
                 label=f"poll upsert {company_name}",
             )
             # #514: a row is a REFRESH iff its external_id was known before
@@ -3265,8 +3274,7 @@ async def _poll_one_source_for_target(
             # Stage-2 pass preserves the persisted Phase-1 verdict for
             # refreshed rows instead of re-litigating admission.
             known_upserted_ids: list[str] = []
-            for raw_row in upsert_resp.data or []:
-                data = cast(dict[str, Any], raw_row)
+            for data in upserted_rows:
                 if data.get("external_id") in known_external_ids:
                     summary["updated"] += 1
                     known_upserted_ids.append(data["id"])
@@ -3290,14 +3298,11 @@ async def _poll_one_source_for_target(
                 except Exception:
                     logger.exception("Stage 1 scoring failed for job %s", row_data.get("id"))
 
-            await asyncio.gather(
-                *(_title_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
-            )
+            await asyncio.gather(*(_title_score_one(r) for r in upserted_rows))
 
             # Stage 2: Full JD scoring (pre-parse JDs once)
             jd_cache: dict[str, Any] = {}
-            for raw_row in upsert_resp.data or []:
-                rd = cast(dict[str, Any], raw_row)
+            for rd in upserted_rows:
                 jd_cache[rd["id"]] = parse_jd(rd.get("description_html") or "")
 
             # #514: persisted Phase-1 verdicts for the refreshed rows —
@@ -3367,9 +3372,7 @@ async def _poll_one_source_for_target(
                 except Exception:
                     logger.exception("Stage 2 scoring failed for job %s", row_data.get("id"))
 
-            await asyncio.gather(
-                *(_full_score_one(cast(dict[str, Any], r)) for r in upsert_resp.data or [])
-            )
+            await asyncio.gather(*(_full_score_one(r) for r in upserted_rows))
 
             # Stage 3: LLM scoring for qualified jobs (concurrent).
             # JobTarget is a global row with no user_id — resolve owning
@@ -3408,7 +3411,7 @@ async def _poll_one_source_for_target(
                         payer_user_id,
                     )
                 else:
-                    cycle_rows = [cast(dict[str, Any], r) for r in upsert_resp.data or []]
+                    cycle_rows = list(upserted_rows)
                     for uid in primary_by_user:
                         try:
                             await run_phase2_for_jobs(
