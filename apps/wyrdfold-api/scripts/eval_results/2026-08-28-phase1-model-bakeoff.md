@@ -77,9 +77,48 @@ Deduped to 160 distinct titles and crossed with all 6 pipeline-active targets �
 against *every* unblocked active target, which is exactly why enabling Phase 1
 for the catalog makes triage a global cost.
 
-Committed as `tests/fixtures/phase1_unadmitted_corpus.json`. Target
-`description` is dropped (second-person prose that names employers, #868; this
-repo is public); the prompt never reads it.
+Committed as `tests/fixtures/phase1_unadmitted_corpus.json`.
+
+### What the committed fixture contains
+
+This repo is public and the corpus is built from production targets, so the
+fixture stores the **minimum that reproduces the eval** — per target, exactly
+five fields:
+
+| field | why it is kept |
+| --- | --- |
+| `label` | read by the Phase-1 prompt (`_split_user_message`) |
+| `example_promising_titles` | read by the Phase-1 prompt |
+| `example_unpromising_titles` | read by the Phase-1 prompt |
+| `app_active` | bare boolean, no user-derived content; required to construct a `JobTarget`, and carries the catalog-vs-followed split the whole analysis turns on |
+| `id` | a **fixture-local alias** (`catalog-software-engineer`, `user-senior-frontend-engineer`), never a production row id |
+
+Everything else is dropped, including **`scoring_profile` and
+`search_keywords`**. Those drive the free gate at *build* time
+(`_passes_free_gates`, and the `stratum` tag), but both outcomes are baked into
+`cases` as data, so the committed artifact has no use for the configuration that
+produced them — and a user-followed target's profile is LLM-derived from that
+user's own résumé. Also dropped: `description` (#868), `normalized_label`,
+`role_family`, `seniority_hint`, `activation_status`, `profile_version`,
+`created_at`, `updated_at`.
+
+The allowlist is enforced in CI (`PERMITTED_TARGET_KEYS`), as a *subset*
+assertion rather than an absence check — a denylist catches the field you
+already found, not the next one.
+
+### Rerunnable, not reproducible
+
+The builder samples **live** target configuration and **live** boards at build
+time. Boards move, and targets and their example pools are edited in the
+database independently of this repo — so rebuilding at the same `--seed` does
+**not** reproduce this corpus or this decision boundary. It reruns the same
+procedure against the then-current production configuration.
+
+Treat the committed fixture as the immutable artifact: the bake-off results
+below are evidence for *this* file, not for whatever a rebuild would produce.
+`meta.target_config_digests` records a one-way fingerprint of each target's
+configuration as used here, so a later rebuild can tell whether the boundary
+moved without the fixture carrying the configuration itself.
 
 ### Corpus skew — read this before trusting the ranking
 
@@ -398,5 +437,7 @@ FN of the cheap tier at 15.7× the cheapest model's cost.
 Raw run output (`phase1_bakeoff_unadmitted_20260828.json`, ~400 KB of per-verdict
 detail) is deliberately not committed — `eval_results/` is gitignored for raw
 output. Every confusion matrix needed to recheck the arithmetic above is in the
-tables; the corpus and harness are committed, so the run is repeatable for
-~$0.90.
+tables. The corpus fixture and the harness are committed, so the **grading** step
+can be re-run against this exact corpus for ~$0.90 (model sampling still varies
+run to run); the **corpus build** cannot be replayed — see "Rerunnable, not
+reproducible" above.

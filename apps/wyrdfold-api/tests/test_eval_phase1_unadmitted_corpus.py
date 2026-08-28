@@ -1,16 +1,22 @@
 """Guards for the unadmitted-stack Phase-1 bake-off corpus and the report
 extensions it drives.
 
-Two things are pinned here, both free (no LLM, no network):
+Three things are pinned here, all free (no LLM, no network):
 
-1. **The committed corpus fixture** — it is the input to a model-swap decision,
-   so its shape has to hold: every case names a real target, every target
-   carries the two fields the Phase-1 prompt actually reads, no case carries the
-   second-person ``description`` (this repo is public, #868), and the strata
-   are both populated (a corpus that is all ``cross_gate`` would be an easy
-   off-family quiz, not a triage eval).
+1. **Data minimization of the published fixture.** This repo is PUBLIC and the
+   corpus is built from production targets, so the guard is an **allowlist**:
+   a target may carry only the fields the Phase-1 prompt actually reads, keyed
+   by fixture-local alias rather than production row id. It was originally a
+   denylist (``"description" not in target``, #868) and that is precisely why
+   nine other fields — including a user-followed target's LLM-derived
+   ``scoring_profile`` — sailed through. A denylist catches the field you
+   already found; an allowlist catches the next one.
 
-2. **The report extensions** — cost-per-1k / backlog projection, and the
+2. **Corpus shape** — every case names a real target, both strata are populated
+   (a corpus that is all ``cross_gate`` would be an easy off-family quiz, not a
+   triage eval), and the cases are the full target x title cross product.
+
+3. **The report extensions** — cost-per-1k / backlog projection, and the
    per-stratum split. The split exists because a model can post a great headline
    agreement while being bad at the only pairs that are hard; a test that only
    checked the headline would not notice.
@@ -19,15 +25,22 @@ Two things are pinned here, both free (no LLM, no network):
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from app.services.relevance.title_triage import _build_user_message
+from scripts.build_phase1_unadmitted_corpus import (
+    PERMITTED_TARGET_KEYS,
+    assert_permitted,
+)
 from scripts.eval_phase1_triage import (
     _agreement_report,
     _apply_admission,
     _parse_confidences,
+    _rehydrate_targets,
     _strata_by_key,
     _strata_by_target,
 )
@@ -58,11 +71,95 @@ def test_targets_carry_what_the_phase1_prompt_reads(corpus: dict[str, Any]) -> N
         assert t["example_unpromising_titles"], f"{tid} has no unpromising examples"
 
 
-def test_no_target_description_leaks_into_the_public_fixture(corpus: dict[str, Any]) -> None:
-    # targets.description is second-person prose that names employers (#868).
-    # The prompt never reads it, so its presence here would be pure leak.
+def test_committed_targets_carry_only_permitted_fields(corpus: dict[str, Any]) -> None:
+    """Data minimization, enforced as an ALLOWLIST.
+
+    This started life as ``assert "description" not in target`` — a denylist,
+    which catches exactly the one field someone already thought of and waves
+    through every future one. It waved through nine: ``scoring_profile``,
+    ``search_keywords``, ``role_family``, ``seniority_hint``,
+    ``normalized_label``, ``activation_status``, ``profile_version``,
+    ``created_at``, ``updated_at``. A user-followed target's scoring profile is
+    LLM-derived from that user's own résumé; this repo is public.
+
+    Subset, not equality, so a target legitimately missing an optional field
+    still passes — but nothing new can land without a deliberate edit here.
+    """
     for tid, meta in corpus["targets"].items():
-        assert "description" not in meta["target"], f"{tid} carries a description"
+        extra = set(meta["target"]) - PERMITTED_TARGET_KEYS
+        assert not extra, (
+            f"{tid} carries non-permitted field(s) {sorted(extra)} in a PUBLIC artifact. "
+            f"Add to PERMITTED_TARGET_KEYS only if the eval genuinely needs it."
+        )
+
+
+def test_the_allowlist_rejects_a_field_it_has_never_seen() -> None:
+    """The guard above must FAIL on a new field, not just on ``description``.
+
+    Without this, the allowlist could be silently widened (or the assertion
+    inverted) and nothing would notice — the failure mode the denylist had.
+    """
+    smuggled = {
+        "id": "catalog-x",
+        "label": "X",
+        "app_active": True,
+        "example_promising_titles": ["a"],
+        "example_unpromising_titles": ["b"],
+        "scoring_profile": {"categories": {"frontend": {"keywords": {"React": 3}}}},
+    }
+    assert set(smuggled) - PERMITTED_TARGET_KEYS == {"scoring_profile"}
+
+    # And the builder refuses to write it in the first place.
+    with pytest.raises(RuntimeError, match="non-permitted"):
+        assert_permitted(smuggled)
+
+    # A payload that stays inside the allowlist passes untouched.
+    clean = {k: v for k, v in smuggled.items() if k != "scoring_profile"}
+    assert assert_permitted(clean) == clean
+
+
+def test_no_production_uuid_anywhere_in_the_fixture() -> None:
+    """Target ids must be fixture-local aliases, never production row ids.
+
+    Scans the whole file, not just the ``id`` fields — a uuid could as easily
+    ride along in a case, in meta, or in a note.
+    """
+    blob = _CORPUS.read_text()
+    uuids = re.findall(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", blob, re.IGNORECASE
+    )
+    assert not uuids, f"production row ids in a public artifact: {sorted(set(uuids))}"
+
+
+def test_target_keys_are_aliases_that_match_their_own_id(corpus: dict[str, Any]) -> None:
+    for tid, meta in corpus["targets"].items():
+        assert re.fullmatch(r"(catalog|user)-[a-z0-9-]+", tid), f"{tid} is not an alias"
+        assert meta["target"]["id"] == tid, f"{tid} disagrees with its own id field"
+        # The prefix must state the truth: it is what the catalog-vs-followed
+        # split in the write-up is computed from.
+        expected = "catalog" if meta["target"]["app_active"] else "user"
+        assert tid.startswith(expected), f"{tid} contradicts app_active"
+
+
+def test_minimized_target_still_produces_the_production_prompt(corpus: dict[str, Any]) -> None:
+    """Minimization must not have changed what the model sees.
+
+    The stub fields ``_rehydrate_targets`` fills in are only safe if the prompt
+    never reads them. This asserts that directly: rehydrate from the committed
+    (minimized) payload, build the real Phase-1 user message, and check the
+    parts that come from the target are all present and that no stub leaks in.
+    """
+    targets = _rehydrate_targets(corpus)
+    assert targets, "no targets rehydrated"
+    for tid, t in targets.items():
+        msg = _build_user_message(t, ["Senior Frontend Engineer"])
+        assert f"Target role: {t.label}" in msg
+        for ex in t.example_promising_titles:
+            assert ex in msg
+        for ex in t.example_unpromising_titles:
+            assert ex in msg
+        # Stub values must never reach the model.
+        assert "1970-01-01" not in msg, f"{tid}: a stub timestamp leaked into the prompt"
 
 
 def test_both_strata_are_populated(corpus: dict[str, Any]) -> None:

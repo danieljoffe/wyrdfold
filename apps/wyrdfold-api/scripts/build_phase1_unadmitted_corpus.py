@@ -65,9 +65,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import random
+import re
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -312,30 +314,117 @@ def _pick_titles(
     return picked
 
 
-def _target_payload(t: JobTarget) -> dict[str, Any]:
-    """The target as the fixture stores it.
+def _slug(text: str) -> str:
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", text.lower())).strip("-")
 
-    ``description`` is dropped: it is second-person prose that names employers
-    (#868) and this fixture is committed to a PUBLIC repo. The Phase-1 prompt
-    never reads it — ``title_triage._split_user_message`` uses ``label`` and the
-    two example pools only — so nothing about the eval changes.
+
+def _aliases_for(targets: list[JobTarget]) -> dict[str, str]:
+    """``{production target uuid: fixture-local alias}``.
+
+    The committed fixture must not carry production row ids. They identify real
+    rows in a published artifact and are the join key back to everything else
+    about a target, and the eval needs no such thing — it needs a stable handle
+    that groups cases by target. The ``catalog-`` / ``user-`` prefix records the
+    only distinction the analysis turns on (``app_active``); the slug keeps the
+    file readable.
     """
-    return {
-        "id": t.id,
-        "label": t.label,
-        "normalized_label": t.normalized_label,
-        "scoring_profile": t.scoring_profile.model_dump(mode="json"),
-        "search_keywords": t.search_keywords,
-        "example_promising_titles": t.example_promising_titles,
-        "example_unpromising_titles": t.example_unpromising_titles,
-        "role_family": t.role_family,
-        "seniority_hint": t.seniority_hint,
-        "app_active": t.app_active,
-        "activation_status": t.activation_status,
-        "profile_version": t.profile_version,
-        "created_at": t.created_at.isoformat(),
-        "updated_at": t.updated_at.isoformat(),
-    }
+    out: dict[str, str] = {}
+    used: set[str] = set()
+    for t in targets:
+        base = f"{'catalog' if t.app_active else 'user'}-{_slug(t.label)}"
+        alias, n = base, 2
+        while alias in used:  # two targets may share a label
+            alias, n = f"{base}-{n}", n + 1
+        used.add(alias)
+        out[t.id] = alias
+    return out
+
+
+def _config_digest(t: JobTarget) -> str:
+    """Short fingerprint of the target configuration this build actually used.
+
+    Targets and their example pools are edited in the database, independently of
+    this repo, and boards move under us. So a rebuild at the same ``--seed`` does
+    NOT reproduce the same decision boundary, and without this the fixture would
+    have no way to say so. Same digest ⇒ same boundary; different digest ⇒ the
+    corpus and any results derived from it describe different targets. One-way,
+    so it carries the comparison without carrying the configuration.
+    """
+    canonical = json.dumps(
+        {
+            "label": t.label,
+            "search_keywords": sorted(t.search_keywords),
+            "scoring_profile": t.scoring_profile.model_dump(mode="json"),
+            "example_promising_titles": sorted(t.example_promising_titles),
+            "example_unpromising_titles": sorted(t.example_unpromising_titles),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()[:12]
+
+
+# Every key the committed fixture may carry for a target. Enforced as an
+# ALLOWLIST in tests/test_eval_phase1_unadmitted_corpus.py — a denylist only
+# catches the field you already thought of, and this artifact is published.
+PERMITTED_TARGET_KEYS: frozenset[str] = frozenset(
+    {"id", "label", "app_active", "example_promising_titles", "example_unpromising_titles"}
+)
+
+
+def assert_permitted(payload: dict[str, Any]) -> dict[str, Any]:
+    """Raise unless ``payload`` carries only allowlisted keys; else return it.
+
+    Named and public so the CI guard can exercise the real check rather than
+    restate the rule — a test that reimplements the predicate it is testing
+    passes even when the predicate is wrong.
+    """
+    extra = set(payload) - PERMITTED_TARGET_KEYS
+    if extra:
+        raise RuntimeError(
+            f"target payload carries non-permitted keys {sorted(extra)}; this fixture is PUBLIC"
+        )
+    return payload
+
+
+def _target_payload(t: JobTarget, alias: str) -> dict[str, Any]:
+    """The target as the fixture stores it — the minimum that reproduces the eval.
+
+    This repo is PUBLIC, so the fixture carries only what the Phase-1 prompt
+    reads. ``title_triage._split_user_message`` reads exactly three things:
+    ``label`` and the two example pools. ``app_active`` is the fourth field kept
+    — a bare boolean with no user-derived content, required to construct a
+    ``JobTarget`` at all, and carrying the catalog-vs-followed split the whole
+    analysis turns on.
+
+    Everything else is dropped, each omission deliberate:
+
+    - ``description`` — second-person prose naming employers (#868).
+    - ``scoring_profile`` / ``search_keywords`` — a user-followed target's
+      profile is LLM-derived from that user's own résumé and history. They drive
+      the free gate at BUILD time (``_passes_free_gates``, and the ``stratum``
+      tag), but both outcomes are baked into ``cases`` as data, so the committed
+      artifact has no use for the configuration that produced them. Publishing
+      them would publish a user's derived profile to buy nothing.
+    - ``id`` — replaced by ``alias``; see ``_aliases_for``.
+    - ``normalized_label`` / ``role_family`` / ``seniority_hint`` /
+      ``activation_status`` / ``profile_version`` / ``created_at`` /
+      ``updated_at`` — configuration and lifecycle state no part of the eval reads.
+
+    ``eval_phase1_triage._rehydrate_targets`` fills the rest of ``JobTarget``
+    with neutral stubs, which is safe precisely because the prompt never reads
+    them.
+    """
+    # The allowlist is enforced in CI, but a build that would emit a disallowed
+    # key should fail here rather than write the file and rely on review.
+    return assert_permitted(
+        {
+            "id": alias,
+            "label": t.label,
+            "app_active": t.app_active,
+            "example_promising_titles": t.example_promising_titles,
+            "example_unpromising_titles": t.example_unpromising_titles,
+        }
+    )
 
 
 def _build_fixture(
@@ -347,15 +436,19 @@ def _build_fixture(
     per_provider: dict[str, int],
     survivors_total: int,
 ) -> dict[str, Any]:
+    aliases = _aliases_for(targets)
     cases: list[dict[str, Any]] = []
     for t in targets:
         for row in titles:
             title = str(row["title"])
             cases.append(
                 {
-                    "target_id": t.id,
+                    "target_id": aliases[t.id],
                     "title": title,
                     # Which half of the workload this pair is — see module docstring.
+                    # Computed HERE from the live target and stored as DATA: the
+                    # configuration needed to recompute it is deliberately not
+                    # committed (see _target_payload).
                     "stratum": "own_gate" if _title_matches_any_target(title, [t]) else "cross_gate",
                     "provider": row["provider"],
                 }
@@ -373,13 +466,19 @@ def _build_fixture(
             "title_provider_mix": dict(Counter(str(r["provider"]) for r in titles)),
             "stratum_mix": dict(Counter(c["stratum"] for c in cases)),
             "funnel": stats,
+            # Snapshot identity for the boundary this corpus was built against.
+            # The seed alone does NOT make a rebuild reproducible: boards move and
+            # target configuration is edited in the database, outside this repo.
+            "target_config_digests": {aliases[t.id]: _config_digest(t) for t in targets},
             "note": (
                 "Free-gate survivors NOT present in jobs.external_id, fetched live "
                 "from ATS boards and filtered through poller._passes_free_gates. "
-                "Target descriptions are intentionally omitted (public repo)."
+                "Targets are stored MINIMALLY (see _target_payload): only the fields "
+                "the Phase-1 prompt reads, under fixture-local aliases, never "
+                "production row ids. This artifact is published."
             ),
         },
-        "targets": {t.id: {"target": _target_payload(t)} for t in targets},
+        "targets": {aliases[t.id]: {"target": _target_payload(t, aliases[t.id])} for t in targets},
         "cases": cases,
     }
 

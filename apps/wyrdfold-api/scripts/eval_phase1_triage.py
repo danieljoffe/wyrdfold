@@ -126,10 +126,25 @@ def _load_fixture(path: Path | None = None) -> dict[str, Any]:
     return cast(dict[str, Any], json.loads(fixture_path.read_text()))
 
 
+# ``JobTarget`` requires more fields than the Phase-1 prompt reads, and the
+# published corpus deliberately stores only the fields it reads (see
+# ``build_phase1_unadmitted_corpus._target_payload``). These neutral stubs make a
+# minimized target constructible, and they are safe precisely BECAUSE the prompt
+# never reads them: ``title_triage._split_user_message`` uses ``label`` and the
+# two example pools, nothing else. A fixture carrying a real value overrides the
+# stub, so the full-fidelity snapshot fixture is unaffected.
+_TARGET_STUBS: dict[str, Any] = {
+    "scoring_profile": {},
+    "app_active": False,
+    "created_at": "1970-01-01T00:00:00+00:00",
+    "updated_at": "1970-01-01T00:00:00+00:00",
+}
+
+
 def _rehydrate_targets(fixture: dict[str, Any]) -> dict[str, JobTarget]:
     out: dict[str, JobTarget] = {}
     for tid, meta in fixture["targets"].items():
-        out[tid] = JobTarget.model_validate(meta["target"])
+        out[tid] = JobTarget.model_validate({**_TARGET_STUBS, **meta["target"]})
     return out
 
 
