@@ -804,15 +804,33 @@ async def _resolve_user_targets_for_stage3(
     return primary_by_user, user_optimized
 
 
-# Rotating cursor for the liveness sweep below (in-process, like
-# ``_LIFECYCLE_LAST_RUN``; a restart simply re-starts the walk at the oldest
-# row). Under LAZY tagging "untagged" is the NORMAL state, so the sweep's
+# Rotating KEYSET cursor for the liveness sweep below — the last
+# ``(cataloged_at, id)`` pair it handed out, or None to (re)start at the oldest.
+#
+# Under LAZY tagging "untagged" is the NORMAL state, so the sweep's
 # ``role_family IS NULL`` selection no longer shrinks as it runs the way it did
 # when the sweep itself filled ``role_family`` — ordered oldest-first with a
 # plain LIMIT it would re-check the SAME oldest batch every cycle forever and
-# never reach the row after it. The offset walks one batch per cycle and wraps
-# at the end.
-_QUALIFY_BACKFILL_OFFSET = 0
+# never reach the row after it. So it has to walk.
+#
+# It walks by KEYSET, not OFFSET. An offset over this predicate silently SKIPS
+# rows: the set is unstable (a row leaves it the moment this sweep archives it),
+# so when earlier rows drop out the later ones shift backward underneath a
+# cursor that only moves forward, and whatever slid past the offset is never
+# checked. ``(cataloged_at, id)`` is a total order — ``cataloged_at`` is NOT
+# NULL across the table — so "everything after this pair" is exact regardless of
+# what left the set in between.
+#
+# STILL IN-PROCESS, deliberately: a restart re-starts the walk at the oldest
+# row. That costs coverage of the tail on a deploy-heavy day, but it is a
+# fairness question, not a correctness one, and the check it repeats is a bounded
+# HTTP validate — no LLM spend. ``url_health`` is the mechanism that solves this
+# properly, with a real persisted cursor column (``last_url_check_at``) and a
+# consecutive-failure threshold; consolidating onto it is the follow-up if tail
+# coverage ever proves inadequate. It cannot simply replace this sweep today:
+# at ``url_health_batch_size`` 250/24h it needs ~7 weeks for one pass of the
+# live corpus, where this sweep covers a batch every cycle.
+_QUALIFY_BACKFILL_CURSOR: tuple[str, str] | None = None
 
 
 async def _backfill_qualify_stale(supabase: AsyncClient, limit: int) -> None:
@@ -840,30 +858,46 @@ async def _backfill_qualify_stale(supabase: AsyncClient, limit: int) -> None:
       and re-checked on a later rotation — archival is sticky, so it needs the
       hard 4xx signal.
     """
-    global _QUALIFY_BACKFILL_OFFSET
+    global _QUALIFY_BACKFILL_CURSOR
     if limit <= 0:
         return
-    offset = _QUALIFY_BACKFILL_OFFSET
+    cursor = _QUALIFY_BACKFILL_CURSOR
+
+    def _select(c: Any) -> Any:
+        q = (
+            c.table("jobs")
+            .select("id, absolute_url, cataloged_at")
+            .is_("role_family", "null")
+            .is_("archived_at", "null")
+        )
+        if cursor is not None:
+            seen_at, seen_id = cursor
+            # (cataloged_at, id) > (seen_at, seen_id). Values are quoted because
+            # a timestamptz carries '+' and ':' which PostgREST would otherwise
+            # read as filter syntax.
+            q = q.or_(
+                f'cataloged_at.gt."{seen_at}",'
+                f'and(cataloged_at.eq."{seen_at}",id.gt."{seen_id}")'
+            )
+        return q.order("cataloged_at", desc=False).order("id", desc=False).limit(limit)
+
     try:
         resp = await poll_db_read(
-            supabase,
-            lambda c: (
-                c.table("jobs")
-                .select("id, absolute_url")
-                .is_("role_family", "null")
-                .is_("archived_at", "null")
-                .order("cataloged_at", desc=False)
-                .range(offset, offset + limit - 1)
-            ),
-            label="poll qualify-backfill select",
+            supabase, _select, label="poll qualify-backfill select"
         )
     except Exception:
         logger.exception("Qualification backfill: select failed; skipping this cycle")
         return
     rows = cast(list[dict[str, Any]], resp.data or [])
-    # Advance the walk; a short (or empty) page means we reached the end of the
-    # untagged set, so wrap back to the oldest.
-    _QUALIFY_BACKFILL_OFFSET = offset + len(rows) if len(rows) == limit else 0
+    # Advance to the last pair handed out. A short (or empty) page means we
+    # reached the end of the untagged set, so wrap back to the oldest.
+    if len(rows) == limit and rows[-1].get("cataloged_at") and rows[-1].get("id"):
+        _QUALIFY_BACKFILL_CURSOR = (
+            str(rows[-1]["cataloged_at"]),
+            str(rows[-1]["id"]),
+        )
+    else:
+        _QUALIFY_BACKFILL_CURSOR = None
     if not rows:
         return
 
