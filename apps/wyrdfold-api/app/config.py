@@ -927,6 +927,20 @@ class Settings(BaseSettings):
     # ingestion-health alert reports honestly rather than hiding.
     persistent_block_admits_ingestion: bool = False
 
+    # Ramp for the admission that flag opens. Bounds how many previously
+    # unadmitted listings enter the catalog per POLL CYCLE, so the ~14,800-row
+    # backlog drains over days rather than arriving in one tick and dragging a
+    # burst of score rows, activation-time tagging and archival behind it.
+    #
+    # Only the persistent-block FALLBACK consumes this. A job admitted the
+    # ordinary way — a target actually triaged it and said promising — is never
+    # rate-limited, and neither is a cycle with triage off or no targets.
+    #
+    # 0 disables the cap (drain as fast as the poller finds them). 50/cycle at
+    # a 30-minute tick is ~2,400/day, so the measured backlog clears in under a
+    # week while steady-state intake (~100-200/day) never touches the ceiling.
+    persistent_block_admission_cap_per_cycle: int = Field(default=50, ge=0)
+
     source_failure_disable_threshold: int = Field(default=10, ge=0)
     # Adaptive source cadence. Sources whose ``last_candidate_at`` is
     # older than this many days get their poll interval stretched to

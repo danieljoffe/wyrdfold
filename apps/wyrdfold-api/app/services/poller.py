@@ -7,6 +7,7 @@ import inspect
 import logging
 import time
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -131,6 +132,53 @@ LLM_CONCURRENCY = 3
 # twin moved to ``qualification.materialize`` with the tagger itself.)
 VALIDATE_CONCURRENCY = 20
 _validate_sems: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
+
+
+@dataclass
+class AdmissionBudget:
+    """One poll cycle's allowance for the persistent-block admission fallback.
+
+    CYCLE-LOCAL, deliberately, not a module global. Cycles can overlap: the
+    scheduler holds a Postgres advisory lock, but ``POST /poll/due`` calls
+    ``poll_due_sources`` DIRECTLY without it — it exists for external cron
+    callers (pg_cron, GitHub Actions) — so a scheduled tick and an HTTP-driven
+    one can run at once. A module-level counter would let the second cycle's
+    reset wipe the first cycle's remaining allowance mid-drain, and the
+    50-per-cycle guarantee this class exists to provide would quietly stop
+    holding. Each cycle carries its own.
+
+    Within one cycle, concurrent source workers are safe: ``take`` has no
+    ``await``, so check-and-decrement is atomic on the event loop.
+
+    Only the FALLBACK draws on it. A job a target actually triaged and admitted
+    is never rate-limited, so a healthy pipeline never touches this.
+    """
+
+    cap: int
+    remaining: int | None
+
+    def take(self) -> bool:
+        """Consume one slot, or report this cycle's ramp is spent."""
+        if self.remaining is None:
+            return True  # uncapped
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+    def report(self) -> str:
+        """One-line ramp state for the cycle log."""
+        if self.cap <= 0 or self.remaining is None:
+            return "admission_ramp=uncapped"
+        used = self.cap - self.remaining
+        spent = " EXHAUSTED (backlog continues next cycle)" if self.remaining <= 0 else ""
+        return f"admission_ramp={used}/{self.cap}{spent}"
+
+
+def new_admission_budget() -> AdmissionBudget:
+    """A fresh allowance for one cycle. Cap 0 means uncapped."""
+    cap = settings.persistent_block_admission_cap_per_cycle
+    return AdmissionBudget(cap=cap, remaining=cap if cap > 0 else None)
 
 
 def _validate_semaphore() -> asyncio.Semaphore:
@@ -1177,6 +1225,7 @@ async def _poll_one_source(
     source: dict[str, Any],
     supabase: AsyncClient,
     budget_gate: PayerBudgetGate | None = None,
+    admission_budget: AdmissionBudget | None = None,
     *,
     active_targets: list[JobTarget] | None = None,
     stage3_users: tuple[dict[str, JobTarget], dict[str, OptimizedDoc]] | None = None,
@@ -1374,6 +1423,10 @@ async def _poll_one_source(
         # missing verdict for an attempted job fail-opens (LLM hiccup); a
         # missing verdict for a NON-attempted job was budget-deferred → defer.
         phase1_attempted: dict[str, set[int]] = {}
+        # How many targets abstained because their block is PERSISTENT. Non-zero
+        # means an empty ``phase1_verdicts`` is the ramped fallback, not the
+        # ordinary "triage off / no targets" admit — see ``_any_target_admits``.
+        persistent_skips = 0
         triage_candidates = [
             (idx, job)
             for idx, job in enumerate(jobs)
@@ -1432,15 +1485,31 @@ async def _poll_one_source(
                     admits = settings.persistent_block_admits_ingestion and block_is_persistent(
                         reason
                     )
+                    if admits:
+                        persistent_skips += 1
                     if not admits:
                         phase1_verdicts[active_target.id] = {}
                         phase1_attempted[active_target.id] = set()  # → all defer
+                    # Three distinct outcomes, said plainly. "will re-triage"
+                    # is only TRUE for a transient block, where the next cycle
+                    # genuinely retries — claiming it for a persistent one
+                    # repeats the overstatement #917 existed to fix.
+                    if admits:
+                        outcome = "not vetoing ingestion"
+                    elif block_is_persistent(reason):
+                        outcome = (
+                            "deferring; persistent block and "
+                            "persistent_block_admits_ingestion is off, so this will NOT "
+                            "re-triage until the block lifts"
+                        )
+                    else:
+                        outcome = "deferring, will re-triage next cycle"
                     logger.info(
                         "Phase 1 deferred for target %s (payer %s blocked: %s; %s)",
                         active_target.id,
                         gate.payer_for(active_target.id),
                         reason,
-                        "not vetoing ingestion" if admits else "deferring, will re-triage",
+                        outcome,
                     )
                     continue
                 # BYOK (#5 P3): grade on the payer's own key. No key in
@@ -1569,6 +1638,16 @@ async def _poll_one_source(
             and re-triaged next cycle rather than admitted blind (#285 f/u).
             """
             if not phase1_verdicts:
+                if persistent_skips and admission_budget is not None:
+                    # Every target abstained on a PERSISTENT block, so this
+                    # admit is the fallback to the deterministic free gates —
+                    # the path that drains the backlog. Ramp it: the untouched
+                    # backlog is ~14,800 rows, and admitting it in one tick
+                    # drags a burst of score rows, activation tagging and
+                    # archival behind it. A job that loses the race is dropped
+                    # exactly as before and re-offered next cycle, so nothing is
+                    # lost — only slowed.
+                    return admission_budget.take()
                 return True  # gate disabled or no targets — admit
             for tid, target_verdicts in phase1_verdicts.items():
                 if global_job_idx not in phase1_attempted.get(tid, set()):
@@ -2539,6 +2618,7 @@ async def _poll_one_source_budgeted(
     *,
     active_targets: list[JobTarget] | None,
     stage3_users: tuple[dict[str, JobTarget], dict[str, OptimizedDoc]] | None,
+    admission_budget: AdmissionBudget | None = None,
 ) -> dict[str, Any]:
     """``_poll_one_source`` bounded by the per-source wall-time budget.
 
@@ -2562,6 +2642,7 @@ async def _poll_one_source_budgeted(
             budget_gate,
             active_targets=active_targets,
             stage3_users=stage3_users,
+            admission_budget=admission_budget,
         )
     try:
         return await asyncio.wait_for(
@@ -2571,6 +2652,7 @@ async def _poll_one_source_budgeted(
                 budget_gate,
                 active_targets=active_targets,
                 stage3_users=stage3_users,
+                admission_budget=admission_budget,
             ),
             timeout=budget,
         )
@@ -2642,6 +2724,7 @@ async def poll_all_sources(
     scheduler's watchdog) still exposes partial progress. When provided, the
     return value is that same object.
     """
+    admission_budget = new_admission_budget()
     result = (
         progress
         if progress is not None
@@ -2668,12 +2751,14 @@ async def poll_all_sources(
                 budget_gate,
                 active_targets=active_targets,
                 stage3_users=stage3_users,
+                admission_budget=admission_budget,
             )
         # No await between the source completing and the fold, so a
         # cancellation can never drop a finished source's counts.
         _accumulate_poll_summary(result, summary)
 
     await asyncio.gather(*(_worker(s) for s in sources))
+    logger.info("poll cycle finished: %s", admission_budget.report())
     return result
 
 
@@ -2753,6 +2838,7 @@ async def poll_due_sources(
     # piggyback/throttle shape, flag-gated.
     await _maybe_run_archival_sweep(_async_service_client())
 
+    admission_budget = new_admission_budget()
     due = filter_due_sources(all_enabled)
 
     # Liveness-check a rotating slice of the untagged catalog (#285) EVERY
@@ -2823,6 +2909,7 @@ async def poll_due_sources(
                 budget_gate,
                 active_targets=active_targets,
                 stage3_users=stage3_users,
+                admission_budget=admission_budget,
             )
         # No await between the source completing and the fold, so a
         # cancellation can never drop a finished source's counts.
@@ -2831,6 +2918,7 @@ async def poll_due_sources(
         phase1_store_stats["misses"] += summary.get("phase1_store_misses", 0)
 
     await asyncio.gather(*(_worker(s) for s in due))
+    logger.info("poll cycle finished: %s", admission_budget.report())
     if phase1_store_stats["hits"] or phase1_store_stats["misses"]:
         logger.info(
             "phase1 rejection store: %d LLM verdict(s) avoided, %d sent to the model this cycle",

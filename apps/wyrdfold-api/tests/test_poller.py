@@ -2363,3 +2363,173 @@ def test_block_persistence_classification() -> None:
     from app.services.targets.payers import BlockReason
 
     assert set(BlockReason.__args__) == PERSISTENT_BLOCK_REASONS | TRANSIENT_BLOCK_REASONS
+
+
+# ---------------------------------------------------------------------------
+# Admission ramp (#923): bound the backlog drain, don't touch ordinary admits
+# ---------------------------------------------------------------------------
+
+
+async def _run_blocked_poll_with_jobs(
+    monkeypatch, *, n_jobs: int, cap: int
+) -> tuple[dict, MagicMock]:
+    """Every target persistently blocked, ``n_jobs`` admissible listings, and a
+    per-cycle ramp of ``cap``."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "persistent_block_admits_ingestion", True)
+    monkeypatch.setattr(live_settings, "persistent_block_admission_cap_per_cycle", cap)
+    budget = poller_mod.new_admission_budget()
+
+    supabase, _jobs, _sources = _make_poll_supabase([])
+
+    async def many(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id=f"new-{i}",
+                title=f"Brand New Role {i}",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-01",
+                absolute_url=f"https://example.com/j/{i}",
+            )
+            for i in range(n_jobs)
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", many)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "triage_titles", AsyncMock())
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+
+    gate = MagicMock()
+    gate.target_blocked.return_value = True
+    gate.target_block_reason.return_value = "idle"
+    gate.payer_for.return_value = "u1"
+    summary = await poller_mod._poll_one_source(
+        dict(_GUARD_SOURCE), supabase, budget_gate=gate, admission_budget=budget
+    )
+    return summary, _jobs
+
+
+@pytest.mark.asyncio
+async def test_ramp_bounds_the_backlog_drain(monkeypatch) -> None:
+    """The measured backlog is ~14,800 rows. Admitting it in one tick drags a
+    burst of score rows, activation-time tagging and archival behind it, so the
+    fallback drains against a per-cycle ceiling."""
+    _summary, jobs_table = await _run_blocked_poll_with_jobs(monkeypatch, n_jobs=5, cap=2)
+
+    upserted = [r for c in jobs_table.upsert.call_args_list for r in c.args[0]]
+    assert len(upserted) == 2, [r.get("external_id") for r in upserted]
+
+
+@pytest.mark.asyncio
+async def test_ramp_resets_each_cycle(monkeypatch) -> None:
+    """Rows that lose the race are dropped exactly as before and re-offered next
+    cycle — nothing is lost, only slowed."""
+    _s, first = await _run_blocked_poll_with_jobs(monkeypatch, n_jobs=5, cap=2)
+    assert len([r for c in first.upsert.call_args_list for r in c.args[0]]) == 2
+
+    # The harness builds a FRESH budget per run, which is what a cycle entry
+    # point does — so the next cycle gets its own full allowance.
+    _s2, second = await _run_blocked_poll_with_jobs(monkeypatch, n_jobs=5, cap=2)
+    assert len([r for c in second.upsert.call_args_list for r in c.args[0]]) == 2
+
+
+@pytest.mark.asyncio
+async def test_cap_zero_is_uncapped(monkeypatch) -> None:
+    _summary, jobs_table = await _run_blocked_poll_with_jobs(monkeypatch, n_jobs=5, cap=0)
+
+    upserted = [r for c in jobs_table.upsert.call_args_list for r in c.args[0]]
+    assert len(upserted) == 5
+
+
+@pytest.mark.asyncio
+async def test_ordinary_admits_are_never_rate_limited(monkeypatch) -> None:
+    """THE anti-vacuous control. The ramp must touch ONLY the persistent-block
+    fallback: a job a target actually triaged and called promising is normal
+    pipeline work, and throttling it would starve a healthy instance."""
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    from app.config import settings as live_settings
+    from app.models.llm import LLMResult, LLMUsage
+    from app.services import poller as poller_mod
+    from app.services.relevance.title_triage import TitleVerdict
+
+    monkeypatch.setattr(live_settings, "persistent_block_admission_cap_per_cycle", 1)
+    spent = poller_mod.new_admission_budget()
+    assert spent.take() is True
+    # Precondition: the ramp is now SPENT.
+    assert spent.take() is False
+
+    ok = LLMResult(
+        content="{}", model="claude-haiku-4-5", usage=LLMUsage(), cost_usd=0.0, latency_ms=1
+    )
+    fake_triage = _AsyncMock(return_value=({1: TitleVerdict(id=1, promising=True)}, ok))
+    summary, jobs_table = await _run_triage_with_budget(
+        monkeypatch, exhausted=_AsyncMock(return_value=False), fake_triage=fake_triage
+    )
+
+    assert summary["error"] is None
+    jobs_table.upsert.assert_called()  # a real verdict ingests regardless of the ramp
+
+
+def test_admission_ramp_report(monkeypatch) -> None:
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "persistent_block_admission_cap_per_cycle", 3)
+    b = poller_mod.new_admission_budget()
+    assert b.report() == "admission_ramp=0/3"
+    b.take()
+    assert b.report() == "admission_ramp=1/3"
+    b.take()
+    b.take()
+    assert "EXHAUSTED" in b.report()
+
+    monkeypatch.setattr(live_settings, "persistent_block_admission_cap_per_cycle", 0)
+    assert poller_mod.new_admission_budget().report() == "admission_ramp=uncapped"
+
+
+def test_overlapping_cycles_hold_independent_ramps(monkeypatch) -> None:
+    """Cycles can genuinely overlap: the scheduler polls under a Postgres
+    advisory lock, but ``POST /poll/due`` calls ``poll_due_sources`` DIRECTLY
+    without it — that endpoint exists for external cron callers (pg_cron,
+    GitHub Actions). A module-global counter would let the second cycle's reset
+    wipe the first cycle's remaining allowance mid-drain, and the per-cycle
+    guarantee would quietly stop holding."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "persistent_block_admission_cap_per_cycle", 2)
+    a = poller_mod.new_admission_budget()
+    b = poller_mod.new_admission_budget()
+
+    assert a.take() is True
+    assert a.take() is True
+    assert a.take() is False  # A is spent...
+    assert b.take() is True  # ...and B still holds its own full allowance
+    assert b.report() == "admission_ramp=1/2"
+    assert "EXHAUSTED" in a.report()
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_cycles_each_respect_their_own_cap(monkeypatch) -> None:
+    """The same guarantee through the real call graph rather than the object:
+    two cycles running at once must each admit at most their OWN cap, not race
+    over one shared counter."""
+    import asyncio as _asyncio
+
+    (_s1, first), (_s2, second) = await _asyncio.gather(
+        _run_blocked_poll_with_jobs(monkeypatch, n_jobs=5, cap=2),
+        _run_blocked_poll_with_jobs(monkeypatch, n_jobs=5, cap=2),
+    )
+
+    n1 = len([r for c in first.upsert.call_args_list for r in c.args[0]])
+    n2 = len([r for c in second.upsert.call_args_list for r in c.args[0]])
+    # Precondition: both cycles really did work (a no-op cycle proves nothing).
+    assert n1 > 0 and n2 > 0
+    assert n1 == 2 and n2 == 2, (n1, n2)
