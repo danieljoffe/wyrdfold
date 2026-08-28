@@ -3399,8 +3399,21 @@ async def _poll_one_source_for_target(
 
             # The board's own US verdict (see _poll_one_source) — free,
             # deterministic, and the half of the tag-time pruning that lazy
-            # tagging can give straight back.
-            await _apply_board_us_verdicts(supabase, jobs, upsert_resp.data or [])
+            # tagging can give straight back. This path has no ``poll_funnel``
+            # line, so the counters get their own: an operator has to be able
+            # to see the prune on BOTH ingest paths, not just the shared cycle.
+            board_us_marked, board_us_archived = await _apply_board_us_verdicts(
+                supabase, jobs, upsert_resp.data or []
+            )
+            if board_us_marked or board_us_archived:
+                logger.info(
+                    "poll_funnel_target source=%s target=%s "
+                    "board_us_marked=%d board_us_archived=%d",
+                    company_name,
+                    target.id,
+                    board_us_marked,
+                    board_us_archived,
+                )
 
             # Qualification tags are LAZY (see _poll_one_source): the Phase-2
             # runner's ensure_job_tags buys them for the trimmed grade set.

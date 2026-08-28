@@ -44,6 +44,34 @@ disagreed 22, and the board was right in every sampled disagreement — "CA -
 Toronto" parses as California, "IN - Bangalore" as Indiana, "London, ON" as the
 UK.
 
+**A value that was inert became load-bearing, and nobody re-checked its
+validation.** `normalize_country` accepted any two-letter alphabetic string as a
+country. That was harmless while the result was discarded; the moment it drove a
+one-way archive, `TX` / `NY` / `FL` became "not the United States" and would have
+pruned US roles. `location_parse` had already written the warning down — "bare ISO
+codes need comma context — too collision-prone", "two-letter abbreviations must
+arrive UPPERCASE to count as a state" — and this module did the exact thing that
+comment refuses. **Ask what a value's validation was written for before you give
+it a new job.** Two guards now: a real ISO 3166-1 register (which alone kills
+`TX`, `NY`, `WA`, `OH` — they are not countries anywhere), and, for the ~25 codes
+that genuinely are both a country and a USPS state (`CA`, `DE`, `IN`, `MD`, `MT`
+…), a requirement that the location's own parse not read as US before the row may
+be pruned. The blunt fix — refuse every colliding code — was measured and
+rejected: those codes carry 883 of the 4,285 prunes, a fifth of the whole
+feature, and across 21,891 live postings with a board country not one was a US
+state (`CA`→"Ontario - Remote", `MD`→"Chișinău", `PA`→"Panama City, Panama"). The
+corroboration guard withholds exactly one posting. Separately, US territories
+have their own ISO codes: `PR`, `GU`, `VI`, `AS`, `MP`, `UM` were being archived
+as foreign, and a live Lever posting located "American Samoa" was in the sample.
+
+**One predicate, both writes.** The country column and the US verdict were
+initially allowed to disagree — a "New York, NY; London" posting with a `GB`
+postal address got no verdict (correctly vetoed) but still got filed under `UK`.
+That is the worst of both: a wrong /jobs facet AND a disabled `country = 'US'`
+veto in the tagger, on exactly the multi-country class the veto exists for. Any
+reason to distrust the board's country enough to withhold a verdict is a reason
+not to file the posting under it.
+
 **Scope, stated honestly.** Greenhouse and Workday publish no country in their
 cheap path, and they are 60% of the live corpus, so this removes roughly 38% of
 the non-US pollution — the share attributable to boards that answer the question.

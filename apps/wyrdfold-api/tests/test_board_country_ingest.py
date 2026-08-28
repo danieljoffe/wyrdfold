@@ -34,7 +34,12 @@ from app.config import settings as live_settings
 from app.services import poller as poller_mod
 from app.services.qualification import materialize
 from app.services.standard_job import StandardJob
-from tests.test_poller import _GUARD_SOURCE, _full_target, _make_poll_supabase
+from tests.test_poller import (
+    _GUARD_SOURCE,
+    _full_target,
+    _make_poll_supabase,
+    _make_targeted_poll_supabase,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -94,21 +99,72 @@ def _control_row() -> dict[str, Any]:
     return _upserted_row(row_id=_CONTROL_ROW_ID, external_id=_CONTROL_ID)
 
 
+class _UpdateCall:
+    """One recorded ``jobs.update(...)`` chain, WHOLE.
+
+    A bare ``MagicMock`` records ``update()`` args and ``in_()`` args on
+    separate mocks and drops the link between them — so an assertion built on
+    it cannot see the ``.is_("archived_at", "null")`` filter at all, and
+    deleting that filter passes every test. This records the chain as one
+    object so the WHERE clause is assertable.
+    """
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        self.ids: list[str] = []
+        self.filters: list[tuple[str, Any]] = []
+
+    def in_(self, column: str, values: list[str]) -> _UpdateCall:
+        assert column == "id", column
+        self.ids = list(values)
+        return self
+
+    def is_(self, column: str, value: Any) -> _UpdateCall:
+        self.filters.append((column, value))
+        return self
+
+    def execute(self) -> MagicMock:
+        return MagicMock(data=[])
+
+
+def _record_updates(jobs_table: MagicMock) -> list[_UpdateCall]:
+    calls: list[_UpdateCall] = []
+
+    def _update(payload: dict[str, Any]) -> _UpdateCall:
+        call = _UpdateCall(payload)
+        calls.append(call)
+        return call
+
+    jobs_table.update.side_effect = _update
+    return calls
+
+
 async def _run_poll(
     monkeypatch: pytest.MonkeyPatch,
     jobs: list[StandardJob],
     *,
     upserted: list[dict[str, Any]],
     archive_non_us: bool = True,
-) -> tuple[MagicMock, dict[str, Any]]:
-    """Drive a real ``_poll_one_source`` cycle and hand back the jobs table."""
+    target_path: bool = False,
+) -> tuple[list[_UpdateCall], MagicMock, dict[str, Any]]:
+    """Drive a real poll cycle through ONE of the two ingest paths.
+
+    ``target_path`` selects ``_poll_one_source_for_target`` (the activation
+    fan-out) instead of ``_poll_one_source`` (the scheduled cycle). Both build
+    rows the same way and both upsert; anything asserted here must hold on both
+    or it is only half-pinned.
+    """
     monkeypatch.setattr(live_settings, "qualification_enabled", True)
     monkeypatch.setattr(live_settings, "phase1_triage_enabled", False)
     monkeypatch.setattr(live_settings, "validate_poll_urls", False)
     monkeypatch.setattr(live_settings, "qualification_archive_non_us", archive_non_us)
 
-    supabase, jobs_table, _sources = _make_poll_supabase([])
+    if target_path:
+        supabase, jobs_table, _junction = _make_targeted_poll_supabase()
+    else:
+        supabase, jobs_table, _sources = _make_poll_supabase([])
     jobs_table.upsert.return_value.execute.return_value.data = upserted
+    updates = _record_updates(jobs_table)
 
     async def _fetch(_token: str) -> list[StandardJob]:
         return list(jobs)
@@ -119,6 +175,16 @@ async def _run_poll(
     monkeypatch.setattr(materialize, "get_llm_client_async", _no_llm)
     monkeypatch.setattr(poller_mod, "get_llm_client_async", _no_llm)
     monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", _fetch)
+
+    if target_path:
+        summary = await poller_mod._poll_one_source_for_target(
+            dict(_GUARD_SOURCE),
+            supabase,
+            _full_target(app_active=True, search_keywords=["frontend"]),
+            payer_user_id="payer-1",
+        )
+        return updates, jobs_table, summary
+
     monkeypatch.setattr(
         poller_mod,
         "_active_targets",
@@ -132,15 +198,11 @@ async def _run_poll(
     gate.user_blocked.return_value = False
 
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase, budget_gate=gate)
-    return jobs_table, summary
+    return updates, jobs_table, summary
 
 
-def _updates(jobs_table: MagicMock) -> list[tuple[dict[str, Any], list[str]]]:
-    """Every ``jobs.update({...}).in_("id", [...])`` issued during the cycle."""
-    payloads = [call.args[0] for call in jobs_table.update.call_args_list if call.args]
-    id_lists = [list(call.args[1]) for call in jobs_table.update.return_value.in_.call_args_list]
-    assert len(payloads) == len(id_lists), (payloads, id_lists)
-    return list(zip(payloads, id_lists, strict=True))
+def _payload_ids(updates: list[_UpdateCall]) -> list[tuple[dict[str, Any], list[str]]]:
+    return [(u.payload, u.ids) for u in updates]
 
 
 def _written_row(jobs_table: MagicMock, external_id: str) -> dict[str, Any]:
@@ -161,7 +223,7 @@ async def test_a_board_stated_non_us_country_marks_and_archives(
 ) -> None:
     """The pruning lazy tagging removed, bought back for free. Without this the
     row lands ``is_us = NULL``, which ``is_us IS NOT FALSE`` serves publicly."""
-    jobs_table, summary = await _run_poll(
+    updates, jobs_table, summary = await _run_poll(
         monkeypatch, [_board_job(country="DE")], upserted=[_upserted_row()]
     )
 
@@ -171,35 +233,35 @@ async def test_a_board_stated_non_us_country_marks_and_archives(
     assert summary["new"] == 1
     assert jobs_table.upsert.called
 
-    updates = _updates(jobs_table)
-    assert ({"is_us": False}, ["j1"]) in updates
-    assert any("archived_at" in payload and ids == ["j1"] for payload, ids in updates)
+    pairs = _payload_ids(updates)
+    assert ({"is_us": False}, ["j1"]) in pairs
+    assert any("archived_at" in payload and ids == ["j1"] for payload, ids in pairs)
 
 
 async def test_a_silent_board_leaves_the_row_alone(monkeypatch: pytest.MonkeyPatch) -> None:
     """Greenhouse and Workday publish no country. Silence is not falsity: an
     absent answer must never become ``is_us = False``, and must never archive."""
-    jobs_table, summary = await _run_poll(
+    updates, jobs_table, summary = await _run_poll(
         monkeypatch,
         [_board_job(country=None), _control_job()],
         upserted=[_upserted_row(), _control_row()],
     )
 
     assert summary["new"] == 2  # precondition: BOTH rows were ingested
-    updates = _updates(jobs_table)
-    _assert_control_was_marked(updates)
-    assert all("j1" not in ids for _payload, ids in updates), updates
+    pairs = _payload_ids(updates)
+    _assert_control_was_marked(pairs)
+    assert all("j1" not in ids for _payload, ids in pairs), pairs
 
 
 async def test_a_board_stated_us_country_is_recorded_and_not_archived(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    jobs_table, summary = await _run_poll(
+    updates, jobs_table, summary = await _run_poll(
         monkeypatch, [_board_job(country="US")], upserted=[_upserted_row()]
     )
 
     assert summary["new"] == 1
-    assert _updates(jobs_table) == [({"is_us": True}, ["j1"])]
+    assert _payload_ids(updates) == [({"is_us": True}, ["j1"])]
 
 
 async def test_archiving_is_flag_gated_but_the_verdict_is_not(
@@ -208,14 +270,14 @@ async def test_archiving_is_flag_gated_but_the_verdict_is_not(
     """A global-catalog self-host turns archiving off. The FACT still gets
     stored — it is the archive POLICY that is optional, and ``is_us = false``
     is what the read gates act on either way."""
-    jobs_table, _ = await _run_poll(
+    updates, jobs_table, _ = await _run_poll(
         monkeypatch,
         [_board_job(country="DE")],
         upserted=[_upserted_row()],
         archive_non_us=False,
     )
 
-    assert _updates(jobs_table) == [({"is_us": False}, ["j1"])]
+    assert _payload_ids(updates) == [({"is_us": False}, ["j1"])]
 
 
 async def test_a_row_that_already_agrees_costs_no_write(
@@ -224,7 +286,7 @@ async def test_a_row_that_already_agrees_costs_no_write(
     """The upsert RETURNING carries the STORED verdict, so a re-poll of an
     already-marked, already-archived row must not rewrite it — and must not
     move its ``archived_at`` forward."""
-    jobs_table, _ = await _run_poll(
+    updates, jobs_table, _ = await _run_poll(
         monkeypatch,
         [_board_job(country="DE"), _control_job()],
         upserted=[
@@ -233,9 +295,9 @@ async def test_a_row_that_already_agrees_costs_no_write(
         ],
     )
 
-    updates = _updates(jobs_table)
-    _assert_control_was_marked(updates)
-    assert all("j1" not in ids for _payload, ids in updates), updates
+    pairs = _payload_ids(updates)
+    _assert_control_was_marked(pairs)
+    assert all("j1" not in ids for _payload, ids in pairs), pairs
 
 
 async def test_a_plainly_us_location_vetoes_a_foreign_board_country(
@@ -244,16 +306,16 @@ async def test_a_plainly_us_location_vetoes_a_foreign_board_country(
     """A multi-country posting whose postal address is abroad but which also
     lists a US office must not be pruned on the address alone (#60 workstream
     B). Leaving it NULL hands the decision to the grader."""
-    jobs_table, summary = await _run_poll(
+    updates, jobs_table, summary = await _run_poll(
         monkeypatch,
         [_board_job(country="GB", location="New York, NY; London"), _control_job()],
         upserted=[_upserted_row(), _control_row()],
     )
 
     assert summary["new"] == 2  # precondition: BOTH rows were ingested
-    updates = _updates(jobs_table)
-    _assert_control_was_marked(updates)
-    assert all("j1" not in ids for _payload, ids in updates), updates
+    pairs = _payload_ids(updates)
+    _assert_control_was_marked(pairs)
+    assert all("j1" not in ids for _payload, ids in pairs), pairs
 
 
 async def test_the_verdict_is_patched_into_the_rows_phase_2_will_grade(
@@ -263,7 +325,7 @@ async def test_the_verdict_is_patched_into_the_rows_phase_2_will_grade(
     Leaving those dicts at their pre-update ``is_us = None`` would send a row we
     just archived straight to the grader — the waste this change removes."""
     row = _upserted_row()
-    _jobs_table, _ = await _run_poll(monkeypatch, [_board_job(country="DE")], upserted=[row])
+    _u, _jobs_table, _ = await _run_poll(monkeypatch, [_board_job(country="DE")], upserted=[row])
 
     assert row["is_us"] is False
     assert row["archived_at"] is not None
@@ -275,20 +337,81 @@ async def test_the_display_country_lands_in_the_upsert_not_an_iso_code(
     """#805: ``jobs.country`` is read by filters that send ``UK``. The board's
     ``GB`` has to be translated on the way in, and it overrides the location
     parse — which for this string produced nothing at all."""
-    jobs_table, _ = await _run_poll(
+    _u, jobs_table, _ = await _run_poll(
         monkeypatch, [_board_job(country="GB")], upserted=[_upserted_row()]
     )
 
     assert _written_row(jobs_table, "k3")["country"] == "UK"
 
 
+async def test_the_archive_write_re_asserts_that_the_row_is_still_unarchived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The archive UPDATE carries ``.is_("archived_at", "null")``.
+
+    Without it, a row archived by url_health or the stale sweep BETWEEN the
+    upsert and this write has its ``archived_at`` silently moved forward — the
+    read-then-write race the WHERE clause closes. The ``is_us`` writes must NOT
+    carry it: they are corrections that have to land on archived rows too."""
+    updates, _jobs_table, _ = await _run_poll(
+        monkeypatch, [_board_job(country="DE")], upserted=[_upserted_row()]
+    )
+
+    archive = [u for u in updates if "archived_at" in u.payload]
+    assert len(archive) == 1, updates  # precondition: an archive WAS issued
+    assert archive[0].filters == [("archived_at", "null")]
+    verdicts = [u for u in updates if "is_us" in u.payload]
+    assert verdicts and all(u.filters == [] for u in verdicts), verdicts
+
+
+async def test_the_target_activation_path_prunes_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_poll_one_source_for_target`` builds rows and upserts exactly like the
+    scheduled cycle, so a prune wired into only one of them leaves the other
+    ingesting unpruned non-US rows. Deleting the call there passed every other
+    test in the suite."""
+    updates, jobs_table, summary = await _run_poll(
+        monkeypatch,
+        [_board_job(country="DE")],
+        upserted=[_upserted_row()],
+        target_path=True,
+    )
+
+    # Preconditions: this really is the OTHER path, and it really ingested.
+    assert summary["error"] is None
+    assert summary["new"] == 1
+    assert jobs_table.upsert.called
+
+    pairs = _payload_ids(updates)
+    assert ({"is_us": False}, ["j1"]) in pairs
+    assert any("archived_at" in payload and ids == ["j1"] for payload, ids in pairs)
+
+
+async def test_the_target_activation_path_leaves_a_silent_board_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same silence contract on the second path, with the same live control."""
+    updates, _jobs_table, summary = await _run_poll(
+        monkeypatch,
+        [_board_job(country=None), _control_job()],
+        upserted=[_upserted_row(), _control_row()],
+        target_path=True,
+    )
+
+    assert summary["new"] == 2  # precondition: BOTH rows were ingested
+    pairs = _payload_ids(updates)
+    _assert_control_was_marked(pairs)
+    assert all("j1" not in ids for _payload, ids in pairs), pairs
+
+
 async def test_an_unspellable_country_still_prunes(monkeypatch: pytest.MonkeyPatch) -> None:
     """``CH`` has no entry in the parser's display vocabulary, so the display
     column stays silent — but not being able to SPELL Switzerland has no
     bearing on whether the role is in the United States."""
-    jobs_table, _ = await _run_poll(
+    updates, jobs_table, _ = await _run_poll(
         monkeypatch, [_board_job(country="CH")], upserted=[_upserted_row()]
     )
 
     assert _written_row(jobs_table, "k3")["country"] is None
-    assert ({"is_us": False}, ["j1"]) in _updates(jobs_table)
+    assert ({"is_us": False}, ["j1"]) in _payload_ids(updates)

@@ -231,6 +231,19 @@ def test_a_plainly_us_location_vetoes_a_foreign_board_country() -> None:
     assert board_us_verdict(job) is None
 
 
+def test_a_vetoed_country_is_not_written_to_the_display_column_either() -> None:
+    """ONE predicate for both writes. Filing a New York role under ``UK`` while
+    refusing to prune it is the worst of both: a wrong /jobs country facet AND
+    a disabled ``country = 'US'`` veto in the tagger, on exactly the
+    multi-country class that veto exists for."""
+    vetoed = _job(country="GB", location_name="New York, NY; London")
+    assert board_us_verdict(vetoed) is None  # precondition
+    assert "country" not in board_columns(vetoed)
+    # Control: the identical board answer on an unambiguous location IS written,
+    # so the assertion above cannot pass by the feature being dead.
+    assert board_columns(_job(country="GB", location_name="London"))["country"] == "UK"
+
+
 def test_the_veto_is_one_sided() -> None:
     """A US board country is recorded even when the location string is
     ambiguous — the veto exists to stop a foreign address hiding a US role,
@@ -238,6 +251,66 @@ def test_the_veto_is_one_sided() -> None:
     job = _job(country="US", location_name="Remote")
     assert positively_us_location(job.location_name) is False  # precondition
     assert board_us_verdict(job) is True
+
+
+# ---- the code that is not a country, and the country that is the US ---------
+
+
+@pytest.mark.parametrize("state", ["TX", "NY", "FL", "OH", "WA", "MI"])
+def test_a_us_state_code_that_is_not_an_iso_country_is_refused(state: str) -> None:
+    """ "Two letters and alphabetic" is not a country. This value now drives a
+    ONE-WAY archive, so a board putting a state code in its country field would
+    have pruned a US role outright."""
+    assert normalize_country(state) is None
+    assert board_us_verdict(_job(country=normalize_country(state))) is None
+
+
+@pytest.mark.parametrize(
+    ("code", "us_location"),
+    [
+        ("CA", "San Diego"),
+        ("CO", "Denver"),
+        ("GA", "Atlanta"),
+        ("IL", "Chicago"),
+        ("MA", "Boston"),
+    ],
+)
+def test_a_state_ambiguous_code_will_not_prune_a_location_that_reads_as_us(
+    code: str, us_location: str
+) -> None:
+    """``CA`` is Canada in ISO and California in an address, and the archive is
+    one-way. When the location's own deterministic parse says US, withhold —
+    even though ``positively_us_location`` (which needs an explicit marker or a
+    "City, ST" form) would not have caught these bare metro names."""
+    job = _job(country=code, location_name=us_location)
+    assert positively_us_location(us_location) is False  # precondition: the OLD veto misses
+    assert parse_location(us_location).country == "US"  # precondition: the parse sees US
+    assert board_us_verdict(job) is None
+    assert "country" not in board_columns(job)
+
+
+@pytest.mark.parametrize(
+    ("code", "location"),
+    [("CA", "Ontario - Remote"), ("DE", "Stuttgart"), ("MT", "Valetta"), ("IN", "Ahmedabad")],
+)
+def test_a_state_ambiguous_code_still_prunes_when_nothing_says_us(code: str, location: str) -> None:
+    """The guard must not cost the signal. All four are real live postings; the
+    ambiguous codes carry 883 of the 4,285 prunes in the fleet sample, so
+    dropping them wholesale would forfeit a fifth of the pruning."""
+    assert board_us_verdict(_job(country=code, location_name=location)) is False
+
+
+@pytest.mark.parametrize("code", ["PR", "GU", "VI", "AS", "MP", "UM"])
+def test_us_territories_are_the_united_states(code: str) -> None:
+    """Puerto Rico and Guam carry their own ISO codes and were being archived as
+    foreign — a live Lever posting located "American Samoa" was in the sample."""
+    assert board_us_verdict(_job(country=code, location_name="Remote")) is True
+
+
+def test_the_british_virgin_islands_are_not_the_us() -> None:
+    """``VG`` next to ``VI`` is exactly the pair a copied-in territory list gets
+    wrong."""
+    assert board_us_verdict(_job(country="VG", location_name="Remote")) is False
 
 
 def test_the_ambiguous_residue_the_l1_gate_cannot_judge() -> None:
