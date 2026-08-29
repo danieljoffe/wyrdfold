@@ -1,0 +1,5998 @@
+{
+  "meta": {
+    "kind": "phase1_unadmitted_corpus",
+    "built_at_unix": 1787956145,
+    "seed": 20260828,
+    "sources_per_provider_requested": {
+      "greenhouse": 45,
+      "ashby": 40,
+      "lever": 30,
+      "workday": 25,
+      "smartrecruiters": 15
+    },
+    "distinct_titles": 160,
+    "targets": 6,
+    "cases": 960,
+    "survivors_before_dedupe": 524,
+    "title_provider_mix": {
+      "ashby": 32,
+      "greenhouse": 32,
+      "lever": 32,
+      "smartrecruiters": 32,
+      "workday": 32
+    },
+    "stratum_mix": {
+      "own_gate": 228,
+      "cross_gate": 732
+    },
+    "funnel": {
+      "sources_fetched": 153,
+      "listed": 5581,
+      "already_held": 637,
+      "new_to_us": 4944,
+      "survivors": 524,
+      "survivors_ashby": 79,
+      "free_gate_rejected": 4420,
+      "fetch_errors": 2,
+      "survivors_greenhouse": 186,
+      "survivors_lever": 103,
+      "survivors_workday": 66,
+      "survivors_smartrecruiters": 90
+    },
+    "note": "Free-gate survivors NOT present in jobs.external_id, fetched live from ATS boards and filtered through poller._passes_free_gates. Targets are stored MINIMALLY (see _target_payload): only the fields the Phase-1 prompt reads, under fixture-local aliases, never production row ids. This artifact is published.",
+    "target_config_digests": {
+      "catalog-product-manager": "f7bffce60916",
+      "catalog-software-engineer": "0a47c59ec320",
+      "catalog-product-designer": "c7fdb3c19978",
+      "catalog-data-scientist-ml-engineer": "10abbb65dd9d",
+      "catalog-devops-sre-engineer": "c57a8c2c7d44",
+      "user-senior-frontend-engineer": "a48b2f991663"
+    }
+  },
+  "targets": {
+    "catalog-product-manager": {
+      "target": {
+        "id": "catalog-product-manager",
+        "label": "Product Manager",
+        "app_active": true,
+        "example_promising_titles": [
+          "Product Manager",
+          "Senior Product Manager",
+          "Staff Product Manager",
+          "Principal Product Manager",
+          "Group Product Manager",
+          "Technical Product Manager",
+          "Platform Product Manager",
+          "Growth Product Manager",
+          "Senior Product Owner"
+        ],
+        "example_unpromising_titles": [
+          "Product Marketing Manager",
+          "Program Manager",
+          "Project Manager",
+          "UX Researcher",
+          "Business Analyst",
+          "Solutions Engineer",
+          "Customer Success Manager",
+          "Product Operations Manager",
+          "Product Designer",
+          "Strategy & Operations Manager"
+        ]
+      }
+    },
+    "catalog-software-engineer": {
+      "target": {
+        "id": "catalog-software-engineer",
+        "label": "Software Engineer",
+        "app_active": true,
+        "example_promising_titles": [
+          "Software Engineer",
+          "Senior Software Engineer",
+          "Staff Software Engineer",
+          "Principal Software Engineer",
+          "Software Development Engineer",
+          "Backend Software Engineer",
+          "Full Stack Software Engineer",
+          "Platform Software Engineer",
+          "Senior Backend Engineer",
+          "Senior Full Stack Engineer"
+        ],
+        "example_unpromising_titles": [
+          "Senior Product Manager",
+          "Data Scientist",
+          "Machine Learning Engineer",
+          "DevOps Engineer",
+          "Security Engineer",
+          "QA Engineer",
+          "Solutions Architect",
+          "Technical Program Manager",
+          "Product Designer",
+          "Sales Engineer"
+        ]
+      }
+    },
+    "catalog-product-designer": {
+      "target": {
+        "id": "catalog-product-designer",
+        "label": "Product Designer",
+        "app_active": true,
+        "example_promising_titles": [
+          "Senior Product Designer",
+          "Staff Product Designer",
+          "Principal Product Designer",
+          "Senior UX Designer",
+          "Senior UI/UX Designer",
+          "Senior Interaction Designer",
+          "Product Designer II",
+          "Senior Experience Designer",
+          "Lead Product Designer"
+        ],
+        "example_unpromising_titles": [
+          "Senior Product Manager",
+          "UX Researcher",
+          "UX Writer",
+          "Brand Designer",
+          "Senior Graphic Designer",
+          "Motion Designer",
+          "Design Program Manager",
+          "Frontend Engineer",
+          "Senior Content Designer",
+          "Design Technologist"
+        ]
+      }
+    },
+    "catalog-data-scientist-ml-engineer": {
+      "target": {
+        "id": "catalog-data-scientist-ml-engineer",
+        "label": "Data Scientist / ML Engineer",
+        "app_active": true,
+        "example_promising_titles": [
+          "Senior Data Scientist",
+          "Senior Machine Learning Engineer",
+          "Staff ML Engineer",
+          "Principal Data Scientist",
+          "Applied Scientist",
+          "Staff Data Scientist",
+          "Machine Learning Platform Engineer",
+          "Senior Applied Machine Learning Engineer",
+          "Senior AI/ML Engineer",
+          "Principal Machine Learning Engineer"
+        ],
+        "example_unpromising_titles": [
+          "Senior Data Engineer",
+          "Senior Business Intelligence Analyst",
+          "Data Analytics Manager",
+          "Senior Software Engineer",
+          "Senior Product Analyst",
+          "AI Product Manager",
+          "Senior Quantitative Analyst",
+          "Senior Data Analyst",
+          "ML Infrastructure Engineer",
+          "Senior Research Engineer"
+        ]
+      }
+    },
+    "catalog-devops-sre-engineer": {
+      "target": {
+        "id": "catalog-devops-sre-engineer",
+        "label": "DevOps / SRE Engineer",
+        "app_active": true,
+        "example_promising_titles": [
+          "Senior DevOps Engineer",
+          "Site Reliability Engineer",
+          "Senior SRE",
+          "Staff Platform Engineer",
+          "Principal Infrastructure Engineer",
+          "Senior Cloud Engineer",
+          "Staff Site Reliability Engineer",
+          "DevOps Platform Engineer",
+          "Senior Production Engineer"
+        ],
+        "example_unpromising_titles": [
+          "Senior Backend Engineer",
+          "Cloud Security Engineer",
+          "Senior Data Engineer",
+          "Network Engineer",
+          "IT Systems Administrator",
+          "Senior Solutions Architect",
+          "Engineering Manager",
+          "Technical Program Manager",
+          "Senior Software Engineer"
+        ]
+      }
+    },
+    "user-senior-frontend-engineer": {
+      "target": {
+        "id": "user-senior-frontend-engineer",
+        "label": "Senior Frontend Engineer",
+        "app_active": false,
+        "example_promising_titles": [
+          "Senior Frontend Engineer",
+          "Senior Front-End Engineer",
+          "Staff Frontend Engineer",
+          "Principal Frontend Engineer",
+          "Senior UI Engineer",
+          "Senior React Engineer",
+          "Senior Web Engineer",
+          "Staff Full-Stack Engineer",
+          "Frontend Platform Engineer",
+          "Senior JavaScript Engineer"
+        ],
+        "example_unpromising_titles": [
+          "Senior Product Designer",
+          "Senior Backend Engineer",
+          "Senior Mobile Engineer",
+          "Senior iOS Engineer",
+          "Senior Android Engineer",
+          "Senior Data Engineer",
+          "Product Manager",
+          "Senior DevOps Engineer",
+          "UX Researcher",
+          "Senior Site Reliability Engineer"
+        ]
+      }
+    }
+  },
+  "cases": [
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Growth Manager - Asia",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate, Insurance Product & Benefit Execution",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Sales Associate (Sur La Table)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Staff Software Engineer - Native Infrastructure",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Early Talent Acquisition Associate (Hybrid - Reston, VA)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Systems Engineer, Robotics",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Engineer, Scientific Computing",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Data Engineer",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate, Driver Acquisition",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Sr. Infrastructure Platform Engineer - Data Center",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Full-stack AI Application Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate Director, Oligonucleotide Development",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Lead Software Engineer (Team Lead)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Engineer, Backend - Agent Experience",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Business Operations Associate- REMOTE",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Manager, Software Engineering ",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Staff Software Engineer, Fullstack",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Seasonal Warehouse Associate",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Product Marketing Manager - B2C",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Product Management Sr. Specialist (Smartphones, A&S)",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Staff Backend Engineer - Data Platform- Seattle ",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate Director, Corporate Compliance",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Binance Accelerator Program - Frontend Engineer (for current students)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Consultor de Solu\u00e7\u00f5es I - PM",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Guest Service Associate/Cashier - Jiffy Mart",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Member of Technical Staff (Software Engineer, Desktop Apps)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate, Medical Economics",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Binance Accelerator Program - Research Data Scientist",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Lead Software Engineer, Backend (Build Automation)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Engineer II",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Map Experience Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate Implementation Consultant \u2013 Food & Nutrition Services",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Staff Product Manager - Care Application Platform",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Software Engineer, Backend - Insurance",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Site Reliability Engineer",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Social Media Intern",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Product Designer (Contract), London, UK",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Growth & Partnerships Manager - Staking Products",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Machine Learning Engineer, Agent Eval Platform",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Inventory Control Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Software Engineer - 2027 New Grads",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Engineer II (Mobile, iOS)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Growth Manager - CIS",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Manager, Software Engineering Management - AI Experience Framework",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Assistant City Attorney Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Public Policy Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Project Manager- Pharmacy Associate",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Backend Engineer - ERP Systems",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Intern, Residential Leasing",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Sr. IT Support Specialist",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Engineer (Cryptography)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Core Experience & AI Product Manager",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Engineer, Mobile (iOS) - Consumer Experience",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Component Design Engineer - Engineering for Production and Aftermarket",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Member of Technical Staff (Software Engineer, Computer Growth)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Engineer, Cloud Infrastructure / SRE",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate Buyer",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Global Head Portfolio Management (PM) GTM Lead  ",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Warehouse Operations Associate (Future Opportunities - Government Solutions)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Member of Data Staff (Data Scientist)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate Director, Insurance Product Innovation & Emerging Solutions",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Full Stack Engineer - KYC Tech (fully remote!)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Strategy & Planning Southern Sumatera, Associate",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Mobile Business Analyst",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Founder's Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Process Management Associate, Provider Operations",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Seasonal Retail Gearhead / Sales Associate - Part Time (Backcountry)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "GrabFin Process Management and Data Analyst Associate",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Software Developer Senior",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior / Principal Product Manager, Contract Orchestration",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Engineer II (Auth)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Frontend Engineer - Stablecoin",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate District Manager",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Software Engineering Lead",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Staff Backend Engineer - Data Platform- San Francisco ",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate, Process Optimization",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Marketing Associate - SEA",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Principal Software Engineer - Mobile Platform",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Data Engineer (GCP)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Member of Technical Staff (Software Engineer, Data Platform)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate Director of Product Marketing, ICHRA",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Marketing Intern",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Software Engineer, Backend",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Assistant/Associate/Full Professor of Philosophy",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Commercial Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Backend Engineer",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Business Continuity Associate APAC",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Research Data Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Parcel Experience BI Analyst",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Founding AI PM - SF",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Group Product Manager, Member Coverage & Support Platform",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Software Engineering Manager .NET",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Category Management Intern",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Data Analyst / Embedded UAT Tester - (Junior/Mid - Remote - US)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Member of Technical Staff (ML Engineer, Recommendations & User Modeling)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Product Designer, ICHRA",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "3rd shift (11pm - 7am) Seasonal Distribution Associate (Sur La Table)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Cloud Engineer (6 months Contract)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Systems Engineering, Validation & Verification-Naval",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Software Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Engineer, Decision Science",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Growth Campaign Manager - CIS",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Staff Software Engineer - ITAM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Assistant, Associate, or Professor of French with a specialization in African Francophone Studies",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Founding AI PM - NYC",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Quant Trading Associate - 2027 Start",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate Clinical Director, Integrated Care Quality (NP/MD)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Product Manager ",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate Director, Law Careers and Pre-Law Advising",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Member of Technical Staff (Software Engineer, Acceleration)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate, Operational Forecasting",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Warehouse Associate - Material Handler",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Staff Machine Learning Engineer, Agent Eval Platform",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Junior Portfolio Manager",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Video Editor & Motion Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate, Payment Integrity IBR",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Retail Gearhead / Sales Associate - Part Time (Backcountry)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Data Scientist (Analytics)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Fulfillment Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Internship - Search Machine Learning Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Fullstack Engineer (TypeScript)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Engineer, Web",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Machine Learning Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Warehouse Associate - ATL1",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Member of Technical Staff (Software Engineer, Cloud Infrastructure)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate Director, Insurance Product Employer Subsidized & Emerging Solutions",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Earn Product Operations & User Growth",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Data Scientist (Country and Marketing Analytics)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Systems Engineer",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Product Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Design Release Engineer, Frame",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Junior Engineer",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate, Key Account Management - Expansion",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Planner Associate - Subdivision Land Development",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": " Software Engineer, Model Evaluation and Improvement",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Data Scientist - Staff or Senior (United Kingdom)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Warehouse Associate",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Principal Research Scientist - Evaluations ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "DevOps Engineer",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate Product Marketing Manager",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Staff Software Engineer (Mobile, Android)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Pioneer Talent Program - Applied Data Scientist",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate, Vendor Onboarding",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Market Associate/Cashier - Honey Farms Market",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Electrical Systems Engineer II",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Cloud Platform Engineer ",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Growth Manager, West Africa",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Engineer - Data Platform - Kubernetes - Federal",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "On-call Software Engineer, Cloud Data Platform",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Member of Technical Staff (Software Engineer, Computer)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Principal Product Manager ",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Associate Medical Director, Maternal and Pediatric Health",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Software Engineer, Backend - GrabDefence",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Financial Operations Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Machine Learning Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Medical Support Associate, Manila (Registered Nurse)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Junior Quality Analyst",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Senior Software Engineer - ITAM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-manager",
+      "title": "Product Manager II",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Growth Manager - Asia",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate, Insurance Product & Benefit Execution",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Sales Associate (Sur La Table)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Staff Software Engineer - Native Infrastructure",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Early Talent Acquisition Associate (Hybrid - Reston, VA)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Systems Engineer, Robotics",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Engineer, Scientific Computing",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Data Engineer",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate, Driver Acquisition",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Sr. Infrastructure Platform Engineer - Data Center",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Full-stack AI Application Engineer",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate Director, Oligonucleotide Development",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Lead Software Engineer (Team Lead)",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Engineer, Backend - Agent Experience",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Business Operations Associate- REMOTE",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Manager, Software Engineering ",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Staff Software Engineer, Fullstack",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Seasonal Warehouse Associate",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Product Marketing Manager - B2C",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Product Management Sr. Specialist (Smartphones, A&S)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Staff Backend Engineer - Data Platform- Seattle ",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate Director, Corporate Compliance",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Binance Accelerator Program - Frontend Engineer (for current students)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Consultor de Solu\u00e7\u00f5es I - PM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Guest Service Associate/Cashier - Jiffy Mart",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Desktop Apps)",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate, Medical Economics",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Binance Accelerator Program - Research Data Scientist",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Lead Software Engineer, Backend (Build Automation)",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Engineer II",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Map Experience Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate Implementation Consultant \u2013 Food & Nutrition Services",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Staff Product Manager - Care Application Platform",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Software Engineer, Backend - Insurance",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Site Reliability Engineer",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Social Media Intern",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Product Designer (Contract), London, UK",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Growth & Partnerships Manager - Staking Products",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Machine Learning Engineer, Agent Eval Platform",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Inventory Control Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Software Engineer - 2027 New Grads",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Engineer II (Mobile, iOS)",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Growth Manager - CIS",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Manager, Software Engineering Management - AI Experience Framework",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Assistant City Attorney Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Public Policy Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Project Manager- Pharmacy Associate",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Backend Engineer - ERP Systems",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Engineer",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Intern, Residential Leasing",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Sr. IT Support Specialist",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Engineer (Cryptography)",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Core Experience & AI Product Manager",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Engineer, Mobile (iOS) - Consumer Experience",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Component Design Engineer - Engineering for Production and Aftermarket",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Computer Growth)",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Engineer, Cloud Infrastructure / SRE",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate Buyer",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Global Head Portfolio Management (PM) GTM Lead  ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Warehouse Operations Associate (Future Opportunities - Government Solutions)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Member of Data Staff (Data Scientist)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate Director, Insurance Product Innovation & Emerging Solutions",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Full Stack Engineer - KYC Tech (fully remote!)",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Strategy & Planning Southern Sumatera, Associate",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Mobile Business Analyst",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Founder's Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Process Management Associate, Provider Operations",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Seasonal Retail Gearhead / Sales Associate - Part Time (Backcountry)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "GrabFin Process Management and Data Analyst Associate",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Software Developer Senior",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior / Principal Product Manager, Contract Orchestration",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Engineer II (Auth)",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Frontend Engineer - Stablecoin",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate District Manager",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Software Engineering Lead",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Staff Backend Engineer - Data Platform- San Francisco ",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate, Process Optimization",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Marketing Associate - SEA",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Principal Software Engineer - Mobile Platform",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Data Engineer (GCP)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Data Platform)",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate Director of Product Marketing, ICHRA",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Marketing Intern",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Software Engineer, Backend",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Assistant/Associate/Full Professor of Philosophy",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Commercial Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Backend Engineer",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Business Continuity Associate APAC",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Research Data Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Parcel Experience BI Analyst",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Founding AI PM - SF",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Group Product Manager, Member Coverage & Support Platform",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Software Engineering Manager .NET",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Category Management Intern",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Data Analyst / Embedded UAT Tester - (Junior/Mid - Remote - US)",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Member of Technical Staff (ML Engineer, Recommendations & User Modeling)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Product Designer, ICHRA",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "3rd shift (11pm - 7am) Seasonal Distribution Associate (Sur La Table)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Cloud Engineer (6 months Contract)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Systems Engineering, Validation & Verification-Naval",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Software Engineer",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Engineer, Decision Science",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Growth Campaign Manager - CIS",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Staff Software Engineer - ITAM",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Assistant, Associate, or Professor of French with a specialization in African Francophone Studies",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Founding AI PM - NYC",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Quant Trading Associate - 2027 Start",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate Clinical Director, Integrated Care Quality (NP/MD)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Product Manager ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate Director, Law Careers and Pre-Law Advising",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Acceleration)",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate, Operational Forecasting",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Warehouse Associate - Material Handler",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Staff Machine Learning Engineer, Agent Eval Platform",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Junior Portfolio Manager",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Video Editor & Motion Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate, Payment Integrity IBR",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Retail Gearhead / Sales Associate - Part Time (Backcountry)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Data Scientist (Analytics)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Fulfillment Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Internship - Search Machine Learning Engineer",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Fullstack Engineer (TypeScript)",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Engineer, Web",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Machine Learning Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Warehouse Associate - ATL1",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Cloud Infrastructure)",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate Director, Insurance Product Employer Subsidized & Emerging Solutions",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Earn Product Operations & User Growth",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Data Scientist (Country and Marketing Analytics)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Systems Engineer",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Product Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Design Release Engineer, Frame",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Junior Engineer",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate, Key Account Management - Expansion",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Planner Associate - Subdivision Land Development",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": " Software Engineer, Model Evaluation and Improvement",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Data Scientist - Staff or Senior (United Kingdom)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Warehouse Associate",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Principal Research Scientist - Evaluations ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "DevOps Engineer",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate Product Marketing Manager",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Staff Software Engineer (Mobile, Android)",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Pioneer Talent Program - Applied Data Scientist",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate, Vendor Onboarding",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Market Associate/Cashier - Honey Farms Market",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Electrical Systems Engineer II",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Cloud Platform Engineer ",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Growth Manager, West Africa",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Engineer - Data Platform - Kubernetes - Federal",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "On-call Software Engineer, Cloud Data Platform",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Computer)",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Principal Product Manager ",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Associate Medical Director, Maternal and Pediatric Health",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Software Engineer, Backend - GrabDefence",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Financial Operations Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Machine Learning Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Medical Support Associate, Manila (Registered Nurse)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Junior Quality Analyst",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Senior Software Engineer - ITAM",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-software-engineer",
+      "title": "Product Manager II",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Growth Manager - Asia",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate, Insurance Product & Benefit Execution",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Sales Associate (Sur La Table)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Staff Software Engineer - Native Infrastructure",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Early Talent Acquisition Associate (Hybrid - Reston, VA)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Systems Engineer, Robotics",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Engineer, Scientific Computing",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Data Engineer",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate, Driver Acquisition",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Sr. Infrastructure Platform Engineer - Data Center",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Full-stack AI Application Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate Director, Oligonucleotide Development",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Lead Software Engineer (Team Lead)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Engineer, Backend - Agent Experience",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Business Operations Associate- REMOTE",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Manager, Software Engineering ",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Staff Software Engineer, Fullstack",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Seasonal Warehouse Associate",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Product Marketing Manager - B2C",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Product Management Sr. Specialist (Smartphones, A&S)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Staff Backend Engineer - Data Platform- Seattle ",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate Director, Corporate Compliance",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Binance Accelerator Program - Frontend Engineer (for current students)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Consultor de Solu\u00e7\u00f5es I - PM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Guest Service Associate/Cashier - Jiffy Mart",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Member of Technical Staff (Software Engineer, Desktop Apps)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate, Medical Economics",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Binance Accelerator Program - Research Data Scientist",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Lead Software Engineer, Backend (Build Automation)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Engineer II",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Map Experience Designer",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate Implementation Consultant \u2013 Food & Nutrition Services",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Staff Product Manager - Care Application Platform",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Software Engineer, Backend - Insurance",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Site Reliability Engineer",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Social Media Intern",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Product Designer (Contract), London, UK",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Growth & Partnerships Manager - Staking Products",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Machine Learning Engineer, Agent Eval Platform",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Inventory Control Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Software Engineer - 2027 New Grads",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Engineer II (Mobile, iOS)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Growth Manager - CIS",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Manager, Software Engineering Management - AI Experience Framework",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Assistant City Attorney Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Public Policy Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Project Manager- Pharmacy Associate",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Backend Engineer - ERP Systems",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Intern, Residential Leasing",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Sr. IT Support Specialist",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Engineer (Cryptography)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Core Experience & AI Product Manager",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Engineer, Mobile (iOS) - Consumer Experience",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Component Design Engineer - Engineering for Production and Aftermarket",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Member of Technical Staff (Software Engineer, Computer Growth)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Engineer, Cloud Infrastructure / SRE",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate Buyer",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Global Head Portfolio Management (PM) GTM Lead  ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Warehouse Operations Associate (Future Opportunities - Government Solutions)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Member of Data Staff (Data Scientist)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate Director, Insurance Product Innovation & Emerging Solutions",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Full Stack Engineer - KYC Tech (fully remote!)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Strategy & Planning Southern Sumatera, Associate",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Mobile Business Analyst",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Founder's Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Process Management Associate, Provider Operations",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Seasonal Retail Gearhead / Sales Associate - Part Time (Backcountry)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "GrabFin Process Management and Data Analyst Associate",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Software Developer Senior",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior / Principal Product Manager, Contract Orchestration",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Engineer II (Auth)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Frontend Engineer - Stablecoin",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate District Manager",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Software Engineering Lead",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Staff Backend Engineer - Data Platform- San Francisco ",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate, Process Optimization",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Marketing Associate - SEA",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Principal Software Engineer - Mobile Platform",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Data Engineer (GCP)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Member of Technical Staff (Software Engineer, Data Platform)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate Director of Product Marketing, ICHRA",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Marketing Intern",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Software Engineer, Backend",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Assistant/Associate/Full Professor of Philosophy",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Commercial Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Backend Engineer",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Business Continuity Associate APAC",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Research Data Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Parcel Experience BI Analyst",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Founding AI PM - SF",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Group Product Manager, Member Coverage & Support Platform",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Software Engineering Manager .NET",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Category Management Intern",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Data Analyst / Embedded UAT Tester - (Junior/Mid - Remote - US)",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Member of Technical Staff (ML Engineer, Recommendations & User Modeling)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Product Designer, ICHRA",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "3rd shift (11pm - 7am) Seasonal Distribution Associate (Sur La Table)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Cloud Engineer (6 months Contract)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Systems Engineering, Validation & Verification-Naval",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Software Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Engineer, Decision Science",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Growth Campaign Manager - CIS",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Staff Software Engineer - ITAM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Assistant, Associate, or Professor of French with a specialization in African Francophone Studies",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Founding AI PM - NYC",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Quant Trading Associate - 2027 Start",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate Clinical Director, Integrated Care Quality (NP/MD)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Product Manager ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate Director, Law Careers and Pre-Law Advising",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Member of Technical Staff (Software Engineer, Acceleration)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate, Operational Forecasting",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Warehouse Associate - Material Handler",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Staff Machine Learning Engineer, Agent Eval Platform",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Junior Portfolio Manager",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Video Editor & Motion Designer",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate, Payment Integrity IBR",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Retail Gearhead / Sales Associate - Part Time (Backcountry)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Data Scientist (Analytics)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Fulfillment Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Internship - Search Machine Learning Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Fullstack Engineer (TypeScript)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Engineer, Web",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Machine Learning Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Warehouse Associate - ATL1",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Member of Technical Staff (Software Engineer, Cloud Infrastructure)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate Director, Insurance Product Employer Subsidized & Emerging Solutions",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Earn Product Operations & User Growth",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Data Scientist (Country and Marketing Analytics)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Systems Engineer",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Product Designer",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Design Release Engineer, Frame",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Junior Engineer",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate, Key Account Management - Expansion",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Planner Associate - Subdivision Land Development",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": " Software Engineer, Model Evaluation and Improvement",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Data Scientist - Staff or Senior (United Kingdom)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Warehouse Associate",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Principal Research Scientist - Evaluations ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "DevOps Engineer",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate Product Marketing Manager",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Staff Software Engineer (Mobile, Android)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Pioneer Talent Program - Applied Data Scientist",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate, Vendor Onboarding",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Market Associate/Cashier - Honey Farms Market",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Electrical Systems Engineer II",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Cloud Platform Engineer ",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Growth Manager, West Africa",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Engineer - Data Platform - Kubernetes - Federal",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "On-call Software Engineer, Cloud Data Platform",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Member of Technical Staff (Software Engineer, Computer)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Principal Product Manager ",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Associate Medical Director, Maternal and Pediatric Health",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Software Engineer, Backend - GrabDefence",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Financial Operations Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Machine Learning Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Medical Support Associate, Manila (Registered Nurse)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Junior Quality Analyst",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Senior Software Engineer - ITAM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-product-designer",
+      "title": "Product Manager II",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Growth Manager - Asia",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate, Insurance Product & Benefit Execution",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Sales Associate (Sur La Table)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Staff Software Engineer - Native Infrastructure",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Early Talent Acquisition Associate (Hybrid - Reston, VA)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Systems Engineer, Robotics",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Engineer, Scientific Computing",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Data Engineer",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate, Driver Acquisition",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Sr. Infrastructure Platform Engineer - Data Center",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Full-stack AI Application Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate Director, Oligonucleotide Development",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Lead Software Engineer (Team Lead)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Engineer, Backend - Agent Experience",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Business Operations Associate- REMOTE",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Manager, Software Engineering ",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Staff Software Engineer, Fullstack",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Seasonal Warehouse Associate",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Product Marketing Manager - B2C",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Product Management Sr. Specialist (Smartphones, A&S)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Staff Backend Engineer - Data Platform- Seattle ",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate Director, Corporate Compliance",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Binance Accelerator Program - Frontend Engineer (for current students)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Consultor de Solu\u00e7\u00f5es I - PM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Guest Service Associate/Cashier - Jiffy Mart",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Desktop Apps)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate, Medical Economics",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Binance Accelerator Program - Research Data Scientist",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Lead Software Engineer, Backend (Build Automation)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Engineer II",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Map Experience Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate Implementation Consultant \u2013 Food & Nutrition Services",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Staff Product Manager - Care Application Platform",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Software Engineer, Backend - Insurance",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Site Reliability Engineer",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Social Media Intern",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Product Designer (Contract), London, UK",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Growth & Partnerships Manager - Staking Products",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Machine Learning Engineer, Agent Eval Platform",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Inventory Control Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Software Engineer - 2027 New Grads",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Engineer II (Mobile, iOS)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Growth Manager - CIS",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Manager, Software Engineering Management - AI Experience Framework",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Assistant City Attorney Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Public Policy Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Project Manager- Pharmacy Associate",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Backend Engineer - ERP Systems",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Intern, Residential Leasing",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Sr. IT Support Specialist",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Engineer (Cryptography)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Core Experience & AI Product Manager",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Engineer, Mobile (iOS) - Consumer Experience",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Component Design Engineer - Engineering for Production and Aftermarket",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Computer Growth)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Engineer, Cloud Infrastructure / SRE",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate Buyer",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Global Head Portfolio Management (PM) GTM Lead  ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Warehouse Operations Associate (Future Opportunities - Government Solutions)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Member of Data Staff (Data Scientist)",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate Director, Insurance Product Innovation & Emerging Solutions",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Full Stack Engineer - KYC Tech (fully remote!)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Strategy & Planning Southern Sumatera, Associate",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Mobile Business Analyst",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Founder's Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Process Management Associate, Provider Operations",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Seasonal Retail Gearhead / Sales Associate - Part Time (Backcountry)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "GrabFin Process Management and Data Analyst Associate",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Software Developer Senior",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior / Principal Product Manager, Contract Orchestration",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Engineer II (Auth)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Frontend Engineer - Stablecoin",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate District Manager",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Software Engineering Lead",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Staff Backend Engineer - Data Platform- San Francisco ",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate, Process Optimization",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Marketing Associate - SEA",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Principal Software Engineer - Mobile Platform",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Data Engineer (GCP)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Data Platform)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate Director of Product Marketing, ICHRA",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Marketing Intern",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Software Engineer, Backend",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Assistant/Associate/Full Professor of Philosophy",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Commercial Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Backend Engineer",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Business Continuity Associate APAC",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Research Data Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Parcel Experience BI Analyst",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Founding AI PM - SF",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Group Product Manager, Member Coverage & Support Platform",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Software Engineering Manager .NET",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Category Management Intern",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Data Analyst / Embedded UAT Tester - (Junior/Mid - Remote - US)",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Member of Technical Staff (ML Engineer, Recommendations & User Modeling)",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Product Designer, ICHRA",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "3rd shift (11pm - 7am) Seasonal Distribution Associate (Sur La Table)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Cloud Engineer (6 months Contract)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Systems Engineering, Validation & Verification-Naval",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Software Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Engineer, Decision Science",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Growth Campaign Manager - CIS",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Staff Software Engineer - ITAM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Assistant, Associate, or Professor of French with a specialization in African Francophone Studies",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Founding AI PM - NYC",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Quant Trading Associate - 2027 Start",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate Clinical Director, Integrated Care Quality (NP/MD)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Product Manager ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate Director, Law Careers and Pre-Law Advising",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Acceleration)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate, Operational Forecasting",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Warehouse Associate - Material Handler",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Staff Machine Learning Engineer, Agent Eval Platform",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Junior Portfolio Manager",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Video Editor & Motion Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate, Payment Integrity IBR",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Retail Gearhead / Sales Associate - Part Time (Backcountry)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Data Scientist (Analytics)",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Fulfillment Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Internship - Search Machine Learning Engineer",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Fullstack Engineer (TypeScript)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Engineer, Web",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Machine Learning Engineer",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Warehouse Associate - ATL1",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Cloud Infrastructure)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate Director, Insurance Product Employer Subsidized & Emerging Solutions",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Earn Product Operations & User Growth",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Data Scientist (Country and Marketing Analytics)",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Systems Engineer",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Product Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Design Release Engineer, Frame",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Junior Engineer",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate, Key Account Management - Expansion",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Planner Associate - Subdivision Land Development",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": " Software Engineer, Model Evaluation and Improvement",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Data Scientist - Staff or Senior (United Kingdom)",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Warehouse Associate",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Principal Research Scientist - Evaluations ",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "DevOps Engineer",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate Product Marketing Manager",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Staff Software Engineer (Mobile, Android)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Pioneer Talent Program - Applied Data Scientist",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate, Vendor Onboarding",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Market Associate/Cashier - Honey Farms Market",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Electrical Systems Engineer II",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Cloud Platform Engineer ",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Growth Manager, West Africa",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Engineer - Data Platform - Kubernetes - Federal",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "On-call Software Engineer, Cloud Data Platform",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Computer)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Principal Product Manager ",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Associate Medical Director, Maternal and Pediatric Health",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Software Engineer, Backend - GrabDefence",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Financial Operations Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Machine Learning Engineer",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Medical Support Associate, Manila (Registered Nurse)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Junior Quality Analyst",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Senior Software Engineer - ITAM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-data-scientist-ml-engineer",
+      "title": "Product Manager II",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Growth Manager - Asia",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate, Insurance Product & Benefit Execution",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Sales Associate (Sur La Table)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Staff Software Engineer - Native Infrastructure",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Early Talent Acquisition Associate (Hybrid - Reston, VA)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Systems Engineer, Robotics",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Engineer, Scientific Computing",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Data Engineer",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate, Driver Acquisition",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Sr. Infrastructure Platform Engineer - Data Center",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Full-stack AI Application Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate Director, Oligonucleotide Development",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Lead Software Engineer (Team Lead)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Engineer, Backend - Agent Experience",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Business Operations Associate- REMOTE",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Manager, Software Engineering ",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Staff Software Engineer, Fullstack",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Seasonal Warehouse Associate",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Product Marketing Manager - B2C",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Product Management Sr. Specialist (Smartphones, A&S)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Staff Backend Engineer - Data Platform- Seattle ",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate Director, Corporate Compliance",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Binance Accelerator Program - Frontend Engineer (for current students)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Consultor de Solu\u00e7\u00f5es I - PM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Guest Service Associate/Cashier - Jiffy Mart",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Desktop Apps)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate, Medical Economics",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Binance Accelerator Program - Research Data Scientist",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Lead Software Engineer, Backend (Build Automation)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Engineer II",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Map Experience Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate Implementation Consultant \u2013 Food & Nutrition Services",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Staff Product Manager - Care Application Platform",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Software Engineer, Backend - Insurance",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Site Reliability Engineer",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Social Media Intern",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Product Designer (Contract), London, UK",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Growth & Partnerships Manager - Staking Products",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Machine Learning Engineer, Agent Eval Platform",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Inventory Control Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Software Engineer - 2027 New Grads",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Engineer II (Mobile, iOS)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Growth Manager - CIS",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Manager, Software Engineering Management - AI Experience Framework",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Assistant City Attorney Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Public Policy Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Project Manager- Pharmacy Associate",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Backend Engineer - ERP Systems",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Intern, Residential Leasing",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Sr. IT Support Specialist",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Engineer (Cryptography)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Core Experience & AI Product Manager",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Engineer, Mobile (iOS) - Consumer Experience",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Component Design Engineer - Engineering for Production and Aftermarket",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Computer Growth)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Engineer, Cloud Infrastructure / SRE",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate Buyer",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Global Head Portfolio Management (PM) GTM Lead  ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Warehouse Operations Associate (Future Opportunities - Government Solutions)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Member of Data Staff (Data Scientist)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate Director, Insurance Product Innovation & Emerging Solutions",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Full Stack Engineer - KYC Tech (fully remote!)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Strategy & Planning Southern Sumatera, Associate",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Mobile Business Analyst",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Founder's Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Process Management Associate, Provider Operations",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Seasonal Retail Gearhead / Sales Associate - Part Time (Backcountry)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "GrabFin Process Management and Data Analyst Associate",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Software Developer Senior",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior / Principal Product Manager, Contract Orchestration",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Engineer II (Auth)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Frontend Engineer - Stablecoin",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate District Manager",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Software Engineering Lead",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Staff Backend Engineer - Data Platform- San Francisco ",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate, Process Optimization",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Marketing Associate - SEA",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Principal Software Engineer - Mobile Platform",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Data Engineer (GCP)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Data Platform)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate Director of Product Marketing, ICHRA",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Marketing Intern",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Software Engineer, Backend",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Assistant/Associate/Full Professor of Philosophy",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Commercial Associate",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Backend Engineer",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Business Continuity Associate APAC",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Research Data Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Parcel Experience BI Analyst",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Founding AI PM - SF",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Group Product Manager, Member Coverage & Support Platform",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Software Engineering Manager .NET",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Category Management Intern",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Data Analyst / Embedded UAT Tester - (Junior/Mid - Remote - US)",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Member of Technical Staff (ML Engineer, Recommendations & User Modeling)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Product Designer, ICHRA",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "3rd shift (11pm - 7am) Seasonal Distribution Associate (Sur La Table)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Cloud Engineer (6 months Contract)",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Systems Engineering, Validation & Verification-Naval",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Software Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Engineer, Decision Science",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Growth Campaign Manager - CIS",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Staff Software Engineer - ITAM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Assistant, Associate, or Professor of French with a specialization in African Francophone Studies",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Founding AI PM - NYC",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Quant Trading Associate - 2027 Start",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate Clinical Director, Integrated Care Quality (NP/MD)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Product Manager ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate Director, Law Careers and Pre-Law Advising",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Acceleration)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate, Operational Forecasting",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Warehouse Associate - Material Handler",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Staff Machine Learning Engineer, Agent Eval Platform",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Junior Portfolio Manager",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Video Editor & Motion Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate, Payment Integrity IBR",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Retail Gearhead / Sales Associate - Part Time (Backcountry)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Data Scientist (Analytics)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Fulfillment Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Internship - Search Machine Learning Engineer",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Fullstack Engineer (TypeScript)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Engineer, Web",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Machine Learning Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Warehouse Associate - ATL1",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Cloud Infrastructure)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate Director, Insurance Product Employer Subsidized & Emerging Solutions",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Earn Product Operations & User Growth",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Data Scientist (Country and Marketing Analytics)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Systems Engineer",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Product Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Design Release Engineer, Frame",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Junior Engineer",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate, Key Account Management - Expansion",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Planner Associate - Subdivision Land Development",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": " Software Engineer, Model Evaluation and Improvement",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Data Scientist - Staff or Senior (United Kingdom)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Warehouse Associate",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Principal Research Scientist - Evaluations ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "DevOps Engineer",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate Product Marketing Manager",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Staff Software Engineer (Mobile, Android)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Pioneer Talent Program - Applied Data Scientist",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate, Vendor Onboarding",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Market Associate/Cashier - Honey Farms Market",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Electrical Systems Engineer II",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Cloud Platform Engineer ",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Growth Manager, West Africa",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Engineer - Data Platform - Kubernetes - Federal",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "On-call Software Engineer, Cloud Data Platform",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Computer)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Principal Product Manager ",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Associate Medical Director, Maternal and Pediatric Health",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Software Engineer, Backend - GrabDefence",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Financial Operations Associate",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Machine Learning Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Medical Support Associate, Manila (Registered Nurse)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Junior Quality Analyst",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Senior Software Engineer - ITAM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "catalog-devops-sre-engineer",
+      "title": "Product Manager II",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Growth Manager - Asia",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate, Insurance Product & Benefit Execution",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Sales Associate (Sur La Table)",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Staff Software Engineer - Native Infrastructure",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Early Talent Acquisition Associate (Hybrid - Reston, VA)",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Systems Engineer, Robotics",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Engineer, Scientific Computing",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Data Engineer",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate, Driver Acquisition",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Sr. Infrastructure Platform Engineer - Data Center",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Full-stack AI Application Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate Director, Oligonucleotide Development",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Lead Software Engineer (Team Lead)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Engineer, Backend - Agent Experience",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Business Operations Associate- REMOTE",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Manager, Software Engineering ",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Staff Software Engineer, Fullstack",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Seasonal Warehouse Associate",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Product Marketing Manager - B2C",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Product Management Sr. Specialist (Smartphones, A&S)",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Staff Backend Engineer - Data Platform- Seattle ",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate Director, Corporate Compliance",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Binance Accelerator Program - Frontend Engineer (for current students)",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Consultor de Solu\u00e7\u00f5es I - PM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Guest Service Associate/Cashier - Jiffy Mart",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Desktop Apps)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate, Medical Economics",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Binance Accelerator Program - Research Data Scientist",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Lead Software Engineer, Backend (Build Automation)",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Engineer II",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Map Experience Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate Implementation Consultant \u2013 Food & Nutrition Services",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Staff Product Manager - Care Application Platform",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Software Engineer, Backend - Insurance",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Site Reliability Engineer",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Social Media Intern",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Product Designer (Contract), London, UK",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Growth & Partnerships Manager - Staking Products",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Machine Learning Engineer, Agent Eval Platform",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Inventory Control Associate",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Software Engineer - 2027 New Grads",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Engineer II (Mobile, iOS)",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Growth Manager - CIS",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Manager, Software Engineering Management - AI Experience Framework",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Assistant City Attorney Associate",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Public Policy Associate",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Project Manager- Pharmacy Associate",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Backend Engineer - ERP Systems",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Engineer",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Intern, Residential Leasing",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Sr. IT Support Specialist",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Engineer (Cryptography)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Core Experience & AI Product Manager",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Engineer, Mobile (iOS) - Consumer Experience",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Component Design Engineer - Engineering for Production and Aftermarket",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Computer Growth)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Engineer, Cloud Infrastructure / SRE",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate Buyer",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Global Head Portfolio Management (PM) GTM Lead  ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Warehouse Operations Associate (Future Opportunities - Government Solutions)",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Member of Data Staff (Data Scientist)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate Director, Insurance Product Innovation & Emerging Solutions",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Full Stack Engineer - KYC Tech (fully remote!)",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Strategy & Planning Southern Sumatera, Associate",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Mobile Business Analyst",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Founder's Associate",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Process Management Associate, Provider Operations",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Seasonal Retail Gearhead / Sales Associate - Part Time (Backcountry)",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "GrabFin Process Management and Data Analyst Associate",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Software Developer Senior",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior / Principal Product Manager, Contract Orchestration",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Engineer II (Auth)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Frontend Engineer - Stablecoin",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate District Manager",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Software Engineering Lead",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Staff Backend Engineer - Data Platform- San Francisco ",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate, Process Optimization",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Marketing Associate - SEA",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Principal Software Engineer - Mobile Platform",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Data Engineer (GCP)",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Data Platform)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate Director of Product Marketing, ICHRA",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Marketing Intern",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Software Engineer, Backend",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Assistant/Associate/Full Professor of Philosophy",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Commercial Associate",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Backend Engineer",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Business Continuity Associate APAC",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Research Data Engineer",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Parcel Experience BI Analyst",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Founding AI PM - SF",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Group Product Manager, Member Coverage & Support Platform",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Software Engineering Manager .NET",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Category Management Intern",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Data Analyst / Embedded UAT Tester - (Junior/Mid - Remote - US)",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Member of Technical Staff (ML Engineer, Recommendations & User Modeling)",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Product Designer, ICHRA",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "3rd shift (11pm - 7am) Seasonal Distribution Associate (Sur La Table)",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Cloud Engineer (6 months Contract)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Systems Engineering, Validation & Verification-Naval",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Software Engineer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Engineer, Decision Science",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Growth Campaign Manager - CIS",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Staff Software Engineer - ITAM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Assistant, Associate, or Professor of French with a specialization in African Francophone Studies",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Founding AI PM - NYC",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Quant Trading Associate - 2027 Start",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate Clinical Director, Integrated Care Quality (NP/MD)",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Product Manager ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate Director, Law Careers and Pre-Law Advising",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Acceleration)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate, Operational Forecasting",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Warehouse Associate - Material Handler",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Staff Machine Learning Engineer, Agent Eval Platform",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Junior Portfolio Manager",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Video Editor & Motion Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate, Payment Integrity IBR",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Retail Gearhead / Sales Associate - Part Time (Backcountry)",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Data Scientist (Analytics)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Fulfillment Associate",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Internship - Search Machine Learning Engineer",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Fullstack Engineer (TypeScript)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Engineer, Web",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Machine Learning Engineer",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Warehouse Associate - ATL1",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Cloud Infrastructure)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate Director, Insurance Product Employer Subsidized & Emerging Solutions",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Earn Product Operations & User Growth",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Data Scientist (Country and Marketing Analytics)",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Systems Engineer",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Product Designer",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Design Release Engineer, Frame",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Junior Engineer",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate, Key Account Management - Expansion",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Planner Associate - Subdivision Land Development",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": " Software Engineer, Model Evaluation and Improvement",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Data Scientist - Staff or Senior (United Kingdom)",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Warehouse Associate",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Principal Research Scientist - Evaluations ",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "DevOps Engineer",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate Product Marketing Manager",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Staff Software Engineer (Mobile, Android)",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Pioneer Talent Program - Applied Data Scientist",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate, Vendor Onboarding",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Market Associate/Cashier - Honey Farms Market",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Electrical Systems Engineer II",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Cloud Platform Engineer ",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Growth Manager, West Africa",
+      "stratum": "cross_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Engineer - Data Platform - Kubernetes - Federal",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "On-call Software Engineer, Cloud Data Platform",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Member of Technical Staff (Software Engineer, Computer)",
+      "stratum": "cross_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Principal Product Manager ",
+      "stratum": "cross_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Associate Medical Director, Maternal and Pediatric Health",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Software Engineer, Backend - GrabDefence",
+      "stratum": "own_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Financial Operations Associate",
+      "stratum": "own_gate",
+      "provider": "workday"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Machine Learning Engineer",
+      "stratum": "own_gate",
+      "provider": "ashby"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Medical Support Associate, Manila (Registered Nurse)",
+      "stratum": "own_gate",
+      "provider": "greenhouse"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Junior Quality Analyst",
+      "stratum": "own_gate",
+      "provider": "lever"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Senior Software Engineer - ITAM",
+      "stratum": "cross_gate",
+      "provider": "smartrecruiters"
+    },
+    {
+      "target_id": "user-senior-frontend-engineer",
+      "title": "Product Manager II",
+      "stratum": "cross_gate",
+      "provider": "workday"
+    }
+  ]
+}

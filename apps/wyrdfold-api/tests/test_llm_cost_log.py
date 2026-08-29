@@ -206,7 +206,13 @@ def test_enqueue_carries_metadata_when_provided() -> None:
         metadata={"job_id": "abc", "target_id": "xyz"},
     )
     drained = buffer._drain()
-    assert drained[0]["metadata"] == {"job_id": "abc", "target_id": "xyz"}
+    # Caller metadata is preserved; the row also carries the cost provenance
+    # stamp every LLM row now gets (#933).
+    assert drained[0]["metadata"] == {
+        "job_id": "abc",
+        "target_id": "xyz",
+        "cost_source": "estimated",
+    }
     # user_id=None (a cron enqueue) is stamped SYSTEM at row-build time (#88
     # groundwork) — the buffered write is no longer a NULL-owner row.
     assert drained[0]["user_id"] == SYSTEM_USER_ID
@@ -264,7 +270,7 @@ async def test_record_async_awaits_insert_and_returns_record() -> None:
     assert inserted["purpose"] == "experience.derive"
     assert inserted["cost_usd"] == 0.01
     assert inserted["output_tokens"] == 5
-    assert inserted["metadata"] == {"prose_doc_id": "p1"}
+    assert inserted["metadata"] == {"prose_doc_id": "p1", "cost_source": "estimated"}
     sb.table.return_value.insert.return_value.execute.assert_awaited_once()
 
 
@@ -501,3 +507,45 @@ async def test_cache_metrics_all_async_sums_token_buckets() -> None:
     result = await cost_log.cache_metrics_all_async(sb, since=datetime.now(UTC))
     assert result == {"cache_read": 1000, "cache_creation": 100, "uncached_input": 100}
     sb.rpc.assert_not_called()
+
+
+# ---- cost provenance stamped on every LLM row (#933) ------------------------
+
+
+@pytest.mark.parametrize("source", ["reported", "estimated"])
+def test_every_llm_writer_stamps_the_cost_provenance(source: str) -> None:
+    """`cost_usd` alone can't tell a reader whether it was billed or guessed.
+
+    Stamped into the jsonb `metadata` (no migration), through all three
+    writers, so "are we still estimating in prod?" is answerable from the
+    table. The parametrize is the anti-vacuous half: the stamp must TRACK the
+    result, not be a constant.
+    """
+    result = _llm_result()
+    result = result.model_copy(update={"cost_source": source})
+    assert result.cost_source == source  # precondition
+
+    # 1. sync record
+    sb = MagicMock()
+    sb.table.return_value.insert.return_value.execute.return_value = _Resp([_stored_row()])
+    cost_log.record(sb, user_id="u1", purpose="p", result=result)
+    assert sb.table.return_value.insert.call_args[0][0]["metadata"]["cost_source"] == source
+
+    # 2. buffered enqueue
+    buffer._drain()
+    cost_log.enqueue(user_id=None, purpose="p", result=result)
+    assert buffer._drain()[0]["metadata"]["cost_source"] == source
+
+
+@pytest.mark.asyncio
+async def test_record_async_stamps_the_cost_provenance() -> None:
+    sb = MagicMock()
+    sb.table.return_value.insert.return_value.execute = AsyncMock(
+        return_value=_Resp([_stored_row()])
+    )
+    result = _llm_result().model_copy(update={"cost_source": "reported"})
+
+    await cost_log.record_async(sb, user_id="u1", purpose="p", result=result)
+
+    inserted = sb.table.return_value.insert.call_args[0][0]
+    assert inserted["metadata"] == {"cost_source": "reported"}

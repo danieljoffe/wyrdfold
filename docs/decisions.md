@@ -3,6 +3,143 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-08-28 — Price is a routing outcome, so a static table cannot be right
+
+`pricing.py` held one price per model and `calculate_cost(model, usage)`
+derived every `cost_usd` from it. But we send OpenRouter slugs **unpinned**,
+and OpenRouter serves `deepseek/deepseek-v3.2` from 14 endpoints spanning
+$0.209/$0.310 to $3.00/$4.50 per Mtok — a 14x spread. There is no such thing
+as "the price of deepseek-v3.2"; there is only the price of the endpoint the
+router happened to pick for that call. Our table encoded roughly the cheapest
+tier, and a bake-off measured effective billing at ~2.9x what we recorded
+(~1.25x for haiku).
+
+**This was a spend-control failure, not a reporting one.** `llm_costs` is the
+input to `_global_budget_exhausted`, `PayerBudgetGate`,
+`grading_budget_reserve_usd` and `check_daily_count`. Recorded spend running
+~2.9x low means all four gates passed ~2.9x more than configured — the daily
+cap was not enforcing what it said.
+
+**Decision:** stop estimating. OpenRouter returns `usage.cost` on every
+response (no opt-in — the old `usage: {include: true}` flag is deprecated and
+inert), and `_openai_usage` was already reading `data["usage"]` and keeping
+only the token counts. `resolve_cost` now prefers the reported figure and
+falls back to the table only when it is genuinely absent. Provenance is
+recorded (`LLMResult.cost_source`, and a `cost_source` key in each row's jsonb
+metadata) so a reader can tell a billed number from a guessed one.
+
+Three things this taught:
+
+**"The SDK exposes what the server sent" is an assumption, not a fact — and it
+was half wrong.** Anthropic's SDK types only Anthropic's own fields, so
+OpenRouter's additions land in pydantic's `model_extra`. On non-streaming
+calls that works: `usage.model_extra["cost"]` is there. On **streaming** it
+does not. The raw SSE `message_delta` frame carries `cost`, and the SDK's
+accumulated final message drops it — `final_message.usage.model_extra` comes
+back as `{"speed": "standard"}` alone. A fix that read the final message would
+have silently estimated every streamed call while looking correct. The cost is
+now read off the `message_delta` event as it passes. Four probes against the
+live API found this; no amount of reading the SDK source would have been
+trusted without them.
+
+**Units and caching get measured, not reasoned about.** `usage.cost` is USD
+(OpenRouter's credit base currency is US dollars) and is already net of prompt
+caching: a Haiku cache-write billed 6,001 tokens at 1.25x the input rate and
+the very next cache-read billed the same 6,001 at 0.1x, both matching `cost`
+to the cent. Had we "corrected" for caching on top, we would have replaced an
+under-read with a double-count.
+
+**An anti-vacuous precondition caught the test author.** The first version of
+the "reported cost wins" test used the real measured figure ($0.000824) with
+the newly corrected haiku fallback (1.00/5.00) — which reproduces exactly
+$0.000824 on those tokens. The precondition `assert table_estimate !=
+reported` failed, which is the only reason the test did not silently pass
+while proving nothing. Every claim here is sabotage-checked: nine one-line
+reversions, each turning the relevant tests red.
+
+**Explicitly not done:** pinning an OpenRouter provider. It changes routing
+behaviour (price, throughput, uptime, tool-choice support all differ per
+endpoint) and is the owner's call. The gap it would close is in #933.
+
+Rule lives in `app/services/llm/pricing.py`'s module docstring and
+`.claude/rules/llm-surfaces.md`.
+
+## 2026-08-28 — The board already knew the country (and a bulk upsert is not a per-row upsert)
+
+The 2026-08-27 correction below left a hole: lazily tagged rows never reach
+`QUALIFICATION_ARCHIVE_NON_US`, so 13.4% of new intake — 133 of 134 of it non-US
+— now stays publicly visible until something grades it. The obvious fix, running
+the deterministic `is_us_location()` parser at ingest and persisting its verdict,
+is worth **nothing**, and the reason is worth remembering: the poller already
+runs that parser as an L1 gate, and it drops a listing only when the location
+carries a non-US hint AND no US marker. Every row it ADMITS is, by construction,
+one the same parser cannot call non-US. A gate and a classifier built from one
+predicate cannot disagree. **Decision:** use a different, stronger fact — the
+country Ashby / Lever / SmartRecruiters publish as a structured field, which
+`board_metadata` was already normalizing to ISO alpha-2 and then discarding.
+Measured on 23,908 live postings across 35 real boards: 27.0% of the postings the
+L1 gate admits carry a board-stated non-US country. Against rows we hold and had
+already tagged, the board and the model agreed 257/267 on non-US and 1,283/1,285
+on US.
+
+**A key present on ANY row of a PostgREST bulk upsert is written to EVERY row.**
+The rows that omitted it get NULL. #846's entire design — "omit the key and the
+stored column is untouched" — is true only when _no_ row in the batch supplies
+it, which is not the case for a heterogeneous board batch. Proved on the local
+stack, not assumed: two rows, one carrying `is_remote`, the other not; the second
+row's stored `is_remote` came back NULL, in both input orders. That is why the
+board's `is_us` verdict is a targeted post-upsert UPDATE and not an upsert key,
+and it means `is_remote` / `employment_type` have a live blanking bug of their own
+(filed separately). `country` was safe to add to `board_columns` only because
+every poller payload already carries that key unconditionally.
+
+**No migration.** `jobs.country` holds a display vocabulary (`US`, `UK` — never
+`GB`; #805 was a filter sending alpha-2 at it and matching nothing), so the
+board's ISO code is TRANSLATED on the way in through a map composed from
+`location_parse`'s own token table — a country appears there only when both
+modules already know it, so the two spellings cannot drift. A code with no
+display spelling (`CH`) writes nothing to the column but still produces a
+verdict: not being able to spell Switzerland says nothing about whether the role
+is in the United States. The parser and the board agreed 15,439 times and
+disagreed 22, and the board was right in every sampled disagreement — "CA -
+Toronto" parses as California, "IN - Bangalore" as Indiana, "London, ON" as the
+UK.
+
+**A value that was inert became load-bearing, and nobody re-checked its
+validation.** `normalize_country` accepted any two-letter alphabetic string as a
+country. That was harmless while the result was discarded; the moment it drove a
+one-way archive, `TX` / `NY` / `FL` became "not the United States" and would have
+pruned US roles. `location_parse` had already written the warning down — "bare ISO
+codes need comma context — too collision-prone", "two-letter abbreviations must
+arrive UPPERCASE to count as a state" — and this module did the exact thing that
+comment refuses. **Ask what a value's validation was written for before you give
+it a new job.** Two guards now: a real ISO 3166-1 register (which alone kills
+`TX`, `NY`, `WA`, `OH` — they are not countries anywhere), and, for the ~25 codes
+that genuinely are both a country and a USPS state (`CA`, `DE`, `IN`, `MD`, `MT`
+…), a requirement that the location's own parse not read as US before the row may
+be pruned. The blunt fix — refuse every colliding code — was measured and
+rejected: those codes carry 883 of the 4,285 prunes, a fifth of the whole
+feature, and across 21,891 live postings with a board country not one was a US
+state (`CA`→"Ontario - Remote", `MD`→"Chișinău", `PA`→"Panama City, Panama"). The
+corroboration guard withholds exactly one posting. Separately, US territories
+have their own ISO codes: `PR`, `GU`, `VI`, `AS`, `MP`, `UM` were being archived
+as foreign, and a live Lever posting located "American Samoa" was in the sample.
+
+**One predicate, both writes.** The country column and the US verdict were
+initially allowed to disagree — a "New York, NY; London" posting with a `GB`
+postal address got no verdict (correctly vetoed) but still got filed under `UK`.
+That is the worst of both: a wrong /jobs facet AND a disabled `country = 'US'`
+veto in the tagger, on exactly the multi-country class the veto exists for. Any
+reason to distrust the board's country enough to withhold a verdict is a reason
+not to file the posting under it.
+
+**Scope, stated honestly.** Greenhouse and Workday publish no country in their
+cheap path, and they are 60% of the live corpus, so this removes roughly 38% of
+the non-US pollution — the share attributable to boards that answer the question.
+Within that share it is near-complete (93.9% of admitted postings carry a
+country). Rows skipped as byte-identical (#642) are deliberately not revisited:
+back-filling history is the per-cycle full rewrite that change removed.
+
 ## 2026-08-26 — Work bought at ingest, read at grade time (qualification tags go lazy)
 
 The qualification tagger ran on every newly-upserted or content-changed job at
