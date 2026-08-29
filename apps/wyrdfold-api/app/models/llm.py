@@ -47,12 +47,27 @@ class LLMUsage(BaseModel):
     cache_creation_input_tokens: int = 0
 
 
+CostSource = Literal["reported", "estimated"]
+"""Where a call's ``cost_usd`` came from.
+
+``reported`` — the provider told us what it charged (OpenRouter returns
+``usage.cost`` on every response). ``estimated`` — derived from the static
+per-model table in ``app.services.llm.pricing``, which cannot represent a
+routed price and is only as good as the rate we guessed. Consumers read
+``cost_usd``; this exists so a reader of a cost row can tell which kind of
+number they are looking at.
+"""
+
+
 class LLMResult(BaseModel):
     content: str
     model: ModelId
     usage: LLMUsage
     cost_usd: float
     latency_ms: int
+    # Defaults to "estimated" so every existing constructor (the mock, the
+    # embedding-free test fixtures) stays valid; the real clients set it.
+    cost_source: CostSource = "estimated"
 
 
 class LLMStreamDelta(BaseModel):

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any, cast
 
 from anthropic import APIConnectionError, APIStatusError, APITimeoutError, AsyncAnthropic
@@ -43,7 +43,25 @@ from app.services.llm.errors import (
     LLMUpstreamUnavailableError,
     translate_api_status_error,
 )
-from app.services.llm.pricing import calculate_cost
+from app.services.llm.pricing import resolve_cost
+
+
+def _reported_usage(sdk_usage: object) -> Mapping[str, Any] | None:
+    """The provider-reported billing fields hanging off an SDK usage object.
+
+    The Anthropic SDK types only Anthropic's own usage fields, so anything the
+    server adds lands in pydantic's ``model_extra``. When this client points
+    at OpenRouter (see ``openrouter_client``) that is where ``cost``,
+    ``cost_details`` and ``is_byok`` arrive — verified against a live response.
+    A direct api.anthropic.com call has no such extras, so this returns
+    ``None`` and the caller falls back to the static table.
+
+    Guarded with ``isinstance(Mapping)`` rather than a truthiness check
+    because our test doubles are ``MagicMock``s, whose every attribute is
+    itself a truthy Mock; a looser check would hand ``resolve_cost`` a Mock.
+    """
+    extra = getattr(sdk_usage, "model_extra", None)
+    return extra if isinstance(extra, Mapping) else None
 
 
 def _api_message_content(message: Message) -> Any:
@@ -179,13 +197,14 @@ class AnthropicLLMClient:
                 getattr(response.usage, "cache_creation_input_tokens", 0) or 0
             ),
         )
-        cost = calculate_cost(model, usage)
+        cost, cost_source = resolve_cost(model, usage, reported=_reported_usage(response.usage))
 
         return LLMResult(
             content=content,
             model=model,
             usage=usage,
             cost_usd=cost,
+            cost_source=cost_source,
             latency_ms=latency_ms,
         )
 
@@ -294,13 +313,14 @@ class AnthropicLLMClient:
                 getattr(response.usage, "cache_creation_input_tokens", 0) or 0
             ),
         )
-        cost = calculate_cost(model, usage)
+        cost, cost_source = resolve_cost(model, usage, reported=_reported_usage(response.usage))
 
         result = LLMResult(
             content=json.dumps(tool_input),
             model=model,
             usage=usage,
             cost_usd=cost,
+            cost_source=cost_source,
             latency_ms=latency_ms,
         )
         return tool_input, result
@@ -332,6 +352,17 @@ class AnthropicLLMClient:
 
         api_messages = _api_messages(messages)
 
+        # OpenRouter reports the billed cost on the ``message_delta`` event,
+        # and the SDK's accumulated final message DROPS it — measured: the
+        # raw SSE frame carries ``usage.cost`` but
+        # ``final_message.usage.model_extra`` comes back as
+        # ``{"speed": "standard"}`` alone. So we read it off the event as it
+        # goes past. Iterating the event stream and filtering
+        # ``content_block_delta``/``text_delta`` is exactly what the SDK's
+        # ``text_stream`` helper does internally, so the text we yield is
+        # unchanged.
+        reported: Mapping[str, Any] | None = None
+
         start = time.perf_counter()
         # SDK raises APIStatusError on the initial HTTP handshake (which
         # surfaces from ``async with .stream(...)``) and may raise mid-
@@ -344,9 +375,12 @@ class AnthropicLLMClient:
                 system=system_param,
                 messages=cast(Any, api_messages),
             ) as stream:
-                async for text in stream.text_stream:
-                    if text:
-                        yield LLMStreamDelta(text=text)
+                async for event in stream:
+                    if event.type == "content_block_delta" and event.delta.type == "text_delta":
+                        if event.delta.text:
+                            yield LLMStreamDelta(text=event.delta.text)
+                    elif event.type == "message_delta":
+                        reported = _reported_usage(event.usage) or reported
 
                 final_message = await stream.get_final_message()
         except APIStatusError as exc:
@@ -370,7 +404,11 @@ class AnthropicLLMClient:
                 getattr(final_message.usage, "cache_creation_input_tokens", 0) or 0
             ),
         )
-        cost = calculate_cost(model, usage)
+        # Fall back to the final message's own extras when no message_delta
+        # carried a cost (direct Anthropic never does).
+        cost, cost_source = resolve_cost(
+            model, usage, reported=reported or _reported_usage(final_message.usage)
+        )
 
         yield LLMStreamFinal(
             result=LLMResult(
@@ -378,6 +416,7 @@ class AnthropicLLMClient:
                 model=model,
                 usage=usage,
                 cost_usd=cost,
+                cost_source=cost_source,
                 latency_ms=latency_ms,
             )
         )

@@ -3,6 +3,67 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-08-28 — Price is a routing outcome, so a static table cannot be right
+
+`pricing.py` held one price per model and `calculate_cost(model, usage)`
+derived every `cost_usd` from it. But we send OpenRouter slugs **unpinned**,
+and OpenRouter serves `deepseek/deepseek-v3.2` from 14 endpoints spanning
+$0.209/$0.310 to $3.00/$4.50 per Mtok — a 14x spread. There is no such thing
+as "the price of deepseek-v3.2"; there is only the price of the endpoint the
+router happened to pick for that call. Our table encoded roughly the cheapest
+tier, and a bake-off measured effective billing at ~2.9x what we recorded
+(~1.25x for haiku).
+
+**This was a spend-control failure, not a reporting one.** `llm_costs` is the
+input to `_global_budget_exhausted`, `PayerBudgetGate`,
+`grading_budget_reserve_usd` and `check_daily_count`. Recorded spend running
+~2.9x low means all four gates passed ~2.9x more than configured — the daily
+cap was not enforcing what it said.
+
+**Decision:** stop estimating. OpenRouter returns `usage.cost` on every
+response (no opt-in — the old `usage: {include: true}` flag is deprecated and
+inert), and `_openai_usage` was already reading `data["usage"]` and keeping
+only the token counts. `resolve_cost` now prefers the reported figure and
+falls back to the table only when it is genuinely absent. Provenance is
+recorded (`LLMResult.cost_source`, and a `cost_source` key in each row's jsonb
+metadata) so a reader can tell a billed number from a guessed one.
+
+Three things this taught:
+
+**"The SDK exposes what the server sent" is an assumption, not a fact — and it
+was half wrong.** Anthropic's SDK types only Anthropic's own fields, so
+OpenRouter's additions land in pydantic's `model_extra`. On non-streaming
+calls that works: `usage.model_extra["cost"]` is there. On **streaming** it
+does not. The raw SSE `message_delta` frame carries `cost`, and the SDK's
+accumulated final message drops it — `final_message.usage.model_extra` comes
+back as `{"speed": "standard"}` alone. A fix that read the final message would
+have silently estimated every streamed call while looking correct. The cost is
+now read off the `message_delta` event as it passes. Four probes against the
+live API found this; no amount of reading the SDK source would have been
+trusted without them.
+
+**Units and caching get measured, not reasoned about.** `usage.cost` is USD
+(OpenRouter's credit base currency is US dollars) and is already net of prompt
+caching: a Haiku cache-write billed 6,001 tokens at 1.25x the input rate and
+the very next cache-read billed the same 6,001 at 0.1x, both matching `cost`
+to the cent. Had we "corrected" for caching on top, we would have replaced an
+under-read with a double-count.
+
+**An anti-vacuous precondition caught the test author.** The first version of
+the "reported cost wins" test used the real measured figure ($0.000824) with
+the newly corrected haiku fallback (1.00/5.00) — which reproduces exactly
+$0.000824 on those tokens. The precondition `assert table_estimate !=
+reported` failed, which is the only reason the test did not silently pass
+while proving nothing. Every claim here is sabotage-checked: nine one-line
+reversions, each turning the relevant tests red.
+
+**Explicitly not done:** pinning an OpenRouter provider. It changes routing
+behaviour (price, throughput, uptime, tool-choice support all differ per
+endpoint) and is the owner's call. The gap it would close is in #933.
+
+Rule lives in `app/services/llm/pricing.py`'s module docstring and
+`.claude/rules/llm-surfaces.md`.
+
 ## 2026-08-28 — The board already knew the country (and a bulk upsert is not a per-row upsert)
 
 The 2026-08-27 correction below left a hole: lazily tagged rows never reach

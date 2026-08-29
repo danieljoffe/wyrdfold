@@ -206,7 +206,9 @@ async def test_deepseek_routes_through_openai_path(monkeypatch) -> None:
 
     assert out == {"ok": True}
     assert result.model == "deepseek-v3-2"
-    assert result.cost_usd > 0  # priced via PRICING["deepseek-v3-2"]
+    # No cost in this payload's usage → the static table priced it.
+    assert result.cost_usd > 0
+    assert result.cost_source == "estimated"
     # Forced function call, deepseek slug, temperature forwarded, system folded in.
     body = fake.posted["body"]
     assert body["model"] == "deepseek/deepseek-v3.2"
@@ -519,12 +521,15 @@ _REAL_TAGS_CONTENT = (
 
 def test_prose_tool_call_is_salvaged_not_discarded() -> None:
     data = _resp([], finish="stop", content=_REAL_TRIAGE_CONTENT)
-    out = _parse_openai_tool_response(
-        data, tool_name="return_TitleTriageResponse", max_tokens=1000
-    )
+    out = _parse_openai_tool_response(data, tool_name="return_TitleTriageResponse", max_tokens=1000)
     assert out == {
         "verdicts": [
-            {"id": 1, "promising": False, "confidence": 85, "title_prefix": "Data Scientist – Cyber"}
+            {
+                "id": 1,
+                "promising": False,
+                "confidence": 85,
+                "title_prefix": "Data Scientist – Cyber",
+            }
         ]
     }
 
@@ -533,9 +538,7 @@ def test_prose_salvage_decodes_json_and_string_parameters() -> None:
     """``string="true"`` marks a raw string; anything else is JSON — so
     ``true``/``100`` must not come back as the strings "true"/"100"."""
     data = _resp([], finish="stop", content=_REAL_TAGS_CONTENT)
-    out = _parse_openai_tool_response(
-        data, tool_name="return_QualificationTags", max_tokens=1000
-    )
+    out = _parse_openai_tool_response(data, tool_name="return_QualificationTags", max_tokens=1000)
     assert out == {"is_us": True, "us_confidence": 100, "role_family": "engineering"}
 
 
@@ -546,12 +549,10 @@ def test_prose_salvage_refuses_a_truncated_block() -> None:
     pass, so a partial dict would validate silently and write a confidently
     wrong tag. Better to raise and let the retry/fallback run.
     """
-    truncated = _REAL_TAGS_CONTENT[: _REAL_TAGS_CONTENT.index("<parameter name=\"role_family\"")]
+    truncated = _REAL_TAGS_CONTENT[: _REAL_TAGS_CONTENT.index('<parameter name="role_family"')]
     data = _resp([], finish="stop", content=truncated)
     with pytest.raises(ValueError, match="Expected a forced tool_call"):
-        _parse_openai_tool_response(
-            data, tool_name="return_QualificationTags", max_tokens=1000
-        )
+        _parse_openai_tool_response(data, tool_name="return_QualificationTags", max_tokens=1000)
 
 
 def test_prose_salvage_refuses_when_a_parameter_failed_to_parse() -> None:
@@ -565,9 +566,7 @@ def test_prose_salvage_refuses_when_a_parameter_failed_to_parse() -> None:
     )
     data = _resp([], finish="stop", content=content)
     with pytest.raises(ValueError, match="Expected a forced tool_call"):
-        _parse_openai_tool_response(
-            data, tool_name="return_QualificationTags", max_tokens=1000
-        )
+        _parse_openai_tool_response(data, tool_name="return_QualificationTags", max_tokens=1000)
 
 
 def test_prose_salvage_refuses_a_different_tools_payload() -> None:
@@ -575,9 +574,7 @@ def test_prose_salvage_refuses_a_different_tools_payload() -> None:
     question with a well-formed dict."""
     data = _resp([], finish="stop", content=_REAL_TRIAGE_CONTENT)
     with pytest.raises(ValueError, match="Expected a forced tool_call"):
-        _parse_openai_tool_response(
-            data, tool_name="return_QualificationTags", max_tokens=1000
-        )
+        _parse_openai_tool_response(data, tool_name="return_QualificationTags", max_tokens=1000)
 
 
 def test_plain_prose_refusal_still_raises() -> None:
@@ -696,3 +693,99 @@ def test_no_schema_means_no_json_salvage() -> None:
             tool_name="return_TitleTriageResponse",
             max_tokens=1000,
         )
+
+
+# ---- reported cost on the OpenAI-shaped path (#933) -------------------------
+#
+# This is the path prod actually runs on: LLM_PROVIDER=openrouter with all
+# three phase models set to deepseek-v3-2, which is OpenAI-shaped. The slug is
+# sent UNPINNED and OpenRouter serves it from 14 endpoints spanning
+# $0.209/$0.310 to $3.00/$4.50 per Mtok, so no static rate can be right.
+# Usage block shape below is copied from a live response.
+
+
+def _payload_with_usage(usage: dict) -> dict:
+    return {
+        "choices": [
+            {"finish_reason": "tool_calls", "message": {"tool_calls": _tool_calls('{"ok": true}')}}
+        ],
+        "usage": usage,
+    }
+
+
+async def _run_openai_path(monkeypatch, payload: dict):
+    client = OpenRouterLLMClient(api_key="sk-test")
+    fake = _FakeHttp(
+        httpx.Response(200, request=httpx.Request("POST", _OPENROUTER_OPENAI_URL), json=payload)
+    )
+    monkeypatch.setattr(client, "_openai_client", lambda: fake)
+    _, result = await client.complete_tool_use(
+        model="deepseek-v3-2",
+        system="S",
+        messages=[Message(role="user", content="U")],
+        tool_name="return_X",
+        tool_description="d",
+        tool_input_schema={"type": "object"},
+        purpose="relevance.title_triage",
+    )
+    return result
+
+
+@pytest.mark.asyncio
+async def test_openai_path_records_the_cost_openrouter_reported(monkeypatch) -> None:
+    from app.services.llm.pricing import calculate_cost
+
+    usage = {
+        "prompt_tokens": 306,
+        "completion_tokens": 32,
+        "cost": 9.2694e-05,
+        "is_byok": False,
+        "cost_details": {"upstream_inference_cost": 9.2694e-05},
+    }
+    # Anti-vacuous: the payload really carries a cost, and the table really
+    # would have produced a different figure — so "reported" can only be
+    # reached by reading it off the response.
+    assert usage["cost"] == 9.2694e-05
+    assert calculate_cost("deepseek-v3-2", _openai_usage({"usage": usage})) != pytest.approx(
+        9.2694e-05
+    )
+
+    result = await _run_openai_path(monkeypatch, _payload_with_usage(usage))
+    assert result.cost_usd == pytest.approx(9.2694e-05)
+    assert result.cost_source == "reported"
+
+
+@pytest.mark.asyncio
+async def test_openai_path_falls_back_to_the_table_without_a_cost(monkeypatch) -> None:
+    from app.services.llm.pricing import calculate_cost
+
+    usage = {"prompt_tokens": 306, "completion_tokens": 32}
+    # Anti-vacuous: the cost really IS absent.
+    assert "cost" not in usage
+
+    result = await _run_openai_path(monkeypatch, _payload_with_usage(usage))
+    assert result.cost_source == "estimated"
+    assert result.cost_usd == pytest.approx(
+        calculate_cost("deepseek-v3-2", _openai_usage({"usage": usage}))
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_path_reported_cost_survives_cache_hit_bookkeeping(monkeypatch) -> None:
+    """`cost` is already net of caching (measured: a Haiku cache-write billed
+    1.25x and the following cache-read 0.1x, both matching `cost` exactly), so
+    the reported figure is used AS IS — not re-derived from the token split."""
+    usage = {
+        "prompt_tokens": 1000,
+        "completion_tokens": 100,
+        "prompt_tokens_details": {"cached_tokens": 900},
+        "cost": 0.000123,
+        "is_byok": False,
+    }
+    result = await _run_openai_path(monkeypatch, _payload_with_usage(usage))
+    # Token split still recorded for reporting…
+    assert result.usage.cache_read_input_tokens == 900
+    assert result.usage.input_tokens == 100
+    # …but the cost is the billed one, untouched by our cache arithmetic.
+    assert result.cost_usd == pytest.approx(0.000123)
+    assert result.cost_source == "reported"

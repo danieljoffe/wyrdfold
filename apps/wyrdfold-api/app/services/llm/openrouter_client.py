@@ -39,7 +39,7 @@ from app.services.llm.errors import (
     MissingToolCallError,
     translate_api_status_error,
 )
-from app.services.llm.pricing import calculate_cost
+from app.services.llm.pricing import resolve_cost
 
 # Anthropic SDK appends "/v1/messages" to base_url internally, so omit /v1 here.
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api"
@@ -576,12 +576,16 @@ class OpenRouterLLMClient(AnthropicLLMClient):
             tool_input_schema=tool_input_schema,
         )
         usage = _openai_usage(data)
-        cost = calculate_cost(model, usage)
+        # OpenRouter puts what it actually billed in ``usage.cost`` on every
+        # response; the static table can only guess, and this slug is served
+        # unpinned from 14 endpoints with a 14x price spread (#933).
+        cost, cost_source = resolve_cost(model, usage, reported=data.get("usage"))
         result = LLMResult(
             content=json.dumps(tool_input),
             model=model,
             usage=usage,
             cost_usd=cost,
+            cost_source=cost_source,
             latency_ms=latency_ms,
         )
         return tool_input, result
