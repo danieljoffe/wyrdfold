@@ -929,3 +929,47 @@ async def test_qualification_non_object_payload_leaves_the_row_untagged() -> Non
     tags, result = await _tag_with(wrapped)
     assert tags is None
     assert result is None  # nothing to bill a verdict for
+
+
+# ---- cost provenance (#933) -------------------------------------------------
+
+
+async def test_mock_never_claims_a_provider_reported_cost() -> None:
+    """The mock has no upstream, so every cost it produces is a table
+    estimate and must say so.
+
+    This matters because the real fix turns on `cost_source`: if the mock
+    ever fabricated `reported`, a test asserting "the reported cost was used"
+    would pass against a client that had stopped reading it. Covers all three
+    of the mock's cost sites — complete, complete_tool_use, stream.
+    """
+    from app.models.llm import LLMStreamFinal
+    from app.services.llm.pricing import calculate_cost
+
+    client = MockLLMClient()
+    messages = [Message(role="user", content="hello")]
+
+    completed = await client.complete(
+        model="claude-haiku-4-5", system="sys", messages=messages, purpose="test.echo"
+    )
+    _, tool_result = await client.complete_tool_use(
+        model="claude-haiku-4-5",
+        system="sys",
+        messages=messages,
+        tool_name="return_Thing",
+        tool_description="d",
+        tool_input_schema={"type": "object"},
+        purpose="test.echo",
+    )
+    streamed = None
+    async for event in client.stream(
+        model="claude-haiku-4-5", system="sys", messages=messages, purpose="test.echo"
+    ):
+        if isinstance(event, LLMStreamFinal):
+            streamed = event.result
+
+    assert streamed is not None
+    for result in (completed, tool_result, streamed):
+        assert result.cost_source == "estimated"
+        # …and the number really is the table's, not a coincidence.
+        assert result.cost_usd == pytest.approx(calculate_cost(result.model, result.usage))

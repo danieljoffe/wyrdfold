@@ -106,20 +106,11 @@ def record(
     result: LLMResult,
     metadata: dict[str, str | int | float | bool] | None = None,
 ) -> LLMCallRecord:
+    # Same row shape as `record_async` and `enqueue` — built by `_row_for` so
+    # the three writers cannot drift (they had already diverged by a copy).
     return _insert_row(
         supabase,
-        {
-            "user_id": resolve_owner(user_id),
-            "model": result.model,
-            "purpose": purpose,
-            "input_tokens": result.usage.input_tokens,
-            "output_tokens": result.usage.output_tokens,
-            "cache_read_input_tokens": result.usage.cache_read_input_tokens,
-            "cache_creation_input_tokens": result.usage.cache_creation_input_tokens,
-            "cost_usd": result.cost_usd,
-            "latency_ms": result.latency_ms,
-            "metadata": metadata or {},
-        },
+        _row_for(user_id=user_id, purpose=purpose, result=result, metadata=metadata),
     )
 
 
@@ -164,7 +155,12 @@ def _row_for(
         "cache_creation_input_tokens": result.usage.cache_creation_input_tokens,
         "cost_usd": result.cost_usd,
         "latency_ms": result.latency_ms,
-        "metadata": metadata or {},
+        # Stamp where cost_usd came from (#933). `metadata` is jsonb, so this
+        # needs no migration, and it makes "are we still estimating?"
+        # answerable from the table itself rather than by reading the code.
+        # Embedding rows carry no cost_source: Voyage reports no cost, so
+        # `_embedding_row_for` is always a table estimate.
+        "metadata": {**(metadata or {}), "cost_source": result.cost_source},
     }
 
 

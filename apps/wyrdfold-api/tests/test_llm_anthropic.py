@@ -9,13 +9,15 @@ thinking blocks mixed with text).
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.models.llm import Message
-from app.services.llm.anthropic_client import AnthropicLLMClient
+from app.models.llm import LLMUsage, Message
+from app.services.llm.anthropic_client import AnthropicLLMClient, _reported_usage
+from app.services.llm.pricing import calculate_cost, reported_cost_usd
 
 
 def _fake_response(
@@ -26,8 +28,16 @@ def _fake_response(
     cache_read: int = 0,
     cache_creation: int = 0,
     extra_blocks: list[Any] | None = None,
+    usage_extra: dict[str, Any] | None = None,
 ) -> Any:
-    """Build a mock response object shaped like Anthropic's SDK returns."""
+    """Build a mock response object shaped like Anthropic's SDK returns.
+
+    ``usage_extra`` mirrors pydantic's ``model_extra`` — the fields the SDK
+    could not type. A direct api.anthropic.com response has none; an
+    OpenRouter one carries ``cost`` / ``cost_details`` / ``is_byok`` there
+    (verified against a live response). ``None`` is the direct-Anthropic case
+    and must stay a non-Mapping so the client sees "no extras".
+    """
     text_block = MagicMock()
     text_block.type = "text"
     text_block.text = text
@@ -40,6 +50,7 @@ def _fake_response(
     response.usage.output_tokens = output_tokens
     response.usage.cache_read_input_tokens = cache_read
     response.usage.cache_creation_input_tokens = cache_creation
+    response.usage.model_extra = usage_extra if usage_extra is not None else MagicMock()
     return response
 
 
@@ -213,6 +224,7 @@ def _fake_tool_use_response(
     input_tokens: int = 100,
     output_tokens: int = 50,
     stop_reason: str = "tool_use",
+    usage_extra: dict[str, Any] | None = None,
 ) -> Any:
     """Build a mock response with a tool_use block matching the Anthropic SDK's shape."""
     tool_block = MagicMock()
@@ -226,6 +238,7 @@ def _fake_tool_use_response(
     response.usage.output_tokens = output_tokens
     response.usage.cache_read_input_tokens = 0
     response.usage.cache_creation_input_tokens = 0
+    response.usage.model_extra = usage_extra if usage_extra is not None else MagicMock()
     response.stop_reason = stop_reason
     return response
 
@@ -513,3 +526,228 @@ async def test_complete_json_pins_temperature_to_zero() -> None:
         purpose="test",
     )
     assert create_mock.call_args.kwargs["temperature"] == 0.0
+
+
+# ---- provider-reported cost vs the static table (#933) ----------------------
+#
+# `OpenRouterLLMClient` subclasses this client, so Claude models reached via
+# OpenRouter come back through the Anthropic-shaped path here. OpenRouter adds
+# `cost` to the usage object; the SDK types only Anthropic's own fields, so it
+# lands in pydantic's `model_extra`. Shape verified against a live response:
+#
+#   usage.model_extra == {"speed": "standard", "cost": 0.000824,
+#                         "is_byok": False, "cost_details": {...}}
+#
+# Direct api.anthropic.com has no such field, so the table must remain the
+# fallback there.
+
+
+def _usage_extra(cost: float) -> dict[str, Any]:
+    return {
+        "speed": "standard",
+        "cost": cost,
+        "is_byok": False,
+        "cost_details": {"upstream_inference_cost": cost},
+    }
+
+
+# Deliberately NOT what the table produces for these tokens. That is the whole
+# point of #933: OpenRouter picks an endpoint per call, so the billed rate is
+# a routing outcome. A run routed somewhere pricier than the fallback rate
+# bills more, and only the reported figure knows it.
+_ROUTED_COST = 0.0031
+_OPENROUTER_USAGE_EXTRA: dict[str, Any] = _usage_extra(_ROUTED_COST)
+_USAGE_664_32 = LLMUsage(input_tokens=664, output_tokens=32)
+# The extras the SDK leaves on an accumulated streamed message: no cost.
+_NO_COST_EXTRA: dict[str, Any] = {"speed": "standard"}
+
+
+async def test_complete_records_the_cost_openrouter_reported() -> None:
+    client, _ = _client_with_mocked_sdk(
+        _fake_response(input_tokens=664, output_tokens=32, usage_extra=_OPENROUTER_USAGE_EXTRA)
+    )
+    # Anti-vacuous: a cost really IS present, and it really does differ from
+    # what the table would have produced (that gap IS the bug).
+    assert "cost" in _OPENROUTER_USAGE_EXTRA
+    assert calculate_cost("claude-haiku-4-5", _USAGE_664_32) != pytest.approx(_ROUTED_COST)
+
+    result = await client.complete(
+        model="claude-haiku-4-5",
+        system="sys",
+        messages=[Message(role="user", content="x")],
+        purpose="test",
+    )
+    assert result.cost_usd == pytest.approx(_ROUTED_COST)
+    assert result.cost_source == "reported"
+
+
+async def test_complete_falls_back_to_the_table_without_a_reported_cost() -> None:
+    """Direct api.anthropic.com sends no cost — the table must still work."""
+    response = _fake_response(input_tokens=664, output_tokens=32)
+    # Anti-vacuous: prove the fixture really carries NO usable cost before
+    # asserting which branch ran.
+    assert reported_cost_usd(_reported_usage(response.usage)) is None
+
+    client, _ = _client_with_mocked_sdk(response)
+    result = await client.complete(
+        model="claude-haiku-4-5",
+        system="sys",
+        messages=[Message(role="user", content="x")],
+        purpose="test",
+    )
+    assert result.cost_source == "estimated"
+    assert result.cost_usd == pytest.approx(calculate_cost("claude-haiku-4-5", _USAGE_664_32))
+
+
+async def test_complete_tool_use_records_the_reported_cost() -> None:
+    """The tool-forced path is the one grading/triage actually uses."""
+    client, _ = _client_with_mocked_sdk(
+        _fake_tool_use_response(
+            tool_name="return_Thing",
+            tool_input={"name": "x"},
+            input_tokens=664,
+            output_tokens=32,
+            usage_extra=_OPENROUTER_USAGE_EXTRA,
+        )
+    )
+    assert calculate_cost("claude-haiku-4-5", _USAGE_664_32) != pytest.approx(_ROUTED_COST)
+
+    _, result = await client.complete_tool_use(
+        model="claude-haiku-4-5",
+        system="sys",
+        messages=[Message(role="user", content="x")],
+        tool_name="return_Thing",
+        tool_description="d",
+        tool_input_schema={"type": "object"},
+        purpose="test",
+    )
+    assert result.cost_usd == pytest.approx(_ROUTED_COST)
+    assert result.cost_source == "reported"
+
+
+async def test_complete_tool_use_falls_back_to_the_table() -> None:
+    response = _fake_tool_use_response(
+        tool_name="return_Thing", tool_input={"name": "x"}, input_tokens=664, output_tokens=32
+    )
+    assert reported_cost_usd(_reported_usage(response.usage)) is None
+
+    client, _ = _client_with_mocked_sdk(response)
+    _, result = await client.complete_tool_use(
+        model="claude-haiku-4-5",
+        system="sys",
+        messages=[Message(role="user", content="x")],
+        tool_name="return_Thing",
+        tool_description="d",
+        tool_input_schema={"type": "object"},
+        purpose="test",
+    )
+    assert result.cost_source == "estimated"
+    assert result.cost_usd == pytest.approx(calculate_cost("claude-haiku-4-5", _USAGE_664_32))
+
+
+# ---- streaming: the SDK drops the cost, so read it off the event ------------
+
+
+def _text_delta_event(text: str) -> Any:
+    event = MagicMock()
+    event.type = "content_block_delta"
+    event.delta.type = "text_delta"
+    event.delta.text = text
+    return event
+
+
+def _message_delta_event(usage_extra: dict[str, Any] | None) -> Any:
+    event = MagicMock()
+    event.type = "message_delta"
+    event.usage.model_extra = usage_extra if usage_extra is not None else MagicMock()
+    return event
+
+
+class _FakeStream:
+    """Stands in for the SDK's AsyncMessageStream.
+
+    Reproduces the MEASURED behaviour: OpenRouter puts `cost` on the
+    message_delta event, and the SDK's accumulated final message DROPS it
+    (`final.usage.model_extra` comes back as `{"speed": "standard"}` alone).
+    So the final message here deliberately carries no cost.
+    """
+
+    def __init__(self, events: list[Any], final: Any) -> None:
+        self._events = events
+        self._final = final
+
+    async def __aenter__(self) -> _FakeStream:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        for event in self._events:
+            yield event
+
+    async def get_final_message(self) -> Any:
+        return self._final
+
+
+def _stream_client(events: list[Any], final: Any) -> AnthropicLLMClient:
+    client = AnthropicLLMClient(api_key="test-key")
+    client._client.messages.stream = MagicMock(  # type: ignore[method-assign]
+        return_value=_FakeStream(events, final)
+    )
+    return client
+
+
+async def _drain(client: AnthropicLLMClient) -> tuple[str, Any]:
+    text: list[str] = []
+    final: Any = None
+    async for event in client.stream(
+        model="claude-haiku-4-5",
+        system="sys",
+        messages=[Message(role="user", content="x")],
+        purpose="test",
+    ):
+        if event.type == "delta":
+            text.append(event.text)
+        else:
+            final = event.result
+    return "".join(text), final
+
+
+async def test_stream_reads_the_cost_off_the_message_delta_event() -> None:
+    """The accumulated final message loses OpenRouter's extras, so a client
+    that only looked there would silently estimate every streamed call."""
+    final = _fake_response(text="ignored", input_tokens=664, output_tokens=32)
+    final.usage.model_extra = _NO_COST_EXTRA  # exactly what the SDK leaves
+
+    # Anti-vacuous, both directions: the final message really has NO cost, and
+    # the message_delta event really HAS one that differs from the estimate.
+    assert reported_cost_usd(_reported_usage(final.usage)) is None
+    assert _OPENROUTER_USAGE_EXTRA["cost"] == _ROUTED_COST
+    assert calculate_cost("claude-haiku-4-5", _USAGE_664_32) != pytest.approx(_ROUTED_COST)
+
+    client = _stream_client(
+        [
+            _text_delta_event("Hel"),
+            _text_delta_event("lo"),
+            _message_delta_event(_OPENROUTER_USAGE_EXTRA),
+        ],
+        final,
+    )
+    text, result = await _drain(client)
+
+    assert text == "Hello"  # text streaming is unchanged by the cost hook
+    assert result.cost_usd == pytest.approx(_ROUTED_COST)
+    assert result.cost_source == "reported"
+
+
+async def test_stream_without_a_reported_cost_uses_the_table() -> None:
+    final = _fake_response(text="ignored", input_tokens=664, output_tokens=32)
+    final.usage.model_extra = _NO_COST_EXTRA
+
+    client = _stream_client([_text_delta_event("Hi"), _message_delta_event(_NO_COST_EXTRA)], final)
+    text, result = await _drain(client)
+
+    assert text == "Hi"
+    assert result.cost_source == "estimated"
+    assert result.cost_usd == pytest.approx(calculate_cost("claude-haiku-4-5", _USAGE_664_32))
