@@ -318,3 +318,208 @@ async def test_read_does_not_hold_the_write_semaphore(
     finally:
         for _ in holds:
             sem.release()
+
+
+# ---- key-set-grouped bulk upsert (#928) ------------------------------------
+
+
+class _RecordingUpsertClient:
+    """Records each ``.upsert(...).execute()`` and echoes the payload back the
+    way PostgREST's ``RETURNING`` does, so the aggregation can be asserted."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[dict[str, Any]], str]] = []
+        self._table = ""
+        self._pending: list[dict[str, Any]] = []
+
+    def table(self, name: str) -> _RecordingUpsertClient:
+        self._table = name
+        return self
+
+    def upsert(self, rows: list[dict[str, Any]], on_conflict: str) -> _RecordingUpsertClient:
+        self.calls.append((self._table, [dict(r) for r in rows], on_conflict))
+        self._pending = [dict(r) for r in rows]
+        return self
+
+    def execute(self) -> Any:
+        return MagicMock(data=list(self._pending))
+
+
+@pytest.fixture
+def _sync_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the seam to the sync path so the recording client is the one used."""
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)
+
+
+@pytest.mark.asyncio
+async def test_upsert_splits_a_heterogeneous_batch_by_key_set(_sync_only: None) -> None:
+    """#928: PostgREST builds ONE statement from the union of a bulk payload's
+    keys, so a key one row supplies is written (as NULL) to the rows that
+    omitted it. Partitioning by key-set is what makes the omission real."""
+    client = _RecordingUpsertClient()
+    rows = [
+        {"external_id": "a", "title": "A"},  # board silent
+        {"external_id": "b", "title": "B", "is_remote": True},  # board speaks
+        {"external_id": "c", "title": "C"},  # board silent
+    ]
+    # PRECONDITION: the batch really is heterogeneous — otherwise this would
+    # pass against the broken code for the wrong reason.
+    assert len({frozenset(r) for r in rows}) == 2
+
+    returned = await db_write.poll_db_upsert(
+        client, table="jobs", rows=rows, on_conflict="source_id,external_id", label="t"
+    )
+
+    assert len(client.calls) == 2
+    for _table, payload, _oc in client.calls:
+        assert len({frozenset(r) for r in payload}) == 1, "a statement mixed key-sets"
+    # Grouping preserves first-appearance order and every row lands exactly once.
+    assert [[r["external_id"] for r in p] for _t, p, _o in client.calls] == [["a", "c"], ["b"]]
+    assert all(t == "jobs" and oc == "source_id,external_id" for t, _p, oc in client.calls)
+    # Splitting the batch must not reshuffle the RESULT: Phase 2's daily-cap
+    # trim resolves residual ties by position, so a reordered result would
+    # quietly change which equally-ranked postings get graded.
+    assert [r["external_id"] for r in returned] == ["a", "b", "c"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_returns_rows_in_the_callers_order(_sync_only: None) -> None:
+    """Explicitly: the result order is the INPUT order, not the group order —
+    including when the groups interleave and the last input row is in the
+    first group."""
+    client = _RecordingUpsertClient()
+    rows = [
+        {"source_id": "s", "external_id": "1", "is_remote": True},
+        {"source_id": "s", "external_id": "2"},
+        {"source_id": "s", "external_id": "3", "is_remote": False},
+        {"source_id": "s", "external_id": "4"},
+    ]
+
+    returned = await db_write.poll_db_upsert(
+        client, table="jobs", rows=rows, on_conflict="source_id,external_id", label="t"
+    )
+
+    # PRECONDITION: the groups really did interleave, so group order != input
+    # order and the assertion below has something to catch.
+    assert [[r["external_id"] for r in p] for _t, p, _o in client.calls] == [
+        ["1", "3"],
+        ["2", "4"],
+    ]
+    assert [r["external_id"] for r in returned] == ["1", "2", "3", "4"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_issues_one_statement_for_a_homogeneous_batch(_sync_only: None) -> None:
+    """The common case must not pay extra round trips."""
+    client = _RecordingUpsertClient()
+    rows = [
+        {"external_id": "a", "title": "A", "is_remote": True},
+        {"external_id": "b", "title": "B", "is_remote": False},
+    ]
+
+    returned = await db_write.poll_db_upsert(
+        client, table="jobs", rows=rows, on_conflict="source_id,external_id", label="t"
+    )
+
+    assert len(client.calls) == 1
+    assert [r["external_id"] for r in returned] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_upsert_raises_on_a_duplicate_conflict_key_across_key_sets(
+    _sync_only: None,
+) -> None:
+    """The failure grouping would otherwise SWALLOW.
+
+    Two rows sharing a conflict key raise Postgres' "cannot affect row a second
+    time" in one statement. With different key-sets they land in different
+    statements, both succeed, and the later group silently wins — leaving this
+    helper less fail-fast than the plain bulk upsert it replaces, in exactly the
+    heterogeneous case it exists for. It must raise instead.
+    """
+    client = _RecordingUpsertClient()
+    rows = [
+        {"source_id": "s", "external_id": "dup", "title": "A"},
+        {"source_id": "s", "external_id": "dup", "title": "B", "is_remote": True},
+    ]
+    # PRECONDITIONS: same conflict key, different key-sets — i.e. grouping
+    # really would split them and hide the collision.
+    assert rows[0]["external_id"] == rows[1]["external_id"]
+    assert rows[0]["source_id"] == rows[1]["source_id"]
+    assert len({frozenset(r) for r in rows}) == 2
+
+    with pytest.raises(ValueError, match="duplicate"):
+        await db_write.poll_db_upsert(
+            client, table="jobs", rows=rows, on_conflict="source_id,external_id", label="t"
+        )
+    # Nothing was written — the guard runs before any statement is issued.
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_upsert_raises_on_a_duplicate_conflict_key_within_one_key_set(
+    _sync_only: None,
+) -> None:
+    """Same-key-set duplicates would have reached Postgres and errored there.
+    The guard reports them earlier and identically, so the helper's contract
+    doesn't depend on how the key-sets happen to fall."""
+    client = _RecordingUpsertClient()
+    rows = [
+        {"source_id": "s", "external_id": "dup", "title": "A"},
+        {"source_id": "s", "external_id": "dup", "title": "B"},
+    ]
+    assert len({frozenset(r) for r in rows}) == 1  # PRECONDITION: one group
+
+    with pytest.raises(ValueError, match="duplicate"):
+        await db_write.poll_db_upsert(
+            client, table="jobs", rows=rows, on_conflict="source_id,external_id", label="t"
+        )
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_upsert_guard_names_columns_but_not_their_values(_sync_only: None) -> None:
+    """The message goes to the platform log. This helper is generic — a conflict
+    key elsewhere could be an email — so it must not echo the values (#885)."""
+    rows = [
+        {"user_id": "u", "email": "person@example.com"},
+        {"user_id": "u", "email": "person@example.com", "extra": 1},
+    ]
+    with pytest.raises(ValueError) as exc:
+        await db_write.poll_db_upsert(
+            _RecordingUpsertClient(), table="t", rows=rows, on_conflict="user_id,email", label="l"
+        )
+    assert "user_id,email" in str(exc.value)  # the columns ARE named
+    assert "person@example.com" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_upsert_does_not_flag_rows_missing_a_conflict_column(_sync_only: None) -> None:
+    """A row that omits a conflict column can't match the conflict target on a
+    value we can see — Postgres would INSERT both rather than error — so
+    flagging it would be a false positive that fails a healthy write."""
+    client = _RecordingUpsertClient()
+    rows = [{"title": "A"}, {"title": "B"}]  # neither carries the conflict key
+
+    returned = await db_write.poll_db_upsert(
+        client, table="jobs", rows=rows, on_conflict="source_id,external_id", label="t"
+    )
+
+    assert len(client.calls) == 1
+    assert len(returned) == 2
+
+
+@pytest.mark.asyncio
+async def test_upsert_of_nothing_issues_no_statement(_sync_only: None) -> None:
+    """``.upsert([])`` raises PGRST100 and would mark the poll failed (the guard
+    the poller carries at its call sites) — the helper must not reintroduce it
+    for a batch that grouped down to nothing."""
+    client = _RecordingUpsertClient()
+
+    assert (
+        await db_write.poll_db_upsert(
+            client, table="jobs", rows=[], on_conflict="source_id,external_id", label="t"
+        )
+        == []
+    )
+    assert client.calls == []

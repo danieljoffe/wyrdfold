@@ -25,8 +25,8 @@ module that issues poll queries can share them without importing the poller.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Sequence
+from typing import Any, cast
 
 from app.services.supabase_retry import execute_with_retry, execute_with_retry_sync
 from app.supabase_pool import get_async_supabase
@@ -93,6 +93,124 @@ async def poll_db_write(
     # #57 slice 4 — the poll cycle is unconditionally async now). This sync path
     # survives for tests/local runs that don't init the async client.
     return await db_to_thread(lambda: execute_with_retry_sync(build(supabase).execute, label=label))
+
+
+async def poll_db_upsert(
+    supabase: Any,
+    *,
+    table: str,
+    rows: Sequence[dict[str, Any]],
+    on_conflict: str,
+    label: str,
+) -> list[dict[str, Any]]:
+    """Bulk-upsert ``rows`` so that a key a row OMITS is never written (#928).
+
+    A PostgREST bulk upsert is ONE ``INSERT … ON CONFLICT DO UPDATE`` built from
+    the UNION of the keys across the whole payload: a key present on *any* row
+    lands in the column list, and the rows that omitted it are sent ``NULL``.
+    So "omit the key and the stored column is untouched" — the contract
+    :func:`app.services.board_metadata.board_columns` is built on, and the way
+    every optional-key spread reads — only holds while NO row in the batch
+    supplies the key. Real poll batches are heterogeneous by construction (one
+    posting states ``isRemote`` / ``employmentType``, its neighbour doesn't), so
+    a board-silent posting was having its stored ``is_remote`` blanked by a
+    board-speaking sibling on every cycle that re-upserted it. That is #795's
+    contradiction problem re-entering through the write path, after #851 stopped
+    the tagger doing the same thing.
+
+    The fix is at the mechanism, not the column: partition by key-set so every
+    statement PostgREST builds is homogeneous, and the omission contract holds
+    exactly. Groups are keyed on ``frozenset(row)`` — the count is bounded by
+    the number of optional keys (2**k, k tiny: a board either publishes a field
+    or it doesn't), so in practice this is one or two round trips, not N.
+
+    GUARDED, because splitting would otherwise LOSE a failure. Two rows sharing
+    a conflict key raise Postgres' "cannot affect row a second time" when they
+    are in one statement — but if their key-sets differ, grouping puts them in
+    DIFFERENT statements, both succeed, and whichever group runs later silently
+    wins. That would make this helper strictly LESS fail-fast than the plain
+    bulk upsert it replaces, in exactly the heterogeneous case it exists for. So
+    the uniqueness invariant is enforced here, before splitting and regardless
+    of how the key-sets fall, and a duplicate raises ``ValueError``.
+
+    Nothing upstream guarantees it. The poller's ``_dedupe_by_content`` is a
+    CONTENT dedupe, not a conflict-key dedupe: it keys on
+    ``_content_dedupe_key(company_name, title)``, so a source returning two
+    postings that share an ``external_id`` under DIFFERENT titles yields two
+    distinct dedupe keys, both rows survive, and the duplicate conflict key
+    reaches the write. The per-target path does not dedupe at all. Neither path
+    is protected — hence the guard lives in the helper, so every caller
+    inherits it rather than each having to know.
+
+    Returns the ``RETURNING`` rows across the groups — the same ``resp.data``
+    the callers iterate — RE-SORTED into the caller's input order, keyed on the
+    ``on_conflict`` columns. Splitting the batch otherwise reshuffles the
+    result, and Phase 2's daily-cap trim (``candidates[:quota]`` after a stable
+    sort) resolves residual ties by position: an ordering change there would
+    quietly alter WHICH equally-ranked postings get graded. Restoring the input
+    order keeps this change a pure write-mechanism fix with no observable
+    downstream effect. Rows we cannot key (a caller whose conflict columns
+    aren't echoed back) keep their group order at the end.
+
+    Each group rides :func:`poll_db_write`, so the semaphore and the
+    transient-blip retry are unchanged; groups are issued sequentially rather
+    than gathered so one source's split write can't multiply the cycle-wide
+    write burst.
+
+    NB the *semantics* stay "silence is not falsity": nothing here invents a
+    value for a key the board didn't supply. It only stops one row's answer
+    being applied to another row's column.
+    """
+    if not rows:
+        return []
+    key_cols = tuple(c.strip() for c in on_conflict.split(",") if c.strip())
+
+    def _conflict_key(row: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(row.get(c) for c in key_cols)
+
+    # Enforce conflict-key uniqueness BEFORE splitting, so the failure mode is
+    # the same whichever way the key-sets happen to partition. Rows missing a
+    # conflict column are skipped: they can't match the conflict target on a
+    # value visible here, so Postgres would INSERT both rather than error, and
+    # flagging them would be a false positive.
+    #
+    # The message names the columns but NOT their values: this helper is
+    # generic, a conflict key elsewhere could be an email or a user id, and an
+    # exception string ends up in the platform log (the #885 lesson). The
+    # caller's ``label`` already identifies the batch.
+    seen: set[tuple[Any, ...]] = set()
+    for row in rows:
+        if not all(c in row for c in key_cols):
+            continue
+        key = _conflict_key(row)
+        if key in seen:
+            raise ValueError(
+                f"poll_db_upsert: duplicate ({on_conflict}) key within one batch "
+                f"for table {table!r} [{label}]. A single statement would raise "
+                "a cardinality error; split across key-set groups it would "
+                "silently last-write-wins. Deduplicate before calling."
+            )
+        seen.add(key)
+
+    groups: dict[frozenset[str], list[dict[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault(frozenset(row), []).append(row)
+
+    upserted: list[dict[str, Any]] = []
+    for group in groups.values():
+        resp = await poll_db_write(
+            supabase,
+            lambda c, g=group: c.table(table).upsert(g, on_conflict=on_conflict),
+            label=label,
+        )
+        upserted.extend(cast(list[dict[str, Any]], resp.data or []))
+
+    if len(groups) > 1:
+        position = {_conflict_key(r): i for i, r in enumerate(rows)}
+        unmatched = len(rows)
+        # Stable, so anything unkeyable keeps its relative order at the end.
+        upserted.sort(key=lambda r: position.get(_conflict_key(r), unmatched))
+    return upserted
 
 
 async def poll_db_read(

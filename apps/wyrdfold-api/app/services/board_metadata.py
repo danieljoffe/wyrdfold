@@ -21,6 +21,14 @@ anything it doesn't positively recognize, and :func:`board_columns` omits
 ``None`` keys entirely. A board that doesn't publish a field must never blank
 a value another path already established, and an unrecognized string must
 never be coerced into a plausible-looking wrong answer.
+
+The omission is only half the rule — the WRITE has to honour it too. A
+PostgREST *bulk* upsert builds one statement from the union of the keys across
+the whole payload, so a key one row supplies is written to every row, and the
+rows that omitted it get ``NULL`` (#928). Bulk-write these columns through
+:func:`app.services.db_write.poll_db_upsert`, which partitions the batch by
+key-set so each statement is homogeneous. Spreading them straight into a bulk
+``.upsert(list)`` reintroduces the blanking.
 """
 
 from __future__ import annotations
@@ -123,9 +131,14 @@ def board_columns(job: StandardJob, location: LocationParts | None = None) -> di
     Mirrors :func:`app.services.extract.salary_columns` — one spread used by
     every write site so board facts land identically everywhere.
 
-    Only keys the board actually supplied are returned. Callers spread this
-    into an upsert payload; an absent key leaves the stored column untouched,
-    which is what keeps a silent board from blanking a tagged value.
+    Only keys the board actually supplied are returned, which is what keeps a
+    silent board from blanking a tagged value — PROVIDED the write honours the
+    omission. A single-row upsert does. A BULK upsert does not: PostgREST
+    builds one statement from the union of the batch's keys and sends ``NULL``
+    for the rows that omitted one, so a board-speaking posting blanks its
+    board-silent neighbour (#928, the same contradiction #795 measured and #851
+    fixed on the tagger side). Bulk callers must route through
+    :func:`app.services.db_write.poll_db_upsert`, which partitions by key-set.
 
     NB ``country`` is deliberately NOT written here. ``jobs.country`` holds a
     DISPLAY vocabulary produced by ``location_parse`` (``US``, ``UK`` — not
