@@ -1962,7 +1962,7 @@ async def _poll_one_source(
             # what restores the pruning lazy tagging took away for the
             # providers that publish a structured country.
             board_us_marked, board_us_archived = await _apply_board_us_verdicts(
-                supabase, jobs, upsert_resp.data or []
+                supabase, jobs, upserted_rows
             )
 
             # Qualification tags are LAZY now, exactly like embeddings below:
@@ -3430,7 +3430,7 @@ async def _poll_one_source_for_target(
             # line, so the counters get their own: an operator has to be able
             # to see the prune on BOTH ingest paths, not just the shared cycle.
             board_us_marked, board_us_archived = await _apply_board_us_verdicts(
-                supabase, jobs, upsert_resp.data or []
+                supabase, jobs, upserted_rows
             )
             if board_us_marked or board_us_archived:
                 logger.info(

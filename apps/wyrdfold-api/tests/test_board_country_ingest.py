@@ -188,7 +188,20 @@ async def _run_poll(
         supabase, jobs_table, _junction = _make_targeted_poll_supabase()
     else:
         supabase, jobs_table, _sources = _make_poll_supabase([])
-    jobs_table.upsert.return_value.execute.return_value.data = upserted
+    # Return only the rows THIS statement wrote. ``poll_db_upsert`` partitions a
+    # heterogeneous batch by key-set (#931), so a fake that answers every call
+    # with the whole list makes the poller count each row once per group — the
+    # fixture would be modelling a single statement that no longer happens.
+    _by_ext = {r.get("external_id"): r for r in upserted}
+
+    def _upsert(payload: Any, **_kw: Any) -> MagicMock:
+        rows = payload if isinstance(payload, list) else [payload]
+        wrote = [_by_ext[e] for r in rows if (e := r.get("external_id")) in _by_ext]
+        resp = MagicMock()
+        resp.execute.return_value = MagicMock(data=wrote)
+        return resp
+
+    jobs_table.upsert.side_effect = _upsert
     # Default DB state agrees with the upsert snapshot; a test that wants the
     # snapshot-vs-DB race passes an explicit ``db``.
     if db is None:
