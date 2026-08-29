@@ -568,7 +568,7 @@ def _title_score_page_rows(rows: list[dict[str, Any]], target: JobTarget) -> lis
 # defer-to-the-board rule and writes the inference over the employer's own
 # answer. ``test_target_scoring`` pins this against the contract.
 _ACTIVATION_JOB_COLUMNS = (
-    "id, title, company_name, location, description_html, "
+    "id, title, company_name, location, country, description_html, "
     "qualified_hash, qualified_at, archived_at, is_remote, employment_type"
 )
 

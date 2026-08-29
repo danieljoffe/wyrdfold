@@ -913,9 +913,11 @@ class TestDefersToTheBoard:
     async def test_tags_no_board_publishes_are_always_written(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """role_family / seniority / is_us / metro / is_genuine_role have no
-        board source, so the tagger stays their only writer — unconditionally,
-        even when the board answered the other two."""
+        """role_family / seniority / metro / is_genuine_role have no board
+        source, so the tagger stays their only writer — unconditionally, even
+        when the board answered the other two. ``is_us`` is always written too,
+        but its VALUE can be overridden by a deterministic country (see
+        ``TestDeterministicUsCountryWins``)."""
         rec = _patch_common(monkeypatch, tag_result=(_TAGS, object()))
         await materialize._qualify_one_job(
             MagicMock(),
@@ -925,6 +927,97 @@ class TestDefersToTheBoard:
         payload = rec["writes"][0]
         for key in ("is_us", "role_family", "seniority", "metro", "is_genuine_role"):
             assert key in payload, key
+
+
+class TestDeterministicUsCountryWins:
+    """``jobs.country`` beats the model on ``is_us``.
+
+    The column has exactly two writers, both deterministic: the board's own
+    structured country field (#846) and ``location_parse`` over the board's own
+    location string. Neither is an inference, so when either says ``US`` the
+    model does not get to overrule it — and cannot archive the row, which is
+    the one-way door here (a real "New York, NY, United States" was seen tagged
+    non-US at confidence 95).
+
+    ONE-SIDED, like ``positively_us_location``, which this generalizes: a US
+    country vetoes a non-US inference, but a non-US country never suppresses
+    one. Losing a non-US finding un-hides a row; losing a US one costs a grade.
+    """
+
+    @pytest.mark.asyncio
+    async def test_control_without_a_country_the_model_still_prunes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The precondition for every assertion below: on an identical row with
+        no ``country``, this verdict DOES mark and archive. Without this the
+        next test could pass because nothing archives at all."""
+        monkeypatch.setattr(live_settings, "qualification_archive_non_us", True)
+        monkeypatch.setattr(live_settings, "qualification_non_us_archive_min_confidence", 80)
+        rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(95), object()))
+
+        await materialize._qualify_one_job(
+            MagicMock(), _supabase_capturing_updates(rec), _row(location="Remote", country=None)
+        )
+
+        payload = rec["writes"][0]
+        assert payload["is_us"] is False
+        assert payload["archived_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_a_us_country_is_not_overwritten_by_the_inference(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(live_settings, "qualification_archive_non_us", True)
+        monkeypatch.setattr(live_settings, "qualification_non_us_archive_min_confidence", 80)
+        rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(95), object()))
+
+        await materialize._qualify_one_job(
+            MagicMock(), _supabase_capturing_updates(rec), _row(location="Remote", country="US")
+        )
+
+        payload = rec["writes"][0]
+        assert payload["is_us"] is True, "the deterministic country must survive"
+        assert "archived_at" not in payload
+
+    @pytest.mark.asyncio
+    async def test_a_non_us_country_does_not_suppress_a_non_us_finding(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The asymmetry, asserted rather than assumed."""
+        monkeypatch.setattr(live_settings, "qualification_archive_non_us", True)
+        monkeypatch.setattr(live_settings, "qualification_non_us_archive_min_confidence", 80)
+        rec = _patch_common(monkeypatch, tag_result=(_non_us_tags(95), object()))
+
+        await materialize._qualify_one_job(
+            MagicMock(),
+            _supabase_capturing_updates(rec),
+            _row(location="Remote", country="Germany"),
+        )
+
+        payload = rec["writes"][0]
+        assert payload["is_us"] is False
+        assert payload["archived_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_a_us_country_does_not_block_the_non_genuine_archive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The veto is about WHERE the role is, not whether it is a role. A
+        talent-pool collector in the US is still not a posting."""
+        monkeypatch.setattr(live_settings, "qualification_archive_non_genuine", True)
+        rec = _patch_common(monkeypatch, tag_result=(_tags(is_genuine_role=False), object()))
+
+        await materialize._qualify_one_job(
+            MagicMock(), _supabase_capturing_updates(rec), _row(country="US")
+        )
+
+        assert rec["writes"][0]["archived_at"] is not None
+
+    def test_country_is_in_the_tagger_input_contract(self) -> None:
+        """A caller whose projection drops ``country`` would read "no country"
+        and re-open the door this class closes — silently. The contract is what
+        the per-caller projection tests assert against."""
+        assert "country" in materialize.TAG_INPUT_COLUMNS
 
 
 class TestArchivedRowsAreNotTagged:
