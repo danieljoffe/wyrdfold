@@ -286,6 +286,12 @@ _PROBERS = {
 
 _PROBE_ORDER = ["greenhouse", "lever", "ashby", "smartrecruiters"]
 
+# Providers whose ``board_token`` :func:`probe_board` knows how to interpret:
+# the four slug-based ATSs plus Workday's composite token. Anything else (the
+# ``manual`` source in prod, any future non-ATS provider) holds a token this
+# module cannot reason about.
+PROBEABLE_PROVIDERS = frozenset({*_PROBERS, "workday"})
+
 
 async def probe_board(provider: str, board_token: str) -> DetectResult | None:
     """Probe ONE already-known ``(provider, board_token)`` pair directly.

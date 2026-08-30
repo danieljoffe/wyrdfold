@@ -48,18 +48,15 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from app.services.ats_detect import _PROBERS, clean_company_name, detect_ats, probe_board
+from app.services.ats_detect import (
+    PROBEABLE_PROVIDERS,
+    clean_company_name,
+    detect_ats,
+    probe_board,
+)
 from app.services.db_write import poll_db_read
 
 logger = logging.getLogger(__name__)
-
-# Providers whose ``board_token`` this module knows how to reason about: the
-# four slug-based ATSs plus Workday's composite token. Prod also holds one
-# ``manual`` source whose token is the literal string "manual" — feeding that
-# to the slug ladder would probe four providers for a board called "manual"
-# and re-point a hand-curated row onto whatever answered. A token we cannot
-# interpret is not a token we may guess from.
-_REDETECTABLE_PROVIDERS = frozenset({*_PROBERS, "workday"})
 
 # Ceiling on the WHOLE re-detection for one source, probes included. This runs
 # inside the poll cycle, and the ladder below can issue up to 13 requests
@@ -188,7 +185,11 @@ async def redetect_source(
     board_token = str(source.get("board_token") or "")
     current = (provider, board_token)
 
-    if provider not in _REDETECTABLE_PROVIDERS:
+    # Prod holds one ``manual`` source whose board_token is the literal string
+    # "manual". Feeding that to the slug ladder would probe four providers for
+    # a board of that name and re-point a hand-curated row onto whatever
+    # answered. A token we cannot interpret is not a token we may guess from.
+    if provider not in PROBEABLE_PROVIDERS:
         return RedetectOutcome(action="not_found")
 
     found = None
