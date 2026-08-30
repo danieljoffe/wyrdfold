@@ -951,6 +951,15 @@ class Settings(BaseSettings):
     # false restores the pre-#912 behaviour (disable at the threshold, no
     # probes). See app/services/source_redetect.py.
     source_redetect_on_disable_enabled: bool = True
+    # Cooldown on RE-VERIFYING a board a probe just confirmed live. A
+    # ``still_live`` verdict suppresses the disable without resetting
+    # ``consecutive_failures`` (the counter is real signal — the normal fetch
+    # path IS still failing), so the source stays above the threshold and every
+    # later failed poll would otherwise re-probe. 12h bounds the probe rate
+    # while staying UNDER ``source_recovery_after_hours`` (24), so a board that
+    # dies during a cooldown is re-verified and retired within one recovery
+    # cycle rather than after it. 0 disables the cooldown (probe every time).
+    source_redetect_still_live_cooldown_hours: int = Field(default=12, ge=0, le=168)
     # Adaptive source cadence. Sources whose ``last_candidate_at`` is
     # older than this many days get their poll interval stretched to
     # daily by the lifecycle sweep; sources that produce candidates

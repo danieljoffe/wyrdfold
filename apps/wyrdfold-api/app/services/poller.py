@@ -2443,13 +2443,24 @@ async def _redetect_before_disabling(
         return "disable"
 
     if outcome.action == "still_live":
+        # Say what was observed, not what it implies. A probe establishes that
+        # the board answered ONE lightweight request just now; the production
+        # fetch path uses different shapes (pagination, per-posting detail) and
+        # is demonstrably still failing — that is why we are here.
         logger.warning(
-            "Source %s hit %d consecutive failures but its board (%s/%s) is "
-            "still live — NOT disabling; the poll failure is transient",
+            "Source %s hit %d consecutive failures but a probe of its board "
+            "(%s/%s) %s — NOT disabling; the normal poll is still failing",
             company,
             failures,
             source.get("provider"),
             source.get("board_token"),
+            (
+                f"answered within the last "
+                f"{settings.source_redetect_still_live_cooldown_hours}h "
+                f"(not re-probed this cycle)"
+                if outcome.from_cooldown
+                else "answered"
+            ),
         )
         return "suppress"
 

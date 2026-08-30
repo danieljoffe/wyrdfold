@@ -27,6 +27,7 @@ to say no.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -127,6 +128,17 @@ class _BoardFleet:
 
     def probed(self, needle: str) -> bool:
         return any(needle in u for u in self.requested)
+
+
+@pytest.fixture(autouse=True)
+def _clear_still_live_memo():
+    """``_STILL_LIVE_UNTIL`` is module-global; a leaked entry would let one
+    test silently suppress another's probe."""
+    from app.services.source_redetect import _STILL_LIVE_UNTIL
+
+    _STILL_LIVE_UNTIL.clear()
+    yield
+    _STILL_LIVE_UNTIL.clear()
 
 
 @pytest.fixture
@@ -434,6 +446,107 @@ async def test_hyphenated_name_recovers_a_company_the_other_rungs_cannot(
     assert outcome.board_token == "black-forest-labs"
     assert fleet.probed(f"{ASHBY_BASE}/blackforestlabs")  # rung 1 missed
     assert fleet.probed(f"{ASHBY_BASE}/bflabs")  # rung 2 missed
+
+
+async def test_a_recent_still_live_verdict_is_not_re_probed(fleet: _BoardFleet) -> None:
+    """A ``still_live`` verdict does NOT reset ``consecutive_failures`` — the
+    counter is real signal that the normal fetch path is still failing — so the
+    source stays above the threshold and every later failed poll would re-ask a
+    question we just answered. For the Workday cohort that is the steady state,
+    so the re-verification is what gets throttled, not the counter.
+    """
+    from app.services.source_redetect import redetect_source
+
+    fleet.add("workday", "tricon|tricon", jobs=29)
+    sb, _table = _supabase()
+
+    first = await redetect_source(sb, _TRICON)
+    assert first.action == "still_live"
+    assert first.from_cooldown is False
+    probes_after_first = len(fleet.requested)
+    assert probes_after_first > 0, "the first verdict must come from a real probe"
+
+    second = await redetect_source(sb, _TRICON)
+
+    assert second.action == "still_live"
+    assert second.from_cooldown is True, "the caller must be able to tell it was remembered"
+    assert len(fleet.requested) == probes_after_first, "the board must not be re-probed"
+
+
+async def test_the_cooldown_is_per_source_and_switchable(
+    fleet: _BoardFleet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Anti-vacuous partner: prove the silence above is the cooldown and not a
+    fleet that stopped answering — with the window at 0 the same second call
+    probes again, and a different source is never covered by another's entry.
+    """
+    from app.services import source_redetect
+
+    fleet.add("workday", "tricon|tricon", jobs=29)
+    fleet.add("greenhouse", "underdogfantasy", jobs=4)
+    sb, _table = _supabase()
+
+    # A cooldown entry for one source must not silence another.
+    await source_redetect.redetect_source(sb, _TRICON)
+    before = len(fleet.requested)
+    other = await source_redetect.redetect_source(
+        sb,
+        {"id": "src-ud", "provider": "greenhouse", "board_token": "underdogfantasy",
+         "company_name": "Underdog"},
+    )
+    assert other.action == "still_live"
+    assert other.from_cooldown is False
+    assert len(fleet.requested) > before
+
+    # Window of 0 disables the memo entirely.
+    monkeypatch.setattr(
+        source_redetect.settings, "source_redetect_still_live_cooldown_hours", 0
+    )
+    source_redetect._STILL_LIVE_UNTIL.clear()
+    await source_redetect.redetect_source(sb, _TRICON)
+    mark = len(fleet.requested)
+    again = await source_redetect.redetect_source(sb, _TRICON)
+    assert again.from_cooldown is False
+    assert len(fleet.requested) > mark, "with the cooldown off, every attempt re-probes"
+
+
+async def test_an_expired_cooldown_re_verifies(fleet: _BoardFleet) -> None:
+    """The window must actually expire — a permanent entry would suppress the
+    disable forever for a board that later genuinely dies."""
+    from app.services import source_redetect
+
+    fleet.add("workday", "tricon|tricon", jobs=29)
+    sb, _table = _supabase()
+
+    await source_redetect.redetect_source(sb, _TRICON)
+    before = len(fleet.requested)
+
+    # Age the entry past its deadline rather than sleeping 12 hours.
+    source_redetect._STILL_LIVE_UNTIL[_TRICON["id"]] = time.monotonic() - 1.0
+
+    third = await source_redetect.redetect_source(sb, _TRICON)
+    assert third.from_cooldown is False
+    assert len(fleet.requested) > before
+
+
+async def test_the_poller_suppresses_from_cooldown_without_probing(
+    fleet: _BoardFleet,
+) -> None:
+    """End to end: the second failed poll still refuses to disable, and does it
+    without touching the provider."""
+    fleet.add("workday", "tricon|tricon", jobs=29)
+
+    first, _t1 = await _record(_TRICON)
+    assert first is not None and "enabled" not in first
+    probes = len(fleet.requested)
+    assert probes > 0
+
+    second, _t2 = await _record({**_TRICON, "consecutive_failures": 10})
+
+    assert second is not None
+    assert "enabled" not in second, "a board verified live recently must not be disabled"
+    assert second["consecutive_failures"] == 11, "the counter still climbs"
+    assert len(fleet.requested) == probes, "no second probe"
 
 
 async def test_a_provider_we_cannot_interpret_is_never_guessed_at(

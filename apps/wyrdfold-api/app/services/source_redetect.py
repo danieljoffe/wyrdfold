@@ -16,7 +16,8 @@ This module answers one question for one source, and writes nothing:
 what to persist. Four outcomes:
 
 ``still_live``
-    The token we hold answers right now. The failed poll was transient and
+    The token we hold answers right now (or answered within the cooldown
+    window — see ``_STILL_LIVE_UNTIL``). The failed poll was transient and
     disabling would be simply wrong. Measured: 33 of the 139 — all Workday,
     all with ``last_error`` = "returned 200 with a non-JSON body" (Workday
     intermittently serves an interstitial instead of JSON), and replaying the
@@ -45,9 +46,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from app.config import settings
 from app.services.ats_detect import (
     PROBEABLE_PROVIDERS,
     clean_company_name,
@@ -75,6 +78,42 @@ _NON_SLUG_RUN = re.compile(r"[^a-z0-9]+")
 # every board on four providers.
 _MIN_SLUG_LEN = 2
 
+# Per-process cooldown on RE-VERIFYING a board we just confirmed live.
+#
+# A ``still_live`` verdict suppresses the disable without resetting
+# ``consecutive_failures`` — deliberately, because the counter carries the
+# genuinely useful signal that the real fetch path is still failing. But the
+# threshold test is ``failures >= threshold``, so the source stays in
+# would-disable territory at 10, 11, 12... and every subsequent failed poll
+# would re-ask a question we answered minutes ago. For the cohort this exists
+# for (Workday: live board, intermittently non-JSON fetch) that IS the steady
+# state, not an edge case. One request per attempt is cheap; unbounded in
+# aggregate against third-party providers is not.
+#
+# Deliberately in-process rather than a ``redetected_live_at`` column: this is
+# an optimisation, migrations here are manual (apply + verify by hand), and a
+# restart costs exactly one extra round of probes. The poll cycle takes an
+# advisory lock, so there is one poller at a time and no cross-process skew to
+# reconcile. Same pattern as ``_LIFECYCLE_LAST_RUN`` and the spend memo.
+_STILL_LIVE_UNTIL: dict[str, float] = {}
+
+
+def _cooldown_active(source_id: str, *, now: float) -> bool:
+    until = _STILL_LIVE_UNTIL.get(source_id)
+    return until is not None and until > now
+
+
+def _mark_still_live(source_id: str, *, now: float) -> None:
+    hours = settings.source_redetect_still_live_cooldown_hours
+    if hours <= 0 or not source_id:
+        return
+    # Prune on write so a long-lived process can't accumulate entries for
+    # sources that have since recovered.
+    for key, until in list(_STILL_LIVE_UNTIL.items()):
+        if until <= now:
+            del _STILL_LIVE_UNTIL[key]
+    _STILL_LIVE_UNTIL[source_id] = now + hours * 3600.0
+
 RedetectAction = Literal["still_live", "repoint", "collision", "not_found"]
 
 
@@ -89,6 +128,10 @@ class RedetectOutcome:
     job_count: int = 0
     # For ``collision``: the id of the source that already owns the token.
     blocked_by: str | None = None
+    # For ``still_live``: True when the verdict came from the cooldown memo
+    # rather than a probe issued just now. The caller must not claim to have
+    # observed something it only remembered.
+    from_cooldown: bool = False
 
 
 def _plain_slug(name: str) -> str:
@@ -192,6 +235,17 @@ async def redetect_source(
     if provider not in PROBEABLE_PROVIDERS:
         return RedetectOutcome(action="not_found")
 
+    # Already verified live recently — suppress the disable without re-probing.
+    # See _STILL_LIVE_UNTIL for why the counter is not reset instead.
+    now = time.monotonic()
+    if _cooldown_active(source_id, now=now):
+        return RedetectOutcome(
+            action="still_live",
+            provider=provider,
+            board_token=board_token,
+            from_cooldown=True,
+        )
+
     found = None
     try:
         async with asyncio.timeout(timeout_s):
@@ -200,6 +254,7 @@ async def redetect_source(
             #    identical to a stale token from the poller's side.
             live = await probe_board(provider, board_token)
             if live is not None:
+                _mark_still_live(source_id, now=now)
                 return RedetectOutcome(
                     action="still_live",
                     provider=provider,
@@ -216,6 +271,7 @@ async def redetect_source(
                 if (detected.provider, detected.board_token) == current:
                     # The direct probe said dead and the ladder says live —
                     # trust the positive and leave the source alone.
+                    _mark_still_live(source_id, now=now)
                     return RedetectOutcome(
                         action="still_live",
                         provider=provider,

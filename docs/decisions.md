@@ -41,8 +41,23 @@ the same bar `source_registration` applies when it refuses a `dead_board`;
 that costs 4 of the 139 and buys the guarantee that we never move a company
 onto a board on the strength of "the org exists".
 
-Rule lives in `app/services/source_redetect.py`; off switch is
-`source_redetect_on_disable_enabled`.
+A `still_live` verdict deliberately does **not** reset
+`consecutive_failures` — the counter is the real signal that the normal fetch
+path is still failing, and resetting it would erase that. But the threshold
+test is `failures >= threshold`, so the source stays in would-disable territory
+and every later failed poll would re-ask a question answered minutes ago. The
+re-verification is what gets throttled (a 12 h in-process cooldown), not the
+counter. In-process, not a column: it is an optimisation, migrations here are
+manual, and a restart costs one extra round of probes.
+
+**And the log says what was observed, not what it implies.** A probe proves the
+board answered one lightweight request; it does not prove the failure was
+transient — the production fetch path uses different shapes and is
+demonstrably still failing, which is why we are there at all.
+
+Rule lives in `app/services/source_redetect.py`; off switches are
+`source_redetect_on_disable_enabled` and
+`source_redetect_still_live_cooldown_hours`.
 
 ## 2026-08-28 — Price is a routing outcome, so a static table cannot be right
 
