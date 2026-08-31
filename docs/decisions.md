@@ -3,6 +3,62 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-08-29 — A 404 describes the identifier, not the company (#912)
+
+#913 made `consecutive_failures` count for the first time, and 139 enabled
+sources immediately showed up failing — Fireworks AI, dbt Labs, Storybook,
+Notion, Ramp, Plaid, Sentry, Supabase. Companies that are transparently still
+hiring. The backoff was about to disable every one of them, because a board
+that 404s reads to the poller exactly like a company that stopped existing.
+
+It isn't. A 404 says the board TOKEN we hold no longer resolves. Companies
+rename their board or migrate ATS, and 27 of the 139 turned out to be sitting
+on a live board under a different provider — almost all of them Greenhouse →
+Ashby. **Acting on an identifier as though it described the entity is the
+bug.**
+
+**The framing that went in was also wrong, and the measurement caught it.**
+"Almost all `returned 404`" was the premise; the actual `last_error` split was
+93 × 404, **33 × `returned 200 with a non-JSON body`**, 10 × 422, and one each
+of 410/403. Those 33 are all Workday, and replaying the real
+`fetch_workday_jobs` against a sample of them succeeded on every one — Workday
+intermittently serves an interstitial instead of JSON. They are not dead
+boards in any sense, and disabling them was simply wrong.
+
+**Decision:** at the disable threshold — and only there — re-detect before
+acting. Probe the token we already hold first (one request; it is the question
+the backoff got wrong), then a three-rung slug ladder. Re-point the EXISTING
+row rather than registering a new source: `jobs.source_id` is an FK, so a new
+row orphans the company's listings. Never re-point onto a `board_token`
+another row owns — `sources` carries `UNIQUE (board_token)`, so that write is
+a 23505 waiting to happen, and a duplicate company even without it.
+
+Two things the numbers decided rather than taste. The slug ladder has three
+rungs because each was measured against the failing cohort (name 27, held
+token +3, hyphenated name +2) — a fourth was never added because nothing
+justified it. And a live board with zero postings is NOT a re-point target,
+the same bar `source_registration` applies when it refuses a `dead_board`;
+that costs 4 of the 139 and buys the guarantee that we never move a company
+onto a board on the strength of "the org exists".
+
+A `still_live` verdict deliberately does **not** reset
+`consecutive_failures` — the counter is the real signal that the normal fetch
+path is still failing, and resetting it would erase that. But the threshold
+test is `failures >= threshold`, so the source stays in would-disable territory
+and every later failed poll would re-ask a question answered minutes ago. The
+re-verification is what gets throttled (a 12 h in-process cooldown), not the
+counter. In-process, not a column: it is an optimisation, migrations here are
+manual, and a restart costs one extra round of probes.
+
+**And the log says what was observed, not what it implies.** A probe proves the
+board answered one lightweight request; it does not prove the failure was
+transient — the production fetch path uses different shapes and is
+demonstrably still failing, which is why we are there at all.
+
+Rule lives in `app/services/source_redetect.py`; off switches are
+`source_redetect_on_disable_enabled` and
+`source_redetect_still_live_cooldown_hours`.
+
 ## 2026-08-28 — Price is a routing outcome, so a static table cannot be right
 
 `pricing.py` held one price per model and `calculate_cost(model, usage)`

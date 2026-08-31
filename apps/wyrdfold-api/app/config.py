@@ -942,6 +942,24 @@ class Settings(BaseSettings):
     persistent_block_admission_cap_per_cycle: int = Field(default=50, ge=0)
 
     source_failure_disable_threshold: int = Field(default=10, ge=0)
+    # #912: when the backoff is about to disable a source, re-detect the
+    # company's ATS first. A 404 says the board TOKEN is stale, not that the
+    # company stopped hiring — measured on prod, 27 of 139 failing sources
+    # resolved to a different LIVE board (Notion/Ramp/Plaid/Sentry, all
+    # Greenhouse -> Ashby) and another 33 were still live on the token we
+    # already held. Off-switch for the probing this adds to the poll cycle:
+    # false restores the pre-#912 behaviour (disable at the threshold, no
+    # probes). See app/services/source_redetect.py.
+    source_redetect_on_disable_enabled: bool = True
+    # Cooldown on RE-VERIFYING a board a probe just confirmed live. A
+    # ``still_live`` verdict suppresses the disable without resetting
+    # ``consecutive_failures`` (the counter is real signal — the normal fetch
+    # path IS still failing), so the source stays above the threshold and every
+    # later failed poll would otherwise re-probe. 12h bounds the probe rate
+    # while staying UNDER ``source_recovery_after_hours`` (24), so a board that
+    # dies during a cooldown is re-verified and retired within one recovery
+    # cycle rather than after it. 0 disables the cooldown (probe every time).
+    source_redetect_still_live_cooldown_hours: int = Field(default=12, ge=0, le=168)
     # Adaptive source cadence. Sources whose ``last_candidate_at`` is
     # older than this many days get their poll interval stretched to
     # daily by the lifecycle sweep; sources that produce candidates

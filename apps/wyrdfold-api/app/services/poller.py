@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from supabase import AsyncClient
 
@@ -64,6 +64,7 @@ from app.services.relevance.title_triage import (
 from app.services.sanitize import sanitize_html
 from app.services.scoring import score_title_against_profile
 from app.services.smartrecruiters import fetch_smartrecruiters_jobs
+from app.services.source_redetect import redetect_source
 from app.services.standard_job import StandardJob
 from app.services.target_scoring import (
     score_and_upsert as target_score_and_upsert,
@@ -2343,6 +2344,12 @@ async def _record_source_failure(
     rotate to the back like any other. The stamp deliberately touches nothing
     else: no ``job_count``, and emphatically no counter reset — this was not a
     clean poll.
+
+    At the threshold — and only there — :func:`_redetect_before_disabling`
+    gets a say first (#912): a board that stopped answering may have moved
+    rather than died, and it may not even be dead. That can re-point this row
+    onto the company's live board (in which case nothing else is written) or
+    veto the disable, but it can never manufacture one.
     """
     threshold = settings.source_failure_disable_threshold
     if threshold <= 0:
@@ -2363,6 +2370,18 @@ async def _record_source_failure(
         if error:
             updates["last_error"] = error[:_SOURCE_LAST_ERROR_MAX_LEN]
         disabling = failures >= threshold
+        if disabling and settings.source_redetect_on_disable_enabled:
+            # #912: the threshold says "this board stopped answering", which is
+            # not the same claim as "this company stopped hiring". Ask the ATSs
+            # before acting on the identifier. Gated on the threshold, not on
+            # every failure, so the probing is bounded to the handful of
+            # sources that would otherwise be disabled this cycle.
+            verdict = await _redetect_before_disabling(supabase, source, failures=failures)
+            if verdict == "repointed":
+                # The row now points at the live board and the failure is
+                # resolved — the failure/disable write below would undo it.
+                return
+            disabling = verdict == "disable"
         if disabling:
             updates["enabled"] = False
             updates["disabled_at"] = now_iso
@@ -2390,6 +2409,126 @@ async def _record_source_failure(
                 logger.exception("Failed to report source auto-disable to Sentry")
     except Exception:
         logger.exception("Failed to record source failure for %s", source_id)
+
+
+async def _redetect_before_disabling(
+    supabase: AsyncClient, source: dict[str, Any], *, failures: int
+) -> Literal["repointed", "suppress", "disable"]:
+    """Re-detect a source the backoff is about to disable (#912).
+
+    Returns what the caller should do:
+
+    ``repointed``
+        The row has already been rewritten to the company's live board. The
+        caller must NOT also write the failure payload — that would put the
+        failure counter and ``last_error`` back on a source that is now
+        healthy.
+    ``suppress``
+        The board we hold is still live, so this was a transient failure and
+        disabling would be wrong. The caller still records the failure (the
+        counter keeps climbing and stays queryable) but leaves ``enabled``
+        alone.
+    ``disable``
+        Nothing found, or the live board is already owned by another source.
+        Today's behaviour, unchanged.
+
+    Best-effort throughout: any unexpected failure degrades to ``disable``.
+    """
+    company = source.get("company_name", source.get("id"))
+    source_id = source.get("id")
+    try:
+        outcome = await redetect_source(supabase, source)
+    except Exception:
+        logger.exception("re-detect failed for %s; disabling as usual", company)
+        return "disable"
+
+    if outcome.action == "still_live":
+        # Say what was observed, not what it implies. A probe establishes that
+        # the board answered ONE lightweight request just now; the production
+        # fetch path uses different shapes (pagination, per-posting detail) and
+        # is demonstrably still failing — that is why we are here.
+        logger.warning(
+            "Source %s hit %d consecutive failures but a probe of its board "
+            "(%s/%s) %s — NOT disabling; the normal poll is still failing",
+            company,
+            failures,
+            source.get("provider"),
+            source.get("board_token"),
+            (
+                f"answered within the last "
+                f"{settings.source_redetect_still_live_cooldown_hours}h "
+                f"(not re-probed this cycle)"
+                if outcome.from_cooldown
+                else "answered"
+            ),
+        )
+        return "suppress"
+
+    if outcome.action == "collision":
+        logger.warning(
+            "Source %s moved to %s/%s but source %s already owns that "
+            "board_token — skipping the re-point (duplicate company); "
+            "disabling after %d consecutive failures",
+            company,
+            outcome.provider,
+            outcome.board_token,
+            outcome.blocked_by,
+            failures,
+        )
+        return "disable"
+
+    if outcome.action != "repoint":
+        return "disable"
+
+    # Re-point the EXISTING row rather than registering a new source: jobs
+    # carry ``source_id`` as an FK, so a new row would orphan every listing we
+    # already hold for this company. ``company_name`` is deliberately left
+    # alone — it is user-visible and feeds the dedup key, so a probe is not
+    # licence to rewrite it.
+    repoint: dict[str, Any] = {
+        "provider": outcome.provider,
+        "board_token": outcome.board_token,
+        # The failure is resolved, so clear the whole failure state — same
+        # shape a clean poll writes.
+        "consecutive_failures": 0,
+        "last_error": None,
+        "last_error_at": None,
+        # Rotate to the back of the most-overdue-first queue: this source just
+        # consumed a poll slot (see _record_source_failure's docstring).
+        "last_polled_at": datetime.now(UTC).isoformat(),
+    }
+    try:
+        await poll_db_write(
+            supabase,
+            lambda c: c.table("sources").update(repoint).eq("id", source_id),
+            label="poll source re-point",
+        )
+    except Exception:
+        # A losing race on UNIQUE(board_token) lands here. Fall through to the
+        # disable rather than leaving the source in limbo.
+        logger.exception(
+            "re-point write failed for %s (%s/%s); disabling as usual",
+            company,
+            outcome.provider,
+            outcome.board_token,
+        )
+        return "disable"
+
+    # Loud on purpose. This mutates a SHARED catalogue row's identity on the
+    # strength of a heuristic probe, and every one of them should be greppable
+    # in the Railway logs (and reversible by hand from this line alone).
+    logger.warning(
+        "Source %s RE-POINTED after %d consecutive failures: %s/%s -> %s/%s "
+        "(%d live postings)",
+        company,
+        failures,
+        source.get("provider"),
+        source.get("board_token"),
+        outcome.provider,
+        outcome.board_token,
+        outcome.job_count,
+    )
+    return "repointed"
 
 
 async def recover_stale_sources(supabase: AsyncClient, *, now: datetime | None = None) -> int:

@@ -286,6 +286,37 @@ _PROBERS = {
 
 _PROBE_ORDER = ["greenhouse", "lever", "ashby", "smartrecruiters"]
 
+# Providers whose ``board_token`` :func:`probe_board` knows how to interpret:
+# the four slug-based ATSs plus Workday's composite token. Anything else (the
+# ``manual`` source in prod, any future non-ATS provider) holds a token this
+# module cannot reason about.
+PROBEABLE_PROVIDERS = frozenset({*_PROBERS, "workday"})
+
+
+async def probe_board(provider: str, board_token: str) -> DetectResult | None:
+    """Probe ONE already-known ``(provider, board_token)`` pair directly.
+
+    The inverse question to :func:`detect_ats`. ``detect_ats`` guesses a slug
+    and asks "which provider hosts this company?"; this asks "is the board we
+    already hold still serving?" — one request, no slug guessing, no
+    cross-provider fan-out.
+
+    Returns the ``DetectResult`` when the board answers with a listing, None
+    when it doesn't (or when ``provider`` isn't one we can probe). A Workday
+    ``board_token`` is the composite ``{base_url}|{tenant}|{site}`` the
+    fetchers use; anything else is a plain slug.
+    """
+    client = get_http_client()
+    if provider == "workday":
+        parts = board_token.split("|")
+        if len(parts) != 3:
+            return None
+        return await _probe_workday(parts[0], parts[1], parts[2], client)
+    prober = _PROBERS.get(provider)
+    if prober is None:
+        return None
+    return await prober(board_token, client)
+
 
 async def detect_ats(raw_input: str) -> DetectResult | None:
     """Parse input (URL or company name), probe ATS providers, return first match."""
