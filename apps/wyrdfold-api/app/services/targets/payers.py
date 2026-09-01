@@ -319,7 +319,14 @@ async def build_budget_gate(supabase: AsyncClient, target_ids: list[str]) -> Pay
         # total but not the RATE; without this a payer can burn a month in a
         # day, and Phase 1 has no other per-user bound at all.
         if daily_cap > 0:
-            spent_day = await cost_log.total_spend_async(supabase, user_id=uid, since=day_since)
+            # BACKGROUND spend only. Metering this with the unfiltered total
+            # (an earlier draft did, and review caught it) let a user's own
+            # INTERACTIVE spend exhaust the background ceiling: tailoring and
+            # analysis already have their own, far larger gate in
+            # ``user_llm_daily_budget_usd``, so one afternoon of tailoring
+            # would silently stop that user's grading for a day. The two
+            # ceilings meter disjoint sets of purposes and cannot fight.
+            spent_day = await cost_log.total_background_spend_async(supabase, uid, since=day_since)
             if spent_day >= daily_cap:
                 over_daily.add(uid)
 
