@@ -5,7 +5,7 @@ after the upsert, from a free deterministic signal), different source of truth.
 The board pass only reaches the 39.2% of enabled sources whose provider
 publishes a structured country — Greenhouse and Workday, 60.8% between them,
 publish none and never will. What they DO publish is a location string, and
-``positively_us_location`` already reads it for admission and for the archive
+``positively_us_location`` already reads it for the archive
 veto; the conclusion was computed and thrown away rather than recorded.
 
 The whole contract here is ONE-DIRECTIONAL. A wrong ``False`` hides a real job

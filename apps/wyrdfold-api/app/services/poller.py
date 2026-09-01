@@ -695,9 +695,14 @@ async def _apply_location_us_verdicts(
     23.5%.
 
     What those boards DO publish is a location string, and
-    ``positively_us_location`` already reads it — the poller, the archive veto
-    and ``board_us_verdict`` all consult it. Until now the conclusion was
-    computed and thrown away: it was used to ADMIT or to VETO, never recorded.
+    ``positively_us_location`` already reads it — the archive veto and
+    ``board_us_verdict`` both consult it. Until now its conclusion was computed
+    and thrown away: it was used to VETO an archive, never recorded.
+
+    NB it is NOT the admission gate. Admission uses the permissive sibling
+    ``is_us_location``, whose True means only "not provably foreign" — a
+    distinction this docstring previously blurred, and one worth keeping sharp
+    because the two helpers have opposite risk profiles.
     This records it. Measured over the 5 days since tagging went lazy: 69 of
     104 untagged rows (66%), taking deterministic coverage 23.5% → 74.3%.
 
