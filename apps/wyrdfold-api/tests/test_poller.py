@@ -3259,13 +3259,26 @@ class TestIntakeCeilingsAreCoherent:
             "ceiling becomes decorative."
         )
 
-    def test_the_ramp_clears_measured_eligible_supply(self) -> None:
-        """Traced against live boards 2026-09-01: ~417 NEW eligible listings per
-        cycle. A ramp below that defers supply indefinitely rather than
-        smoothing a burst, which is the difference between a ramp and a cap."""
+    def test_the_ramp_clears_supply_measured_on_2026_09_01(self) -> None:
+        """OPERATIONAL TRIPWIRE, not a timeless invariant. Read this before
+        "fixing" a failure.
+
+        Traced against live boards on 2026-09-01: ~417 NEW eligible listings
+        per cycle. A ramp below that defers supply indefinitely rather than
+        smoothing a burst -- the difference between a ramp and a cap.
+
+        The number is a snapshot and WILL go stale: it moves with source count,
+        target breadth and poll cadence. If this fails, the right response is
+        usually to RE-MEASURE (the trace is scripts/admission_watch.py plus a
+        board sample) and update the constant with a new date -- not to lower
+        it to whatever the current default happens to be, which would defeat
+        the point. If the deployment stops resembling 2026-09-01 entirely,
+        delete this test; the sibling ceiling-coherence test above is the
+        durable guard and does not depend on any measurement.
+        """
         from app.config import settings as s
 
-        measured_eligible_per_cycle = 417
+        measured_eligible_per_cycle = 417  # 2026-09-01, 40-source overdue sample
         assert s.persistent_block_admission_cap_per_cycle >= measured_eligible_per_cycle, (
             f"ramp {s.persistent_block_admission_cap_per_cycle}/cycle is below the "
             f"~{measured_eligible_per_cycle} eligible listings a cycle actually "
