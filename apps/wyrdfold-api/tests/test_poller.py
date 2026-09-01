@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -16,6 +17,7 @@ from app.services.poller import (
     _title_matches_target,
 )
 from app.services.standard_job import StandardJob
+from tests.support.fake_backfill_db import FakeLlmCostsTable, cost_row
 from tests.support.fake_phase1_store import FakePhase1RejectionsTable
 
 
@@ -466,6 +468,10 @@ def _make_poll_supabase(existing_rows: list[dict]) -> tuple[MagicMock, MagicMock
         scores_table.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
     ) = []
     phase1_rejections_table = FakePhase1RejectionsTable()
+    # #930: the per-target daily Phase-1 CALL cap counts off llm_costs, and
+    # the poller re-reads it before every triage batch. Real counting (not a
+    # stub) so a cap test asserts against rows something actually wrote.
+    llm_costs_table = FakeLlmCostsTable()
     supabase = MagicMock()
     supabase.table.side_effect = lambda name: {
         "jobs": jobs_table,
@@ -473,8 +479,10 @@ def _make_poll_supabase(existing_rows: list[dict]) -> tuple[MagicMock, MagicMock
         "user_targets": user_targets_table,
         "scores": scores_table,
         "phase1_rejections": phase1_rejections_table,
+        "llm_costs": llm_costs_table,
     }[name]
     supabase._phase1_rejections = phase1_rejections_table
+    supabase._llm_costs = llm_costs_table
 
     # #93: both the existing-rows read and the stale-archive write are
     # server-side RPCs now, so route ``supabase.rpc(name, ...)`` by name:
@@ -1039,6 +1047,7 @@ def _make_targeted_poll_supabase() -> tuple[MagicMock, MagicMock, MagicMock]:
         scores_table.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
     ) = []
     phase1_rejections_table = FakePhase1RejectionsTable()
+    llm_costs_table = FakeLlmCostsTable()  # #930 daily Phase-1 call cap
     supabase = MagicMock()
     supabase.table.side_effect = lambda name: {
         "jobs": jobs_table,
@@ -1046,8 +1055,10 @@ def _make_targeted_poll_supabase() -> tuple[MagicMock, MagicMock, MagicMock]:
         "user_targets": user_targets_table,
         "scores": scores_table,
         "phase1_rejections": phase1_rejections_table,
+        "llm_costs": llm_costs_table,
     }[name]
     supabase._phase1_rejections = phase1_rejections_table
+    supabase._llm_costs = llm_costs_table
     # #93: the legacy Stage 3 score pre-fetch (``_batch_fetch_job_scores``)
     # is the ``get_job_scores_by_ids`` RPC now, not ``jobs.select().in_()``.
     # Default it to an empty score set; tests override as needed.
@@ -2090,6 +2101,69 @@ async def test_phase1_rejection_store_skips_llm_on_next_cycle(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_phase1_daily_call_cap_halts_fresh_ingestion(monkeypatch):
+    """#930: Phase 1 gains the per-target daily CALL cap Phase 2 has had all
+    along. Fresh ingestion reads the same counter the activation backfill
+    writes to, so calls the backfill already made today bound the poller too.
+
+    Deferred, not admitted: the titles are never attempted, so
+    ``_any_target_admits`` withholds them and they re-triage next cycle —
+    the #285 posture, unchanged."""
+    from app.config import settings as live_settings
+    from app.services.relevance.title_triage import PHASE1_PURPOSE
+
+    monkeypatch.setattr(live_settings, "phase1_daily_cap", 2)
+    supabase, fake_triage, target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=24.0)
+
+    # PRECONDITION: with the day untouched the very same cycle DOES triage.
+    first = await run()
+    assert fake_triage.await_count == 1
+    assert first["new"] == 0  # this fixture's LLM rejects the job
+
+    # Two Phase-1 calls billed to this target today — by ordinary ingestion,
+    # by an activation backfill, it makes no difference to the counter.
+    supabase._llm_costs.rows.extend(
+        cost_row(target_id=target.id, purpose=PHASE1_PURPOSE) for _ in range(2)
+    )
+    # Clear the store so a cache hit can't be what stops the second cycle.
+    supabase._phase1_rejections.rows.clear()
+
+    second = await run()
+    assert fake_triage.await_count == 1  # capped — the LLM was not called again
+    assert second["new"] == 0  # deferred, NOT admitted blind
+
+
+@pytest.mark.asyncio
+async def test_phase1_daily_call_cap_fails_open_when_unreadable(monkeypatch):
+    """A count-read blip must not stop admission. Phase 1 stalling PAUSES
+    ingestion (#285/#294), so this rail fails OPEN — unlike the backfill's
+    view of the same counter, which fails closed."""
+    from app.config import settings as live_settings
+    from app.services.relevance.title_triage import PHASE1_PURPOSE
+
+    monkeypatch.setattr(live_settings, "phase1_daily_cap", 1)
+    supabase, fake_triage, target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=0.0)
+    supabase._llm_costs.rows.extend(
+        cost_row(target_id=target.id, purpose=PHASE1_PURPOSE) for _ in range(5)
+    )
+
+    # PRECONDITION: readable, the cap bites.
+    assert await run() is not None
+    assert fake_triage.await_count == 0
+
+    original = supabase.table.side_effect
+
+    def _blow_up_on_costs(name):
+        if name == "llm_costs":
+            raise RuntimeError("count read failed")
+        return original(name)
+
+    supabase.table.side_effect = _blow_up_on_costs
+    await run()
+    assert fake_triage.await_count == 1  # unreadable → keep triaging
+
+
+@pytest.mark.asyncio
 async def test_phase1_rejection_store_disabled_at_zero_ttl(monkeypatch):
     """``phase1_rejection_ttl_hours=0`` disables the store: every cycle
     re-pays the verdict and nothing is read from or written to the table."""
@@ -2305,9 +2379,7 @@ async def test_transient_block_still_defers_the_listing(monkeypatch) -> None:
     Without this the fix would be indiscriminate: it would also stop deferring
     for the one block that legitimately clears itself.
     """
-    summary, jobs_table = await _run_poll_with_blocked_gate(
-        monkeypatch, reason="over_allowance"
-    )
+    summary, jobs_table = await _run_poll_with_blocked_gate(monkeypatch, reason="over_allowance")
 
     assert summary["error"] is None
     jobs_table.upsert.assert_not_called()
@@ -2616,3 +2688,349 @@ async def test_poll_upserts_a_heterogeneous_batch_in_key_homogeneous_groups(monk
             "one statement mixed key-sets — PostgREST will NULL the omitted key"
         )
     assert len(payloads) == 2
+
+
+# ---------------------------------------------------------------------------
+# A daily spend block must never cost a listing (#947 review)
+# ---------------------------------------------------------------------------
+
+
+async def _poll_with_block_reason(monkeypatch, *, reason: str, staged: bool):
+    """One source, one admissible listing, every target blocked for ``reason``,
+    with the staged persistent-admission rollout at ``staged``."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "persistent_block_admits_ingestion", staged)
+    monkeypatch.setattr(live_settings, "persistent_block_admission_cap_per_cycle", 50)
+    budget = poller_mod.new_admission_budget()
+    supabase, jobs_table, _sources = _make_poll_supabase([])
+
+    async def one(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id="new-0",
+                title="Brand New Role 0",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-01",
+                absolute_url="https://example.com/j/0",
+            )
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "triage_titles", AsyncMock())
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+
+    gate = MagicMock()
+    gate.target_blocked.return_value = True
+    gate.target_block_reason.return_value = reason
+    gate.payer_for.return_value = "u1"
+    await poller_mod._poll_one_source(
+        dict(_GUARD_SOURCE), supabase, budget_gate=gate, admission_budget=budget
+    )
+    return [r for c in jobs_table.upsert.call_args_list for r in c.args[0]]
+
+
+@pytest.mark.asyncio
+async def test_a_daily_spend_block_never_vetoes_a_new_listing(monkeypatch) -> None:
+    """The #947 review blocker. Classifying ``over_daily_allowance`` persistent
+    was NOT enough: persistent blocks only admit when the staged rollout flag
+    ``persistent_block_admits_ingestion`` is on, and it ships OFF by default.
+    So a spend ceiling — one deliberately expected to bind far more often than
+    the monthly one — would have become the pipeline's most frequent ingestion
+    veto, losing listings that are gone from the board before the payer's
+    window frees.
+
+    Asserted with the rollout flag explicitly OFF, which is the configuration
+    the unit-level classification test could not see."""
+    upserted = await _poll_with_block_reason(
+        monkeypatch, reason="over_daily_allowance", staged=False
+    )
+
+    assert [r["external_id"] for r in upserted] == ["new-0"], (
+        "a daily spend block cost us a listing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_staged_rollout_still_gates_the_older_persistent_reasons(
+    monkeypatch,
+) -> None:
+    """Control, and the reason this is an exemption rather than a redesign.
+    ``catalog_ungraded`` has a measured ~14,800-row backlog behind it, so it
+    keeps its ramped, deliberate rollout — the exemption must not quietly
+    open that."""
+    upserted = await _poll_with_block_reason(monkeypatch, reason="catalog_ungraded", staged=False)
+
+    assert upserted == [], "the staged rollout was bypassed for a backlogged reason"
+
+
+@pytest.mark.asyncio
+async def test_the_older_reasons_still_admit_once_the_rollout_is_on(monkeypatch) -> None:
+    """Control for the control: with the flag ON, the old reasons admit as
+    before, so the exemption changed nothing about their behaviour."""
+    upserted = await _poll_with_block_reason(monkeypatch, reason="catalog_ungraded", staged=True)
+
+    assert [r["external_id"] for r in upserted] == ["new-0"]
+
+
+# Global hourly intake cap: bound write pressure on EVERY admission path
+# ---------------------------------------------------------------------------
+
+
+async def _run_open_poll_with_jobs(
+    monkeypatch, *, n_jobs: int, hourly_cap: int, prior: int = 0, existing: list[dict] | None = None
+) -> tuple[dict, MagicMock]:
+    """No blocked targets, so admission takes the ORDINARY path (the one the
+    admission ramp deliberately never rate-limits) — isolating the intake cap
+    as the only thing that can bound intake here."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "intake_max_new_jobs_per_hour", hourly_cap)
+
+    supabase, _jobs, _sources = _make_poll_supabase(existing or [])
+    # Construct the budget directly rather than patching the shared
+    # ``poll_db_read`` seam, which every other read in the cycle also uses —
+    # ``new_intake_budget``'s own DB read is covered by its own tests below.
+    remaining = max(0, hourly_cap - prior) if hourly_cap > 0 else None
+    intake = poller_mod.IntakeBudget(cap=hourly_cap, remaining=remaining, prior=prior)
+
+    async def many(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id=f"new-{i}",
+                title=f"Brand New Role {i}",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-01",
+                absolute_url=f"https://example.com/j/{i}",
+            )
+            for i in range(n_jobs)
+        ]
+
+    # A target that MATCHES (so the deterministic free gates pass) with triage
+    # off — so ``_any_target_admits`` waves every survivor straight through on
+    # the ordinary path, and the intake cap is the only remaining bound.
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", False)
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", many)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+
+    summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase, intake_budget=intake)
+    return summary, _jobs
+
+
+@pytest.mark.asyncio
+async def test_intake_cap_bounds_the_ordinary_admit_path(monkeypatch) -> None:
+    """The admission ramp bounds only the persistent-block fallback; a job a
+    target triaged and called promising has never been rate-limited. This cap
+    is the one that bounds write pressure regardless of WHY a row was admitted.
+    """
+    _summary, jobs_table = await _run_open_poll_with_jobs(monkeypatch, n_jobs=5, hourly_cap=2)
+
+    upserted = [r for c in jobs_table.upsert.call_args_list for r in c.args[0]]
+    assert len(upserted) == 2, [r.get("external_id") for r in upserted]
+
+
+@pytest.mark.asyncio
+async def test_intake_cap_counts_rows_already_cataloged_this_hour(monkeypatch) -> None:
+    """The ceiling is per rolling HOUR, not per cycle: a cycle starting with
+    the hour already part-spent gets only the remainder. Sourcing that from the
+    DB (not a process counter) is what makes it survive the near-daily deploys
+    and the unlocked ``POST /poll/due`` path."""
+    _summary, jobs_table = await _run_open_poll_with_jobs(
+        monkeypatch, n_jobs=5, hourly_cap=4, prior=3
+    )
+
+    upserted = [r for c in jobs_table.upsert.call_args_list for r in c.args[0]]
+    assert len(upserted) == 1, [r.get("external_id") for r in upserted]
+
+
+@pytest.mark.asyncio
+async def test_intake_cap_never_blocks_a_known_row_refresh(monkeypatch) -> None:
+    """Known rows UPDATE an existing row — none of the insert pressure this
+    bounds — and blocking them would re-create the #514 starvation that stopped
+    JD edits, salary re-extraction and the escaped-HTML heal from ever landing.
+    Cap is fully spent, yet the refresh must still go through."""
+    existing = [{"external_id": "new-0"}]
+    _summary, jobs_table = await _run_open_poll_with_jobs(
+        monkeypatch, n_jobs=1, hourly_cap=1, prior=1, existing=existing
+    )
+
+    upserted = [r for c in jobs_table.upsert.call_args_list for r in c.args[0]]
+    assert [r["external_id"] for r in upserted] == ["new-0"], upserted
+
+
+def test_intake_budget_zero_cap_is_uncapped() -> None:
+    from app.services import poller as poller_mod
+
+    b = poller_mod.IntakeBudget(cap=0, remaining=None)
+    assert all(b.take() for _ in range(1000))
+    assert b.report() == "intake=uncapped"
+
+
+def test_intake_budget_report_shows_hour_position() -> None:
+    from app.services import poller as poller_mod
+
+    b = poller_mod.IntakeBudget(cap=10, remaining=7, prior=3)
+    assert b.take() is True
+    assert "4/10per_h" in b.report() and "+1 this cycle" in b.report()
+    b2 = poller_mod.IntakeBudget(cap=2, remaining=0, prior=2)
+    assert b2.take() is False
+    assert "HOURLY CAP REACHED" in b2.report()
+
+
+@pytest.mark.asyncio
+async def test_new_intake_budget_fails_open_on_read_error(monkeypatch) -> None:
+    """A burst ceiling that fails CLOSED would trade a hypothetical write burst
+    for a certain ingestion stall — the exact failure that cost 50 hours of
+    zero intake. One failed count query must not stop the catalog."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "intake_max_new_jobs_per_hour", 100)
+    monkeypatch.setattr(poller_mod, "poll_db_read", AsyncMock(side_effect=RuntimeError("boom")))
+
+    b = await poller_mod.new_intake_budget(MagicMock())
+    assert b.remaining is None
+    assert all(b.take() for _ in range(500))
+
+
+@pytest.mark.asyncio
+async def test_new_intake_budget_reads_the_hour_from_the_db(monkeypatch) -> None:
+    """Truth comes from ``jobs.cataloged_at``, not a process counter, so a
+    restart mid-hour cannot silently grant a fresh full allowance."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "intake_max_new_jobs_per_hour", 100)
+    captured: dict = {}
+
+    async def fake_read(_sb, builder, **kw):
+        table = MagicMock()
+
+        def _table(name):
+            captured["table"] = name
+            return table
+
+        builder(MagicMock(table=_table))
+        captured["gte"] = table.select.return_value.gte.call_args
+        captured["label"] = kw.get("label")
+        return SimpleNamespace(count=37, data=[])
+
+    monkeypatch.setattr(poller_mod, "poll_db_read", fake_read)
+    b = await poller_mod.new_intake_budget(MagicMock())
+
+    assert captured["table"] == "jobs", captured
+    assert b.prior == 37
+    assert b.remaining == 63
+
+
+@pytest.mark.asyncio
+async def test_intake_cap_also_bounds_the_target_activation_poll_path(monkeypatch) -> None:
+    """``_poll_one_source_for_target`` is a SECOND, independent insert route —
+    the activation fan-out, which polls every source at once and is therefore
+    the burstiest inserter we have. The first version of this cap threaded the
+    budget only through the scheduled cycle, leaving this route uncapped and
+    the ceiling trivially bypassable (caught in review, not by these tests)."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "intake_max_new_jobs_per_hour", 2)
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", False)
+    supabase, jobs_table, _sources = _make_poll_supabase([])
+    intake = poller_mod.IntakeBudget(cap=2, remaining=2, prior=0)
+
+    async def many(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id=f"new-{i}",
+                title=f"Brand New Role {i}",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-01",
+                absolute_url=f"https://example.com/j/{i}",
+            )
+            for i in range(5)
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", many)
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+
+    await poller_mod._poll_one_source_for_target(
+        dict(_GUARD_SOURCE), supabase, target, intake_budget=intake
+    )
+
+    upserted = [r for c in jobs_table.upsert.call_args_list for r in c.args[0]]
+    assert len(upserted) == 2, [r.get("external_id") for r in upserted]
+
+
+@pytest.mark.asyncio
+async def test_a_daily_spend_block_still_respects_the_hourly_intake_ceiling(
+    monkeypatch,
+) -> None:
+    """Cross-PR interaction (#946 x #947), which is where release bugs hide.
+
+    #947 says a daily SPEND block must never veto a listing. #946 says the
+    hourly ceiling bounds inserts regardless of why a row was admitted. Those
+    could have been read as contradicting each other; they compose in one
+    order. The spend block abstains from vetoing, and the listing then meets
+    the write-pressure ceiling like any other.
+
+    So a spend block cannot cost a listing, and it also cannot be used to
+    bypass the ceiling."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "persistent_block_admits_ingestion", False)
+    monkeypatch.setattr(live_settings, "persistent_block_admission_cap_per_cycle", 50)
+    supabase, jobs_table, _sources = _make_poll_supabase([])
+
+    async def two(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id=f"new-{i}",
+                title=f"Brand New Role {i}",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-01",
+                absolute_url=f"https://example.com/j/{i}",
+            )
+            for i in range(2)
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", two)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "triage_titles", AsyncMock())
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+
+    gate = MagicMock()
+    gate.target_blocked.return_value = True
+    gate.target_block_reason.return_value = "over_daily_allowance"
+    gate.payer_for.return_value = "u1"
+
+    # The hour has room for exactly one of the two.
+    await poller_mod._poll_one_source(
+        dict(_GUARD_SOURCE),
+        supabase,
+        budget_gate=gate,
+        admission_budget=poller_mod.new_admission_budget(),
+        intake_budget=poller_mod.IntakeBudget(cap=1, remaining=1, prior=0),
+    )
+
+    upserted = [r for c in jobs_table.upsert.call_args_list for r in c.args[0]]
+    assert len(upserted) == 1, (
+        "the spend block should abstain from vetoing, but the hourly ceiling "
+        f"still applies: {[r.get('external_id') for r in upserted]}"
+    )

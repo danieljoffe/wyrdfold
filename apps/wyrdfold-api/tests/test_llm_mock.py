@@ -931,6 +931,118 @@ async def test_qualification_non_object_payload_leaves_the_row_untagged() -> Non
     assert result is None  # nothing to bill a verdict for
 
 
+# ---- Phase-1 title triage (#930: a second consumer joined this surface) ----
+
+
+async def _triage_with(scripted: str, titles: list[str]) -> tuple[dict[int, Any], Any]:
+    """Drive the REAL ``triage_titles`` against a scripted mock response."""
+    from datetime import UTC, datetime
+
+    from app.models.targets import JobTarget, ScoringProfile
+    from app.services.relevance.title_triage import PHASE1_PURPOSE, triage_titles
+
+    target = JobTarget(
+        id="t-1",
+        label="Staff Frontend Engineer",
+        scoring_profile=ScoringProfile(categories={}),
+        search_keywords=["frontend engineer"],
+        app_active=True,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    client = MockLLMClient(scripted={PHASE1_PURPOSE: scripted})
+    return await triage_titles(client, target=target, titles=titles)
+
+
+async def test_phase1_faithful_verdicts_parse_end_to_end() -> None:
+    """The control every other variant below is measured against: if this
+    payload did not produce real verdicts, the "…was dropped" assertions
+    would be satisfied by a fixture nothing could ever parse."""
+    from app.services.llm.mock import phase1_triage_verdicts_json
+
+    titles = ["Frontend Engineer", "Account Executive"]
+    verdicts, result = await _triage_with(phase1_triage_verdicts_json(titles, "faithful"), titles)
+
+    assert result is not None
+    assert verdicts[1].promising is True
+    assert verdicts[2].promising is False
+    assert verdicts[1].confidence == 92
+
+
+async def test_phase1_omitted_ids_leave_no_verdict_to_fail_open_on() -> None:
+    """The model dropping ids is routine. Those indices must simply be
+    ABSENT — the caller's fail-open depends on ``.get(i)`` returning None,
+    which a fabricated placeholder would defeat."""
+    from app.services.llm.mock import phase1_triage_verdicts_json
+
+    titles = [f"Engineer {i}" for i in range(4)]
+    verdicts, result = await _triage_with(phase1_triage_verdicts_json(titles, "omits_ids"), titles)
+
+    assert result is not None
+    assert set(verdicts) == {1, 2}
+
+
+async def test_phase1_out_of_range_ids_are_discarded() -> None:
+    """Prod showed exactly 7 invented ids per batch across six independent
+    targets (#652). An id past the end of the batch has no title to belong
+    to and must be dropped, never wrapped around onto a real one."""
+    from app.services.llm.mock import phase1_triage_verdicts_json
+
+    titles = ["Frontend Engineer", "Account Executive"]
+    verdicts, _ = await _triage_with(
+        phase1_triage_verdicts_json(titles, "out_of_range_ids"), titles
+    )
+
+    assert set(verdicts) == {1, 2}
+
+
+async def test_phase1_transposed_prefix_is_dropped_not_misassigned() -> None:
+    """#47: ids that look valid but echo ANOTHER title's prefix. Applying
+    them would admit an off-topic role and drop a relevant one, so the
+    cross-check drops them and the caller fails open instead.
+
+    Anti-vacuous: the same batch with faithful prefixes yields two verdicts
+    (asserted above), so the empty map here is the cross-check firing."""
+    from app.services.llm.mock import phase1_triage_verdicts_json
+
+    titles = ["Frontend Engineer", "Account Executive"]
+    verdicts, result = await _triage_with(
+        phase1_triage_verdicts_json(titles, "transposed_prefix"), titles
+    )
+
+    assert result is not None  # the CALL succeeded — this is not a defer
+    assert verdicts == {}
+
+
+async def test_phase1_low_confidence_verdicts_survive_parsing_but_not_admission() -> None:
+    """The confidence gate is the CALLER's, not the parser's: a hedged
+    verdict must arrive intact so ``admitted()`` can weigh it."""
+    from app.services.llm.mock import phase1_triage_verdicts_json
+    from app.services.relevance.title_triage import admitted
+
+    titles = ["Frontend Engineer"]
+    verdicts, _ = await _triage_with(phase1_triage_verdicts_json(titles, "low_confidence"), titles)
+
+    assert verdicts[1].promising is True and verdicts[1].confidence == 25
+    assert admitted(verdicts[1], min_confidence=40) is False
+    assert admitted(verdicts[1], min_confidence=20) is True
+
+
+async def test_phase1_truncated_output_defers_the_batch() -> None:
+    """The deepseek ~8K output ceiling overflowing a full batch. Nothing in
+    the payload closes, so the prose-JSON salvage has no balanced span to
+    recover (#850's all-or-nothing rule) and the batch DEFERS — it must not
+    parse into a partial or empty admit set that fail-opens the whole batch.
+    """
+    from app.services.llm.mock import phase1_triage_verdicts_json
+
+    titles = ["Frontend Engineer", "Account Executive"]
+    verdicts, result = await _triage_with(phase1_triage_verdicts_json(titles, "truncated"), titles)
+
+    assert verdicts == {}
+    assert result is None  # None = failed call = the poller/backfill DEFERS
+
+
 # ---- cost provenance (#933) -------------------------------------------------
 
 

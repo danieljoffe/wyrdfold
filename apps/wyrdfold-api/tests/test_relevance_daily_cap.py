@@ -1,0 +1,212 @@
+"""Per-target daily COUNT cap on Phase-1 triage calls (#930).
+
+Phase 2 has had one since #6; Phase 1 had only DOLLAR rails, which bound the
+bill but not the call volume. These tests pin the two things that make the
+cap a shared rail rather than a constant: what it counts, and how each caller
+treats a count it cannot read.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from app.config import settings
+from app.services.relevance.daily_cap import (
+    phase1_backfill_allowance,
+    phase1_backfill_cap_reached,
+    phase1_calls_today,
+    phase1_cap_reached,
+)
+from app.services.relevance.title_triage import PHASE1_PURPOSE
+from tests.support.fake_backfill_db import backfill_supabase, cost_row
+
+TARGET_ID = "t-1"
+OTHER_TARGET = "t-2"
+
+
+def _sb(costs: list[dict] | None = None):  # type: ignore[no-untyped-def]
+    return backfill_supabase(jobs=[], scores=[], costs=costs)
+
+
+@pytest.fixture(autouse=True)
+def _cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "phase1_daily_cap", 10)
+    monkeypatch.setattr(settings, "phase1_backfill_cap_fraction", 0.25)
+
+
+class TestCounting:
+    @pytest.mark.asyncio
+    async def test_counts_only_this_targets_phase1_calls_today(self) -> None:
+        yesterday = (datetime.now(UTC) - timedelta(days=2)).isoformat()
+        supabase = _sb(
+            [
+                cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE),
+                cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE),
+                # Another target's Phase-1 spend — a separate ceiling.
+                cost_row(target_id=OTHER_TARGET, purpose=PHASE1_PURPOSE),
+                # This target's PHASE-2 spend — a different cap entirely.
+                cost_row(target_id=TARGET_ID, purpose="fit.job"),
+                # This target's Phase-1 spend from before today's rollover.
+                cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE, created_at=yesterday),
+            ]
+        )
+
+        assert await phase1_calls_today(supabase, TARGET_ID) == 2
+
+    @pytest.mark.asyncio
+    async def test_unreadable_count_is_none_not_zero(self) -> None:
+        supabase = _sb()
+        supabase.table.side_effect = KeyError("llm_costs not routed")
+
+        # None, not 0: collapsing the unknown here would hand every caller a
+        # fail-open posture it did not choose.
+        assert await phase1_calls_today(supabase, TARGET_ID) is None
+
+    @pytest.mark.asyncio
+    async def test_a_successful_read_that_ships_no_count_is_also_unknown(self) -> None:
+        """The sibling above covers a raised exception. This covers the quieter
+        case: the request SUCCEEDS but carries no count — PostgREST omitting
+        the Content-Range header, or a stubbed client. An earlier version
+        collapsed that to 0, which reads as "nothing spent today" and hands
+        the backfill a full allowance at exactly the moment spend is
+        invisible — the fail-open this function's docstring promises not to
+        impose. Caught in review."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        supabase = MagicMock()
+        chain = supabase.table.return_value.select.return_value
+        chain = chain.eq.return_value.eq.return_value.gte.return_value
+        chain.execute = AsyncMock(return_value=MagicMock(count=None))
+
+        assert await phase1_calls_today(supabase, TARGET_ID) is None
+
+    @pytest.mark.asyncio
+    async def test_the_unknown_reaches_the_fail_closed_caller(self) -> None:
+        """The whole point of returning None: the SPEND caller must refuse.
+        Asserted end-to-end, because the callers were already correct — the
+        bug was that None could never reach them."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        supabase = MagicMock()
+        chain = supabase.table.return_value.select.return_value
+        chain = chain.eq.return_value.eq.return_value.gte.return_value
+        chain.execute = AsyncMock(return_value=MagicMock(count=None))
+
+        assert await phase1_backfill_allowance(supabase, TARGET_ID) == 0
+        # ...while the INGESTION caller keeps its fail-open posture.
+        assert await phase1_cap_reached(supabase, TARGET_ID) is False
+
+
+class TestCapReached:
+    @pytest.mark.asyncio
+    async def test_true_once_the_cap_is_spent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "phase1_daily_cap", 2)
+        supabase = _sb([cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE)])
+
+        assert await phase1_cap_reached(supabase, TARGET_ID) is False  # precondition
+        supabase._llm_costs.rows.append(cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE))
+        assert await phase1_cap_reached(supabase, TARGET_ID) is True
+
+    @pytest.mark.asyncio
+    async def test_cap_of_zero_disables_the_rail(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "phase1_daily_cap", 0)
+        supabase = _sb([cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE) for _ in range(50)])
+
+        assert await phase1_cap_reached(supabase, TARGET_ID) is False
+        # And it never even reads the counter.
+        assert supabase._llm_costs.count_reads == 0
+
+    @pytest.mark.asyncio
+    async def test_unreadable_count_fails_open_for_ingestion(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Phase-1 stall PAUSES admission (#285/#294), so a transient
+        count-read blip must not stop new listings entering the catalog."""
+        monkeypatch.setattr(settings, "phase1_daily_cap", 1)
+        supabase = _sb([cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE) for _ in range(5)])
+        # Precondition: with a readable count this WOULD be capped.
+        assert await phase1_cap_reached(supabase, TARGET_ID) is True
+
+        supabase.table.side_effect = KeyError("llm_costs not routed")
+        assert await phase1_cap_reached(supabase, TARGET_ID) is False
+
+
+class TestBackfillAllowance:
+    @pytest.mark.asyncio
+    async def test_bounded_by_the_fraction_on_an_untouched_day(self) -> None:
+        supabase = _sb()
+        # cap 10, fraction 0.25 → 2, not 10.
+        assert await phase1_backfill_allowance(supabase, TARGET_ID) == 2
+
+    @pytest.mark.asyncio
+    async def test_bounded_by_what_the_day_has_left(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "phase1_backfill_cap_fraction", 1.0)
+        supabase = _sb([cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE) for _ in range(9)])
+
+        assert await phase1_backfill_allowance(supabase, TARGET_ID) == 1
+
+    @pytest.mark.asyncio
+    async def test_never_negative_when_the_day_is_overspent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "phase1_backfill_cap_fraction", 1.0)
+        supabase = _sb([cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE) for _ in range(25)])
+
+        assert await phase1_backfill_allowance(supabase, TARGET_ID) == 0
+
+    @pytest.mark.asyncio
+    async def test_cap_of_zero_means_unbounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(settings, "phase1_daily_cap", 0)
+        assert await phase1_backfill_allowance(_sb(), TARGET_ID) is None
+
+    @pytest.mark.asyncio
+    async def test_unreadable_count_fails_closed_for_the_backfill(self) -> None:
+        supabase = _sb()
+        assert await phase1_backfill_allowance(supabase, TARGET_ID) == 2  # precondition
+
+        supabase.table.side_effect = KeyError("llm_costs not routed")
+        # Opposite posture to ingestion, on purpose: a backfill that does not
+        # run costs a user nothing they had yesterday.
+        assert await phase1_backfill_allowance(supabase, TARGET_ID) == 0
+
+
+class TestBackfillCapPosture:
+    """The two spenders read the same counter with OPPOSITE postures, and the
+    backfill must keep its fail-CLOSED one for the WHOLE pass, not just at the
+    start. It opened with the fail-closed ``phase1_backfill_allowance`` and
+    then re-checked between batches with the fail-OPEN ``phase1_cap_reached``,
+    so a count that worked at the start and began failing mid-pass let it keep
+    spending. Caught in review."""
+
+    @staticmethod
+    def _unreadable():  # type: ignore[no-untyped-def]
+        supabase = _sb()
+        supabase.table.side_effect = KeyError("llm_costs not routed")
+        return supabase
+
+    @pytest.mark.asyncio
+    async def test_backfill_stops_when_the_count_is_unreadable(self) -> None:
+        assert await phase1_backfill_cap_reached(self._unreadable(), TARGET_ID) is True
+
+    @pytest.mark.asyncio
+    async def test_ingestion_keeps_going_when_the_count_is_unreadable(self) -> None:
+        """The contrast that makes the pair meaningful: a count blip must not
+        stall fresh ingestion, so this sibling stays fail-OPEN."""
+        assert await phase1_cap_reached(self._unreadable(), TARGET_ID) is False
+
+    @pytest.mark.asyncio
+    async def test_a_readable_count_behaves_identically_for_both(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control: the postures differ ONLY on the unknown."""
+        monkeypatch.setattr(settings, "phase1_daily_cap", 2)
+        supabase = _sb(
+            [
+                cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE),
+                cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE),
+            ]
+        )
+        assert await phase1_backfill_cap_reached(supabase, TARGET_ID) is True
+        assert await phase1_cap_reached(supabase, TARGET_ID) is True

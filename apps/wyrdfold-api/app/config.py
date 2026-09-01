@@ -309,6 +309,81 @@ class Settings(BaseSettings):
     # revert instantly by unsetting it, no deploy. Grading (Sonnet) is unaffected.
     phase1_triage_model: ModelId = "claude-haiku-4-5"
 
+    # ---- Phase-1 backfill at target activation (#930) ----------------------
+    #
+    # Phase-1 triage only ever judges listings whose ``external_id`` is NOT
+    # already in the catalog, and ``bulk_title_score_for_target`` (the
+    # activation fan-out) writes keyword-only ``stage1`` rows with no
+    # ``promising`` at all. Together: a job admitted without a Phase-1 verdict
+    # never gets one, so a freshly activated target shows an UNJUDGED list.
+    # This backfill closes that hole — newest-first, age-bounded, bounded by
+    # the daily count cap below.
+    #
+    # Ships FALSE. Turning it on is a visible STEP CHANGE, not a refinement:
+    # the pass writes real ``promising=False`` rows, which set
+    # ``excluded`` and REMOVE listings from the target's /jobs view. That is
+    # the point (judging means rejecting), but measured on prod the majority
+    # of a target's keyword-matched rows are Phase-1 negatives, so flip it
+    # per-deploy and watch — same shape as ``phase1_triage_enabled`` and
+    # ``persistent_block_admits_ingestion``.
+    phase1_backfill_enabled: bool = False
+
+    # How far back the backfill grades, in days since ``jobs.cataloged_at``.
+    # Deliberately the same clock AND the same default as
+    # ``archival_archive_after_days`` (30): archival soft-archives on
+    # ``cataloged_at``, so grading past this bound buys verdicts for listings
+    # that disappear from every view before anyone reads them. Measured on
+    # prod 2026-08-31: only ~1,540 of a target's ~8,200 ungraded score rows
+    # are inside the window — the bound removes ~81% of the candidate set for
+    # zero user-visible loss.
+    phase1_backfill_max_age_days: int = Field(default=30, ge=1, le=365)
+
+    # Phase-1 triage calls per TARGET per UTC day — the count ceiling Phase 2
+    # has had all along as ``phase2_daily_cap`` and Phase 1 never did (only
+    # the global daily budget and the payer's monthly allowance bounded it).
+    # Sourced from ``llm_costs`` exactly like the Phase-2 cap, so the
+    # activation backfill and ordinary poll-cycle ingestion draw on ONE
+    # counter.
+    #
+    # This is a RUNAWAY BACKSTOP, not a rationing device — size it above real
+    # traffic. Measured on prod: the busiest day in the last 10 was 573 calls
+    # for a single target (2026-08-24), so 1000 is ~1.7x the observed peak and
+    # inert against today's behaviour while still catching a loop. 0 disables.
+    phase1_daily_cap: int = Field(default=1000, ge=0)
+
+    # The share of ``phase1_daily_cap`` ONE activation backfill may consume.
+    # Backfill and fresh ingestion share the cap, so without this a large
+    # activation could spend the whole day's ceiling and starve the day's new
+    # intake. At 0.25 a backfill can take at most a quarter of the day's calls
+    # and three quarters are structurally reserved for fresh listings. A full
+    # age-bounded backfill measures ~8 calls per target, so this bounds a
+    # pathological case, not the ordinary one. 0 disables backfill spending
+    # entirely; the cap being 0 (disabled) leaves the backfill unbounded by
+    # count, exactly as Phase 1 is today.
+    phase1_backfill_cap_fraction: float = Field(default=0.25, ge=0.0, le=1.0)
+
+    # How often to RESUME Phase-1 backfills that stopped early. 0 disables the
+    # sweep entirely (the activation-time pass still runs).
+    #
+    # The backfill is allowed to stop early by design — its own fractional
+    # allowance, the shared daily cap, the global budget, or an unavailable
+    # provider. The rows it did not reach stay ``promising IS NULL``, and
+    # NOTHING ELSE WILL EVER JUDGE THEM: ordinary polling only triages
+    # externally-new listings, which is the entire reason this backfill exists.
+    # Before this sweep, ``_activate_pipeline`` was the only caller, so a pass
+    # cut short by a cap stayed cut short until a user happened to toggle the
+    # target off and on. Review caught it; the invariant is that an early stop
+    # must have an automatic path to eventual completion.
+    #
+    # DAILY is the right cadence, not per-cycle. Three of the four stop reasons
+    # (own allowance, shared daily cap, global daily budget) only free up at
+    # the UTC rollover, so resuming sooner cannot spend more — it would just
+    # re-page the window for nothing, and a no-work pass reads every page of
+    # the 30-day window (~3s per target). Each day grants another
+    # ``phase1_backfill_cap_fraction`` share, so even a target needing several
+    # thousand calls converges in days rather than never.
+    phase1_backfill_resume_tick_hours: int = Field(default=24, ge=0, le=720)
+
     # Recency decay (#5). When True the /jobs list sorts/paginates by
     # ``scores.recency_score`` (the fit score decayed by posting age via
     # ``app/services/recency.py``) and the poller refreshes that column
@@ -821,6 +896,39 @@ class Settings(BaseSettings):
     # In saas mode this is the fallback for users outside a managed tier;
     # managed tiers use the plan budgets below (interactive-only counting).
     user_llm_monthly_budget_usd: float = Field(default=5.0, ge=0.0)
+    # Per-PAYER daily ceiling on BACKGROUND LLM work (Phase 1 triage + Phase 2
+    # fit), rolling 24h, charged to whoever activated the target.
+    #
+    # Distinct from ``user_llm_daily_budget_usd`` above, which gates INTERACTIVE
+    # HTTP requests a user makes themselves. Background work is unattended and
+    # automatic, so it needs its own ceiling: that setting's own comment records
+    # that background spend "is charged to the target's activator and gated
+    # against their MONTHLY allowance in the poller" -- monthly and nothing else.
+    #
+    # The gap that leaves: the monthly allowance bounds the TOTAL but not the
+    # RATE, so a payer could burn a whole month in a day. Phase 1 had no
+    # per-user cap of any kind, and ``phase2_daily_cap`` is per TARGET -- a user
+    # following N targets got N x that quota while the only per-user ceiling
+    # stayed monthly.
+    #
+    # Dollars, not call counts, deliberately: a call cap cannot bound cost when
+    # model prices move, and ours did -- the fallback rate table was wrong by
+    # ~3x for one model until #934. Metering reuses the ``cost_log`` totals
+    # ``PayerBudgetGate`` already reads for the monthly window, so this is one
+    # more query per payer per cycle, not a parallel accounting path.
+    #
+    # Covers BOTH phases through one mechanism, because both consult the same
+    # gate (Phase 1 via ``target_blocked``, Phase 2 via ``user_block_reason``).
+    # It does NOT cover target-INDEPENDENT work billed to the instance key --
+    # that has no payer to charge and is bounded by
+    # ``global_llm_daily_budget_usd``. That distinction is precisely what let
+    # the qualification tagger burn on unseen by the per-payer gate.
+    #
+    # Default sizing: against a $5 monthly allowance, 0.50/day spreads a full
+    # month over at least ten days. Typical single-target usage sits far below
+    # it (``phase2_daily_cap`` alone bounds a target to a small fraction), so it
+    # binds exactly the many-targets case it exists for. 0 disables.
+    payer_daily_budget_usd: float = Field(default=0.50, ge=0.0)
     # Phase 3 tiers (saas mode only; app/services/entitlements.py resolves
     # user_profiles.plan → these). Managed-tier quotas count INTERACTIVE
     # purposes only — background (triage/fit-grading/polling) is bounded
@@ -940,6 +1048,55 @@ class Settings(BaseSettings):
     # a 30-minute tick is ~2,400/day, so the measured backlog clears in under a
     # week while steady-state intake (~100-200/day) never touches the ceiling.
     persistent_block_admission_cap_per_cycle: int = Field(default=50, ge=0)
+
+    # Ceiling on how many NEW listings AUTOMATED intake may add to the catalog
+    # per rolling hour. Automated intake means the poller: the scheduled cycle,
+    # ``POST /poll/due``, ``poll_all_sources`` and the target-activation
+    # fan-out. All four share this one budget.
+    #
+    # Distinct from ``persistent_block_admission_cap_per_cycle`` above, which
+    # throttles only the persistent-block FALLBACK: a job a target actually
+    # triaged and called promising has never been rate-limited at all, so
+    # before this setting nothing bounded ordinary intake. That was survivable
+    # only because supply happened to be low; a discovery run that adds
+    # sources, or a large board publishing a backlog, could drive an unbounded
+    # insert burst, and each new row drags score rows, embeddings and archival
+    # work behind it.
+    #
+    # USER-INITIATED materialization is deliberately NOT gated by this.
+    # ``job_ingest.materialize_and_score_job`` — behind ``POST /jobs/manual``
+    # and target-creation-from-a-JD-URL — inserts ONE row per request, is
+    # rate-limited at the endpoint, and represents explicit human intent.
+    # Refusing it to protect against a POLLER burst would invert the priority
+    # this codebase already sets elsewhere: ``grading_budget_reserve_usd``
+    # fences off budget so background work yields to live work, never the
+    # reverse. A person clicking "add this job" must not fail because the
+    # poller spent the hour.
+    #
+    # Those rows are still COUNTED: they land in ``jobs.cataloged_at`` like any
+    # other, so they shrink the allowance the next poll cycle reads. The hour
+    # can therefore be exceeded, but only by human action, and only by the
+    # trickle a rate-limited one-row-per-request path can produce. The burst
+    # vectors this exists for are all on the automated side.
+    #
+    # Placed AFTER the relevance gates, so it never changes WHICH listings are
+    # worth admitting — only how fast already-judged-worthy ones land.
+    # Deferred listings are not lost: the next poll of the same source re-sees
+    # them. Known rows are never counted or blocked either — a content refresh
+    # (JD edit, salary re-extraction, the escaped-HTML heal) updates a row that
+    # already exists and adds no insert pressure of the kind this bounds.
+    #
+    # Truth is re-read from ``jobs.cataloged_at`` at the start of each cycle
+    # rather than kept in a process counter, so it survives restarts and the
+    # overlapping-cycle case that broke the admission ramp's first draft
+    # (``POST /poll/due`` runs without the scheduler's advisory lock). Two
+    # cycles overlapping can therefore overshoot by at most one cycle's intake
+    # before the next re-read corrects it — bounded, and far below the headroom
+    # this cap leaves.
+    #
+    # 2000/hour is ~20x the observed steady-state intake, so it never binds in
+    # normal operation and exists purely as a burst ceiling. 0 disables.
+    intake_max_new_jobs_per_hour: int = Field(default=2000, ge=0)
 
     source_failure_disable_threshold: int = Field(default=10, ge=0)
     # #912: when the backoff is about to disable a source, re-detect the
