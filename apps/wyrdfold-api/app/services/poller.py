@@ -2112,6 +2112,17 @@ async def _poll_one_source(
             # listing belongs in the shared catalog if ANY target's keywords
             # want it, active or not. Phase 1 below still grades against
             # ACTIVE targets only -- corpus and spend are separate questions.
+            #
+            # ``or active_targets`` is a LAST-RESORT floor, not a policy: the
+            # active set is a strict SUBSET of all targets, so a healthy wide
+            # read can only be empty when the active one is too, and the two
+            # branches agree. It diverges in exactly one case -- every row of
+            # the wide read failing to parse, which the loader logs per row --
+            # and there the floor keeps ingestion at its pre-existing breadth
+            # instead of silently admitting nothing. If "zero admission targets
+            # means admit nothing" ever needs to be a strict invariant, this is
+            # the line to change; it is deliberate today, not truthiness by
+            # accident. (Raised in review of #952.)
             if not _title_matches_any_target(job.title, admission_targets or active_targets):
                 dropped_title_prematch += 1
                 continue
