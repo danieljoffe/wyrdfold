@@ -736,12 +736,20 @@ def _unblocked_gate(monkeypatch: pytest.MonkeyPatch, reason: str | None = None) 
     return gate
 
 
-def _unblocked_gate(monkeypatch: pytest.MonkeyPatch, reason: str | None = None) -> MagicMock:
-    """Budget-gate stub for the resume sweep. ``reason=None`` = spend allowed."""
+def _unblocked_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str | None = None,
+    payer: str | None = "u-1",
+) -> MagicMock:
+    """Budget-gate stub for the resume sweep. ``reason=None`` = spend allowed.
+
+    Stubs ``payer_for`` too, because the sweep takes the payer FROM the gate:
+    one snapshot answers both "may we spend here" and "who pays"."""
     from app.services import poller as poller_mod
 
     gate = MagicMock()
     gate.target_block_reason.return_value = reason
+    gate.payer_for.return_value = payer
     monkeypatch.setattr(poller_mod, "build_budget_gate", AsyncMock(return_value=gate))
     return gate
 
@@ -765,9 +773,6 @@ async def test_a_capped_pass_is_resumed_without_a_user_toggling_the_target(
     target = _target()
     monkeypatch.setattr(poller_mod.settings, "phase1_backfill_enabled", True)
     monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
-    monkeypatch.setattr(
-        poller_mod, "resolve_target_payers", AsyncMock(return_value={target.id: "u-1"})
-    )
     monkeypatch.setattr(poller_mod, "_resolve_payer_client", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
     _unblocked_gate(monkeypatch)
@@ -820,11 +825,6 @@ async def test_one_failing_target_does_not_stop_the_others(
     t2 = _target().model_copy(update={"id": "tgt-2"})
     monkeypatch.setattr(poller_mod.settings, "phase1_backfill_enabled", True)
     monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[t1, t2]))
-    monkeypatch.setattr(
-        poller_mod,
-        "resolve_target_payers",
-        AsyncMock(return_value={t1.id: "u-1", t2.id: "u-2"}),
-    )
     monkeypatch.setattr(poller_mod, "_resolve_payer_client", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
     _unblocked_gate(monkeypatch)
@@ -901,11 +901,8 @@ async def _run_sweep_for_unsponsored_catalog_target(
     target = _target()
     monkeypatch.setattr(poller_mod.settings, "phase1_backfill_enabled", True)
     monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
-    monkeypatch.setattr(
-        poller_mod, "resolve_target_payers", AsyncMock(return_value={target.id: None})
-    )
     monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
-    _unblocked_gate(monkeypatch, reason=block_reason)
+    _unblocked_gate(monkeypatch, reason=block_reason, payer=None)
     # An instance-key client is what a None payer actually resolves to — the
     # whole reason this can spend without a payer.
     monkeypatch.setattr(poller_mod, "_resolve_payer_client", AsyncMock(return_value=MagicMock()))
@@ -967,9 +964,6 @@ async def test_resume_skips_a_sponsored_target_whose_payer_is_blocked(
     target = _target()
     monkeypatch.setattr(poller_mod.settings, "phase1_backfill_enabled", True)
     monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
-    monkeypatch.setattr(
-        poller_mod, "resolve_target_payers", AsyncMock(return_value={target.id: "u-1"})
-    )
     monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
     monkeypatch.setattr(poller_mod, "_resolve_payer_client", AsyncMock(return_value=MagicMock()))
     _unblocked_gate(monkeypatch, reason="over_daily_allowance")
@@ -981,3 +975,54 @@ async def test_resume_skips_a_sponsored_target_whose_payer_is_blocked(
 
     backfill.assert_not_awaited()
     assert out["skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_bills_the_payer_the_gate_authorised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One snapshot must answer both "may we spend on this target" and "who
+    pays" — otherwise they can disagree.
+
+    ``build_budget_gate`` already resolves the payers it gates on, so a second
+    ``resolve_target_payers`` read is a separate look at ``user_targets``. A
+    membership deactivated between the two leaves the gate saying "sponsored,
+    unblocked" while the second read returns ``None``, and
+    ``_resolve_payer_client(None)`` then bills the INSTANCE KEY for a target
+    that is no longer sponsored — re-creating the unsponsored-catalog spend
+    through a race. Caught in review.
+
+    Asserted by making the two sources disagree on purpose: if the sweep ever
+    re-resolves ownership, it bills ``u-STALE`` instead of the gate's answer."""
+    from app.services import poller as poller_mod
+
+    target = _target()
+    monkeypatch.setattr(poller_mod.settings, "phase1_backfill_enabled", True)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+    _unblocked_gate(monkeypatch, payer="u-AUTHORISED")
+
+    # A second ownership read would return something else entirely.
+    stale = AsyncMock(return_value={target.id: "u-STALE"})
+    monkeypatch.setattr(poller_mod, "resolve_target_payers", stale, raising=False)
+
+    seen: list[str | None] = []
+
+    async def _client(_cache, _sb, payer_user_id):
+        seen.append(payer_user_id)
+        return MagicMock()
+
+    monkeypatch.setattr(poller_mod, "_resolve_payer_client", _client)
+    billed: list[str | None] = []
+
+    async def _backfill(_sb, _llm, _t, *, payer_user_id, budget_blocks=None):
+        billed.append(payer_user_id)
+        return Phase1BackfillResult(verdicts_written=1)
+
+    monkeypatch.setattr(poller_mod, "backfill_phase1_for_target", _backfill)
+
+    await poller_mod.resume_phase1_backfills(MagicMock())
+
+    assert seen == ["u-AUTHORISED"], "client resolved for a payer the gate did not authorise"
+    assert billed == ["u-AUTHORISED"], "spend attributed to a re-resolved payer"
+    stale.assert_not_awaited()

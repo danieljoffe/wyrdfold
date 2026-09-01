@@ -80,7 +80,6 @@ from app.services.targets.payers import (
     PayerBudgetGate,
     block_is_persistent,
     build_budget_gate,
-    resolve_target_payers,
 )
 from app.services.titles import clean_title_display
 from app.services.validate import liveness_verdict, validate_job_url
@@ -2815,11 +2814,21 @@ async def resume_phase1_backfills(supabase: AsyncClient) -> dict[str, int]:
     # shape as the passive burn this codebase already paid for once:
     # target-independent work bills the instance key and so is invisible to a
     # PER-PAYER gate unless something explicitly consults it.
+    # ONE snapshot decides both "may we spend on this target" and "who pays".
+    # ``build_budget_gate`` already resolves the payers it gates on, so a
+    # second ``resolve_target_payers`` here would be a separate read of
+    # ``user_targets`` that can disagree with it: a membership deactivated
+    # between the two reads leaves the gate saying "sponsored, unblocked"
+    # while the payer comes back ``None``, and ``_resolve_payer_client(None)``
+    # then bills the INSTANCE KEY for a target that is no longer sponsored —
+    # re-creating, through a race, exactly the unsponsored-catalog spend the
+    # gate check above exists to prevent. Taking the payer from the gate makes
+    # authorization and billing attribution atomic with each other, and drops
+    # a query.
     gate = await build_budget_gate(supabase, [t.id for t in targets])
-    payers = await resolve_target_payers(supabase, [t.id for t in targets])
     cache: dict[str | None, LLMClient | None] = {}
     for target in targets:
-        payer = payers.get(target.id)
+        payer = gate.payer_for(target.id)
         block = gate.target_block_reason(target.id)
         if block is not None:
             out["skipped"] += 1
