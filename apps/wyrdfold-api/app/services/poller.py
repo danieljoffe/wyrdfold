@@ -3328,6 +3328,7 @@ async def _poll_one_source_for_target(
     target: JobTarget,
     payer_user_id: str | None = None,
     payer_block_reason: BlockReason | None = None,
+    intake_budget: IntakeBudget | None = None,
 ) -> dict[str, Any]:
     """Poll a single source for a specific target. Three-stage pipeline.
 
@@ -3578,6 +3579,20 @@ async def _poll_one_source_for_target(
                 v = target_verdicts.get(gj)
                 if gj not in phase1_attempted or (v is not None and not v.promising):
                     continue
+
+            # The GLOBAL hourly intake ceiling, same rule as the main poll
+            # path. This route exists for target ACTIVATION, which fans out
+            # across every source at once — so it is the burstiest inserter we
+            # have, and leaving it uncapped would have left the ceiling
+            # trivially bypassable. Known rows stay exempt: they update a row
+            # that already exists and add none of the insert pressure bounded
+            # here.
+            if (
+                job.external_id not in known_external_ids
+                and intake_budget is not None
+                and not intake_budget.take()
+            ):
+                continue
 
             if job.detail_skipped:
                 # Held unchanged, detail deliberately not fetched — ``content``
@@ -3901,6 +3916,12 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
             errors=["Target has no search keywords"],
         )
 
+    # Share the hourly ceiling with the scheduled cycle: it is one budget over
+    # one rolling hour across the whole instance, re-read from the DB here, so
+    # an activation that runs alongside a poll tick sees what that tick has
+    # already spent instead of getting its own fresh allowance.
+    intake_budget = await new_intake_budget(supabase)
+
     sources: list[dict[str, Any]] = await _read_enabled_sources(supabase)
 
     # Optimized doc is fetched per-user inside
@@ -3983,6 +4004,7 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
                 target,
                 payer_user_id=payer,
                 payer_block_reason=block_reason,
+                intake_budget=intake_budget,
             )
 
     try:
@@ -4002,4 +4024,5 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
     if deactivated_mid_run:
         result.errors.append("activation fan-out aborted: target deactivated mid-run")
 
+    logger.info("activation poll finished for target %s: %s", target.id, intake_budget.report())
     return result

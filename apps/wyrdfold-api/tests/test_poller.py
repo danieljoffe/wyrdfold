@@ -2770,3 +2770,43 @@ async def test_new_intake_budget_reads_the_hour_from_the_db(monkeypatch) -> None
     assert captured["table"] == "jobs", captured
     assert b.prior == 37
     assert b.remaining == 63
+
+
+@pytest.mark.asyncio
+async def test_intake_cap_also_bounds_the_target_activation_poll_path(monkeypatch) -> None:
+    """``_poll_one_source_for_target`` is a SECOND, independent insert route —
+    the activation fan-out, which polls every source at once and is therefore
+    the burstiest inserter we have. The first version of this cap threaded the
+    budget only through the scheduled cycle, leaving this route uncapped and
+    the ceiling trivially bypassable (caught in review, not by these tests)."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "intake_max_new_jobs_per_hour", 2)
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", False)
+    supabase, jobs_table, _sources = _make_poll_supabase([])
+    intake = poller_mod.IntakeBudget(cap=2, remaining=2, prior=0)
+
+    async def many(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id=f"new-{i}",
+                title=f"Brand New Role {i}",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-01",
+                absolute_url=f"https://example.com/j/{i}",
+            )
+            for i in range(5)
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", many)
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+
+    await poller_mod._poll_one_source_for_target(
+        dict(_GUARD_SOURCE), supabase, target, intake_budget=intake
+    )
+
+    upserted = [r for c in jobs_table.upsert.call_args_list for r in c.args[0]]
+    assert len(upserted) == 2, [r.get("external_id") for r in upserted]
