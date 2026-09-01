@@ -75,6 +75,7 @@ def test_start_scheduler_returns_none_when_all_disabled() -> None:
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
         mock_settings.activation_sweep_enabled = False
+        mock_settings.phase1_backfill_enabled = False
         result = start_scheduler_if_enabled()
     assert result is None
 
@@ -91,6 +92,7 @@ async def test_start_scheduler_registers_only_poll_when_only_poll_enabled() -> N
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
         mock_settings.activation_sweep_enabled = False
+        mock_settings.phase1_backfill_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -114,6 +116,7 @@ async def test_start_scheduler_registers_only_url_health_when_only_url_health_en
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
         mock_settings.activation_sweep_enabled = False
+        mock_settings.phase1_backfill_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -138,6 +141,7 @@ async def test_start_scheduler_registers_both_jobs_when_both_enabled() -> None:
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
         mock_settings.activation_sweep_enabled = False
+        mock_settings.phase1_backfill_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -164,6 +168,7 @@ async def test_start_scheduler_registers_only_activation_sweep_when_only_it_enab
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
         mock_settings.activation_sweep_enabled = True
+        mock_settings.phase1_backfill_enabled = False
         mock_settings.activation_sweep_tick_hours = 6
         mock_settings.activation_stale_after_hours = 6
         scheduler = start_scheduler_if_enabled()
@@ -207,6 +212,14 @@ async def test_every_ledger_stamped_interval_job_has_a_catch_up_anchor() -> None
         mock_settings.recency_refresh_enabled = True
         mock_settings.recency_refresh_tick_hours = 24
         mock_settings.activation_sweep_enabled = True
+        # ENABLED here, unlike the registration tests above. This property is
+        # the whole reason the sweep has an anchor at all -- leaving the
+        # feature dark here would make the test blind to the very job it
+        # caught. It ticks in HOURS and stamps the ledger, so it must declare
+        # an anchor or a deploy landing inside the interval resets its
+        # countdown and it never fires.
+        mock_settings.phase1_backfill_enabled = True
+        mock_settings.phase1_backfill_resume_tick_hours = 24
         mock_settings.activation_sweep_tick_hours = 6
         mock_settings.activation_stale_after_hours = 6
         scheduler = start_scheduler_if_enabled()
@@ -222,6 +235,7 @@ async def test_every_ledger_stamped_interval_job_has_a_catch_up_anchor() -> None
         "recency_refresh": "recency_refresh_catchup",
         "discovery_run": "discovery_catchup",
         "activation_sweep": "activation_sweep_catchup",
+        "phase1_backfill_resume": "phase1_backfill_resume_catchup",
     }
 
     assert scheduler is not None
@@ -230,7 +244,7 @@ async def test_every_ledger_stamped_interval_job_has_a_catch_up_anchor() -> None
         # `poll_due_sources` ticks in MINUTES — a deploy cannot starve it.
         hourly = {i for i in ids if i != "poll_due_sources" and not i.endswith("_catchup")}
         # Sanity: if this found nothing the assertions below would pass vacuously.
-        assert len(hourly) >= 5, hourly
+        assert len(hourly) >= 6, hourly
 
         undeclared = sorted(hourly - expected_anchor.keys())
         assert not undeclared, (
@@ -256,6 +270,7 @@ async def test_start_scheduler_registers_only_retention_when_only_retention_enab
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
         mock_settings.activation_sweep_enabled = False
+        mock_settings.phase1_backfill_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -281,6 +296,7 @@ async def test_start_scheduler_registers_three_when_poll_health_retention_enable
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
         mock_settings.activation_sweep_enabled = False
+        mock_settings.phase1_backfill_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -310,6 +326,7 @@ async def test_start_scheduler_registers_only_discovery_when_only_discovery_enab
         mock_settings.discovery_tick_hours = 24
         mock_settings.recency_refresh_enabled = False
         mock_settings.activation_sweep_enabled = False
+        mock_settings.phase1_backfill_enabled = False
         scheduler = start_scheduler_if_enabled()
 
     assert scheduler is not None
@@ -336,6 +353,7 @@ async def test_discovery_scheduler_off_by_default_does_not_register() -> None:
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = False
         mock_settings.activation_sweep_enabled = False
+        mock_settings.phase1_backfill_enabled = False
         scheduler = start_scheduler_if_enabled()
     # No flags on → no scheduler at all, so no discovery_run job.
     assert scheduler is None
@@ -355,6 +373,7 @@ async def test_start_scheduler_registers_all_five_when_all_enabled() -> None:
         mock_settings.discovery_tick_hours = 24
         mock_settings.recency_refresh_enabled = True
         mock_settings.activation_sweep_enabled = False
+        mock_settings.phase1_backfill_enabled = False
         mock_settings.recency_refresh_tick_hours = 12
         scheduler = start_scheduler_if_enabled()
 
@@ -387,6 +406,7 @@ async def test_start_scheduler_registers_only_recency_when_only_recency_enabled(
         mock_settings.discovery_scheduler_enabled = False
         mock_settings.recency_refresh_enabled = True
         mock_settings.activation_sweep_enabled = False
+        mock_settings.phase1_backfill_enabled = False
         mock_settings.recency_refresh_tick_hours = 12
         scheduler = start_scheduler_if_enabled()
 

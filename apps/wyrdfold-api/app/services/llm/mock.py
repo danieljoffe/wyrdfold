@@ -547,6 +547,77 @@ def malformed_qualification_tags_json(variant: str = "field_soup") -> str:
     )
 
 
+def phase1_triage_verdicts_json(titles: list[str], variant: str = "faithful") -> str:
+    """A Phase-1 title-triage response, faithful or misbehaving (#930).
+
+    Corpus entry added when a SECOND consumer appeared for
+    ``relevance.title_triage``: until now only the poller called it, and its
+    fail-open/defer semantics were exercised through the poll cycle. The
+    activation backfill (``relevance.phase1_backfill``) calls the same
+    surface and WRITES ``promising`` / ``excluded`` straight onto existing
+    ``scores`` rows, so a mis-parsed verdict does not merely skip an
+    ingestion — it hides a listing the user already had.
+
+    ``titles`` is the batch as sent, so a variant can echo a genuine
+    ``title_prefix`` (or, for the transposition variant, a genuine one
+    belonging to the WRONG id).
+
+    Variants, each a failure this pipeline has actually seen:
+    - ``faithful`` — one high-confidence verdict per id, alternating
+      promising/unpromising, prefixes copied verbatim. The control.
+    - ``omits_ids`` — verdicts for only the first half of the batch. The
+      model dropping ids is routine; the missing ones must fail-OPEN
+      (admit), because a false negative here is lost forever.
+    - ``out_of_range_ids`` — ids past the end of the batch alongside the
+      real ones. Prod showed exactly 7 of these per batch across six
+      independent targets (#652); they must be discarded, never
+      mis-assigned to a real title.
+    - ``transposed_prefix`` — every verdict carries the NEXT title's
+      prefix. This is the shape the ``title_prefix`` cross-check exists to
+      catch (#47): the ids look valid, so without the check an off-topic
+      role is admitted and a relevant one dropped.
+    - ``low_confidence`` — every verdict promising but hedged (confidence
+      below the prompt's own "you're guessing" band). ``admitted()`` must
+      gate these out, so a guess never buys a Phase-2 grade.
+    - ``truncated`` — the JSON cut off mid-verdict, the deepseek ~8K output
+      ceiling overflowing a full batch. Must raise (the batch defers)
+      rather than parse into a partial admit set.
+    """
+    if variant == "truncated":
+        # A max_tokens stop cuts mid-token, so nothing in the payload closes:
+        # no balanced JSON span exists for the prose-JSON salvage to recover
+        # (#850's all-or-nothing rule), and the batch defers.
+        return '{"verdicts": [{"id": 1, "promising": true, "confid'
+
+    verdicts: list[dict[str, Any]] = []
+    for idx, title in enumerate(titles, start=1):
+        if variant == "omits_ids" and idx > max(1, len(titles) // 2):
+            continue
+        prefix = " ".join(title.split()[:2])
+        if variant == "transposed_prefix":
+            other = titles[idx % len(titles)]
+            prefix = " ".join(other.split()[:2])
+        verdicts.append(
+            {
+                "id": idx,
+                "promising": True if variant == "low_confidence" else idx % 2 == 1,
+                "confidence": 25 if variant == "low_confidence" else 92,
+                "title_prefix": prefix,
+            }
+        )
+    if variant == "out_of_range_ids":
+        verdicts.extend(
+            {
+                "id": len(titles) + n,
+                "promising": True,
+                "confidence": 99,
+                "title_prefix": "",
+            }
+            for n in (1, 7)
+        )
+    return json.dumps({"verdicts": verdicts})
+
+
 def prose_xml_tool_call(tool_name: str, **params: Any) -> str:
     """Script the deepseek failure from #821: the forced tool call written as
     Anthropic XML inside ``content`` instead of a structured ``tool_calls``.

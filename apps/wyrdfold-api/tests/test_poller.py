@@ -17,6 +17,7 @@ from app.services.poller import (
     _title_matches_target,
 )
 from app.services.standard_job import StandardJob
+from tests.support.fake_backfill_db import FakeLlmCostsTable, cost_row
 from tests.support.fake_phase1_store import FakePhase1RejectionsTable
 
 
@@ -467,6 +468,10 @@ def _make_poll_supabase(existing_rows: list[dict]) -> tuple[MagicMock, MagicMock
         scores_table.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
     ) = []
     phase1_rejections_table = FakePhase1RejectionsTable()
+    # #930: the per-target daily Phase-1 CALL cap counts off llm_costs, and
+    # the poller re-reads it before every triage batch. Real counting (not a
+    # stub) so a cap test asserts against rows something actually wrote.
+    llm_costs_table = FakeLlmCostsTable()
     supabase = MagicMock()
     supabase.table.side_effect = lambda name: {
         "jobs": jobs_table,
@@ -474,8 +479,10 @@ def _make_poll_supabase(existing_rows: list[dict]) -> tuple[MagicMock, MagicMock
         "user_targets": user_targets_table,
         "scores": scores_table,
         "phase1_rejections": phase1_rejections_table,
+        "llm_costs": llm_costs_table,
     }[name]
     supabase._phase1_rejections = phase1_rejections_table
+    supabase._llm_costs = llm_costs_table
 
     # #93: both the existing-rows read and the stale-archive write are
     # server-side RPCs now, so route ``supabase.rpc(name, ...)`` by name:
@@ -1040,6 +1047,7 @@ def _make_targeted_poll_supabase() -> tuple[MagicMock, MagicMock, MagicMock]:
         scores_table.select.return_value.eq.return_value.in_.return_value.execute.return_value.data
     ) = []
     phase1_rejections_table = FakePhase1RejectionsTable()
+    llm_costs_table = FakeLlmCostsTable()  # #930 daily Phase-1 call cap
     supabase = MagicMock()
     supabase.table.side_effect = lambda name: {
         "jobs": jobs_table,
@@ -1047,8 +1055,10 @@ def _make_targeted_poll_supabase() -> tuple[MagicMock, MagicMock, MagicMock]:
         "user_targets": user_targets_table,
         "scores": scores_table,
         "phase1_rejections": phase1_rejections_table,
+        "llm_costs": llm_costs_table,
     }[name]
     supabase._phase1_rejections = phase1_rejections_table
+    supabase._llm_costs = llm_costs_table
     # #93: the legacy Stage 3 score pre-fetch (``_batch_fetch_job_scores``)
     # is the ``get_job_scores_by_ids`` RPC now, not ``jobs.select().in_()``.
     # Default it to an empty score set; tests override as needed.
@@ -2088,6 +2098,69 @@ async def test_phase1_rejection_store_skips_llm_on_next_cycle(monkeypatch):
     assert second["new"] == 0  # still rejected, still not ingested
     assert second["phase1_store_hits"] == 1
     assert second["phase1_store_misses"] == 0
+
+
+@pytest.mark.asyncio
+async def test_phase1_daily_call_cap_halts_fresh_ingestion(monkeypatch):
+    """#930: Phase 1 gains the per-target daily CALL cap Phase 2 has had all
+    along. Fresh ingestion reads the same counter the activation backfill
+    writes to, so calls the backfill already made today bound the poller too.
+
+    Deferred, not admitted: the titles are never attempted, so
+    ``_any_target_admits`` withholds them and they re-triage next cycle —
+    the #285 posture, unchanged."""
+    from app.config import settings as live_settings
+    from app.services.relevance.title_triage import PHASE1_PURPOSE
+
+    monkeypatch.setattr(live_settings, "phase1_daily_cap", 2)
+    supabase, fake_triage, target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=24.0)
+
+    # PRECONDITION: with the day untouched the very same cycle DOES triage.
+    first = await run()
+    assert fake_triage.await_count == 1
+    assert first["new"] == 0  # this fixture's LLM rejects the job
+
+    # Two Phase-1 calls billed to this target today — by ordinary ingestion,
+    # by an activation backfill, it makes no difference to the counter.
+    supabase._llm_costs.rows.extend(
+        cost_row(target_id=target.id, purpose=PHASE1_PURPOSE) for _ in range(2)
+    )
+    # Clear the store so a cache hit can't be what stops the second cycle.
+    supabase._phase1_rejections.rows.clear()
+
+    second = await run()
+    assert fake_triage.await_count == 1  # capped — the LLM was not called again
+    assert second["new"] == 0  # deferred, NOT admitted blind
+
+
+@pytest.mark.asyncio
+async def test_phase1_daily_call_cap_fails_open_when_unreadable(monkeypatch):
+    """A count-read blip must not stop admission. Phase 1 stalling PAUSES
+    ingestion (#285/#294), so this rail fails OPEN — unlike the backfill's
+    view of the same counter, which fails closed."""
+    from app.config import settings as live_settings
+    from app.services.relevance.title_triage import PHASE1_PURPOSE
+
+    monkeypatch.setattr(live_settings, "phase1_daily_cap", 1)
+    supabase, fake_triage, target, run = _wire_rejection_cache_poll(monkeypatch, ttl_hours=0.0)
+    supabase._llm_costs.rows.extend(
+        cost_row(target_id=target.id, purpose=PHASE1_PURPOSE) for _ in range(5)
+    )
+
+    # PRECONDITION: readable, the cap bites.
+    assert await run() is not None
+    assert fake_triage.await_count == 0
+
+    original = supabase.table.side_effect
+
+    def _blow_up_on_costs(name):
+        if name == "llm_costs":
+            raise RuntimeError("count read failed")
+        return original(name)
+
+    supabase.table.side_effect = _blow_up_on_costs
+    await run()
+    assert fake_triage.await_count == 1  # unreadable → keep triaging
 
 
 @pytest.mark.asyncio

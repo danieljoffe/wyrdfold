@@ -78,6 +78,7 @@ from app.services.extract import (
 from app.services.llm import cost_log
 from app.services.llm.client import LLMClient
 from app.services.poller import _global_budget_exhausted, poll_sources_for_target
+from app.services.relevance.phase1_backfill import backfill_phase1_for_target
 from app.services.scoring import strip_html
 from app.services.source_discovery import (
     DiscoveryRunStats,
@@ -1097,6 +1098,36 @@ async def _activate_pipeline(
             "Activation pipeline for target %s: retro-scored %d existing jobs",
             target_id,
             retro_scored,
+        )
+
+        # Step 4 (#930): JUDGE what step 3 just surfaced. Step 3 writes
+        # keyword-only ``stage1`` rows with ``promising`` untouched, and the
+        # poller only ever triages listings whose ``external_id`` is NEW — so
+        # without this pass every pre-existing posting under a freshly
+        # activated target stays permanently unjudged. Newest-first,
+        # age-bounded, and bounded by the per-target daily Phase-1 call cap it
+        # SHARES with poll-cycle ingestion (it may take at most
+        # ``phase1_backfill_cap_fraction`` of the day's calls, so a big
+        # activation cannot starve the day's new intake).
+        #
+        # ``llm`` is the activating user's own client and ``user_id`` is the
+        # payer by construction — this user just asked for this target, so the
+        # spend is attributed to exactly the person who caused it, with no
+        # payer resolution to get wrong. The global daily-spend meter is
+        # injected for the same reason the tagger's is (the poller owns it and
+        # ``relevance`` cannot import the poller); with NO reserve, matching
+        # the poller's own triage check — Phase 1 reads the full cap.
+        backfilled = await backfill_phase1_for_target(
+            supabase,
+            llm,
+            target,
+            payer_user_id=user_id,
+            budget_blocks=lambda: _global_budget_exhausted(supabase),
+        )
+        logger.info(
+            "Activation pipeline for target %s: Phase-1 backfill %s",
+            target_id,
+            backfilled,
         )
 
         await _update_target_async(supabase, target_id, TargetUpdate(activation_status="ready"))

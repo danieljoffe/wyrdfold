@@ -37,7 +37,11 @@ from app.config import settings
 from app.models.schemas import PollResult
 from app.services.ingestion_health import _newest_discovery_at, check_ingestion_health
 from app.services.poll_lock import poll_advisory_lock
-from app.services.poller import poll_all_sources, poll_due_sources
+from app.services.poller import (
+    poll_all_sources,
+    poll_due_sources,
+    resume_phase1_backfills,
+)
 from app.services.recency import refresh_all_recency_scores
 from app.services.retention import purge_expired_records
 from app.services.source_discovery import run_discovery_all_targets_locked
@@ -256,6 +260,29 @@ async def _run_scheduled_url_health() -> None:
             job_list_cache.invalidate()
     except Exception:
         logger.exception("scheduled url_health raised")
+
+
+async def _run_phase1_backfill_resume() -> None:
+    """Tick body — resume Phase-1 backfills that stopped early.
+
+    Same defensive shape as the other sweeps: pull the singleton client, skip
+    if uninitialized, never raise (APScheduler would swallow it).
+
+    Why this tick exists: the activation backfill may stop on its own
+    allowance, the shared daily cap, the global budget or a provider outage,
+    and the rows it did not reach are judged by NOTHING else — ordinary polling
+    triages only externally-new listings. Without this, an early stop was
+    permanent until a user toggled the target off and on.
+    """
+    try:
+        client = get_async_supabase()
+        if client is None:
+            logger.warning("phase1 backfill resume skipped — async supabase client not initialized")
+            return
+        await _record_scheduler_run("phase1_backfill_resume")
+        await resume_phase1_backfills(client)
+    except Exception:
+        logger.exception("phase1 backfill resume tick failed")
 
 
 async def _run_scheduled_retention_purge() -> None:
@@ -583,6 +610,43 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         logger.info(
             "url_health scheduler registered (tick every %d h)",
             settings.url_health_tick_hours,
+        )
+
+    if settings.phase1_backfill_enabled and settings.phase1_backfill_resume_tick_hours > 0:
+        scheduler.add_job(
+            _run_phase1_backfill_resume,
+            IntervalTrigger(hours=settings.phase1_backfill_resume_tick_hours),
+            id="phase1_backfill_resume",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+            misfire_grace_time=_SWEEP_MISFIRE_GRACE_S,
+        )
+        # Catch-up anchor. MANDATORY for an hour-scale, ledger-stamped job:
+        # ``IntervalTrigger`` measures from BOOT, and this app deploys near
+        # daily, so a 24h tick would reset its countdown on every deploy and
+        # this sweep would essentially never fire — silently reinstating the
+        # permanent-partial-backfill bug it exists to fix. The suite's
+        # "every ledger-stamped interval job has a catch-up anchor" property
+        # test caught exactly that here.
+        scheduler.add_job(
+            _anchor_job_from_ledger,
+            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=3)),
+            kwargs={
+                "job_id": "phase1_backfill_resume",
+                "tick_hours": settings.phase1_backfill_resume_tick_hours,
+                "runner": _run_phase1_backfill_resume,
+            },
+            args=[scheduler],
+            id="phase1_backfill_resume_catchup",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+        logger.info(
+            "Phase-1 backfill resume sweep scheduled every %dh",
+            settings.phase1_backfill_resume_tick_hours,
         )
 
     if settings.retention_purge_enabled:

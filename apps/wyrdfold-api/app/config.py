@@ -309,6 +309,81 @@ class Settings(BaseSettings):
     # revert instantly by unsetting it, no deploy. Grading (Sonnet) is unaffected.
     phase1_triage_model: ModelId = "claude-haiku-4-5"
 
+    # ---- Phase-1 backfill at target activation (#930) ----------------------
+    #
+    # Phase-1 triage only ever judges listings whose ``external_id`` is NOT
+    # already in the catalog, and ``bulk_title_score_for_target`` (the
+    # activation fan-out) writes keyword-only ``stage1`` rows with no
+    # ``promising`` at all. Together: a job admitted without a Phase-1 verdict
+    # never gets one, so a freshly activated target shows an UNJUDGED list.
+    # This backfill closes that hole — newest-first, age-bounded, bounded by
+    # the daily count cap below.
+    #
+    # Ships FALSE. Turning it on is a visible STEP CHANGE, not a refinement:
+    # the pass writes real ``promising=False`` rows, which set
+    # ``excluded`` and REMOVE listings from the target's /jobs view. That is
+    # the point (judging means rejecting), but measured on prod the majority
+    # of a target's keyword-matched rows are Phase-1 negatives, so flip it
+    # per-deploy and watch — same shape as ``phase1_triage_enabled`` and
+    # ``persistent_block_admits_ingestion``.
+    phase1_backfill_enabled: bool = False
+
+    # How far back the backfill grades, in days since ``jobs.cataloged_at``.
+    # Deliberately the same clock AND the same default as
+    # ``archival_archive_after_days`` (30): archival soft-archives on
+    # ``cataloged_at``, so grading past this bound buys verdicts for listings
+    # that disappear from every view before anyone reads them. Measured on
+    # prod 2026-08-31: only ~1,540 of a target's ~8,200 ungraded score rows
+    # are inside the window — the bound removes ~81% of the candidate set for
+    # zero user-visible loss.
+    phase1_backfill_max_age_days: int = Field(default=30, ge=1, le=365)
+
+    # Phase-1 triage calls per TARGET per UTC day — the count ceiling Phase 2
+    # has had all along as ``phase2_daily_cap`` and Phase 1 never did (only
+    # the global daily budget and the payer's monthly allowance bounded it).
+    # Sourced from ``llm_costs`` exactly like the Phase-2 cap, so the
+    # activation backfill and ordinary poll-cycle ingestion draw on ONE
+    # counter.
+    #
+    # This is a RUNAWAY BACKSTOP, not a rationing device — size it above real
+    # traffic. Measured on prod: the busiest day in the last 10 was 573 calls
+    # for a single target (2026-08-24), so 1000 is ~1.7x the observed peak and
+    # inert against today's behaviour while still catching a loop. 0 disables.
+    phase1_daily_cap: int = Field(default=1000, ge=0)
+
+    # The share of ``phase1_daily_cap`` ONE activation backfill may consume.
+    # Backfill and fresh ingestion share the cap, so without this a large
+    # activation could spend the whole day's ceiling and starve the day's new
+    # intake. At 0.25 a backfill can take at most a quarter of the day's calls
+    # and three quarters are structurally reserved for fresh listings. A full
+    # age-bounded backfill measures ~8 calls per target, so this bounds a
+    # pathological case, not the ordinary one. 0 disables backfill spending
+    # entirely; the cap being 0 (disabled) leaves the backfill unbounded by
+    # count, exactly as Phase 1 is today.
+    phase1_backfill_cap_fraction: float = Field(default=0.25, ge=0.0, le=1.0)
+
+    # How often to RESUME Phase-1 backfills that stopped early. 0 disables the
+    # sweep entirely (the activation-time pass still runs).
+    #
+    # The backfill is allowed to stop early by design — its own fractional
+    # allowance, the shared daily cap, the global budget, or an unavailable
+    # provider. The rows it did not reach stay ``promising IS NULL``, and
+    # NOTHING ELSE WILL EVER JUDGE THEM: ordinary polling only triages
+    # externally-new listings, which is the entire reason this backfill exists.
+    # Before this sweep, ``_activate_pipeline`` was the only caller, so a pass
+    # cut short by a cap stayed cut short until a user happened to toggle the
+    # target off and on. Review caught it; the invariant is that an early stop
+    # must have an automatic path to eventual completion.
+    #
+    # DAILY is the right cadence, not per-cycle. Three of the four stop reasons
+    # (own allowance, shared daily cap, global daily budget) only free up at
+    # the UTC rollover, so resuming sooner cannot spend more — it would just
+    # re-page the window for nothing, and a no-work pass reads every page of
+    # the 30-day window (~3s per target). Each day grants another
+    # ``phase1_backfill_cap_fraction`` share, so even a target needing several
+    # thousand calls converges in days rather than never.
+    phase1_backfill_resume_tick_hours: int = Field(default=24, ge=0, le=720)
+
     # Recency decay (#5). When True the /jobs list sorts/paginates by
     # ``scores.recency_score`` (the fit score decayed by posting age via
     # ``app/services/recency.py``) and the poller refreshes that column

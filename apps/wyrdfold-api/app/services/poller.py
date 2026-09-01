@@ -49,6 +49,8 @@ from app.services.location_parse import parse_location
 from app.services.mock_board import fetch_mock_jobs
 from app.services.qualification import is_us_location, positively_us_location
 from app.services.recency import refresh_recency_scores_poll
+from app.services.relevance.daily_cap import phase1_cap_reached
+from app.services.relevance.phase1_backfill import backfill_phase1_for_target
 from app.services.relevance.rejection_store import (
     fetch_rejected_titles,
     normalize_title,
@@ -1921,6 +1923,20 @@ async def _poll_one_source(
                             active_target.id,
                         )
                         break
+                    # #930: the per-target daily COUNT cap, shared with the
+                    # activation backfill. The $-rails above bound the bill;
+                    # this bounds the call volume, which is what a runaway
+                    # looks like before it is expensive. Same break semantics
+                    # as the budget check — collected verdicts stand, the rest
+                    # defer to the next cycle.
+                    if await phase1_cap_reached(supabase, active_target.id):
+                        logger.warning(
+                            "Phase 1 triage: per-target daily call cap (%d) reached "
+                            "for target %s — deferring remaining titles",
+                            settings.phase1_daily_cap,
+                            active_target.id,
+                        )
+                        break
                     batch = titles[start : start + batch_cap]
                     verdicts, result = await triage_titles(llm, target=active_target, titles=batch)
                     if result is not None:
@@ -2989,6 +3005,104 @@ async def _global_circuit_breaker_tripped(supabase: AsyncClient) -> bool:
     return True
 
 
+async def resume_phase1_backfills(supabase: AsyncClient) -> dict[str, int]:
+    """Resume Phase-1 backfills for active targets that stopped early.
+
+    The activation pass is allowed to stop short — its own fractional
+    allowance, the shared daily cap, the global budget, a provider outage. The
+    rows it did not reach keep ``scores.promising IS NULL``, and nothing else
+    in the system will ever judge them: ordinary polling triages only
+    externally-NEW listings (#514), which is the whole reason the backfill
+    exists. So without this sweep an early stop was permanent unless a user
+    happened to toggle the target off and on. Caught in review.
+
+    Lives HERE rather than in ``relevance`` because it needs the poller's
+    active-target read, per-payer client cache and global spend meter, and
+    ``relevance`` cannot import the poller without a cycle — the same reason
+    ``backfill_phase1_for_target`` takes its budget predicate injected.
+
+    Idempotent and self-limiting: the backfill only touches ungraded in-window
+    rows and re-reads its own allowance, so a target with nothing left is a
+    cheap no-op and a target still behind picks up exactly one more day's
+    share. Per-target failures are isolated — one bad target must not stop the
+    others, exactly like the poll cycle's per-source isolation.
+    """
+    out = {"targets": 0, "resumed": 0, "written": 0, "skipped": 0, "errors": 0}
+    if not settings.phase1_backfill_enabled:
+        return out
+
+    targets = await _active_targets(supabase)
+    if not targets:
+        return out
+    out["targets"] = len(targets)
+
+    # Spend only where the poller itself would spend. The sweep is pure
+    # DISCRETIONARY catch-up, so any reason the gate gives to skip a target is
+    # a reason not to buy grades for it — there is no admission decision here
+    # for the transient/persistent split to matter to, only a spend one.
+    #
+    # Without this the sweep re-opened the exact hole this codebase was built
+    # to close. ``_active_targets`` is ``app_active OR any active membership``,
+    # so it deliberately includes APP-OWNED CATALOG targets; those resolve to
+    # ``payer=None``; and ``_resolve_payer_client(None)`` hands back the
+    # INSTANCE-KEY client rather than nothing. So a daily sweep would have
+    # bought Phase-1 grades for targets nobody is pursuing, billed to the
+    # instance, in flat contradiction of ``grade_catalog_targets=false`` — the
+    # setting whose entire purpose is refusing that spend. It is also the same
+    # shape as the passive burn this codebase already paid for once:
+    # target-independent work bills the instance key and so is invisible to a
+    # PER-PAYER gate unless something explicitly consults it.
+    # ONE snapshot decides both "may we spend on this target" and "who pays".
+    # ``build_budget_gate`` already resolves the payers it gates on, so a
+    # second ``resolve_target_payers`` here would be a separate read of
+    # ``user_targets`` that can disagree with it: a membership deactivated
+    # between the two reads leaves the gate saying "sponsored, unblocked"
+    # while the payer comes back ``None``, and ``_resolve_payer_client(None)``
+    # then bills the INSTANCE KEY for a target that is no longer sponsored —
+    # re-creating, through a race, exactly the unsponsored-catalog spend the
+    # gate check above exists to prevent. Taking the payer from the gate makes
+    # authorization and billing attribution atomic with each other, and drops
+    # a query.
+    gate = await build_budget_gate(supabase, [t.id for t in targets])
+    cache: dict[str | None, LLMClient | None] = {}
+    for target in targets:
+        payer = gate.payer_for(target.id)
+        block = gate.target_block_reason(target.id)
+        if block is not None:
+            out["skipped"] += 1
+            logger.info("phase1 backfill resume: skipping target %s (%s)", target.id, block)
+            continue
+        try:
+            llm = await _resolve_payer_client(cache, supabase, payer)
+            if llm is None:
+                # No key for this payer (BYOK-required, disabled, no client).
+                # Not an error — the next sweep retries.
+                continue
+            result = await backfill_phase1_for_target(
+                supabase,
+                llm,
+                target,
+                payer_user_id=payer,
+                budget_blocks=lambda: _global_budget_exhausted(supabase),
+            )
+            if result.verdicts_written:
+                out["resumed"] += 1
+                out["written"] += result.verdicts_written
+        except Exception:
+            out["errors"] += 1
+            logger.exception("Phase-1 backfill resume failed for target %s", target.id)
+    logger.info(
+        "phase1 backfill resume sweep: %d target(s), %d resumed, %d verdict(s), "
+        "%d skipped, %d error(s)",
+        out["targets"],
+        out["resumed"],
+        out["written"],
+        out["skipped"],
+        out["errors"],
+    )
+    return out
+
+
 async def _cycle_budget_gate(supabase: AsyncClient) -> tuple[PayerBudgetGate, bool]:
     """Build the payer/allowance snapshot once per poll cycle.
 
@@ -3639,6 +3753,16 @@ async def _poll_one_source_for_target(
                         "($%.2f) mid-cycle — deferring remaining titles for "
                         "target %s",
                         settings.global_llm_daily_budget_usd,
+                        target.id,
+                    )
+                    break
+                # #930: the per-target daily COUNT cap, shared with the
+                # activation backfill (see the scheduled path for why).
+                if await phase1_cap_reached(supabase, target.id):
+                    logger.warning(
+                        "Phase 1 triage: per-target daily call cap (%d) reached "
+                        "for target %s — deferring remaining titles",
+                        settings.phase1_daily_cap,
                         target.id,
                     )
                     break
