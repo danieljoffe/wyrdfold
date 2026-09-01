@@ -3184,7 +3184,7 @@ class TestExclusionAdmitScope:
             is False
         )
 
-    def test_an_active_targets_negatives_STILL_admit_for_audit(self) -> None:
+    def test_an_active_targets_negatives_still_admit_for_audit(self) -> None:
         """The rule is preserved where it earns its keep: someone follows this
         target, so the rejection is explainable in their UI."""
         from app.services import poller as poller_mod
