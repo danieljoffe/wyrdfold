@@ -49,6 +49,7 @@ from app.services.location_parse import parse_location
 from app.services.mock_board import fetch_mock_jobs
 from app.services.qualification import is_us_location
 from app.services.recency import refresh_recency_scores_poll
+from app.services.relevance.daily_cap import phase1_cap_reached
 from app.services.relevance.rejection_store import (
     fetch_rejected_titles,
     normalize_title,
@@ -1710,6 +1711,20 @@ async def _poll_one_source(
                             "($%.2f) mid-cycle — deferring remaining titles "
                             "for target %s",
                             settings.global_llm_daily_budget_usd,
+                            active_target.id,
+                        )
+                        break
+                    # #930: the per-target daily COUNT cap, shared with the
+                    # activation backfill. The $-rails above bound the bill;
+                    # this bounds the call volume, which is what a runaway
+                    # looks like before it is expensive. Same break semantics
+                    # as the budget check — collected verdicts stand, the rest
+                    # defer to the next cycle.
+                    if await phase1_cap_reached(supabase, active_target.id):
+                        logger.warning(
+                            "Phase 1 triage: per-target daily call cap (%d) reached "
+                            "for target %s — deferring remaining titles",
+                            settings.phase1_daily_cap,
                             active_target.id,
                         )
                         break
@@ -3399,6 +3414,16 @@ async def _poll_one_source_for_target(
                         "($%.2f) mid-cycle — deferring remaining titles for "
                         "target %s",
                         settings.global_llm_daily_budget_usd,
+                        target.id,
+                    )
+                    break
+                # #930: the per-target daily COUNT cap, shared with the
+                # activation backfill (see the scheduled path for why).
+                if await phase1_cap_reached(supabase, target.id):
+                    logger.warning(
+                        "Phase 1 triage: per-target daily call cap (%d) reached "
+                        "for target %s — deferring remaining titles",
+                        settings.phase1_daily_cap,
                         target.id,
                     )
                     break
