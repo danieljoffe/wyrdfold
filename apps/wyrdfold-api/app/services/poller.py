@@ -2790,7 +2790,7 @@ async def resume_phase1_backfills(supabase: AsyncClient) -> dict[str, int]:
     share. Per-target failures are isolated — one bad target must not stop the
     others, exactly like the poll cycle's per-source isolation.
     """
-    out = {"targets": 0, "resumed": 0, "written": 0, "errors": 0}
+    out = {"targets": 0, "resumed": 0, "written": 0, "skipped": 0, "errors": 0}
     if not settings.phase1_backfill_enabled:
         return out
 
@@ -2799,10 +2799,32 @@ async def resume_phase1_backfills(supabase: AsyncClient) -> dict[str, int]:
         return out
     out["targets"] = len(targets)
 
+    # Spend only where the poller itself would spend. The sweep is pure
+    # DISCRETIONARY catch-up, so any reason the gate gives to skip a target is
+    # a reason not to buy grades for it — there is no admission decision here
+    # for the transient/persistent split to matter to, only a spend one.
+    #
+    # Without this the sweep re-opened the exact hole this codebase was built
+    # to close. ``_active_targets`` is ``app_active OR any active membership``,
+    # so it deliberately includes APP-OWNED CATALOG targets; those resolve to
+    # ``payer=None``; and ``_resolve_payer_client(None)`` hands back the
+    # INSTANCE-KEY client rather than nothing. So a daily sweep would have
+    # bought Phase-1 grades for targets nobody is pursuing, billed to the
+    # instance, in flat contradiction of ``grade_catalog_targets=false`` — the
+    # setting whose entire purpose is refusing that spend. It is also the same
+    # shape as the passive burn this codebase already paid for once:
+    # target-independent work bills the instance key and so is invisible to a
+    # PER-PAYER gate unless something explicitly consults it.
+    gate = await build_budget_gate(supabase, [t.id for t in targets])
     payers = await resolve_target_payers(supabase, [t.id for t in targets])
     cache: dict[str | None, LLMClient | None] = {}
     for target in targets:
         payer = payers.get(target.id)
+        block = gate.target_block_reason(target.id)
+        if block is not None:
+            out["skipped"] += 1
+            logger.info("phase1 backfill resume: skipping target %s (%s)", target.id, block)
+            continue
         try:
             llm = await _resolve_payer_client(cache, supabase, payer)
             if llm is None:
@@ -2823,10 +2845,12 @@ async def resume_phase1_backfills(supabase: AsyncClient) -> dict[str, int]:
             out["errors"] += 1
             logger.exception("Phase-1 backfill resume failed for target %s", target.id)
     logger.info(
-        "phase1 backfill resume sweep: %d target(s), %d resumed, %d verdict(s), %d error(s)",
+        "phase1 backfill resume sweep: %d target(s), %d resumed, %d verdict(s), "
+        "%d skipped, %d error(s)",
         out["targets"],
         out["resumed"],
         out["written"],
+        out["skipped"],
         out["errors"],
     )
     return out

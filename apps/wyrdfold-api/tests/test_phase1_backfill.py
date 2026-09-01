@@ -726,6 +726,26 @@ async def test_activation_pipeline_judges_what_the_retro_score_surfaced(
 # ---------------------------------------------------------------------------
 
 
+def _unblocked_gate(monkeypatch: pytest.MonkeyPatch, reason: str | None = None) -> MagicMock:
+    """Budget gate stub for the resume sweep. ``reason=None`` = spend allowed."""
+    from app.services import poller as poller_mod
+
+    gate = MagicMock()
+    gate.target_block_reason.return_value = reason
+    monkeypatch.setattr(poller_mod, "build_budget_gate", AsyncMock(return_value=gate))
+    return gate
+
+
+def _unblocked_gate(monkeypatch: pytest.MonkeyPatch, reason: str | None = None) -> MagicMock:
+    """Budget-gate stub for the resume sweep. ``reason=None`` = spend allowed."""
+    from app.services import poller as poller_mod
+
+    gate = MagicMock()
+    gate.target_block_reason.return_value = reason
+    monkeypatch.setattr(poller_mod, "build_budget_gate", AsyncMock(return_value=gate))
+    return gate
+
+
 @pytest.mark.asyncio
 async def test_a_capped_pass_is_resumed_without_a_user_toggling_the_target(
     monkeypatch: pytest.MonkeyPatch,
@@ -750,6 +770,7 @@ async def test_a_capped_pass_is_resumed_without_a_user_toggling_the_target(
     )
     monkeypatch.setattr(poller_mod, "_resolve_payer_client", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+    _unblocked_gate(monkeypatch)
 
     calls: list[str] = []
 
@@ -784,7 +805,7 @@ async def test_resume_sweep_is_inert_while_the_feature_is_dark(
 
     out = await poller_mod.resume_phase1_backfills(MagicMock())
 
-    assert out == {"targets": 0, "resumed": 0, "written": 0, "errors": 0}
+    assert out == {"targets": 0, "resumed": 0, "written": 0, "skipped": 0, "errors": 0}
     active.assert_not_awaited()
 
 
@@ -806,6 +827,7 @@ async def test_one_failing_target_does_not_stop_the_others(
     )
     monkeypatch.setattr(poller_mod, "_resolve_payer_client", AsyncMock(return_value=MagicMock()))
     monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+    _unblocked_gate(monkeypatch)
 
     async def _flaky(_sb, _llm, tgt, *, payer_user_id, budget_blocks=None):
         if tgt.id == t1.id:
@@ -867,3 +889,95 @@ async def test_verdicts_written_counts_a_successful_write() -> None:
     ]
 
     assert await bf._write_verdicts(supabase, rows) == 5
+
+
+async def _run_sweep_for_unsponsored_catalog_target(
+    monkeypatch: pytest.MonkeyPatch, *, block_reason: str | None
+) -> AsyncMock:
+    """One app_active catalog target with NO active membership, so
+    ``resolve_target_payers`` yields ``None`` — the app-owned catalog case."""
+    from app.services import poller as poller_mod
+
+    target = _target()
+    monkeypatch.setattr(poller_mod.settings, "phase1_backfill_enabled", True)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(
+        poller_mod, "resolve_target_payers", AsyncMock(return_value={target.id: None})
+    )
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+    _unblocked_gate(monkeypatch, reason=block_reason)
+    # An instance-key client is what a None payer actually resolves to — the
+    # whole reason this can spend without a payer.
+    monkeypatch.setattr(poller_mod, "_resolve_payer_client", AsyncMock(return_value=MagicMock()))
+
+    backfill = AsyncMock(return_value=Phase1BackfillResult(verdicts_written=9))
+    monkeypatch.setattr(poller_mod, "backfill_phase1_for_target", backfill)
+
+    await poller_mod.resume_phase1_backfills(MagicMock())
+    return backfill
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_backfill_an_unsponsored_catalog_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The #945 re-review blocker.
+
+    ``_active_targets`` is ``app_active OR any active membership``, so it
+    deliberately includes APP-OWNED catalog targets. Those resolve to
+    ``payer=None``, and ``_resolve_payer_client(None)`` returns the
+    INSTANCE-KEY client rather than nothing — so a sweep that only checked
+    "did I get a client?" would buy Phase-1 grades for targets nobody is
+    pursuing, billed to the instance, in flat contradiction of
+    ``grade_catalog_targets=false``, the setting whose whole purpose is
+    refusing that spend.
+
+    It is also the same shape as the passive burn this codebase already paid
+    for once: target-independent work bills the instance key and is therefore
+    invisible to a PER-PAYER gate unless something explicitly consults it."""
+    backfill = await _run_sweep_for_unsponsored_catalog_target(
+        monkeypatch, block_reason="catalog_ungraded"
+    )
+
+    backfill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resume_does_backfill_a_catalog_target_when_the_operator_opts_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control. With ``grade_catalog_targets=true`` the gate returns
+    no reason for an unsponsored target, and the sweep proceeds — so the guard
+    above is respecting the policy, not just refusing everything payerless."""
+    backfill = await _run_sweep_for_unsponsored_catalog_target(monkeypatch, block_reason=None)
+
+    backfill.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resume_skips_a_sponsored_target_whose_payer_is_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sweep is discretionary catch-up spend, so ANY reason the gate gives
+    to skip a target is a reason not to buy grades for it. There is no
+    admission decision here for the transient/persistent split to matter to —
+    only a spend one."""
+    from app.services import poller as poller_mod
+
+    target = _target()
+    monkeypatch.setattr(poller_mod.settings, "phase1_backfill_enabled", True)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(
+        poller_mod, "resolve_target_payers", AsyncMock(return_value={target.id: "u-1"})
+    )
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+    monkeypatch.setattr(poller_mod, "_resolve_payer_client", AsyncMock(return_value=MagicMock()))
+    _unblocked_gate(monkeypatch, reason="over_daily_allowance")
+
+    backfill = AsyncMock(return_value=Phase1BackfillResult())
+    monkeypatch.setattr(poller_mod, "backfill_phase1_for_target", backfill)
+
+    out = await poller_mod.resume_phase1_backfills(MagicMock())
+
+    backfill.assert_not_awaited()
+    assert out["skipped"] == 1
