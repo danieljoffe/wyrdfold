@@ -941,6 +941,36 @@ class Settings(BaseSettings):
     # week while steady-state intake (~100-200/day) never touches the ceiling.
     persistent_block_admission_cap_per_cycle: int = Field(default=50, ge=0)
 
+    # GLOBAL ceiling on how many NEW listings enter the catalog per rolling
+    # hour, across EVERY admission path. Distinct from
+    # ``persistent_block_admission_cap_per_cycle`` above, which throttles only
+    # the persistent-block FALLBACK: a job a target actually triaged and called
+    # promising has never been rate-limited at all, so before this setting
+    # nothing bounded ordinary intake. That was survivable only because supply
+    # happened to be low; a discovery run that adds sources, or a large board
+    # publishing a backlog, could drive an unbounded insert burst (each new row
+    # drags score rows, embeddings and archival work behind it).
+    #
+    # This is a DATABASE-PROTECTION ceiling, not a spend or relevance control —
+    # admission decisions are made by the gates above; this only bounds the RATE
+    # at which their output lands. Known rows are never counted or blocked: a
+    # content refresh (JD edit, salary re-extraction, the escaped-HTML heal)
+    # updates a row that already exists and adds no write pressure of the kind
+    # this bounds. Deferred listings are not lost — an undersupplied cycle
+    # re-sees them on the next poll of the same source.
+    #
+    # Truth is re-read from ``jobs.cataloged_at`` at the start of each cycle
+    # rather than kept in a process counter, so it survives restarts and the
+    # overlapping-cycle case that broke the admission ramp's first draft
+    # (``POST /poll/due`` runs without the scheduler's advisory lock). Two
+    # cycles overlapping can therefore overshoot by at most one cycle's intake
+    # before the next re-read corrects it — bounded, and far below the headroom
+    # this cap leaves.
+    #
+    # 2000/hour is ~20x the observed steady-state intake, so it never binds in
+    # normal operation and exists purely as a burst ceiling. 0 disables.
+    intake_max_new_jobs_per_hour: int = Field(default=2000, ge=0)
+
     source_failure_disable_threshold: int = Field(default=10, ge=0)
     # #912: when the backoff is about to disable a source, re-detect the
     # company's ATS first. A 404 says the board TOKEN is stale, not that the

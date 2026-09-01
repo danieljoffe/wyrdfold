@@ -187,6 +187,90 @@ def new_admission_budget() -> AdmissionBudget:
     return AdmissionBudget(cap=cap, remaining=cap if cap > 0 else None)
 
 
+@dataclass
+class IntakeBudget:
+    """This cycle's slice of the GLOBAL hourly ceiling on new listings.
+
+    Bounds write pressure, not spend or relevance: ``settings.
+    intake_max_new_jobs_per_hour`` caps how many rows may be INSERTED into
+    ``jobs`` per rolling hour across every admission path, including the
+    ordinary "a target triaged it and said promising" path that
+    :class:`AdmissionBudget` deliberately never touches.
+
+    Seeded from the DATABASE, not a process counter. ``remaining`` is
+    ``cap - (rows cataloged in the last hour)``, re-read once per cycle, for the
+    same reason the admission ramp had to become cycle-local: ``POST /poll/due``
+    calls ``poll_due_sources`` without the scheduler's advisory lock, so two
+    cycles can run at once, and a module-global counter would let one cycle's
+    reset wipe the other's. Re-reading truth also survives a restart mid-hour —
+    a process counter would silently grant a fresh full allowance on every
+    deploy, and this app deploys near-daily.
+
+    Overlap is bounded, not eliminated: two concurrent cycles each read the same
+    pre-cycle count, so the pair can overshoot by at most one cycle's intake
+    before the next read corrects. At the default cap that overshoot is a
+    rounding error, and the alternative (a DB round-trip per admitted row) would
+    cost far more than the burst it prevents.
+
+    Within one cycle, concurrent source workers are safe: ``take`` has no
+    ``await``, so check-and-decrement is atomic on the event loop.
+    """
+
+    cap: int
+    remaining: int | None
+    prior: int = 0
+
+    def take(self) -> bool:
+        """Consume one slot, or report the hourly ceiling is reached."""
+        if self.remaining is None:
+            return True  # uncapped
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+    def report(self) -> str:
+        """One-line intake state for the cycle log."""
+        if self.cap <= 0 or self.remaining is None:
+            return "intake=uncapped"
+        admitted = max(0, self.cap - self.prior - self.remaining)
+        spent = " HOURLY CAP REACHED (deferred to a later poll)" if self.remaining <= 0 else ""
+        return f"intake={self.prior + admitted}/{self.cap}per_h (+{admitted} this cycle){spent}"
+
+
+async def new_intake_budget(supabase: AsyncClient) -> IntakeBudget:
+    """Read how much of this hour's intake ceiling is already spent.
+
+    Counts live+archived rows alike: ``cataloged_at`` records when we WROTE the
+    row, which is the write pressure being bounded, and a row archived minutes
+    after ingest cost exactly as much to insert as one that survived.
+
+    Fails OPEN (uncapped) on a read error. This is a burst ceiling on a path
+    that is otherwise unbounded and is nowhere near binding in normal
+    operation, so refusing all intake because one count query failed would
+    trade a hypothetical write burst for a certain ingestion stall — the
+    failure mode that cost 50 hours of zero intake once already.
+    """
+    cap = settings.intake_max_new_jobs_per_hour
+    if cap <= 0:
+        return IntakeBudget(cap=cap, remaining=None)
+    since = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    try:
+        resp = await poll_db_read(
+            supabase,
+            lambda c: (
+                c.table("jobs").select("id", count="exact", head=True).gte("cataloged_at", since)
+            ),
+            label="poll intake hourly count",
+            retry_sync=True,
+        )
+    except Exception:
+        logger.exception("Intake cap: hourly count failed — proceeding uncapped this cycle")
+        return IntakeBudget(cap=cap, remaining=None)
+    prior = int(resp.count or 0)
+    return IntakeBudget(cap=cap, remaining=max(0, cap - prior), prior=prior)
+
+
 def _validate_semaphore() -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
     sem = _validate_sems.get(loop)
@@ -1066,15 +1150,12 @@ async def _backfill_qualify_stale(supabase: AsyncClient, limit: int) -> None:
             # a timestamptz carries '+' and ':' which PostgREST would otherwise
             # read as filter syntax.
             q = q.or_(
-                f'cataloged_at.gt."{seen_at}",'
-                f'and(cataloged_at.eq."{seen_at}",id.gt."{seen_id}")'
+                f'cataloged_at.gt."{seen_at}",and(cataloged_at.eq."{seen_at}",id.gt."{seen_id}")'
             )
         return q.order("cataloged_at", desc=False).order("id", desc=False).limit(limit)
 
     try:
-        resp = await poll_db_read(
-            supabase, _select, label="poll qualify-backfill select"
-        )
+        resp = await poll_db_read(supabase, _select, label="poll qualify-backfill select")
     except Exception:
         logger.exception("Qualification backfill: select failed; skipping this cycle")
         return
@@ -1320,9 +1401,7 @@ async def _resolve_payer_client(
             # A lapsed trial stops costing money the moment it lapses: the
             # same defer path as a missing key, so background grading halts
             # without needing a separate sweep (#841).
-            logger.info(
-                "Background grading deferred for payer %s (trial expired)", payer_user_id
-            )
+            logger.info("Background grading deferred for payer %s (trial expired)", payer_user_id)
             cache[payer_user_id] = None
         except MissingUserKeyError:
             logger.info(
@@ -1363,6 +1442,7 @@ async def _poll_one_source(
     supabase: AsyncClient,
     budget_gate: PayerBudgetGate | None = None,
     admission_budget: AdmissionBudget | None = None,
+    intake_budget: IntakeBudget | None = None,
     *,
     active_targets: list[JobTarget] | None = None,
     stage3_users: tuple[dict[str, JobTarget], dict[str, OptimizedDoc]] | None = None,
@@ -1810,6 +1890,7 @@ async def _poll_one_source(
         # single `poll_funnel` log line at end of cycle so an operator
         # can grep one source's funnel without a DB pass.
         dropped_phase1 = 0
+        dropped_intake_cap = 0
         dropped_title_prematch = 0
         dropped_non_us = 0
         for idx, job in enumerate(jobs):
@@ -1835,8 +1916,23 @@ async def _poll_one_source(
             # row from the conflict-update whenever a cycle produced any
             # verdicts, starving busy boards of content refreshes entirely
             # (JD edits, the escaped-HTML heal, salary re-extraction).
-            if job.external_id not in known_external_ids and not _any_target_admits(idx + 1):
+            is_new_row = job.external_id not in known_external_ids
+            if is_new_row and not _any_target_admits(idx + 1):
                 dropped_phase1 += 1
+                continue
+
+            # The GLOBAL hourly intake ceiling, applied AFTER the relevance
+            # gates so it never changes WHICH listings are worth admitting —
+            # only how fast the ones already judged worthy may land. Applies to
+            # every admission path, including the ordinary triage-said-yes one
+            # that ``_any_target_admits`` waves straight through, because write
+            # pressure does not care why a row was admitted.
+            #
+            # Known rows are exempt: they update a row that already exists, so
+            # they add none of the insert pressure this bounds, and blocking
+            # them would re-create the #514 content-refresh starvation.
+            if is_new_row and intake_budget is not None and not intake_budget.take():
+                dropped_intake_cap += 1
                 continue
 
             if job.detail_skipped:
@@ -2279,6 +2375,7 @@ async def _poll_one_source(
         }
         logger.info(
             "poll_funnel source=%s fetched=%d dropped_phase1=%d "
+            "dropped_intake_cap=%d "
             "dropped_title_prematch=%d dropped_non_us=%d candidates=%d "
             "upserted_new=%d upserted_updated=%d archived=%d "
             "board_us_marked=%d board_us_archived=%d "
@@ -2286,6 +2383,7 @@ async def _poll_one_source(
             company_name,
             len(jobs),
             dropped_phase1,
+            dropped_intake_cap,
             dropped_title_prematch,
             dropped_non_us,
             len(rows_to_upsert),
@@ -2518,8 +2616,7 @@ async def _redetect_before_disabling(
     # strength of a heuristic probe, and every one of them should be greppable
     # in the Railway logs (and reversible by hand from this line alone).
     logger.warning(
-        "Source %s RE-POINTED after %d consecutive failures: %s/%s -> %s/%s "
-        "(%d live postings)",
+        "Source %s RE-POINTED after %d consecutive failures: %s/%s -> %s/%s (%d live postings)",
         company,
         failures,
         source.get("provider"),
@@ -2906,6 +3003,7 @@ async def _poll_one_source_budgeted(
     active_targets: list[JobTarget] | None,
     stage3_users: tuple[dict[str, JobTarget], dict[str, OptimizedDoc]] | None,
     admission_budget: AdmissionBudget | None = None,
+    intake_budget: IntakeBudget | None = None,
 ) -> dict[str, Any]:
     """``_poll_one_source`` bounded by the per-source wall-time budget.
 
@@ -2930,6 +3028,7 @@ async def _poll_one_source_budgeted(
             active_targets=active_targets,
             stage3_users=stage3_users,
             admission_budget=admission_budget,
+            intake_budget=intake_budget,
         )
     try:
         return await asyncio.wait_for(
@@ -2940,6 +3039,7 @@ async def _poll_one_source_budgeted(
                 active_targets=active_targets,
                 stage3_users=stage3_users,
                 admission_budget=admission_budget,
+                intake_budget=intake_budget,
             ),
             timeout=budget,
         )
@@ -3012,6 +3112,7 @@ async def poll_all_sources(
     return value is that same object.
     """
     admission_budget = new_admission_budget()
+    intake_budget = await new_intake_budget(supabase)
     result = (
         progress
         if progress is not None
@@ -3039,13 +3140,14 @@ async def poll_all_sources(
                 active_targets=active_targets,
                 stage3_users=stage3_users,
                 admission_budget=admission_budget,
+                intake_budget=intake_budget,
             )
         # No await between the source completing and the fold, so a
         # cancellation can never drop a finished source's counts.
         _accumulate_poll_summary(result, summary)
 
     await asyncio.gather(*(_worker(s) for s in sources))
-    logger.info("poll cycle finished: %s", admission_budget.report())
+    logger.info("poll cycle finished: %s %s", admission_budget.report(), intake_budget.report())
     return result
 
 
@@ -3126,6 +3228,7 @@ async def poll_due_sources(
     await _maybe_run_archival_sweep(_async_service_client())
 
     admission_budget = new_admission_budget()
+    intake_budget = await new_intake_budget(supabase)
     due = filter_due_sources(all_enabled)
 
     # Liveness-check a rotating slice of the untagged catalog (#285) EVERY
@@ -3197,6 +3300,7 @@ async def poll_due_sources(
                 active_targets=active_targets,
                 stage3_users=stage3_users,
                 admission_budget=admission_budget,
+                intake_budget=intake_budget,
             )
         # No await between the source completing and the fold, so a
         # cancellation can never drop a finished source's counts.
@@ -3205,7 +3309,7 @@ async def poll_due_sources(
         phase1_store_stats["misses"] += summary.get("phase1_store_misses", 0)
 
     await asyncio.gather(*(_worker(s) for s in due))
-    logger.info("poll cycle finished: %s", admission_budget.report())
+    logger.info("poll cycle finished: %s %s", admission_budget.report(), intake_budget.report())
     if phase1_store_stats["hits"] or phase1_store_stats["misses"]:
         logger.info(
             "phase1 rejection store: %d LLM verdict(s) avoided, %d sent to the model this cycle",
@@ -3819,8 +3923,7 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
     over = block_reason is not None
     if over:
         logger.info(
-            "poll_sources_for_target: Phase 1 deferred for target %s "
-            "(payer %s blocked: %s)",
+            "poll_sources_for_target: Phase 1 deferred for target %s (payer %s blocked: %s)",
             target.id,
             payer,
             block_reason,
