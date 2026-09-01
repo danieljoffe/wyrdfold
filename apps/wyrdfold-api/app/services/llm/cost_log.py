@@ -374,6 +374,39 @@ async def _total_billable_spend_python_async(
     )
 
 
+async def total_background_spend_async(
+    supabase: AsyncClient,
+    user_id: str | None,
+    since: datetime | None = None,
+) -> float:
+    """Sum of ``cost_usd`` this user incurred on BACKGROUND work in the window.
+
+    The exact complement of :func:`total_billable_spend_async`, and defined by
+    subtracting it from the unfiltered total rather than by re-listing the
+    purposes: ``entitlements.NON_BILLABLE_PURPOSES`` stays the single source of
+    truth for what "background" means, so a purpose added there is picked up
+    here for free and the two can never disagree about the same row.
+
+    Why it exists: the per-payer DAILY ceiling meters unattended grading, and
+    metering it with the unfiltered total let a user's own INTERACTIVE spend
+    (résumé tailoring, analysis) exhaust it. That spend already has its own
+    gate — ``user_llm_daily_budget_usd``, an order of magnitude larger — so the
+    two ceilings would have fought: one afternoon of tailoring would silently
+    stop that user's background grading for a day.
+
+    Costs two RPC-backed reads rather than one. Both are exact and neither is
+    subject to the PostgREST row cap a client-side sum over a purpose filter
+    would hit, which is why this is a subtraction and not a new query.
+    """
+    from app.services.entitlements import NON_BILLABLE_PURPOSES
+
+    total = await total_spend_async(supabase, user_id=user_id, since=since)
+    interactive = await total_billable_spend_async(
+        supabase, user_id, since, excluded_purposes=NON_BILLABLE_PURPOSES
+    )
+    return round(max(0.0, total - interactive), 6)
+
+
 async def total_billable_spend_async(
     supabase: AsyncClient,
     user_id: str | None,

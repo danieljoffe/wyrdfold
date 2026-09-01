@@ -821,6 +821,39 @@ class Settings(BaseSettings):
     # In saas mode this is the fallback for users outside a managed tier;
     # managed tiers use the plan budgets below (interactive-only counting).
     user_llm_monthly_budget_usd: float = Field(default=5.0, ge=0.0)
+    # Per-PAYER daily ceiling on BACKGROUND LLM work (Phase 1 triage + Phase 2
+    # fit), rolling 24h, charged to whoever activated the target.
+    #
+    # Distinct from ``user_llm_daily_budget_usd`` above, which gates INTERACTIVE
+    # HTTP requests a user makes themselves. Background work is unattended and
+    # automatic, so it needs its own ceiling: that setting's own comment records
+    # that background spend "is charged to the target's activator and gated
+    # against their MONTHLY allowance in the poller" -- monthly and nothing else.
+    #
+    # The gap that leaves: the monthly allowance bounds the TOTAL but not the
+    # RATE, so a payer could burn a whole month in a day. Phase 1 had no
+    # per-user cap of any kind, and ``phase2_daily_cap`` is per TARGET -- a user
+    # following N targets got N x that quota while the only per-user ceiling
+    # stayed monthly.
+    #
+    # Dollars, not call counts, deliberately: a call cap cannot bound cost when
+    # model prices move, and ours did -- the fallback rate table was wrong by
+    # ~3x for one model until #934. Metering reuses the ``cost_log`` totals
+    # ``PayerBudgetGate`` already reads for the monthly window, so this is one
+    # more query per payer per cycle, not a parallel accounting path.
+    #
+    # Covers BOTH phases through one mechanism, because both consult the same
+    # gate (Phase 1 via ``target_blocked``, Phase 2 via ``user_block_reason``).
+    # It does NOT cover target-INDEPENDENT work billed to the instance key --
+    # that has no payer to charge and is bounded by
+    # ``global_llm_daily_budget_usd``. That distinction is precisely what let
+    # the qualification tagger burn on unseen by the per-payer gate.
+    #
+    # Default sizing: against a $5 monthly allowance, 0.50/day spreads a full
+    # month over at least ten days. Typical single-target usage sits far below
+    # it (``phase2_daily_cap`` alone bounds a target to a small fraction), so it
+    # binds exactly the many-targets case it exists for. 0 disables.
+    payer_daily_budget_usd: float = Field(default=0.50, ge=0.0)
     # Phase 3 tiers (saas mode only; app/services/entitlements.py resolves
     # user_profiles.plan → these). Managed-tier quotas count INTERACTIVE
     # purposes only — background (triage/fit-grading/polling) is bounded
@@ -940,6 +973,55 @@ class Settings(BaseSettings):
     # a 30-minute tick is ~2,400/day, so the measured backlog clears in under a
     # week while steady-state intake (~100-200/day) never touches the ceiling.
     persistent_block_admission_cap_per_cycle: int = Field(default=50, ge=0)
+
+    # Ceiling on how many NEW listings AUTOMATED intake may add to the catalog
+    # per rolling hour. Automated intake means the poller: the scheduled cycle,
+    # ``POST /poll/due``, ``poll_all_sources`` and the target-activation
+    # fan-out. All four share this one budget.
+    #
+    # Distinct from ``persistent_block_admission_cap_per_cycle`` above, which
+    # throttles only the persistent-block FALLBACK: a job a target actually
+    # triaged and called promising has never been rate-limited at all, so
+    # before this setting nothing bounded ordinary intake. That was survivable
+    # only because supply happened to be low; a discovery run that adds
+    # sources, or a large board publishing a backlog, could drive an unbounded
+    # insert burst, and each new row drags score rows, embeddings and archival
+    # work behind it.
+    #
+    # USER-INITIATED materialization is deliberately NOT gated by this.
+    # ``job_ingest.materialize_and_score_job`` — behind ``POST /jobs/manual``
+    # and target-creation-from-a-JD-URL — inserts ONE row per request, is
+    # rate-limited at the endpoint, and represents explicit human intent.
+    # Refusing it to protect against a POLLER burst would invert the priority
+    # this codebase already sets elsewhere: ``grading_budget_reserve_usd``
+    # fences off budget so background work yields to live work, never the
+    # reverse. A person clicking "add this job" must not fail because the
+    # poller spent the hour.
+    #
+    # Those rows are still COUNTED: they land in ``jobs.cataloged_at`` like any
+    # other, so they shrink the allowance the next poll cycle reads. The hour
+    # can therefore be exceeded, but only by human action, and only by the
+    # trickle a rate-limited one-row-per-request path can produce. The burst
+    # vectors this exists for are all on the automated side.
+    #
+    # Placed AFTER the relevance gates, so it never changes WHICH listings are
+    # worth admitting — only how fast already-judged-worthy ones land.
+    # Deferred listings are not lost: the next poll of the same source re-sees
+    # them. Known rows are never counted or blocked either — a content refresh
+    # (JD edit, salary re-extraction, the escaped-HTML heal) updates a row that
+    # already exists and adds no insert pressure of the kind this bounds.
+    #
+    # Truth is re-read from ``jobs.cataloged_at`` at the start of each cycle
+    # rather than kept in a process counter, so it survives restarts and the
+    # overlapping-cycle case that broke the admission ramp's first draft
+    # (``POST /poll/due`` runs without the scheduler's advisory lock). Two
+    # cycles overlapping can therefore overshoot by at most one cycle's intake
+    # before the next re-read corrects it — bounded, and far below the headroom
+    # this cap leaves.
+    #
+    # 2000/hour is ~20x the observed steady-state intake, so it never binds in
+    # normal operation and exists purely as a burst ceiling. 0 disables.
+    intake_max_new_jobs_per_hour: int = Field(default=2000, ge=0)
 
     source_failure_disable_threshold: int = Field(default=10, ge=0)
     # #912: when the backoff is about to disable a source, re-detect the
