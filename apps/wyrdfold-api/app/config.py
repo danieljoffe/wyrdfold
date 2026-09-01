@@ -1098,6 +1098,35 @@ class Settings(BaseSettings):
     # normal operation and exists purely as a burst ceiling. 0 disables.
     intake_max_new_jobs_per_hour: int = Field(default=2000, ge=0)
 
+    # Whether a listing may enter the catalog on ANY target's keywords, or only
+    # on an ACTIVE target's.
+    #
+    # These are two different questions that the poller answered with one set
+    # for a long time. "Which listings belong in the shared catalog that public
+    # /search reads?" is a CORPUS question. "Which targets do we spend LLM money
+    # grading against?" is a SPEND question. Tying the first to the second means
+    # the public corpus silently shrinks to whatever a handful of targets happen
+    # to be activated for — and grows or shrinks as people activate and
+    # deactivate, which is not a property anyone asked for.
+    #
+    # Concretely, and the reason this exists: the catalog held four INACTIVE
+    # frontend targets while the five active ones covered backend, full-stack,
+    # PM, design, data and devops. So "Frontend Engineer" matched nothing at the
+    # door and /search could never return a recent frontend role, no matter how
+    # long it ran. The keywords existed; nothing consulted them.
+    #
+    # Admission stays keyword-bounded either way -- this widens the keyword set,
+    # it does not open the door. Measured on 22,730 real listings from 12 live
+    # boards: 20.0% pass on active targets alone, 39.9% on all targets, so the
+    # catalog roughly DOUBLES rather than exploding toward the ~211,000 the
+    # boards collectively list.
+    #
+    # SPEND IS UNAFFECTED. Phase 1 and Phase 2 keep grading against ACTIVE
+    # targets only; this flag governs the free deterministic gate and nothing
+    # else. A row admitted for an inactive target simply sits in the catalog
+    # ungraded, which is exactly what /search reads (it skips ``scores``).
+    admit_on_any_target: bool = True
+
     source_failure_disable_threshold: int = Field(default=10, ge=0)
     # #912: when the backoff is about to disable a source, re-detect the
     # company's ATS first. A 404 says the board TOKEN is stale, not that the
