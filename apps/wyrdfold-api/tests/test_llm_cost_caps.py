@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from app.services.llm import budget
 from app.services.targets.payers import (
     PayerBudgetGate,
+    block_is_persistent,
     build_budget_gate,
     resolve_target_payers,
 )
@@ -355,6 +356,9 @@ async def test_build_gate_classifies_over_budget_payer(monkeypatch):
         return_value=MagicMock(data=[])
     )
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
+    # Isolate the MONTHLY dimension: the daily ceiling is orthogonal and has
+    # its own tests below. Without this the mocked spend trips both.
+    monkeypatch.setattr(payers_mod.settings, "payer_daily_budget_usd", 0.0)
     monkeypatch.setattr(
         payers_mod.cost_log,
         "total_spend_async",
@@ -375,6 +379,9 @@ async def test_build_gate_zero_cap_disables_gating(monkeypatch):
         return_value=MagicMock(data=[])
     )
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 0.0)
+    # Isolate the MONTHLY dimension: the daily ceiling is orthogonal and has
+    # its own tests below. Without this the mocked spend trips both.
+    monkeypatch.setattr(payers_mod.settings, "payer_daily_budget_usd", 0.0)
     spend_called = False
 
     async def _spend(*a, **kw):
@@ -409,6 +416,9 @@ async def test_build_gate_blocks_operator_disabled_user(monkeypatch):
         )
     )
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
+    # Isolate the MONTHLY dimension: the daily ceiling is orthogonal and has
+    # its own tests below. Without this the mocked spend trips both.
+    monkeypatch.setattr(payers_mod.settings, "payer_daily_budget_usd", 0.0)
     monkeypatch.setattr(payers_mod.settings, "idle_defer_days", 0)
     spend_calls: list[str] = []
 
@@ -437,6 +447,9 @@ async def test_build_gate_override_raises_cap(monkeypatch):
         return_value=MagicMock(data=[{"user_id": "u-vip", "llm_monthly_budget_usd": 50}])
     )
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
+    # Isolate the MONTHLY dimension: the daily ceiling is orthogonal and has
+    # its own tests below. Without this the mocked spend trips both.
+    monkeypatch.setattr(payers_mod.settings, "payer_daily_budget_usd", 0.0)
     monkeypatch.setattr(payers_mod.cost_log, "total_spend_async", AsyncMock(return_value=20.0))
 
     gate = await build_budget_gate(sb, ["t-1"])
@@ -568,3 +581,100 @@ def test_approaching_cap_silent_when_already_over(monkeypatch):
     # approaching path.
     assert len(captured) == 1
     assert "exceeded" in captured[0][0].lower()
+
+
+# ---- Per-payer DAILY ceiling on background work ----------------------------
+
+
+def _gate_sb(profile_rows: list[dict] | None = None) -> MagicMock:
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.in_.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=profile_rows or [])
+    )
+    return sb
+
+
+async def _daily_gate(monkeypatch, *, spend: float, monthly: float, daily: float):
+    import app.services.targets.payers as payers_mod
+
+    monkeypatch.setattr(payers_mod, "resolve_target_payers", AsyncMock(return_value={"t-1": "u-1"}))
+    monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", monthly)
+    monkeypatch.setattr(payers_mod.settings, "payer_daily_budget_usd", daily)
+    monkeypatch.setattr(payers_mod.settings, "idle_defer_days", 0)
+    calls: list = []
+
+    async def _spend(sb, user_id, since):
+        calls.append(since)
+        return spend
+
+    monkeypatch.setattr(payers_mod.cost_log, "total_spend_async", _spend)
+    gate = await build_budget_gate(_gate_sb(), ["t-1"])
+    return gate, calls
+
+
+async def test_daily_ceiling_blocks_a_payer_under_their_monthly_allowance(monkeypatch):
+    """The monthly allowance bounds the TOTAL but not the RATE. A payer well
+    inside their month can still burn it in a day; that is what this stops."""
+    gate, _ = await _daily_gate(monkeypatch, spend=1.0, monthly=5.0, daily=0.5)
+
+    assert gate.user_block_reason("u-1") == "over_daily_allowance"
+    assert gate.target_blocked("t-1") is True
+
+
+async def test_a_disabled_monthly_window_does_not_disable_daily_gating(monkeypatch):
+    """``user_llm_monthly_budget_usd=0`` disables the MONTHLY window only. The
+    two ceilings are orthogonal, and zeroing one must not silently open the
+    other -- otherwise the documented way to widen a payer's month also removes
+    every rate bound on them."""
+    gate, _ = await _daily_gate(monkeypatch, spend=99.0, monthly=0.0, daily=0.5)
+
+    assert gate.user_block_reason("u-1") == "over_daily_allowance"
+
+
+async def test_zero_daily_cap_disables_daily_gating(monkeypatch):
+    gate, _ = await _daily_gate(monkeypatch, spend=99.0, monthly=0.0, daily=0.0)
+
+    assert gate.user_block_reason("u-1") is None
+    assert gate.target_blocked("t-1") is False
+
+
+async def test_monthly_block_skips_the_daily_query(monkeypatch):
+    """Precedence is not cosmetic: it is the invariant that at most one set
+    holds a given user, which ``user_block_reason``'s documented ordering
+    depends on. It also saves a spend RPC per already-blocked payer."""
+    gate, calls = await _daily_gate(monkeypatch, spend=6.0, monthly=5.0, daily=0.5)
+
+    assert gate.user_block_reason("u-1") == "over_allowance"  # monthly, not daily
+    assert len(calls) == 1, "daily query should be skipped once monthly blocks"
+
+
+async def test_unblocked_payer_pays_for_exactly_two_spend_reads(monkeypatch):
+    """Cost of the feature, pinned: one monthly + one daily read per payer per
+    cycle, and only when neither disabled/idle short-circuited first."""
+    gate, calls = await _daily_gate(monkeypatch, spend=0.01, monthly=5.0, daily=0.5)
+
+    assert gate.user_block_reason("u-1") is None
+    assert len(calls) == 2
+    monthly_since, daily_since = calls
+    assert daily_since > monthly_since, "daily window must be the tighter one"
+
+
+def test_over_daily_allowance_is_persistent_so_ingestion_keeps_admitting():
+    """The load-bearing classification. A transient block VETOES admission, and
+    a vetoed listing is gone from the board by the time the payer unblocks --
+    while a wrongly-admitted one costs a single insert now bounded by
+    ``intake_max_new_jobs_per_hour``. Those costs are not symmetric, so a daily
+    ceiling -- which by design binds far more often than the monthly one --
+    must not be able to stall the catalog."""
+    assert block_is_persistent("over_daily_allowance") is True
+
+
+def test_daily_reason_reaches_both_phase_gates():
+    """Phase 1 reads ``target_block_reason``; Phase 2 reads
+    ``user_block_reason``. One ceiling has to surface through both or it only
+    caps half the pipeline."""
+    gate = PayerBudgetGate(payer_by_target={"t-1": "u-1"}, over_daily_users=frozenset({"u-1"}))
+
+    assert gate.user_block_reason("u-1") == "over_daily_allowance"  # Phase 2
+    assert gate.target_block_reason("t-1") == "over_daily_allowance"  # Phase 1
+    assert gate.target_blocked("t-1") is True

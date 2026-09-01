@@ -821,6 +821,39 @@ class Settings(BaseSettings):
     # In saas mode this is the fallback for users outside a managed tier;
     # managed tiers use the plan budgets below (interactive-only counting).
     user_llm_monthly_budget_usd: float = Field(default=5.0, ge=0.0)
+    # Per-PAYER daily ceiling on BACKGROUND LLM work (Phase 1 triage + Phase 2
+    # fit), rolling 24h, charged to whoever activated the target.
+    #
+    # Distinct from ``user_llm_daily_budget_usd`` above, which gates INTERACTIVE
+    # HTTP requests a user makes themselves. Background work is unattended and
+    # automatic, so it needs its own ceiling: that setting's own comment records
+    # that background spend "is charged to the target's activator and gated
+    # against their MONTHLY allowance in the poller" -- monthly and nothing else.
+    #
+    # The gap that leaves: the monthly allowance bounds the TOTAL but not the
+    # RATE, so a payer could burn a whole month in a day. Phase 1 had no
+    # per-user cap of any kind, and ``phase2_daily_cap`` is per TARGET -- a user
+    # following N targets got N x that quota while the only per-user ceiling
+    # stayed monthly.
+    #
+    # Dollars, not call counts, deliberately: a call cap cannot bound cost when
+    # model prices move, and ours did -- the fallback rate table was wrong by
+    # ~3x for one model until #934. Metering reuses the ``cost_log`` totals
+    # ``PayerBudgetGate`` already reads for the monthly window, so this is one
+    # more query per payer per cycle, not a parallel accounting path.
+    #
+    # Covers BOTH phases through one mechanism, because both consult the same
+    # gate (Phase 1 via ``target_blocked``, Phase 2 via ``user_block_reason``).
+    # It does NOT cover target-INDEPENDENT work billed to the instance key --
+    # that has no payer to charge and is bounded by
+    # ``global_llm_daily_budget_usd``. That distinction is precisely what let
+    # the qualification tagger burn on unseen by the per-payer gate.
+    #
+    # Default sizing: against a $5 monthly allowance, 0.50/day spreads a full
+    # month over at least ten days. Typical single-target usage sits far below
+    # it (``phase2_daily_cap`` alone bounds a target to a small fraction), so it
+    # binds exactly the many-targets case it exists for. 0 disables.
+    payer_daily_budget_usd: float = Field(default=0.50, ge=0.0)
     # Phase 3 tiers (saas mode only; app/services/entitlements.py resolves
     # user_profiles.plan → these). Managed-tier quotas count INTERACTIVE
     # purposes only — background (triage/fit-grading/polling) is bounded

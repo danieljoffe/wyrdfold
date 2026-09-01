@@ -39,6 +39,7 @@ BlockReason = Literal[
     "llm_disabled",  # operator kill-switch on the profile
     "idle",  # unseen past settings.idle_defer_days
     "over_allowance",  # spend in the rolling window reached the cap
+    "over_daily_allowance",  # spend in the rolling 24h reached the daily cap
     "catalog_ungraded",  # no payer + grade_catalog_targets off
     "no_budget_snapshot",  # empty gate: breaker / build failure, fail-closed
 ]
@@ -64,11 +65,33 @@ BlockReason = Literal[
 # flips ``grade_catalog_targets``; a disabled account stays disabled. "Retry
 # next cycle" is not a plan here, it is an infinite loop — and a step that drops
 # work while waiting drops it forever (prod: 50h of zero ingestion).
-TRANSIENT_BLOCK_REASONS: frozenset[str] = frozenset(
-    {"over_allowance", "no_budget_snapshot"}
-)
+#
+# ``over_daily_allowance`` sits here even though it is a ROLLING window like
+# ``over_allowance``, which sits above. That asymmetry is deliberate, and it is
+# about ADMISSION, not about how fast the window frees:
+#
+#   * A wrongly-ADMITTED row costs one cheap insert, now itself bounded by
+#     ``intake_max_new_jobs_per_hour``.
+#   * A wrongly-VETOED row is a permanent invisible loss — the listing is gone
+#     from the board by the time the payer unblocks — and on a small instance
+#     where one payer covers every target, it stalls the whole catalog.
+#
+# The costs are not symmetric, so the tie does not get broken by which label is
+# more literally accurate. It is the same inversion that retired the embedding
+# admission gate: tuned as a SPEND gate the threshold looked right, but as an
+# ADMISSION gate a false negative is unrecoverable while a false positive is a
+# rounding error. A daily ceiling is also far likelier to bind than the monthly
+# one — that is the entire point of adding it — so it would be the more
+# frequent vetoer of the two if classified transient.
+#
+# NB this leaves the two spend reasons classified differently. Left that way
+# ON PURPOSE: re-classifying ``over_allowance`` would be a silent behaviour
+# change to a path that is not what this setting is about, and the argument for
+# doing so (spend blocks should never veto ingestion at all) deserves its own
+# change with its own validation rather than riding along here.
+TRANSIENT_BLOCK_REASONS: frozenset[str] = frozenset({"over_allowance", "no_budget_snapshot"})
 PERSISTENT_BLOCK_REASONS: frozenset[str] = frozenset(
-    {"idle", "llm_disabled", "catalog_ungraded"}
+    {"idle", "llm_disabled", "catalog_ungraded", "over_daily_allowance"}
 )
 
 
@@ -107,12 +130,14 @@ async def resolve_target_payers(
 @dataclass(frozen=True)
 class PayerBudgetGate:
     """Per-cycle snapshot of who pays for each target and which payers
-    are blocked — over their monthly allowance OR idle past the defer
-    threshold. Snapshot semantics: at most one cycle of drift if a
-    payer's spend, links, or activity change mid-cycle — acceptable."""
+    are blocked — over their monthly allowance, over their DAILY allowance,
+    idle past the defer threshold, or operator-disabled. Snapshot semantics:
+    at most one cycle of drift if a payer's spend, links, or activity change
+    mid-cycle — acceptable."""
 
     payer_by_target: dict[str, str | None] = field(default_factory=dict)
     over_budget_users: frozenset[str] = frozenset()
+    over_daily_users: frozenset[str] = frozenset()
     idle_users: frozenset[str] = frozenset()
     disabled_users: frozenset[str] = frozenset()
 
@@ -177,10 +202,15 @@ class PayerBudgetGate:
         ``idle_defer_days``, logged as over allowance.)
 
         Precedence mirrors ``build_budget_gate``'s own short-circuits exactly:
-        disabled wins over idle, idle wins over spend — the builder skips the
-        idle check for a disabled payer and skips the spend query for an idle
-        one, so at most one set can hold a given user. Stated explicitly here
-        so the two can't drift apart if that ever changes.
+        disabled wins over idle, idle wins over spend, and MONTHLY spend wins
+        over DAILY — the builder skips the idle check for a disabled payer,
+        skips both spend queries for an idle one, and skips the daily query for
+        a payer already over monthly. So at most one set can hold a given user.
+        Monthly outranks daily because it is the more severe answer to "when
+        does this clear": a daily ceiling frees within 24h, a monthly one may
+        not free for weeks, and reporting the shallower block would send an
+        operator looking for the wrong fix. Stated explicitly here so the two
+        can't drift apart if that ever changes.
         """
         if user_id in self.disabled_users:
             return "llm_disabled"
@@ -188,6 +218,8 @@ class PayerBudgetGate:
             return "idle"
         if user_id in self.over_budget_users:
             return "over_allowance"
+        if user_id in self.over_daily_users:
+            return "over_daily_allowance"
         return None
 
     def target_block_reason(self, target_id: str) -> BlockReason | None:
@@ -212,10 +244,11 @@ class PayerBudgetGate:
 async def build_budget_gate(supabase: AsyncClient, target_ids: list[str]) -> PayerBudgetGate:
     """Build the cycle snapshot: payers, overrides + activity, spends.
 
-    Three queries total (payers IN, profiles IN, one spend RPC per
-    distinct payer) — computed once per poll cycle, not per source/job.
-    A monthly limit of 0 (global or override) disables budget gating;
-    ``idle_defer_days=0`` disables idle gating. A NULL ``last_seen_at``
+    Two IN reads (payers, profiles) plus up to two spend RPCs per distinct
+    payer (monthly, then daily only if monthly did not already block) —
+    computed once per poll cycle, not per source/job. A monthly limit of 0
+    (global or override) disables monthly gating; ``payer_daily_budget_usd=0``
+    disables daily gating; ``idle_defer_days=0`` disables idle gating. A NULL ``last_seen_at``
     (profile predating the column backfill, or no profile row) is
     treated as active — never punish missing data.
 
@@ -247,7 +280,12 @@ async def build_budget_gate(supabase: AsyncClient, target_ids: list[str]) -> Pay
     now = datetime.now(UTC)
     since = now - timedelta(days=MONTHLY_WINDOW_DAYS)
     over: set[str] = set()
+    over_daily: set[str] = set()
     idle: set[str] = set()
+    # Rolling 24h, matching the interactive daily gate's window semantics
+    # (``budget.check_user_budget`` uses ``now - 24h``, not a UTC-day cliff).
+    day_since = now - timedelta(hours=24)
+    daily_cap = settings.payer_daily_budget_usd
 
     idle_cutoff = (
         now - timedelta(days=settings.idle_defer_days) if settings.idle_defer_days > 0 else None
@@ -267,15 +305,28 @@ async def build_budget_gate(supabase: AsyncClient, target_ids: list[str]) -> Pay
 
         raw = overrides.get(uid)
         cap = float(raw) if raw is not None else settings.user_llm_monthly_budget_usd
-        if cap <= 0:
-            continue
-        spent = await cost_log.total_spend_async(supabase, user_id=uid, since=since)
-        if spent >= cap:
-            over.add(uid)
+        if cap > 0:
+            spent = await cost_log.total_spend_async(supabase, user_id=uid, since=since)
+            if spent >= cap:
+                over.add(uid)
+                # Monthly already blocks — skip the daily query. Mirrors the
+                # disabled/idle short-circuits above so at most one set holds a
+                # given user, which is the invariant ``user_block_reason``'s
+                # documented precedence depends on.
+                continue
+
+        # Daily ceiling on BACKGROUND work. The monthly allowance bounds the
+        # total but not the RATE; without this a payer can burn a month in a
+        # day, and Phase 1 has no other per-user bound at all.
+        if daily_cap > 0:
+            spent_day = await cost_log.total_spend_async(supabase, user_id=uid, since=day_since)
+            if spent_day >= daily_cap:
+                over_daily.add(uid)
 
     return PayerBudgetGate(
         payer_by_target=payers,
         over_budget_users=frozenset(over),
+        over_daily_users=frozenset(over_daily),
         idle_users=frozenset(idle),
         disabled_users=frozenset(disabled),
     )
