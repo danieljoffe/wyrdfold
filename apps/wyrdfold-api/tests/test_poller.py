@@ -3034,3 +3034,109 @@ async def test_a_daily_spend_block_still_respects_the_hourly_intake_ceiling(
         "the spend block should abstain from vetoing, but the hourly ceiling "
         f"still applies: {[r.get('external_id') for r in upserted]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Admission is bounded by ANY target's keywords, not just the ACTIVE ones
+# ---------------------------------------------------------------------------
+
+
+async def _poll_with_target_sets(monkeypatch, *, active, admission, title):
+    """One listing, an ACTIVE set and a wider ADMISSION set given explicitly."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", False)
+    supabase, jobs_table, _sources = _make_poll_supabase([])
+
+    async def one(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id="new-0",
+                title=title,
+                location_name="Remote - US",
+                content="",
+                posted_at="2026-01-01",
+                absolute_url="https://example.com/j/0",
+            )
+        ]
+
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one)
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+    await poller_mod._poll_one_source(
+        dict(_GUARD_SOURCE), supabase, active_targets=active, admission_targets=admission
+    )
+    return [r for c in jobs_table.upsert.call_args_list for r in c.args[0]]
+
+
+@pytest.mark.asyncio
+async def test_a_listing_is_admitted_on_an_inactive_targets_keywords(monkeypatch) -> None:
+    """The corpus question and the spend question are different.
+
+    Production held four INACTIVE frontend targets while the five active ones
+    covered backend, full-stack, PM, design, data and devops. Because admission
+    consulted only the ACTIVE set, "Frontend Engineer" matched nothing at the
+    door — so public /search could never return a recent frontend role no
+    matter how long it ran. The keywords existed; nothing read them."""
+    backend = _target_with_keywords({"engineer": 3}, ["backend engineer"])
+    frontend = _target_with_keywords({"engineer": 3}, ["frontend engineer"])
+
+    upserted = await _poll_with_target_sets(
+        monkeypatch,
+        active=[backend],
+        admission=[backend, frontend],
+        title="Frontend Engineer",
+    )
+
+    assert [r["external_id"] for r in upserted] == ["new-0"]
+
+
+@pytest.mark.asyncio
+async def test_the_same_listing_is_dropped_when_admission_is_active_only(
+    monkeypatch,
+) -> None:
+    """Control: the widened set is what admits it, not something else in the
+    fixture. Same listing, same active target, admission narrowed."""
+    backend = _target_with_keywords({"engineer": 3}, ["backend engineer"])
+
+    upserted = await _poll_with_target_sets(
+        monkeypatch,
+        active=[backend],
+        admission=[backend],
+        title="Frontend Engineer",
+    )
+
+    assert upserted == []
+
+
+@pytest.mark.asyncio
+async def test_admission_is_still_keyword_bounded_not_open(monkeypatch) -> None:
+    """This widens the keyword set; it does NOT open the door. A title no
+    target wants is still refused — measured at 39.9% of real board output
+    admitted, not 100%."""
+    backend = _target_with_keywords({"engineer": 3}, ["backend engineer"])
+    frontend = _target_with_keywords({"engineer": 3}, ["frontend engineer"])
+
+    upserted = await _poll_with_target_sets(
+        monkeypatch,
+        active=[backend],
+        admission=[backend, frontend],
+        title="Dental Hygienist",
+    )
+
+    assert upserted == []
+
+
+@pytest.mark.asyncio
+async def test_admission_targets_fall_back_to_active_when_unreadable(monkeypatch) -> None:
+    """A failed targets read must NARROW admission for a cycle, never stop
+    ingestion — the conservative direction, and it must not re-read the same
+    table to discover that."""
+    from app.services import poller as poller_mod
+
+    active = [_target_with_keywords({"engineer": 3}, ["backend engineer"])]
+    monkeypatch.setattr(poller_mod, "poll_db_read", AsyncMock(side_effect=RuntimeError("boom")))
+
+    out = await poller_mod._admission_targets(MagicMock(), fallback=active)
+
+    assert out == active

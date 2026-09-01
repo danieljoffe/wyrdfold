@@ -1065,6 +1065,69 @@ def _async_service_client() -> AsyncClient:
     return cast(AsyncClient, get_async_supabase())
 
 
+async def _admission_targets(
+    supabase: AsyncClient, *, fallback: list[JobTarget] | None = None
+) -> list[JobTarget]:
+    """Targets whose keywords may admit a listing into the shared catalog.
+
+    EVERY target when ``settings.admit_on_any_target`` (the default), not just
+    the active ones. These are two different questions that one set used to
+    answer: "what belongs in the corpus public /search reads" is about the
+    CATALOG, while "what do we pay to grade" is about SPEND. Tying them together
+    made the public corpus a side effect of who happened to have a target
+    activated — it grew and shrank as people came and went.
+
+    Concretely: the catalog held four INACTIVE frontend targets while the five
+    active ones covered backend, full-stack, PM, design, data and devops. So
+    "Frontend Engineer" matched nothing at the door and /search could never
+    surface a recent frontend role. The keywords existed; nothing read them.
+
+    This widens the keyword set, it does NOT open the door — admission stays
+    deterministic and keyword-bounded. Spend is untouched: Phase 1 and Phase 2
+    still grade against ``_active_targets`` alone, so a row admitted for an
+    inactive target sits in the catalog ungraded, which is exactly what
+    /search reads (it skips ``scores`` entirely).
+    """
+    if not settings.admit_on_any_target:
+        return fallback if fallback is not None else await _active_targets(supabase)
+    try:
+        resp = await poll_db_read(
+            supabase,
+            lambda c: c.table(crud.TARGETS_TABLE).select("*"),
+            label="poll admission-targets",
+            retry_sync=True,
+        )
+    except Exception as exc:
+        # Fall back to the ACTIVE set rather than failing the poll. This is the
+        # conservative direction: admission NARROWS to what it was before this
+        # setting existed, so a read blip costs breadth for one cycle instead
+        # of stopping ingestion. Warned, not swallowed silently, because a
+        # persistent failure quietly reverts the widening.
+        #
+        # ONE LINE, NO STACK -- this sits in the per-cycle path and a repeating
+        # traceback here is how #652 flooded Railway's log replica cap, which
+        # is exactly when the logs are needed. Same posture as
+        # ``phase1_calls_today``.
+        logger.warning(
+            "admission targets unreadable (%s: %s) — falling back to active targets",
+            type(exc).__name__,
+            exc,
+        )
+        # ``fallback`` when the caller already holds the active set, so a failed
+        # read costs no second round trip (and cannot fail twice on the same
+        # table).
+        return fallback if fallback is not None else await _active_targets(supabase)
+    rows = cast(list[dict[str, Any]], resp.data or [])
+    out: list[JobTarget] = []
+    for r in rows:
+        try:
+            out.append(crud._parse_target(r))
+        except Exception:
+            # A malformed target must not stop the catalog from ingesting.
+            logger.warning("admission targets: skipping unparseable target %s", r.get("id"))
+    return out
+
+
 async def _active_targets(supabase: AsyncClient) -> list[JobTarget]:
     """Async inline of ``crud.get_active`` (the sync twin stays for its non-poll
     callers): the derived ``app_active OR EXISTS(active membership)`` pipeline
@@ -1574,6 +1637,7 @@ async def _poll_one_source(
     intake_budget: IntakeBudget | None = None,
     *,
     active_targets: list[JobTarget] | None = None,
+    admission_targets: list[JobTarget] | None = None,
     stage3_users: tuple[dict[str, JobTarget], dict[str, OptimizedDoc]] | None = None,
 ) -> dict[str, Any]:
     """Poll a single job source. Returns a per-source summary dict.
@@ -1626,12 +1690,14 @@ async def _poll_one_source(
         # skip the detail request for postings we would only drop.
         if active_targets is None:
             active_targets = await _active_targets(supabase)
+        if admission_targets is None:
+            admission_targets = await _admission_targets(supabase, fallback=active_targets)
 
         def _admissible(title: str, location: str | None) -> bool:
             """The two FREE gates, judged on a provider's list entry. Mirrors
             the row-build loop below — keep them in step, or a posting gets
             skipped here that the loop would have kept."""
-            return _title_matches_any_target(title, active_targets or []) and _is_us_location(
+            return _title_matches_any_target(title, admission_targets or []) and _is_us_location(
                 location
             )
 
@@ -2042,7 +2108,11 @@ async def _poll_one_source(
             # NO active targets there is nothing to match against, so drop
             # everything (previously the `active_targets and` guard SKIPPED this
             # gate when empty, ingesting whole boards of untargeted roles).
-            if not _title_matches_any_target(job.title, active_targets):
+            # ADMISSION uses the widened set (``_admission_targets``): a
+            # listing belongs in the shared catalog if ANY target's keywords
+            # want it, active or not. Phase 1 below still grades against
+            # ACTIVE targets only -- corpus and spend are separate questions.
+            if not _title_matches_any_target(job.title, admission_targets or active_targets):
                 dropped_title_prematch += 1
                 continue
             if not _is_us_location(job.location_name):
@@ -3250,6 +3320,7 @@ async def _poll_one_source_budgeted(
     budget_gate: PayerBudgetGate | None,
     *,
     active_targets: list[JobTarget] | None,
+    admission_targets: list[JobTarget] | None = None,
     stage3_users: tuple[dict[str, JobTarget], dict[str, OptimizedDoc]] | None,
     admission_budget: AdmissionBudget | None = None,
     intake_budget: IntakeBudget | None = None,
@@ -3275,6 +3346,7 @@ async def _poll_one_source_budgeted(
             supabase,
             budget_gate,
             active_targets=active_targets,
+            admission_targets=admission_targets,
             stage3_users=stage3_users,
             admission_budget=admission_budget,
             intake_budget=intake_budget,
@@ -3286,6 +3358,7 @@ async def _poll_one_source_budgeted(
                 supabase,
                 budget_gate,
                 active_targets=active_targets,
+                admission_targets=admission_targets,
                 stage3_users=stage3_users,
                 admission_budget=admission_budget,
                 intake_budget=intake_budget,
@@ -3372,6 +3445,7 @@ async def poll_all_sources(
     # Cycle-wide constants resolved once instead of once per source:
     # active targets and the stage-3 (user → target/optimized-doc) maps.
     active_targets = await _active_targets(supabase)
+    admission_targets = await _admission_targets(supabase, fallback=active_targets)
     stage3_users = await _resolve_user_targets_for_stage3(
         supabase, active_targets, "(cycle prefetch)"
     )
@@ -3387,6 +3461,7 @@ async def poll_all_sources(
                 supabase,
                 budget_gate,
                 active_targets=active_targets,
+                admission_targets=admission_targets,
                 stage3_users=stage3_users,
                 admission_budget=admission_budget,
                 intake_budget=intake_budget,
@@ -3506,6 +3581,7 @@ async def poll_due_sources(
     # Cycle-wide constants resolved once instead of once per source:
     # active targets and the stage-3 (user → target/optimized-doc) maps.
     active_targets = await _active_targets(supabase)
+    admission_targets = await _admission_targets(supabase, fallback=active_targets)
     stage3_users = await _resolve_user_targets_for_stage3(
         supabase, active_targets, "(cycle prefetch)"
     )
@@ -3547,6 +3623,7 @@ async def poll_due_sources(
                 supabase,
                 budget_gate,
                 active_targets=active_targets,
+                admission_targets=admission_targets,
                 stage3_users=stage3_users,
                 admission_budget=admission_budget,
                 intake_budget=intake_budget,
