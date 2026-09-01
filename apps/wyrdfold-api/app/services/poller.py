@@ -76,6 +76,7 @@ from app.services.targets import crud
 from app.services.targets.payers import (
     BlockReason,
     PayerBudgetGate,
+    block_admits_ingestion,
     block_is_persistent,
     build_budget_gate,
 )
@@ -1716,8 +1717,9 @@ async def _poll_one_source(
                     # stays empty and ``_any_target_admits`` falls back to the
                     # deterministic free gates that already passed.
                     reason = gate.target_block_reason(active_target.id)
-                    admits = settings.persistent_block_admits_ingestion and block_is_persistent(
-                        reason
+                    admits = block_admits_ingestion(
+                        reason,
+                        staged_rollout=settings.persistent_block_admits_ingestion,
                     )
                     if admits:
                         persistent_skips += 1
