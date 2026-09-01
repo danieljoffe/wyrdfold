@@ -63,6 +63,40 @@ class TestCounting:
         # fail-open posture it did not choose.
         assert await phase1_calls_today(supabase, TARGET_ID) is None
 
+    @pytest.mark.asyncio
+    async def test_a_successful_read_that_ships_no_count_is_also_unknown(self) -> None:
+        """The sibling above covers a raised exception. This covers the quieter
+        case: the request SUCCEEDS but carries no count — PostgREST omitting
+        the Content-Range header, or a stubbed client. An earlier version
+        collapsed that to 0, which reads as "nothing spent today" and hands
+        the backfill a full allowance at exactly the moment spend is
+        invisible — the fail-open this function's docstring promises not to
+        impose. Caught in review."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        supabase = MagicMock()
+        chain = supabase.table.return_value.select.return_value
+        chain = chain.eq.return_value.eq.return_value.gte.return_value
+        chain.execute = AsyncMock(return_value=MagicMock(count=None))
+
+        assert await phase1_calls_today(supabase, TARGET_ID) is None
+
+    @pytest.mark.asyncio
+    async def test_the_unknown_reaches_the_fail_closed_caller(self) -> None:
+        """The whole point of returning None: the SPEND caller must refuse.
+        Asserted end-to-end, because the callers were already correct — the
+        bug was that None could never reach them."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        supabase = MagicMock()
+        chain = supabase.table.return_value.select.return_value
+        chain = chain.eq.return_value.eq.return_value.gte.return_value
+        chain.execute = AsyncMock(return_value=MagicMock(count=None))
+
+        assert await phase1_backfill_allowance(supabase, TARGET_ID) == 0
+        # ...while the INGESTION caller keeps its fail-open posture.
+        assert await phase1_cap_reached(supabase, TARGET_ID) is False
+
 
 class TestCapReached:
     @pytest.mark.asyncio

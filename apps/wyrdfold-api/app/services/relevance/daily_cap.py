@@ -73,7 +73,12 @@ async def phase1_calls_today(supabase: AsyncClient, target_id: str) -> int | Non
         # the "unreadable" arm, not escape as a TypeError from the caller's
         # comparison — the whole point of this function is that its failure
         # mode is a value the caller chooses how to treat.
-        return 0 if count is None else int(count)
+        # ``None`` here is a SUCCESSFUL request that shipped no count (no
+        # Content-Range header, a stubbed client). That is an unknown, not a
+        # zero, and returning 0 would report "nothing spent today" — handing
+        # the caller a full allowance at exactly the moment spend is invisible.
+        # This is the fail-open the docstring above promises not to impose.
+        return None if count is None else int(count)
     except Exception as exc:
         # One line, no stack: this sits inside the poller's per-batch triage
         # loop, and a repeating traceback there is how #652 flooded Railway's
