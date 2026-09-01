@@ -230,6 +230,9 @@ async def test_gate_blocks_idle_payer(monkeypatch):
     monkeypatch.setattr(payers_mod.settings, "idle_defer_days", 7)
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
     monkeypatch.setattr(payers_mod.cost_log, "total_spend_async", AsyncMock(return_value=0.0))
+    # Isolate the IDLE dimension: the per-payer daily ceiling is orthogonal
+    # and reads its own meter, covered in test_llm_cost_caps.
+    monkeypatch.setattr(payers_mod.settings, "payer_daily_budget_usd", 0.0)
 
     gate = await build_budget_gate(sb, ["t-idle", "t-fresh"])
     assert gate.target_blocked("t-idle") is True
@@ -253,6 +256,9 @@ async def test_gate_null_last_seen_not_blocked(monkeypatch):
     monkeypatch.setattr(payers_mod.settings, "idle_defer_days", 7)
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
     monkeypatch.setattr(payers_mod.cost_log, "total_spend_async", AsyncMock(return_value=0.0))
+    # Isolate the IDLE dimension: the per-payer daily ceiling is orthogonal
+    # and reads its own meter, covered in test_llm_cost_caps.
+    monkeypatch.setattr(payers_mod.settings, "payer_daily_budget_usd", 0.0)
 
     gate = await build_budget_gate(sb, ["t-1"])
     assert gate.target_blocked("t-1") is False
@@ -273,6 +279,9 @@ async def test_gate_idle_defer_zero_disables(monkeypatch):
     monkeypatch.setattr(payers_mod.settings, "idle_defer_days", 0)
     monkeypatch.setattr(payers_mod.settings, "user_llm_monthly_budget_usd", 5.0)
     monkeypatch.setattr(payers_mod.cost_log, "total_spend_async", AsyncMock(return_value=0.0))
+    # Isolate the IDLE dimension: the per-payer daily ceiling is orthogonal
+    # and reads its own meter, covered in test_llm_cost_caps.
+    monkeypatch.setattr(payers_mod.settings, "payer_daily_budget_usd", 0.0)
 
     gate = await build_budget_gate(sb, ["t-1"])
     assert gate.target_blocked("t-1") is False

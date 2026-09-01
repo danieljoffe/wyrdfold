@@ -1026,3 +1026,70 @@ async def test_resume_bills_the_payer_the_gate_authorised(
     assert seen == ["u-AUTHORISED"], "client resolved for a payer the gate did not authorise"
     assert billed == ["u-AUTHORISED"], "spend attributed to a re-resolved payer"
     stale.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resume_skips_a_payer_over_the_daily_background_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-PR integration with #947, using a REAL ``PayerBudgetGate``.
+
+    ``over_daily_allowance`` did not exist when this sweep was written, and the
+    sweep's other tests stub the gate — so a mocked reason proves the sweep
+    honours *a* reason, not that it honours *this* one. This builds the actual
+    gate with the actual daily-over set and asserts the sweep declines.
+
+    The direction matters: #947 deliberately makes this reason NEVER veto
+    ingestion, so a listing still enters the catalogue. That must not be
+    confused with permission to keep BUYING grades for it, which is what this
+    sweep does. Ingestion is free; the sweep is not."""
+    from app.services import poller as poller_mod
+    from app.services.targets.payers import PayerBudgetGate
+
+    target = _target()
+    real_gate = PayerBudgetGate(
+        payer_by_target={target.id: "u-1"},
+        over_daily_users=frozenset({"u-1"}),
+    )
+    assert real_gate.target_block_reason(target.id) == "over_daily_allowance"
+
+    monkeypatch.setattr(poller_mod.settings, "phase1_backfill_enabled", True)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+    monkeypatch.setattr(poller_mod, "build_budget_gate", AsyncMock(return_value=real_gate))
+    monkeypatch.setattr(poller_mod, "_resolve_payer_client", AsyncMock(return_value=MagicMock()))
+    backfill = AsyncMock(return_value=Phase1BackfillResult(verdicts_written=5))
+    monkeypatch.setattr(poller_mod, "backfill_phase1_for_target", backfill)
+
+    out = await poller_mod.resume_phase1_backfills(MagicMock())
+
+    backfill.assert_not_awaited()
+    assert out["skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_runs_for_a_payer_inside_the_daily_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control for the test above, also on a real gate: an unblocked payer is
+    still resumed, so the guard is reading the reason rather than refusing
+    everything."""
+    from app.services import poller as poller_mod
+    from app.services.targets.payers import PayerBudgetGate
+
+    target = _target()
+    real_gate = PayerBudgetGate(payer_by_target={target.id: "u-1"})
+    assert real_gate.target_block_reason(target.id) is None
+
+    monkeypatch.setattr(poller_mod.settings, "phase1_backfill_enabled", True)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+    monkeypatch.setattr(poller_mod, "build_budget_gate", AsyncMock(return_value=real_gate))
+    monkeypatch.setattr(poller_mod, "_resolve_payer_client", AsyncMock(return_value=MagicMock()))
+    backfill = AsyncMock(return_value=Phase1BackfillResult(verdicts_written=5))
+    monkeypatch.setattr(poller_mod, "backfill_phase1_for_target", backfill)
+
+    out = await poller_mod.resume_phase1_backfills(MagicMock())
+
+    backfill.assert_awaited_once()
+    assert out["written"] == 5 and out["skipped"] == 0

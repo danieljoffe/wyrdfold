@@ -210,3 +210,42 @@ async def test_upsert_no_row_returns_none(
     assert posting_id is None
     score.assert_not_called()  # nothing to score
     assert invalidations == [1]
+
+
+# ---------------------------------------------------------------------------
+# The hourly intake ceiling deliberately does NOT gate this path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_full_intake_hour_does_not_refuse_a_user_added_job(monkeypatch) -> None:
+    """``intake_max_new_jobs_per_hour`` bounds AUTOMATED intake — the poller.
+    This helper is user-initiated (manual add, target-from-URL), inserts one
+    row per rate-limited request, and is exempt ON PURPOSE.
+
+    Refusing a person's "add this job" to protect against a POLLER burst would
+    invert the priority the codebase already sets, where background work yields
+    to live work and never the reverse. Review raised this as a possible
+    oversight; this test exists so it reads as the decision it is.
+
+    The row is still COUNTED — it lands in ``cataloged_at`` like any other and
+    shrinks the next poll cycle's allowance — it is simply never refused."""
+    from app.config import settings as live_settings
+
+    # An hour so full that every poller slot is gone.
+    monkeypatch.setattr(live_settings, "intake_max_new_jobs_per_hour", 1)
+    supabase = _supabase()
+
+    posting_id = await job_ingest.materialize_and_score_job(
+        supabase,
+        final_url="https://example.com/jobs/user-added",
+        title="Staff Engineer",
+        company_name="Acme",
+        location="Remote - US",
+        description_html=DESCRIPTION_HTML,
+        salary_text=None,
+        targets=[],
+    )
+
+    assert posting_id == "job-1", "a user-initiated add must never be refused"
+    assert supabase.table.return_value.upsert.called

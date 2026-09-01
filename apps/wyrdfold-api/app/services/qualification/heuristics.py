@@ -152,6 +152,55 @@ _NON_US_HINTS: tuple[str, ...] = (
     "bucharest",
     "ukraine",
     "shenzhen",
+    # --- Cities in countries whose ISO code collides with a USPS state
+    # abbreviation (IN/DE/GA/MT/ID/IL/MD/MN/MO/LA/TN/SC/SD/CO...).
+    #
+    # Why these specifically: ``positively_us_location`` treats a trailing
+    # ", XX" as a US state and its docstring claims the no-foreign-hint clause
+    # stops the collisions — naming "Bangalore, IN" as covered. The clause only
+    # works for cities the hint list KNOWS, and it did not know Chennai or
+    # Ahmedabad, so ``Chennai, IN`` read as Indiana and VETOED the non-US
+    # archive for a genuinely Indian posting. Observed 3 times in 30 days.
+    #
+    # DELIBERATELY EXCLUDED, because each is also a real US place name and a
+    # hint here REJECTS AT INGEST (``is_us_location``) as well as lifting the
+    # archive veto: "georgia" (the state), "panama" (Panama City, FL),
+    # "hamburg" (Hamburg, NY/PA), "cologne" (Cologne, MN), "malta" (Malta,
+    # NY/IL), "morocco" (Morocco, IN), "sudan" (Sudan, TX), "waterloo"
+    # (Waterloo, IA), plain "bogota" (Bogota, NJ). The accented "bogotá" is
+    # safe and included; the unaccented form is not. "frankfurt" is included —
+    # the Kentucky capital is spelled "Frankfort".
+    "chennai",
+    "ahmedabad",
+    "kolkata",
+    "gurgaon",
+    "gurugram",
+    "noida",
+    "jaipur",
+    "stuttgart",
+    "dusseldorf",
+    "d\u00fcsseldorf",
+    "leipzig",
+    "dortmund",
+    "frankfurt",
+    "tbilisi",
+    "valletta",
+    "indonesia",
+    "jakarta",
+    "jerusalem",
+    "haifa",
+    "chisinau",
+    "chi\u0219in\u0103u",
+    "ulaanbaatar",
+    "macau",
+    "vientiane",
+    "tunis",
+    "khartoum",
+    "tirana",
+    "noumea",
+    "medellin",
+    "medell\u00edn",
+    "bogot\u00e1",
 )
 
 # Word-boundary pattern over the hints. Plain substring matching produced
@@ -164,6 +213,18 @@ _NON_US_RE = re.compile(r"\b(?:" + "|".join(re.escape(h) for h in _NON_US_HINTS)
 # "Dublin, CA", "Athens, GA", "Milan, MI" are all real US locations that
 # the hint list would otherwise reject.
 _US_COUNTRY_RE = re.compile(r"\b(?:usa|u\.s\.a?|united states)\b", re.I)
+
+# The bare alpha-2 ``US``, which ``_US_COUNTRY_RE`` deliberately does not carry.
+# CASE-SENSITIVE, and that is the whole point: lower-case "us" is the English
+# pronoun, and a case-insensitive ``\bus\b`` would read "Join us in Berlin" or
+# "Contact us" as a US marker — in ``positively_us_location`` that marker VETOES
+# a non-US archive, so a false positive keeps foreign postings in a US-only
+# catalog. Upper-case ``US`` in a location field is the country code.
+#
+# Why it was missing: real prod strings ("Remote - US", "US") matched none of
+# the spelled-out forms, so a genuinely US remote posting carried no positive
+# marker and lost the archive veto that exists to protect exactly it.
+_US_CODE_RE = re.compile(r"\bUS\b")
 
 _US_STATE_ABBREVS: frozenset[str] = frozenset(
     {
@@ -244,7 +305,7 @@ def is_us_location(location: str | None) -> bool:
     """
     if not location:
         return True
-    if _US_COUNTRY_RE.search(location):
+    if _US_COUNTRY_RE.search(location) or _US_CODE_RE.search(location):
         return True
     if any(m.group(1) in _US_STATE_ABBREVS for m in _US_STATE_ABBREV_RE.finditer(location)):
         return True
@@ -270,7 +331,7 @@ def positively_us_location(location: str | None) -> bool:
         return False
     if _NON_US_RE.search(location.lower()):
         return False
-    if _US_COUNTRY_RE.search(location):
+    if _US_COUNTRY_RE.search(location) or _US_CODE_RE.search(location):
         return True
     return any(m.group(1) in _US_STATE_ABBREVS for m in _US_STATE_ABBREV_RE.finditer(location))
 

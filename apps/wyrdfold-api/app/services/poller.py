@@ -47,7 +47,7 @@ from app.services.llm.provider_breaker import (
 )
 from app.services.location_parse import parse_location
 from app.services.mock_board import fetch_mock_jobs
-from app.services.qualification import is_us_location
+from app.services.qualification import is_us_location, positively_us_location
 from app.services.recency import refresh_recency_scores_poll
 from app.services.relevance.daily_cap import phase1_cap_reached
 from app.services.relevance.phase1_backfill import backfill_phase1_for_target
@@ -78,6 +78,7 @@ from app.services.targets import crud
 from app.services.targets.payers import (
     BlockReason,
     PayerBudgetGate,
+    block_admits_ingestion,
     block_is_persistent,
     build_budget_gate,
 )
@@ -187,6 +188,107 @@ def new_admission_budget() -> AdmissionBudget:
     """A fresh allowance for one cycle. Cap 0 means uncapped."""
     cap = settings.persistent_block_admission_cap_per_cycle
     return AdmissionBudget(cap=cap, remaining=cap if cap > 0 else None)
+
+
+@dataclass
+class IntakeBudget:
+    """This cycle's slice of the hourly ceiling on AUTOMATED new listings.
+
+    Bounds write pressure, not spend or relevance: ``settings.
+    intake_max_new_jobs_per_hour`` caps how many rows the POLLER may INSERT
+    into ``jobs`` per rolling hour — the scheduled cycle, ``POST /poll/due``,
+    ``poll_all_sources`` and the activation fan-out all share this one budget,
+    including the ordinary "a target triaged it and said promising" path that
+    :class:`AdmissionBudget` deliberately never touches.
+
+    NOT a ceiling on every row that can reach ``jobs``.
+    ``job_ingest.materialize_and_score_job`` (manual add, target-from-URL)
+    inserts one row per rate-limited request on explicit human intent and is
+    deliberately exempt — refusing a person's "add this job" to protect against
+    a poller burst would invert the priority ``grading_budget_reserve_usd``
+    already sets, where background yields to live work and not the reverse.
+    Those rows still land in ``cataloged_at``, so they shrink the next cycle's
+    allowance; the hour can be exceeded, but only by human action.
+
+    Seeded from the DATABASE, not a process counter. ``remaining`` is
+    ``cap - (rows cataloged in the last hour)``, re-read once per cycle, for the
+    same reason the admission ramp had to become cycle-local: ``POST /poll/due``
+    calls ``poll_due_sources`` without the scheduler's advisory lock, so two
+    cycles can run at once, and a module-global counter would let one cycle's
+    reset wipe the other's. Re-reading truth also survives a restart mid-hour —
+    a process counter would silently grant a fresh full allowance on every
+    deploy, and this app deploys near-daily.
+
+    Overlap is bounded, not eliminated: two concurrent cycles each read the same
+    pre-cycle count, so the pair can overshoot by at most one cycle's intake
+    before the next read corrects. At the default cap that overshoot is a
+    rounding error, and the alternative (a DB round-trip per admitted row) would
+    cost far more than the burst it prevents.
+
+    Within one cycle, concurrent source workers are safe: ``take`` has no
+    ``await``, so check-and-decrement is atomic on the event loop.
+    """
+
+    cap: int
+    remaining: int | None
+    prior: int = 0
+
+    def take(self) -> bool:
+        """Consume one slot, or report the hourly ceiling is reached."""
+        if self.remaining is None:
+            return True  # uncapped
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+    def report(self) -> str:
+        """One-line intake state for the cycle log.
+
+        The counts are admission SLOTS CONSUMED, not rows confirmed written: a
+        slot is taken before the upsert runs, so a later write failure leaves
+        this line reading high. Deliberate — the ceiling must not be able to
+        under-count itself — but it means an operator should not diff this
+        against a ``COUNT(*)`` and expect equality. ``prior`` is the only
+        figure here read back from the database."""
+        if self.cap <= 0 or self.remaining is None:
+            return "intake=uncapped"
+        admitted = max(0, self.cap - self.prior - self.remaining)
+        spent = " HOURLY CAP REACHED (deferred to a later poll)" if self.remaining <= 0 else ""
+        return f"intake={self.prior + admitted}/{self.cap}per_h (+{admitted} this cycle){spent}"
+
+
+async def new_intake_budget(supabase: AsyncClient) -> IntakeBudget:
+    """Read how much of this hour's intake ceiling is already spent.
+
+    Counts live+archived rows alike: ``cataloged_at`` records when we WROTE the
+    row, which is the write pressure being bounded, and a row archived minutes
+    after ingest cost exactly as much to insert as one that survived.
+
+    Fails OPEN (uncapped) on a read error. This is a burst ceiling on a path
+    that is otherwise unbounded and is nowhere near binding in normal
+    operation, so refusing all intake because one count query failed would
+    trade a hypothetical write burst for a certain ingestion stall — the
+    failure mode that cost 50 hours of zero intake once already.
+    """
+    cap = settings.intake_max_new_jobs_per_hour
+    if cap <= 0:
+        return IntakeBudget(cap=cap, remaining=None)
+    since = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    try:
+        resp = await poll_db_read(
+            supabase,
+            lambda c: (
+                c.table("jobs").select("id", count="exact", head=True).gte("cataloged_at", since)
+            ),
+            label="poll intake hourly count",
+            retry_sync=True,
+        )
+    except Exception:
+        logger.exception("Intake cap: hourly count failed — proceeding uncapped this cycle")
+        return IntakeBudget(cap=cap, remaining=None)
+    prior = int(resp.count or 0)
+    return IntakeBudget(cap=cap, remaining=max(0, cap - prior), prior=prior)
 
 
 def _validate_semaphore() -> asyncio.Semaphore:
@@ -527,9 +629,60 @@ def _partition_unchanged(
     return to_write, skipped
 
 
-# in_() id-chunk bound for the board-verdict writes (#57 lesson: ≤150-200 UUIDs
-# keeps the PostgREST URL under proxy limits).
+# in_() id-chunk bound for the post-upsert ``is_us`` writes (#57 lesson:
+# ≤150-200 UUIDs keeps the PostgREST URL under proxy limits).
 _BOARD_US_CHUNK = 150
+
+
+async def _update_jobs_chunked(
+    supabase: AsyncClient,
+    rows: list[dict[str, Any]],
+    payload: dict[str, Any],
+    *,
+    null_filters: tuple[str, ...] = (),
+    label: str,
+) -> int:
+    """Write ``payload`` to ``rows`` in id-chunks; return how many rows ACTUALLY
+    changed, and patch the payload back into the ones that did.
+
+    Not ``len(rows)``. Every caller re-asserts a precondition in the WHERE
+    clause (``null_filters``), so a row another task changed between the upsert
+    snapshot and this write matches nothing — counting the candidate would
+    report a write that never happened. PostgREST answers an UPDATE with the
+    rows it changed (verified against the local stack: 3 ids in, one
+    concurrently archived, 2 rows back, and the untouched row keeps its
+    original timestamp), so ``.data`` is the outcome rather than the intent.
+
+    The same set drives the patch-back, for the same reason: a row the WHERE
+    clause skipped must not be told it was written. Those dicts go on to become
+    this cycle's Phase-2 ``cycle_rows``, so a lie here is spent grading.
+
+    Shared by the two post-upsert ``is_us`` passes (board country, location
+    string) so neither can drift into counting intent or skipping the
+    patch-back — the failure mode that makes an irreversible write look clean.
+    """
+    written = 0
+    for start in range(0, len(rows), _BOARD_US_CHUNK):
+        chunk = rows[start : start + _BOARD_US_CHUNK]
+        ids = [r["id"] for r in chunk]
+
+        def _build(c: Any, ids: list[str] = ids) -> Any:
+            q = c.table("jobs").update(payload).in_("id", ids)
+            for column in null_filters:
+                q = q.is_(column, "null")
+            return q
+
+        resp = await poll_db_write(supabase, _build, label=label)
+        changed = {
+            r["id"]
+            for r in (getattr(resp, "data", None) or [])
+            if isinstance(r, dict) and r.get("id")
+        }
+        written += len(changed)
+        for row in chunk:
+            if row["id"] in changed:
+                row.update(payload)
+    return written
 
 
 async def _apply_board_us_verdicts(
@@ -603,59 +756,117 @@ async def _apply_board_us_verdicts(
             if settings.qualification_archive_non_us and row.get("archived_at") is None:
                 to_archive.append(row)
 
-    async def _update(
-        rows: list[dict[str, Any]], payload: dict[str, Any], *, unarchived: bool
-    ) -> int:
-        """Write ``payload`` to ``rows``; return how many rows ACTUALLY changed.
-
-        Not ``len(rows)``. The archive write re-asserts ``archived_at IS NULL``,
-        so a row another task archived between the upsert snapshot and this
-        write matches nothing — counting the candidate would report an archive
-        that never happened. PostgREST answers an UPDATE with the rows it
-        changed (verified against the local stack: 3 ids in, one concurrently
-        archived, 2 rows back, and the untouched row keeps its original
-        timestamp), so ``.data`` is the outcome rather than the intent.
-
-        The same set drives the patch-back, for the same reason: a row the
-        WHERE clause skipped must not be told it was archived.
-        """
-        written = 0
-        for start in range(0, len(rows), _BOARD_US_CHUNK):
-            chunk = rows[start : start + _BOARD_US_CHUNK]
-            ids = [r["id"] for r in chunk]
-
-            def _build(c: Any, ids: list[str] = ids) -> Any:
-                q = c.table("jobs").update(payload).in_("id", ids)
-                # Re-assert the precondition in the WHERE clause: a concurrent
-                # archive between the upsert and this write must not have its
-                # timestamp moved.
-                return q.is_("archived_at", "null") if unarchived else q
-
-            resp = await poll_db_write(supabase, _build, label="board country is_us")
-            changed = {
-                r["id"]
-                for r in (getattr(resp, "data", None) or [])
-                if isinstance(r, dict) and r.get("id")
-            }
-            written += len(changed)
-            for row in chunk:
-                if row["id"] in changed:
-                    row.update(payload)
-        return written
-
     marked = archived = 0
+    label = "board country is_us"
     try:
+        # The verdict writes carry NO WHERE filter: they are corrections that
+        # have to land on archived rows too.
         if to_us:
-            marked += await _update(to_us, {"is_us": True}, unarchived=False)
+            marked += await _update_jobs_chunked(supabase, to_us, {"is_us": True}, label=label)
         if to_non_us:
-            marked += await _update(to_non_us, {"is_us": False}, unarchived=False)
+            marked += await _update_jobs_chunked(supabase, to_non_us, {"is_us": False}, label=label)
         if to_archive:
-            archived += await _update(
-                to_archive, {"archived_at": datetime.now(UTC).isoformat()}, unarchived=True
+            # Re-assert the precondition in the WHERE clause: a row archived by
+            # url_health or the stale sweep between the upsert and this write
+            # must not have its timestamp moved forward.
+            archived += await _update_jobs_chunked(
+                supabase,
+                to_archive,
+                {"archived_at": datetime.now(UTC).isoformat()},
+                null_filters=("archived_at",),
+                label=label,
             )
     except Exception:
         logger.exception("Board-country is_us write failed; leaving the rows untagged")
     return marked, archived
+
+
+async def _apply_location_us_verdicts(
+    supabase: AsyncClient,
+    jobs: list[StandardJob],
+    upserted: list[dict[str, Any]],
+) -> int:
+    """Stamp ``jobs.is_us = TRUE`` where the LOCATION STRING plainly names the US.
+
+    Returns the rows ACTUALLY written, for the cycle's funnel log.
+
+    WHY THIS EXISTS. ``_apply_board_us_verdicts`` above restored ingest-time
+    ``is_us`` for the providers that publish a structured country — Ashby,
+    Lever, SmartRecruiters — which is 39.2% of enabled sources (1,904 of 4,857
+    the day this shipped). Greenhouse (1,708) and Workday (1,245) publish no
+    country at all and never will, so 60.8% of sources are out of that path's
+    reach by construction, and measured coverage of newly cataloged rows sat at
+    23.5%.
+
+    What those boards DO publish is a location string, and
+    ``positively_us_location`` already reads it — the archive veto and
+    ``board_us_verdict`` both consult it. Until now its conclusion was computed
+    and thrown away: it was used to VETO an archive, never recorded.
+
+    NB it is NOT the admission gate. Admission uses the permissive sibling
+    ``is_us_location``, whose True means only "not provably foreign" — a
+    distinction this docstring previously blurred, and one worth keeping sharp
+    because the two helpers have opposite risk profiles.
+    This records it. Measured over the 5 days since tagging went lazy: 69 of
+    104 untagged rows (66%), taking deterministic coverage 23.5% → 74.3%.
+
+    ONE-DIRECTIONAL — it writes TRUE and never FALSE. The costs are asymmetric:
+    a wrong FALSE hides a real job from every serving surface (they all gate
+    ``is_us IS NOT FALSE``) and, with ``QUALIFICATION_ARCHIVE_NON_US`` on, gets
+    it archived — irreversibly. A withheld verdict merely leaves the row NULL,
+    which is exactly where it sits today and which the lazy tagger still grades
+    later. So a location string is trusted to CONFIRM the US and never to deny
+    it, the same asymmetry ``board_us_verdict`` and ``board_columns`` apply to
+    the board's own fields. ``is_us_location`` — the permissive sibling that
+    returns True for "Remote" and for anything ambiguous — is deliberately NOT
+    used here: it is an admission filter, and its True means "not provably
+    foreign", which is not a fact worth storing.
+
+    NEVER OVERWRITES. A row that already carries a verdict — from the board
+    pass that ran first, or from an earlier LLM tagging — is left alone, and
+    the write re-asserts ``is_us IS NULL`` in the WHERE clause so a verdict
+    that landed between the upsert snapshot and this write survives too. Order
+    matters: the board's structured country is the employer's own answer and
+    the stronger fact, so it runs first and this pass fills only what it left
+    unknown.
+
+    NOT AN UPSERT KEY, for the same reason the board pass isn't one: a
+    PostgREST bulk upsert builds ONE column list for the whole batch, so a key
+    present on any row is written to every row and the rows that omitted it get
+    NULL (#928). ``is_us`` is decided per row, so riding the payload would
+    blank the tagger's verdict on every silent sibling in the batch.
+
+    BEST-EFFORT: a write failure is logged and swallowed. The verdict re-derives
+    from the same location string on the next poll that touches the row, so a
+    transient blip must not fail a poll whose upsert already succeeded (a failed
+    poll counts toward the source's auto-disable threshold).
+    """
+    us_ids = {j.external_id for j in jobs if positively_us_location(j.location_name)}
+    if not us_ids:
+        return 0
+    # The upsert RETURNING carries the STORED ``is_us`` (the payload never sets
+    # it) and the board pass has already patched its own verdicts in, so
+    # ``is_us is None`` here means "still unknown after the stronger source".
+    to_us = [
+        row
+        for row in upserted
+        if isinstance(row.get("external_id"), str)
+        and row["external_id"] in us_ids
+        and row.get("is_us") is None
+    ]
+    if not to_us:
+        return 0
+    try:
+        return await _update_jobs_chunked(
+            supabase,
+            to_us,
+            {"is_us": True},
+            null_filters=("is_us",),
+            label="location is_us",
+        )
+    except Exception:
+        logger.exception("Location is_us write failed; leaving the rows untagged")
+        return 0
 
 
 def _dedupe_by_content(
@@ -1360,6 +1571,7 @@ async def _poll_one_source(
     supabase: AsyncClient,
     budget_gate: PayerBudgetGate | None = None,
     admission_budget: AdmissionBudget | None = None,
+    intake_budget: IntakeBudget | None = None,
     *,
     active_targets: list[JobTarget] | None = None,
     stage3_users: tuple[dict[str, JobTarget], dict[str, OptimizedDoc]] | None = None,
@@ -1616,8 +1828,9 @@ async def _poll_one_source(
                     # stays empty and ``_any_target_admits`` falls back to the
                     # deterministic free gates that already passed.
                     reason = gate.target_block_reason(active_target.id)
-                    admits = settings.persistent_block_admits_ingestion and block_is_persistent(
-                        reason
+                    admits = block_admits_ingestion(
+                        reason,
+                        staged_rollout=settings.persistent_block_admits_ingestion,
                     )
                     if admits:
                         persistent_skips += 1
@@ -1821,6 +2034,7 @@ async def _poll_one_source(
         # single `poll_funnel` log line at end of cycle so an operator
         # can grep one source's funnel without a DB pass.
         dropped_phase1 = 0
+        dropped_intake_cap = 0
         dropped_title_prematch = 0
         dropped_non_us = 0
         for idx, job in enumerate(jobs):
@@ -1846,8 +2060,23 @@ async def _poll_one_source(
             # row from the conflict-update whenever a cycle produced any
             # verdicts, starving busy boards of content refreshes entirely
             # (JD edits, the escaped-HTML heal, salary re-extraction).
-            if job.external_id not in known_external_ids and not _any_target_admits(idx + 1):
+            is_new_row = job.external_id not in known_external_ids
+            if is_new_row and not _any_target_admits(idx + 1):
                 dropped_phase1 += 1
+                continue
+
+            # The GLOBAL hourly intake ceiling, applied AFTER the relevance
+            # gates so it never changes WHICH listings are worth admitting —
+            # only how fast the ones already judged worthy may land. Applies to
+            # every admission path, including the ordinary triage-said-yes one
+            # that ``_any_target_admits`` waves straight through, because write
+            # pressure does not care why a row was admitted.
+            #
+            # Known rows are exempt: they update a row that already exists, so
+            # they add none of the insert pressure this bounds, and blocking
+            # them would re-create the #514 content-refresh starvation.
+            if is_new_row and intake_budget is not None and not intake_budget.take():
+                dropped_intake_cap += 1
                 continue
 
             if job.detail_skipped:
@@ -1900,6 +2129,7 @@ async def _poll_one_source(
         new_rows: list[dict[str, Any]] = []
         board_us_marked = 0
         board_us_archived = 0
+        location_us_marked = 0
         if rows_to_upsert:
             # Dedupe rows_to_upsert by (company, title). Both within
             # the current batch and against existing rows that have a
@@ -1976,6 +2206,11 @@ async def _poll_one_source(
             board_us_marked, board_us_archived = await _apply_board_us_verdicts(
                 supabase, jobs, upserted_rows
             )
+            # ...and then the location string, for the 61% of sources whose
+            # board publishes no country at all. Second, never first: the
+            # board's structured field is the stronger fact, so this fills only
+            # what it left unknown. TRUE only — see _apply_location_us_verdicts.
+            location_us_marked = await _apply_location_us_verdicts(supabase, jobs, upserted_rows)
 
             # Qualification tags are LAZY now, exactly like embeddings below:
             # ingest is $0 LLM. ``ensure_job_tags`` in the Phase-2 runner buys
@@ -2290,13 +2525,15 @@ async def _poll_one_source(
         }
         logger.info(
             "poll_funnel source=%s fetched=%d dropped_phase1=%d "
+            "dropped_intake_cap=%d "
             "dropped_title_prematch=%d dropped_non_us=%d candidates=%d "
             "upserted_new=%d upserted_updated=%d archived=%d "
-            "board_us_marked=%d board_us_archived=%d "
+            "board_us_marked=%d board_us_archived=%d location_us_marked=%d "
             "phase1_no_by_target=%s",
             company_name,
             len(jobs),
             dropped_phase1,
+            dropped_intake_cap,
             dropped_title_prematch,
             dropped_non_us,
             len(rows_to_upsert),
@@ -2305,6 +2542,7 @@ async def _poll_one_source(
             summary["archived"],
             board_us_marked,
             board_us_archived,
+            location_us_marked,
             per_target_phase1_no or "{}",
         )
 
@@ -3014,6 +3252,7 @@ async def _poll_one_source_budgeted(
     active_targets: list[JobTarget] | None,
     stage3_users: tuple[dict[str, JobTarget], dict[str, OptimizedDoc]] | None,
     admission_budget: AdmissionBudget | None = None,
+    intake_budget: IntakeBudget | None = None,
 ) -> dict[str, Any]:
     """``_poll_one_source`` bounded by the per-source wall-time budget.
 
@@ -3038,6 +3277,7 @@ async def _poll_one_source_budgeted(
             active_targets=active_targets,
             stage3_users=stage3_users,
             admission_budget=admission_budget,
+            intake_budget=intake_budget,
         )
     try:
         return await asyncio.wait_for(
@@ -3048,6 +3288,7 @@ async def _poll_one_source_budgeted(
                 active_targets=active_targets,
                 stage3_users=stage3_users,
                 admission_budget=admission_budget,
+                intake_budget=intake_budget,
             ),
             timeout=budget,
         )
@@ -3120,6 +3361,7 @@ async def poll_all_sources(
     return value is that same object.
     """
     admission_budget = new_admission_budget()
+    intake_budget = await new_intake_budget(supabase)
     result = (
         progress
         if progress is not None
@@ -3147,13 +3389,14 @@ async def poll_all_sources(
                 active_targets=active_targets,
                 stage3_users=stage3_users,
                 admission_budget=admission_budget,
+                intake_budget=intake_budget,
             )
         # No await between the source completing and the fold, so a
         # cancellation can never drop a finished source's counts.
         _accumulate_poll_summary(result, summary)
 
     await asyncio.gather(*(_worker(s) for s in sources))
-    logger.info("poll cycle finished: %s", admission_budget.report())
+    logger.info("poll cycle finished: %s %s", admission_budget.report(), intake_budget.report())
     return result
 
 
@@ -3234,6 +3477,7 @@ async def poll_due_sources(
     await _maybe_run_archival_sweep(_async_service_client())
 
     admission_budget = new_admission_budget()
+    intake_budget = await new_intake_budget(supabase)
     due = filter_due_sources(all_enabled)
 
     # Liveness-check a rotating slice of the untagged catalog (#285) EVERY
@@ -3305,6 +3549,7 @@ async def poll_due_sources(
                 active_targets=active_targets,
                 stage3_users=stage3_users,
                 admission_budget=admission_budget,
+                intake_budget=intake_budget,
             )
         # No await between the source completing and the fold, so a
         # cancellation can never drop a finished source's counts.
@@ -3313,7 +3558,7 @@ async def poll_due_sources(
         phase1_store_stats["misses"] += summary.get("phase1_store_misses", 0)
 
     await asyncio.gather(*(_worker(s) for s in due))
-    logger.info("poll cycle finished: %s", admission_budget.report())
+    logger.info("poll cycle finished: %s %s", admission_budget.report(), intake_budget.report())
     if phase1_store_stats["hits"] or phase1_store_stats["misses"]:
         logger.info(
             "phase1 rejection store: %d LLM verdict(s) avoided, %d sent to the model this cycle",
@@ -3332,6 +3577,7 @@ async def _poll_one_source_for_target(
     target: JobTarget,
     payer_user_id: str | None = None,
     payer_block_reason: BlockReason | None = None,
+    intake_budget: IntakeBudget | None = None,
 ) -> dict[str, Any]:
     """Poll a single source for a specific target. Three-stage pipeline.
 
@@ -3593,6 +3839,20 @@ async def _poll_one_source_for_target(
                 if gj not in phase1_attempted or (v is not None and not v.promising):
                     continue
 
+            # The GLOBAL hourly intake ceiling, same rule as the main poll
+            # path. This route exists for target ACTIVATION, which fans out
+            # across every source at once — so it is the burstiest inserter we
+            # have, and leaving it uncapped would have left the ceiling
+            # trivially bypassable. Known rows stay exempt: they update a row
+            # that already exists and add none of the insert pressure bounded
+            # here.
+            if (
+                job.external_id not in known_external_ids
+                and intake_budget is not None
+                and not intake_budget.take()
+            ):
+                continue
+
             if job.detail_skipped:
                 # Held unchanged, detail deliberately not fetched — ``content``
                 # is empty, so building a row here would blank the stored
@@ -3689,14 +3949,16 @@ async def _poll_one_source_for_target(
             board_us_marked, board_us_archived = await _apply_board_us_verdicts(
                 supabase, jobs, upserted_rows
             )
-            if board_us_marked or board_us_archived:
+            location_us_marked = await _apply_location_us_verdicts(supabase, jobs, upserted_rows)
+            if board_us_marked or board_us_archived or location_us_marked:
                 logger.info(
                     "poll_funnel_target source=%s target=%s "
-                    "board_us_marked=%d board_us_archived=%d",
+                    "board_us_marked=%d board_us_archived=%d location_us_marked=%d",
                     company_name,
                     target.id,
                     board_us_marked,
                     board_us_archived,
+                    location_us_marked,
                 )
 
             # Qualification tags are LAZY (see _poll_one_source): the Phase-2
@@ -3915,6 +4177,12 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
             errors=["Target has no search keywords"],
         )
 
+    # Share the hourly ceiling with the scheduled cycle: it is one budget over
+    # one rolling hour across the whole instance, re-read from the DB here, so
+    # an activation that runs alongside a poll tick sees what that tick has
+    # already spent instead of getting its own fresh allowance.
+    intake_budget = await new_intake_budget(supabase)
+
     sources: list[dict[str, Any]] = await _read_enabled_sources(supabase)
 
     # Optimized doc is fetched per-user inside
@@ -3997,6 +4265,7 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
                 target,
                 payer_user_id=payer,
                 payer_block_reason=block_reason,
+                intake_budget=intake_budget,
             )
 
     try:
@@ -4016,4 +4285,5 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
     if deactivated_mid_run:
         result.errors.append("activation fan-out aborted: target deactivated mid-run")
 
+    logger.info("activation poll finished for target %s: %s", target.id, intake_budget.report())
     return result

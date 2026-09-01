@@ -203,9 +203,15 @@ async def _run_poll(
 
     jobs_table.upsert.side_effect = _upsert
     # Default DB state agrees with the upsert snapshot; a test that wants the
-    # snapshot-vs-DB race passes an explicit ``db``.
+    # snapshot-vs-DB race passes an explicit ``db``. ``is_us`` is carried as
+    # well as ``archived_at`` because the location pass re-asserts
+    # ``is_us IS NULL`` in its WHERE clause — a fixture that dropped the column
+    # would let that filter match everything and could not fail.
     if db is None:
-        db = {r["id"]: {"archived_at": r.get("archived_at")} for r in upserted}
+        db = {
+            r["id"]: {"archived_at": r.get("archived_at"), "is_us": r.get("is_us")}
+            for r in upserted
+        }
     updates = _record_updates(jobs_table, db)
 
     async def _fetch(_token: str) -> list[StandardJob]:
@@ -347,7 +353,14 @@ async def test_a_plainly_us_location_vetoes_a_foreign_board_country(
 ) -> None:
     """A multi-country posting whose postal address is abroad but which also
     lists a US office must not be pruned on the address alone (#60 workstream
-    B). Leaving it NULL hands the decision to the grader."""
+    B).
+
+    The assertion is about the PRUNE, not about the row being left untouched:
+    the location pass that runs next reads the same "New York, NY" and stamps
+    ``is_us = True``, which is the one direction that cannot hide a real job.
+    What must never happen is the FALSE verdict or the archive — remove the
+    ``positively_us_location`` veto from ``board_us_verdict`` and both appear.
+    """
     updates, jobs_table, summary = await _run_poll(
         monkeypatch,
         [_board_job(country="GB", location="New York, NY; London"), _control_job()],
@@ -357,7 +370,11 @@ async def test_a_plainly_us_location_vetoes_a_foreign_board_country(
     assert summary["new"] == 2  # precondition: BOTH rows were ingested
     pairs = _payload_ids(updates)
     _assert_control_was_marked(pairs)
-    assert all("j1" not in ids for _payload, ids in pairs), pairs
+    assert not [
+        (payload, ids)
+        for payload, ids in pairs
+        if "j1" in ids and (payload.get("is_us") is False or "archived_at" in payload)
+    ], pairs
 
 
 async def test_the_verdict_is_patched_into_the_rows_phase_2_will_grade(
