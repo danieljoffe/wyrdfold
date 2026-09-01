@@ -47,7 +47,7 @@ from app.services.llm.provider_breaker import (
 )
 from app.services.location_parse import parse_location
 from app.services.mock_board import fetch_mock_jobs
-from app.services.qualification import is_us_location
+from app.services.qualification import is_us_location, positively_us_location
 from app.services.recency import refresh_recency_scores_poll
 from app.services.relevance.rejection_store import (
     fetch_rejected_titles,
@@ -525,9 +525,60 @@ def _partition_unchanged(
     return to_write, skipped
 
 
-# in_() id-chunk bound for the board-verdict writes (#57 lesson: ≤150-200 UUIDs
-# keeps the PostgREST URL under proxy limits).
+# in_() id-chunk bound for the post-upsert ``is_us`` writes (#57 lesson:
+# ≤150-200 UUIDs keeps the PostgREST URL under proxy limits).
 _BOARD_US_CHUNK = 150
+
+
+async def _update_jobs_chunked(
+    supabase: AsyncClient,
+    rows: list[dict[str, Any]],
+    payload: dict[str, Any],
+    *,
+    null_filters: tuple[str, ...] = (),
+    label: str,
+) -> int:
+    """Write ``payload`` to ``rows`` in id-chunks; return how many rows ACTUALLY
+    changed, and patch the payload back into the ones that did.
+
+    Not ``len(rows)``. Every caller re-asserts a precondition in the WHERE
+    clause (``null_filters``), so a row another task changed between the upsert
+    snapshot and this write matches nothing — counting the candidate would
+    report a write that never happened. PostgREST answers an UPDATE with the
+    rows it changed (verified against the local stack: 3 ids in, one
+    concurrently archived, 2 rows back, and the untouched row keeps its
+    original timestamp), so ``.data`` is the outcome rather than the intent.
+
+    The same set drives the patch-back, for the same reason: a row the WHERE
+    clause skipped must not be told it was written. Those dicts go on to become
+    this cycle's Phase-2 ``cycle_rows``, so a lie here is spent grading.
+
+    Shared by the two post-upsert ``is_us`` passes (board country, location
+    string) so neither can drift into counting intent or skipping the
+    patch-back — the failure mode that makes an irreversible write look clean.
+    """
+    written = 0
+    for start in range(0, len(rows), _BOARD_US_CHUNK):
+        chunk = rows[start : start + _BOARD_US_CHUNK]
+        ids = [r["id"] for r in chunk]
+
+        def _build(c: Any, ids: list[str] = ids) -> Any:
+            q = c.table("jobs").update(payload).in_("id", ids)
+            for column in null_filters:
+                q = q.is_(column, "null")
+            return q
+
+        resp = await poll_db_write(supabase, _build, label=label)
+        changed = {
+            r["id"]
+            for r in (getattr(resp, "data", None) or [])
+            if isinstance(r, dict) and r.get("id")
+        }
+        written += len(changed)
+        for row in chunk:
+            if row["id"] in changed:
+                row.update(payload)
+    return written
 
 
 async def _apply_board_us_verdicts(
@@ -601,59 +652,112 @@ async def _apply_board_us_verdicts(
             if settings.qualification_archive_non_us and row.get("archived_at") is None:
                 to_archive.append(row)
 
-    async def _update(
-        rows: list[dict[str, Any]], payload: dict[str, Any], *, unarchived: bool
-    ) -> int:
-        """Write ``payload`` to ``rows``; return how many rows ACTUALLY changed.
-
-        Not ``len(rows)``. The archive write re-asserts ``archived_at IS NULL``,
-        so a row another task archived between the upsert snapshot and this
-        write matches nothing — counting the candidate would report an archive
-        that never happened. PostgREST answers an UPDATE with the rows it
-        changed (verified against the local stack: 3 ids in, one concurrently
-        archived, 2 rows back, and the untouched row keeps its original
-        timestamp), so ``.data`` is the outcome rather than the intent.
-
-        The same set drives the patch-back, for the same reason: a row the
-        WHERE clause skipped must not be told it was archived.
-        """
-        written = 0
-        for start in range(0, len(rows), _BOARD_US_CHUNK):
-            chunk = rows[start : start + _BOARD_US_CHUNK]
-            ids = [r["id"] for r in chunk]
-
-            def _build(c: Any, ids: list[str] = ids) -> Any:
-                q = c.table("jobs").update(payload).in_("id", ids)
-                # Re-assert the precondition in the WHERE clause: a concurrent
-                # archive between the upsert and this write must not have its
-                # timestamp moved.
-                return q.is_("archived_at", "null") if unarchived else q
-
-            resp = await poll_db_write(supabase, _build, label="board country is_us")
-            changed = {
-                r["id"]
-                for r in (getattr(resp, "data", None) or [])
-                if isinstance(r, dict) and r.get("id")
-            }
-            written += len(changed)
-            for row in chunk:
-                if row["id"] in changed:
-                    row.update(payload)
-        return written
-
     marked = archived = 0
+    label = "board country is_us"
     try:
+        # The verdict writes carry NO WHERE filter: they are corrections that
+        # have to land on archived rows too.
         if to_us:
-            marked += await _update(to_us, {"is_us": True}, unarchived=False)
+            marked += await _update_jobs_chunked(supabase, to_us, {"is_us": True}, label=label)
         if to_non_us:
-            marked += await _update(to_non_us, {"is_us": False}, unarchived=False)
+            marked += await _update_jobs_chunked(supabase, to_non_us, {"is_us": False}, label=label)
         if to_archive:
-            archived += await _update(
-                to_archive, {"archived_at": datetime.now(UTC).isoformat()}, unarchived=True
+            # Re-assert the precondition in the WHERE clause: a row archived by
+            # url_health or the stale sweep between the upsert and this write
+            # must not have its timestamp moved forward.
+            archived += await _update_jobs_chunked(
+                supabase,
+                to_archive,
+                {"archived_at": datetime.now(UTC).isoformat()},
+                null_filters=("archived_at",),
+                label=label,
             )
     except Exception:
         logger.exception("Board-country is_us write failed; leaving the rows untagged")
     return marked, archived
+
+
+async def _apply_location_us_verdicts(
+    supabase: AsyncClient,
+    jobs: list[StandardJob],
+    upserted: list[dict[str, Any]],
+) -> int:
+    """Stamp ``jobs.is_us = TRUE`` where the LOCATION STRING plainly names the US.
+
+    Returns the rows ACTUALLY written, for the cycle's funnel log.
+
+    WHY THIS EXISTS. ``_apply_board_us_verdicts`` above restored ingest-time
+    ``is_us`` for the providers that publish a structured country — Ashby,
+    Lever, SmartRecruiters — which is 39.2% of enabled sources (1,904 of 4,857
+    the day this shipped). Greenhouse (1,708) and Workday (1,245) publish no
+    country at all and never will, so 60.8% of sources are out of that path's
+    reach by construction, and measured coverage of newly cataloged rows sat at
+    23.5%.
+
+    What those boards DO publish is a location string, and
+    ``positively_us_location`` already reads it — the poller, the archive veto
+    and ``board_us_verdict`` all consult it. Until now the conclusion was
+    computed and thrown away: it was used to ADMIT or to VETO, never recorded.
+    This records it. Measured over the 5 days since tagging went lazy: 69 of
+    104 untagged rows (66%), taking deterministic coverage 23.5% → 74.3%.
+
+    ONE-DIRECTIONAL — it writes TRUE and never FALSE. The costs are asymmetric:
+    a wrong FALSE hides a real job from every serving surface (they all gate
+    ``is_us IS NOT FALSE``) and, with ``QUALIFICATION_ARCHIVE_NON_US`` on, gets
+    it archived — irreversibly. A withheld verdict merely leaves the row NULL,
+    which is exactly where it sits today and which the lazy tagger still grades
+    later. So a location string is trusted to CONFIRM the US and never to deny
+    it, the same asymmetry ``board_us_verdict`` and ``board_columns`` apply to
+    the board's own fields. ``is_us_location`` — the permissive sibling that
+    returns True for "Remote" and for anything ambiguous — is deliberately NOT
+    used here: it is an admission filter, and its True means "not provably
+    foreign", which is not a fact worth storing.
+
+    NEVER OVERWRITES. A row that already carries a verdict — from the board
+    pass that ran first, or from an earlier LLM tagging — is left alone, and
+    the write re-asserts ``is_us IS NULL`` in the WHERE clause so a verdict
+    that landed between the upsert snapshot and this write survives too. Order
+    matters: the board's structured country is the employer's own answer and
+    the stronger fact, so it runs first and this pass fills only what it left
+    unknown.
+
+    NOT AN UPSERT KEY, for the same reason the board pass isn't one: a
+    PostgREST bulk upsert builds ONE column list for the whole batch, so a key
+    present on any row is written to every row and the rows that omitted it get
+    NULL (#928). ``is_us`` is decided per row, so riding the payload would
+    blank the tagger's verdict on every silent sibling in the batch.
+
+    BEST-EFFORT: a write failure is logged and swallowed. The verdict re-derives
+    from the same location string on the next poll that touches the row, so a
+    transient blip must not fail a poll whose upsert already succeeded (a failed
+    poll counts toward the source's auto-disable threshold).
+    """
+    us_ids = {j.external_id for j in jobs if positively_us_location(j.location_name)}
+    if not us_ids:
+        return 0
+    # The upsert RETURNING carries the STORED ``is_us`` (the payload never sets
+    # it) and the board pass has already patched its own verdicts in, so
+    # ``is_us is None`` here means "still unknown after the stronger source".
+    to_us = [
+        row
+        for row in upserted
+        if isinstance(row.get("external_id"), str)
+        and row["external_id"] in us_ids
+        and row.get("is_us") is None
+    ]
+    if not to_us:
+        return 0
+    try:
+        return await _update_jobs_chunked(
+            supabase,
+            to_us,
+            {"is_us": True},
+            null_filters=("is_us",),
+            label="location is_us",
+        )
+    except Exception:
+        logger.exception("Location is_us write failed; leaving the rows untagged")
+        return 0
 
 
 def _dedupe_by_content(
@@ -1889,6 +1993,7 @@ async def _poll_one_source(
         new_rows: list[dict[str, Any]] = []
         board_us_marked = 0
         board_us_archived = 0
+        location_us_marked = 0
         if rows_to_upsert:
             # Dedupe rows_to_upsert by (company, title). Both within
             # the current batch and against existing rows that have a
@@ -1965,6 +2070,11 @@ async def _poll_one_source(
             board_us_marked, board_us_archived = await _apply_board_us_verdicts(
                 supabase, jobs, upserted_rows
             )
+            # ...and then the location string, for the 61% of sources whose
+            # board publishes no country at all. Second, never first: the
+            # board's structured field is the stronger fact, so this fills only
+            # what it left unknown. TRUE only — see _apply_location_us_verdicts.
+            location_us_marked = await _apply_location_us_verdicts(supabase, jobs, upserted_rows)
 
             # Qualification tags are LAZY now, exactly like embeddings below:
             # ingest is $0 LLM. ``ensure_job_tags`` in the Phase-2 runner buys
@@ -2281,7 +2391,7 @@ async def _poll_one_source(
             "poll_funnel source=%s fetched=%d dropped_phase1=%d "
             "dropped_title_prematch=%d dropped_non_us=%d candidates=%d "
             "upserted_new=%d upserted_updated=%d archived=%d "
-            "board_us_marked=%d board_us_archived=%d "
+            "board_us_marked=%d board_us_archived=%d location_us_marked=%d "
             "phase1_no_by_target=%s",
             company_name,
             len(jobs),
@@ -2294,6 +2404,7 @@ async def _poll_one_source(
             summary["archived"],
             board_us_marked,
             board_us_archived,
+            location_us_marked,
             per_target_phase1_no or "{}",
         )
 
@@ -3571,14 +3682,16 @@ async def _poll_one_source_for_target(
             board_us_marked, board_us_archived = await _apply_board_us_verdicts(
                 supabase, jobs, upserted_rows
             )
-            if board_us_marked or board_us_archived:
+            location_us_marked = await _apply_location_us_verdicts(supabase, jobs, upserted_rows)
+            if board_us_marked or board_us_archived or location_us_marked:
                 logger.info(
                     "poll_funnel_target source=%s target=%s "
-                    "board_us_marked=%d board_us_archived=%d",
+                    "board_us_marked=%d board_us_archived=%d location_us_marked=%d",
                     company_name,
                     target.id,
                     board_us_marked,
                     board_us_archived,
+                    location_us_marked,
                 )
 
             # Qualification tags are LAZY (see _poll_one_source): the Phase-2
