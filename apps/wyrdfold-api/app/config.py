@@ -941,23 +941,42 @@ class Settings(BaseSettings):
     # week while steady-state intake (~100-200/day) never touches the ceiling.
     persistent_block_admission_cap_per_cycle: int = Field(default=50, ge=0)
 
-    # GLOBAL ceiling on how many NEW listings enter the catalog per rolling
-    # hour, across EVERY admission path. Distinct from
-    # ``persistent_block_admission_cap_per_cycle`` above, which throttles only
-    # the persistent-block FALLBACK: a job a target actually triaged and called
-    # promising has never been rate-limited at all, so before this setting
-    # nothing bounded ordinary intake. That was survivable only because supply
-    # happened to be low; a discovery run that adds sources, or a large board
-    # publishing a backlog, could drive an unbounded insert burst (each new row
-    # drags score rows, embeddings and archival work behind it).
+    # Ceiling on how many NEW listings AUTOMATED intake may add to the catalog
+    # per rolling hour. Automated intake means the poller: the scheduled cycle,
+    # ``POST /poll/due``, ``poll_all_sources`` and the target-activation
+    # fan-out. All four share this one budget.
     #
-    # This is a DATABASE-PROTECTION ceiling, not a spend or relevance control —
-    # admission decisions are made by the gates above; this only bounds the RATE
-    # at which their output lands. Known rows are never counted or blocked: a
-    # content refresh (JD edit, salary re-extraction, the escaped-HTML heal)
-    # updates a row that already exists and adds no write pressure of the kind
-    # this bounds. Deferred listings are not lost — an undersupplied cycle
-    # re-sees them on the next poll of the same source.
+    # Distinct from ``persistent_block_admission_cap_per_cycle`` above, which
+    # throttles only the persistent-block FALLBACK: a job a target actually
+    # triaged and called promising has never been rate-limited at all, so
+    # before this setting nothing bounded ordinary intake. That was survivable
+    # only because supply happened to be low; a discovery run that adds
+    # sources, or a large board publishing a backlog, could drive an unbounded
+    # insert burst, and each new row drags score rows, embeddings and archival
+    # work behind it.
+    #
+    # USER-INITIATED materialization is deliberately NOT gated by this.
+    # ``job_ingest.materialize_and_score_job`` — behind ``POST /jobs/manual``
+    # and target-creation-from-a-JD-URL — inserts ONE row per request, is
+    # rate-limited at the endpoint, and represents explicit human intent.
+    # Refusing it to protect against a POLLER burst would invert the priority
+    # this codebase already sets elsewhere: ``grading_budget_reserve_usd``
+    # fences off budget so background work yields to live work, never the
+    # reverse. A person clicking "add this job" must not fail because the
+    # poller spent the hour.
+    #
+    # Those rows are still COUNTED: they land in ``jobs.cataloged_at`` like any
+    # other, so they shrink the allowance the next poll cycle reads. The hour
+    # can therefore be exceeded, but only by human action, and only by the
+    # trickle a rate-limited one-row-per-request path can produce. The burst
+    # vectors this exists for are all on the automated side.
+    #
+    # Placed AFTER the relevance gates, so it never changes WHICH listings are
+    # worth admitting — only how fast already-judged-worthy ones land.
+    # Deferred listings are not lost: the next poll of the same source re-sees
+    # them. Known rows are never counted or blocked either — a content refresh
+    # (JD edit, salary re-extraction, the escaped-HTML heal) updates a row that
+    # already exists and adds no insert pressure of the kind this bounds.
     #
     # Truth is re-read from ``jobs.cataloged_at`` at the start of each cycle
     # rather than kept in a process counter, so it survives restarts and the

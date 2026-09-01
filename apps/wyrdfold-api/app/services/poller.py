@@ -189,13 +189,23 @@ def new_admission_budget() -> AdmissionBudget:
 
 @dataclass
 class IntakeBudget:
-    """This cycle's slice of the GLOBAL hourly ceiling on new listings.
+    """This cycle's slice of the hourly ceiling on AUTOMATED new listings.
 
     Bounds write pressure, not spend or relevance: ``settings.
-    intake_max_new_jobs_per_hour`` caps how many rows may be INSERTED into
-    ``jobs`` per rolling hour across every admission path, including the
-    ordinary "a target triaged it and said promising" path that
+    intake_max_new_jobs_per_hour`` caps how many rows the POLLER may INSERT
+    into ``jobs`` per rolling hour — the scheduled cycle, ``POST /poll/due``,
+    ``poll_all_sources`` and the activation fan-out all share this one budget,
+    including the ordinary "a target triaged it and said promising" path that
     :class:`AdmissionBudget` deliberately never touches.
+
+    NOT a ceiling on every row that can reach ``jobs``.
+    ``job_ingest.materialize_and_score_job`` (manual add, target-from-URL)
+    inserts one row per rate-limited request on explicit human intent and is
+    deliberately exempt — refusing a person's "add this job" to protect against
+    a poller burst would invert the priority ``grading_budget_reserve_usd``
+    already sets, where background yields to live work and not the reverse.
+    Those rows still land in ``cataloged_at``, so they shrink the next cycle's
+    allowance; the hour can be exceeded, but only by human action.
 
     Seeded from the DATABASE, not a process counter. ``remaining`` is
     ``cap - (rows cataloged in the last hour)``, re-read once per cycle, for the
@@ -230,7 +240,14 @@ class IntakeBudget:
         return True
 
     def report(self) -> str:
-        """One-line intake state for the cycle log."""
+        """One-line intake state for the cycle log.
+
+        The counts are admission SLOTS CONSUMED, not rows confirmed written: a
+        slot is taken before the upsert runs, so a later write failure leaves
+        this line reading high. Deliberate — the ceiling must not be able to
+        under-count itself — but it means an operator should not diff this
+        against a ``COUNT(*)`` and expect equality. ``prior`` is the only
+        figure here read back from the database."""
         if self.cap <= 0 or self.remaining is None:
             return "intake=uncapped"
         admitted = max(0, self.cap - self.prior - self.remaining)
