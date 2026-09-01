@@ -3227,3 +3227,47 @@ class TestExclusionAdmitScope:
         active = _target_with_negatives(["assistant"], ["director of operations"])
 
         assert poller_mod._admits_for_catalog("Administrative Assistant", [active], None) is True
+
+
+class TestIntakeCeilingsAreCoherent:
+    """Two ceilings bound intake. They must stay within sight of each other.
+
+    For a day, they did not: the admission ramp allowed 50/cycle (~1,200/h)
+    while ``intake_max_new_jobs_per_hour`` allowed 2,000/h. The hourly ceiling
+    -- the one designed, measured and documented as THE intake bound -- sat at
+    ~5% utilisation while the ramp bound every single cycle. Nothing failed;
+    the catalogue just quietly refused ~367 eligible listings per cycle, and a
+    whole role family never reached /search.
+
+    The lesson is not the number, it is that a vestigial guard outlived its
+    reason and nobody noticed because both were 'working'."""
+
+    def test_the_ramp_is_not_secretly_the_real_intake_ceiling(self) -> None:
+        from app.config import settings as s
+
+        cycles_per_hour = 60 / s.poll_tick_minutes
+        ramp_per_hour = s.persistent_block_admission_cap_per_cycle * cycles_per_hour
+
+        assert s.persistent_block_admission_cap_per_cycle > 0, (
+            "0 means uncapped; fine, but then this test is moot"
+        )
+        assert ramp_per_hour >= s.intake_max_new_jobs_per_hour / 2, (
+            f"the admission ramp allows {ramp_per_hour:.0f}/h against an hourly "
+            f"ceiling of {s.intake_max_new_jobs_per_hour}/h. The ramp is meant to "
+            "smooth a backlog drain, not to be the system's intake ceiling — if "
+            "it is this much tighter it will bind first and the documented "
+            "ceiling becomes decorative."
+        )
+
+    def test_the_ramp_clears_measured_eligible_supply(self) -> None:
+        """Traced against live boards 2026-09-01: ~417 NEW eligible listings per
+        cycle. A ramp below that defers supply indefinitely rather than
+        smoothing a burst, which is the difference between a ramp and a cap."""
+        from app.config import settings as s
+
+        measured_eligible_per_cycle = 417
+        assert s.persistent_block_admission_cap_per_cycle >= measured_eligible_per_cycle, (
+            f"ramp {s.persistent_block_admission_cap_per_cycle}/cycle is below the "
+            f"~{measured_eligible_per_cycle} eligible listings a cycle actually "
+            "produces, so listings queue forever instead of draining"
+        )

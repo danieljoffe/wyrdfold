@@ -1036,18 +1036,40 @@ class Settings(BaseSettings):
     persistent_block_admits_ingestion: bool = False
 
     # Ramp for the admission that flag opens. Bounds how many previously
-    # unadmitted listings enter the catalog per POLL CYCLE, so the ~14,800-row
-    # backlog drains over days rather than arriving in one tick and dragging a
-    # burst of score rows, activation-time tagging and archival behind it.
+    # unadmitted listings enter the catalog per POLL CYCLE, so a backlog drains
+    # over days rather than arriving in one tick and dragging a burst of score
+    # rows, activation-time tagging and archival behind it.
     #
     # Only the persistent-block FALLBACK consumes this. A job admitted the
     # ordinary way — a target actually triaged it and said promising — is never
     # rate-limited, and neither is a cycle with triage off or no targets.
     #
-    # 0 disables the cap (drain as fast as the poller finds them). 50/cycle at
-    # a 30-minute tick is ~2,400/day, so the measured backlog clears in under a
-    # week while steady-state intake (~100-200/day) never touches the ceiling.
-    persistent_block_admission_cap_per_cycle: int = Field(default=50, ge=0)
+    # 0 disables the cap. RAISED 50 -> 500 (2026-09-01) because the assumption
+    # this number was sized against stopped being true, and the sentence that
+    # used to live here — "steady-state intake (~100-200/day) never touches the
+    # ceiling" — was measurably wrong within a day:
+    #
+    #   * It was sized to drain a ONE-OFF ~14,800-row backlog gently. But with
+    #     no active user targets, EVERY admission takes the persistent-block
+    #     fallback, so this stopped being a backlog throttle and became the
+    #     total intake ceiling for the whole system.
+    #   * ``admit_on_any_target`` widened the eligible pool. Traced against live
+    #     boards: ~417 NEW eligible listings per cycle, against 50 slots — so
+    #     ~367 were deferred every cycle and a given listing had roughly a
+    #     1-in-8 chance of ever landing. Frontend roles (about 1 new per cycle)
+    #     effectively never won that lottery, which is what made /search look
+    #     stale for a whole role family.
+    #   * ``intake_max_new_jobs_per_hour`` (2000/h) now does the burst
+    #     protection this was improvised for, properly and at the right layer.
+    #     It sat at ~5% utilisation while THIS ceiling bound every single cycle,
+    #     which is the tell that the wrong one was doing the work.
+    #
+    # 500/cycle at a 30-minute tick is ~24,000/day, comfortably above measured
+    # eligible supply so listings stop queueing indefinitely, while the hourly
+    # ceiling above stays the real backstop. Deliberately NOT uncapped: two
+    # ceilings at very different scales is what hid this for a day, and one
+    # notch with a measurement beats removing the guard outright.
+    persistent_block_admission_cap_per_cycle: int = Field(default=500, ge=0)
 
     # Ceiling on how many NEW listings AUTOMATED intake may add to the catalog
     # per rolling hour. Automated intake means the poller: the scheduled cycle,
