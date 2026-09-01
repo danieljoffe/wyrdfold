@@ -132,9 +132,7 @@ async def phase1_backfill_allowance(
     effective_cap = settings.phase1_daily_cap if cap is None else cap
     if effective_cap <= 0:
         return None
-    effective_fraction = (
-        settings.phase1_backfill_cap_fraction if fraction is None else fraction
-    )
+    effective_fraction = settings.phase1_backfill_cap_fraction if fraction is None else fraction
     share = int(effective_cap * effective_fraction)
     used = await phase1_calls_today(supabase, target_id)
     if used is None:

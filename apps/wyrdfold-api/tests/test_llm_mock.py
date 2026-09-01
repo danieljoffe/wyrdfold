@@ -961,9 +961,7 @@ async def test_phase1_faithful_verdicts_parse_end_to_end() -> None:
     from app.services.llm.mock import phase1_triage_verdicts_json
 
     titles = ["Frontend Engineer", "Account Executive"]
-    verdicts, result = await _triage_with(
-        phase1_triage_verdicts_json(titles, "faithful"), titles
-    )
+    verdicts, result = await _triage_with(phase1_triage_verdicts_json(titles, "faithful"), titles)
 
     assert result is not None
     assert verdicts[1].promising is True
@@ -978,9 +976,7 @@ async def test_phase1_omitted_ids_leave_no_verdict_to_fail_open_on() -> None:
     from app.services.llm.mock import phase1_triage_verdicts_json
 
     titles = [f"Engineer {i}" for i in range(4)]
-    verdicts, result = await _triage_with(
-        phase1_triage_verdicts_json(titles, "omits_ids"), titles
-    )
+    verdicts, result = await _triage_with(phase1_triage_verdicts_json(titles, "omits_ids"), titles)
 
     assert result is not None
     assert set(verdicts) == {1, 2}
@@ -1025,9 +1021,7 @@ async def test_phase1_low_confidence_verdicts_survive_parsing_but_not_admission(
     from app.services.relevance.title_triage import admitted
 
     titles = ["Frontend Engineer"]
-    verdicts, _ = await _triage_with(
-        phase1_triage_verdicts_json(titles, "low_confidence"), titles
-    )
+    verdicts, _ = await _triage_with(phase1_triage_verdicts_json(titles, "low_confidence"), titles)
 
     assert verdicts[1].promising is True and verdicts[1].confidence == 25
     assert admitted(verdicts[1], min_confidence=40) is False
@@ -1043,9 +1037,7 @@ async def test_phase1_truncated_output_defers_the_batch() -> None:
     from app.services.llm.mock import phase1_triage_verdicts_json
 
     titles = ["Frontend Engineer", "Account Executive"]
-    verdicts, result = await _triage_with(
-        phase1_triage_verdicts_json(titles, "truncated"), titles
-    )
+    verdicts, result = await _triage_with(phase1_triage_verdicts_json(titles, "truncated"), titles)
 
     assert verdicts == {}
     assert result is None  # None = failed call = the poller/backfill DEFERS

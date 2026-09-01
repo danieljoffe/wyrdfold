@@ -133,7 +133,10 @@ def _enable_backfill(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_backfill_writes_real_promising_verdicts_over_stage1_rows() -> None:
     """The headline. ``bulk_title_score_for_target`` leaves ``promising`` NULL;
     this pass fills it in with an actual LLM verdict."""
-    jobs = [_job("j1", "Frontend Engineer", days_ago=1), _job("j2", "Account Executive", days_ago=2)]
+    jobs = [
+        _job("j1", "Frontend Engineer", days_ago=1),
+        _job("j2", "Account Executive", days_ago=2),
+    ]
     supabase = backfill_supabase(jobs=jobs, scores=[_score("j1"), _score("j2")])
 
     # PRECONDITION: the stage1 rows exist and carry NO Phase-1 verdict, which
@@ -142,9 +145,7 @@ async def test_backfill_writes_real_promising_verdicts_over_stage1_rows() -> Non
     assert all(r["scoring_status"] == "stage1" for r in supabase._scores.rows.values())
 
     client = _llm()
-    result = await backfill_phase1_for_target(
-        supabase, client, _target(), payer_user_id="u-1"
-    )
+    result = await backfill_phase1_for_target(supabase, client, _target(), payer_user_id="u-1")
 
     assert result.llm_calls == 1
     assert result.verdicts_written == 2
@@ -165,10 +166,11 @@ async def test_backfill_writes_real_promising_verdicts_over_stage1_rows() -> Non
 async def test_backfill_leaves_already_graded_rows_alone() -> None:
     """Only ``promising IS NULL`` rows are candidates — a graded row is never
     re-billed."""
-    jobs = [_job("j1", "Frontend Engineer", days_ago=1), _job("j2", "Staff Web Engineer", days_ago=2)]
-    supabase = backfill_supabase(
-        jobs=jobs, scores=[_score("j1", promising=True), _score("j2")]
-    )
+    jobs = [
+        _job("j1", "Frontend Engineer", days_ago=1),
+        _job("j2", "Staff Web Engineer", days_ago=2),
+    ]
+    supabase = backfill_supabase(jobs=jobs, scores=[_score("j1", promising=True), _score("j2")])
     assert supabase._scores.rows[("j1", TARGET_ID)]["promising"] is True  # precondition
 
     client = _llm()
@@ -425,9 +427,7 @@ async def test_cap_of_zero_leaves_the_backfill_unbounded(
     jobs = [_job(f"j{i}", f"Engineer {i}", days_ago=i + 1) for i in range(3)]
     supabase = backfill_supabase(jobs=jobs, scores=[_score(j["id"]) for j in jobs])
 
-    result = await backfill_phase1_for_target(
-        supabase, _llm(), _target(), payer_user_id="u-1"
-    )
+    result = await backfill_phase1_for_target(supabase, _llm(), _target(), payer_user_id="u-1")
 
     assert result.allowance is None
     assert result.llm_calls == 3

@@ -364,9 +364,7 @@ async def backfill_phase1_for_target(
                     # the id, or the title_prefix cross-check rejected it)
                     # fail-opens to promising — false positives are cheap,
                     # false negatives are lost forever.
-                    is_promising = admitted(
-                        verdict, min_confidence=settings.phase1_min_confidence
-                    )
+                    is_promising = admitted(verdict, min_confidence=settings.phase1_min_confidence)
                     rows.append(
                         _verdict_row(
                             job_posting_id=jid,

@@ -48,9 +48,7 @@ class TestCounting:
                 # This target's PHASE-2 spend — a different cap entirely.
                 cost_row(target_id=TARGET_ID, purpose="fit.job"),
                 # This target's Phase-1 spend from before today's rollover.
-                cost_row(
-                    target_id=TARGET_ID, purpose=PHASE1_PURPOSE, created_at=yesterday
-                ),
+                cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE, created_at=yesterday),
             ]
         )
 
@@ -108,9 +106,7 @@ class TestBackfillAllowance:
         assert await phase1_backfill_allowance(supabase, TARGET_ID) == 2
 
     @pytest.mark.asyncio
-    async def test_bounded_by_what_the_day_has_left(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_bounded_by_what_the_day_has_left(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(settings, "phase1_backfill_cap_fraction", 1.0)
         supabase = _sb([cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE) for _ in range(9)])
 
