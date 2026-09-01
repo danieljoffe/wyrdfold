@@ -362,6 +362,28 @@ class Settings(BaseSettings):
     # count, exactly as Phase 1 is today.
     phase1_backfill_cap_fraction: float = Field(default=0.25, ge=0.0, le=1.0)
 
+    # How often to RESUME Phase-1 backfills that stopped early. 0 disables the
+    # sweep entirely (the activation-time pass still runs).
+    #
+    # The backfill is allowed to stop early by design — its own fractional
+    # allowance, the shared daily cap, the global budget, or an unavailable
+    # provider. The rows it did not reach stay ``promising IS NULL``, and
+    # NOTHING ELSE WILL EVER JUDGE THEM: ordinary polling only triages
+    # externally-new listings, which is the entire reason this backfill exists.
+    # Before this sweep, ``_activate_pipeline`` was the only caller, so a pass
+    # cut short by a cap stayed cut short until a user happened to toggle the
+    # target off and on. Review caught it; the invariant is that an early stop
+    # must have an automatic path to eventual completion.
+    #
+    # DAILY is the right cadence, not per-cycle. Three of the four stop reasons
+    # (own allowance, shared daily cap, global daily budget) only free up at
+    # the UTC rollover, so resuming sooner cannot spend more — it would just
+    # re-page the window for nothing, and a no-work pass reads every page of
+    # the 30-day window (~3s per target). Each day grants another
+    # ``phase1_backfill_cap_fraction`` share, so even a target needing several
+    # thousand calls converges in days rather than never.
+    phase1_backfill_resume_tick_hours: int = Field(default=24, ge=0, le=720)
+
     # Recency decay (#5). When True the /jobs list sorts/paginates by
     # ``scores.recency_score`` (the fit score decayed by posting age via
     # ``app/services/recency.py``) and the poller refreshes that column

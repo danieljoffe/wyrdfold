@@ -112,6 +112,39 @@ async def phase1_cap_reached(
     return used >= effective
 
 
+async def phase1_backfill_cap_reached(
+    supabase: AsyncClient, target_id: str, *, cap: int | None = None
+) -> bool:
+    """The backfill's mid-pass twin of :func:`phase1_cap_reached`, failing
+    CLOSED where that one fails open.
+
+    The two spenders have opposite postures by design (see the module
+    docstring): a fresh-ingestion count blip must not stall the catalog, so
+    :func:`phase1_cap_reached` treats the unknown as "not reached". The
+    activation backfill is discretionary catch-up spend, so it treats the
+    unknown as "stop".
+
+    Why this exists: the backfill opened with the fail-CLOSED
+    :func:`phase1_backfill_allowance` and then re-checked BETWEEN batches with
+    the fail-OPEN :func:`phase1_cap_reached`, so a count that worked at the
+    start and began failing mid-pass let it keep spending to its original
+    allowance. The bound still held, but the documented posture did not.
+    Caught in review.
+    """
+    effective = settings.phase1_daily_cap if cap is None else cap
+    if effective <= 0:
+        return False
+    used = await phase1_calls_today(supabase, target_id)
+    if used is None:
+        logger.warning(
+            "phase1_backfill_cap_reached: count unreadable for target %s — "
+            "stopping the pass (fail-closed)",
+            target_id,
+        )
+        return True
+    return used >= effective
+
+
 async def phase1_backfill_allowance(
     supabase: AsyncClient,
     target_id: str,

@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -30,7 +30,10 @@ from app.models.targets import (
 )
 from app.services.llm.mock import MockLLMClient, phase1_triage_verdicts_json
 from app.services.relevance import phase1_backfill as bf
-from app.services.relevance.phase1_backfill import backfill_phase1_for_target
+from app.services.relevance.phase1_backfill import (
+    Phase1BackfillResult,
+    backfill_phase1_for_target,
+)
 from app.services.relevance.title_triage import PHASE1_PURPOSE
 from tests.support.fake_backfill_db import backfill_supabase, cost_row
 
@@ -716,3 +719,151 @@ async def test_activation_pipeline_judges_what_the_retro_score_surfaced(
     assert supabase._scores.rows[("j1", TARGET_ID)]["promising"] is True
     assert supabase._scores.rows[("j2", TARGET_ID)]["promising"] is False
     assert len(client.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Resumability: an early stop must have an automatic path to completion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_capped_pass_is_resumed_without_a_user_toggling_the_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The blocker this sweep exists for.
+
+    Stopping early is part of the design — own allowance, shared daily cap,
+    global budget, provider outage. But the rows a stopped pass did not reach
+    keep ``promising IS NULL``, and NOTHING else judges them: ordinary polling
+    triages only externally-new listings. Activation was the sole caller, so an
+    early stop stayed permanent unless a user toggled the target off and on.
+
+    This proves the second run finishes the job with no user action: run one
+    stops on its allowance, run two grades what run one left."""
+    from app.services import poller as poller_mod
+
+    target = _target()
+    monkeypatch.setattr(poller_mod.settings, "phase1_backfill_enabled", True)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(
+        poller_mod, "resolve_target_payers", AsyncMock(return_value={target.id: "u-1"})
+    )
+    monkeypatch.setattr(poller_mod, "_resolve_payer_client", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+
+    calls: list[str] = []
+
+    async def _fake_backfill(_sb, _llm, tgt, *, payer_user_id, budget_blocks=None):
+        calls.append(tgt.id)
+        # Run 1 stops on its allowance with rows still ungraded; run 2 finishes.
+        if len(calls) == 1:
+            return Phase1BackfillResult(verdicts_written=40, stopped="allowance")
+        return Phase1BackfillResult(verdicts_written=12, stopped=None)
+
+    monkeypatch.setattr(poller_mod, "backfill_phase1_for_target", _fake_backfill)
+
+    first = await poller_mod.resume_phase1_backfills(MagicMock())
+    second = await poller_mod.resume_phase1_backfills(MagicMock())
+
+    assert first["written"] == 40
+    assert second["written"] == 12, "leftovers were never picked up"
+    assert calls == [target.id, target.id], "the sweep must re-visit the target"
+
+
+@pytest.mark.asyncio
+async def test_resume_sweep_is_inert_while_the_feature_is_dark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control: the sweep ships dark with the feature and must not read
+    anything — not even the active-target list — while disabled."""
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(poller_mod.settings, "phase1_backfill_enabled", False)
+    active = AsyncMock(return_value=[_target()])
+    monkeypatch.setattr(poller_mod, "_active_targets", active)
+
+    out = await poller_mod.resume_phase1_backfills(MagicMock())
+
+    assert out == {"targets": 0, "resumed": 0, "written": 0, "errors": 0}
+    active.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_one_failing_target_does_not_stop_the_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-target isolation, mirroring the poll cycle's per-source isolation."""
+    from app.services import poller as poller_mod
+
+    t1 = _target()
+    t2 = _target().model_copy(update={"id": "tgt-2"})
+    monkeypatch.setattr(poller_mod.settings, "phase1_backfill_enabled", True)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[t1, t2]))
+    monkeypatch.setattr(
+        poller_mod,
+        "resolve_target_payers",
+        AsyncMock(return_value={t1.id: "u-1", t2.id: "u-2"}),
+    )
+    monkeypatch.setattr(poller_mod, "_resolve_payer_client", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+
+    async def _flaky(_sb, _llm, tgt, *, payer_user_id, budget_blocks=None):
+        if tgt.id == t1.id:
+            raise RuntimeError("provider exploded")
+        return Phase1BackfillResult(verdicts_written=7)
+
+    monkeypatch.setattr(poller_mod, "backfill_phase1_for_target", _flaky)
+
+    out = await poller_mod.resume_phase1_backfills(MagicMock())
+
+    assert out["errors"] == 1
+    assert out["written"] == 7, "the healthy target was skipped"
+
+
+@pytest.mark.asyncio
+async def test_verdicts_written_counts_rows_that_actually_landed() -> None:
+    """``_write_verdicts`` swallows a failed chunk on purpose — a lost verdict
+    is re-derived on a later pass and raising would fail the whole activation
+    over a partial write. But the caller incremented by ``len(rows)``
+    regardless, so the log could claim "150 verdict(s) written" when the write
+    failed and none landed — the one number an operator would use to decide
+    whether the backfill is working. Caught in review."""
+    supabase = MagicMock()
+    supabase.table.return_value.upsert.return_value.execute = AsyncMock(
+        side_effect=RuntimeError("postgrest exploded")
+    )
+
+    rows = [
+        bf._verdict_row(
+            job_posting_id=f"j-{i}",
+            target_id=TARGET_ID,
+            promising=True,
+            confidence=90,
+            was_excluded=False,
+        )
+        for i in range(5)
+    ]
+
+    assert await bf._write_verdicts(supabase, rows) == 0
+
+
+@pytest.mark.asyncio
+async def test_verdicts_written_counts_a_successful_write() -> None:
+    """Control for the test above: a working write must still be counted."""
+    supabase = MagicMock()
+    supabase.table.return_value.upsert.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=[])
+    )
+
+    rows = [
+        bf._verdict_row(
+            job_posting_id=f"j-{i}",
+            target_id=TARGET_ID,
+            promising=True,
+            confidence=90,
+            was_excluded=False,
+        )
+        for i in range(5)
+    ]
+
+    assert await bf._write_verdicts(supabase, rows) == 5

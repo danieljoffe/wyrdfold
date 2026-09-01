@@ -74,7 +74,10 @@ from app.config import settings
 from app.models.targets import JobTarget
 from app.services.llm.client import LLMClient
 from app.services.llm.cost_log import record_async as record_llm_cost_async
-from app.services.relevance.daily_cap import phase1_backfill_allowance, phase1_cap_reached
+from app.services.relevance.daily_cap import (
+    phase1_backfill_allowance,
+    phase1_backfill_cap_reached,
+)
 from app.services.relevance.rejection_store import (
     fetch_rejected_titles,
     normalize_title,
@@ -161,11 +164,20 @@ def _verdict_row(
     }
 
 
-async def _write_verdicts(supabase: AsyncClient, rows: list[dict[str, Any]]) -> None:
-    """Upsert verdict rows in chunks. Best-effort: a failed chunk is logged
-    and the pass continues, exactly like the rejection store's write posture —
-    a lost verdict is re-derived on the next activation, and raising here
-    would fail the whole activation over a partial write."""
+async def _write_verdicts(supabase: AsyncClient, rows: list[dict[str, Any]]) -> int:
+    """Upsert verdict rows in chunks, returning how many were PERSISTED.
+
+    Best-effort: a failed chunk is logged and the pass continues, exactly like
+    the rejection store's write posture — a lost verdict is re-derived on a
+    later pass, and raising here would fail the whole activation over a partial
+    write.
+
+    Returns the persisted count rather than ``None`` because the caller reports
+    it. Incrementing by ``len(rows)`` regardless (as it did) meant a log line
+    could claim "150 verdict(s) written" when the write failed and none landed
+    — the one number an operator would use to decide whether the backfill is
+    working. Caught in review."""
+    persisted = 0
     for i in range(0, len(rows), _UPSERT_CHUNK_SIZE):
         chunk = rows[i : i + _UPSERT_CHUNK_SIZE]
         try:
@@ -181,6 +193,9 @@ async def _write_verdicts(supabase: AsyncClient, rows: list[dict[str, Any]]) -> 
                 len(chunk),
                 exc_info=True,
             )
+        else:
+            persisted += len(chunk)
+    return persisted
 
 
 async def _ungraded_page(
@@ -311,7 +326,7 @@ async def backfill_phase1_for_target(
             todo = [c for c in page if normalize_title(c[1]) not in cached]
             if hits:
                 store_hits += len(hits)
-                await _write_verdicts(
+                written += await _write_verdicts(
                     supabase,
                     [
                         _verdict_row(
@@ -324,14 +339,13 @@ async def backfill_phase1_for_target(
                         for jid, _title, was_excluded in hits
                     ],
                 )
-                written += len(hits)
                 rejected_n += len(hits)
 
             for start in range(0, len(todo), batch_cap):
                 if allowance is not None and llm_calls >= allowance:
                     stopped = "allowance"
                     break
-                if await phase1_cap_reached(supabase, target.id):
+                if await phase1_backfill_cap_reached(supabase, target.id):
                     stopped = "daily_cap"
                     break
                 if budget_blocks is not None and await budget_blocks():
@@ -384,8 +398,7 @@ async def backfill_phase1_for_target(
                     if verdict is not None and not verdict.promising:
                         rejections.append((title, verdict.confidence))
 
-                await _write_verdicts(supabase, rows)
-                written += len(rows)
+                written += await _write_verdicts(supabase, rows)
                 if rejections:
                     await record_rejections(supabase, target, rejections)
 

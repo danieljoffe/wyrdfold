@@ -15,6 +15,7 @@ import pytest
 from app.config import settings
 from app.services.relevance.daily_cap import (
     phase1_backfill_allowance,
+    phase1_backfill_cap_reached,
     phase1_calls_today,
     phase1_cap_reached,
 )
@@ -169,3 +170,43 @@ class TestBackfillAllowance:
         # Opposite posture to ingestion, on purpose: a backfill that does not
         # run costs a user nothing they had yesterday.
         assert await phase1_backfill_allowance(supabase, TARGET_ID) == 0
+
+
+class TestBackfillCapPosture:
+    """The two spenders read the same counter with OPPOSITE postures, and the
+    backfill must keep its fail-CLOSED one for the WHOLE pass, not just at the
+    start. It opened with the fail-closed ``phase1_backfill_allowance`` and
+    then re-checked between batches with the fail-OPEN ``phase1_cap_reached``,
+    so a count that worked at the start and began failing mid-pass let it keep
+    spending. Caught in review."""
+
+    @staticmethod
+    def _unreadable():  # type: ignore[no-untyped-def]
+        supabase = _sb()
+        supabase.table.side_effect = KeyError("llm_costs not routed")
+        return supabase
+
+    @pytest.mark.asyncio
+    async def test_backfill_stops_when_the_count_is_unreadable(self) -> None:
+        assert await phase1_backfill_cap_reached(self._unreadable(), TARGET_ID) is True
+
+    @pytest.mark.asyncio
+    async def test_ingestion_keeps_going_when_the_count_is_unreadable(self) -> None:
+        """The contrast that makes the pair meaningful: a count blip must not
+        stall fresh ingestion, so this sibling stays fail-OPEN."""
+        assert await phase1_cap_reached(self._unreadable(), TARGET_ID) is False
+
+    @pytest.mark.asyncio
+    async def test_a_readable_count_behaves_identically_for_both(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Control: the postures differ ONLY on the unknown."""
+        monkeypatch.setattr(settings, "phase1_daily_cap", 2)
+        supabase = _sb(
+            [
+                cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE),
+                cost_row(target_id=TARGET_ID, purpose=PHASE1_PURPOSE),
+            ]
+        )
+        assert await phase1_backfill_cap_reached(supabase, TARGET_ID) is True
+        assert await phase1_cap_reached(supabase, TARGET_ID) is True

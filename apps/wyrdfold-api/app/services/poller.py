@@ -50,6 +50,7 @@ from app.services.mock_board import fetch_mock_jobs
 from app.services.qualification import is_us_location
 from app.services.recency import refresh_recency_scores_poll
 from app.services.relevance.daily_cap import phase1_cap_reached
+from app.services.relevance.phase1_backfill import backfill_phase1_for_target
 from app.services.relevance.rejection_store import (
     fetch_rejected_titles,
     normalize_title,
@@ -79,6 +80,7 @@ from app.services.targets.payers import (
     PayerBudgetGate,
     block_is_persistent,
     build_budget_gate,
+    resolve_target_payers,
 )
 from app.services.titles import clean_title_display
 from app.services.validate import liveness_verdict, validate_job_url
@@ -1067,15 +1069,12 @@ async def _backfill_qualify_stale(supabase: AsyncClient, limit: int) -> None:
             # a timestamptz carries '+' and ':' which PostgREST would otherwise
             # read as filter syntax.
             q = q.or_(
-                f'cataloged_at.gt."{seen_at}",'
-                f'and(cataloged_at.eq."{seen_at}",id.gt."{seen_id}")'
+                f'cataloged_at.gt."{seen_at}",and(cataloged_at.eq."{seen_at}",id.gt."{seen_id}")'
             )
         return q.order("cataloged_at", desc=False).order("id", desc=False).limit(limit)
 
     try:
-        resp = await poll_db_read(
-            supabase, _select, label="poll qualify-backfill select"
-        )
+        resp = await poll_db_read(supabase, _select, label="poll qualify-backfill select")
     except Exception:
         logger.exception("Qualification backfill: select failed; skipping this cycle")
         return
@@ -1321,9 +1320,7 @@ async def _resolve_payer_client(
             # A lapsed trial stops costing money the moment it lapses: the
             # same defer path as a missing key, so background grading halts
             # without needing a separate sweep (#841).
-            logger.info(
-                "Background grading deferred for payer %s (trial expired)", payer_user_id
-            )
+            logger.info("Background grading deferred for payer %s (trial expired)", payer_user_id)
             cache[payer_user_id] = None
         except MissingUserKeyError:
             logger.info(
@@ -2533,8 +2530,7 @@ async def _redetect_before_disabling(
     # strength of a heuristic probe, and every one of them should be greppable
     # in the Railway logs (and reversible by hand from this line alone).
     logger.warning(
-        "Source %s RE-POINTED after %d consecutive failures: %s/%s -> %s/%s "
-        "(%d live postings)",
+        "Source %s RE-POINTED after %d consecutive failures: %s/%s -> %s/%s (%d live postings)",
         company,
         failures,
         source.get("provider"),
@@ -2770,6 +2766,70 @@ async def _global_circuit_breaker_tripped(supabase: AsyncClient) -> bool:
         except Exception:
             logger.exception("Failed to report circuit breaker trip to Sentry")
     return True
+
+
+async def resume_phase1_backfills(supabase: AsyncClient) -> dict[str, int]:
+    """Resume Phase-1 backfills for active targets that stopped early.
+
+    The activation pass is allowed to stop short — its own fractional
+    allowance, the shared daily cap, the global budget, a provider outage. The
+    rows it did not reach keep ``scores.promising IS NULL``, and nothing else
+    in the system will ever judge them: ordinary polling triages only
+    externally-NEW listings (#514), which is the whole reason the backfill
+    exists. So without this sweep an early stop was permanent unless a user
+    happened to toggle the target off and on. Caught in review.
+
+    Lives HERE rather than in ``relevance`` because it needs the poller's
+    active-target read, per-payer client cache and global spend meter, and
+    ``relevance`` cannot import the poller without a cycle — the same reason
+    ``backfill_phase1_for_target`` takes its budget predicate injected.
+
+    Idempotent and self-limiting: the backfill only touches ungraded in-window
+    rows and re-reads its own allowance, so a target with nothing left is a
+    cheap no-op and a target still behind picks up exactly one more day's
+    share. Per-target failures are isolated — one bad target must not stop the
+    others, exactly like the poll cycle's per-source isolation.
+    """
+    out = {"targets": 0, "resumed": 0, "written": 0, "errors": 0}
+    if not settings.phase1_backfill_enabled:
+        return out
+
+    targets = await _active_targets(supabase)
+    if not targets:
+        return out
+    out["targets"] = len(targets)
+
+    payers = await resolve_target_payers(supabase, [t.id for t in targets])
+    cache: dict[str | None, LLMClient | None] = {}
+    for target in targets:
+        payer = payers.get(target.id)
+        try:
+            llm = await _resolve_payer_client(cache, supabase, payer)
+            if llm is None:
+                # No key for this payer (BYOK-required, disabled, no client).
+                # Not an error — the next sweep retries.
+                continue
+            result = await backfill_phase1_for_target(
+                supabase,
+                llm,
+                target,
+                payer_user_id=payer,
+                budget_blocks=lambda: _global_budget_exhausted(supabase),
+            )
+            if result.verdicts_written:
+                out["resumed"] += 1
+                out["written"] += result.verdicts_written
+        except Exception:
+            out["errors"] += 1
+            logger.exception("Phase-1 backfill resume failed for target %s", target.id)
+    logger.info(
+        "phase1 backfill resume sweep: %d target(s), %d resumed, %d verdict(s), %d error(s)",
+        out["targets"],
+        out["resumed"],
+        out["written"],
+        out["errors"],
+    )
+    return out
 
 
 async def _cycle_budget_gate(supabase: AsyncClient) -> tuple[PayerBudgetGate, bool]:
@@ -3844,8 +3904,7 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
     over = block_reason is not None
     if over:
         logger.info(
-            "poll_sources_for_target: Phase 1 deferred for target %s "
-            "(payer %s blocked: %s)",
+            "poll_sources_for_target: Phase 1 deferred for target %s (payer %s blocked: %s)",
             target.id,
             payer,
             block_reason,
