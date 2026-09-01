@@ -3140,3 +3140,90 @@ async def test_admission_targets_fall_back_to_active_when_unreadable(monkeypatch
     out = await poller_mod._admission_targets(MagicMock(), fallback=active)
 
     assert out == active
+
+
+# ---------------------------------------------------------------------------
+# The excluded-so-admit audit rule belongs to ACTIVE targets only
+# ---------------------------------------------------------------------------
+
+
+def _target_with_negatives(negatives: list[str], search: list[str]):
+    """A target that EXCLUDES these titles rather than wanting them.
+
+    Negatives live in ``scoring_profile.negative.keywords`` (a NegativeProfile),
+    NOT a flat list -- an earlier draft of this fixture set a field that does
+    not exist, so the exclusion never fired and the tests passed vacuously."""
+    from app.models.targets import CategoryProfile, NegativeProfile, ScoringProfile
+
+    t = _target_with_keywords({"engineer": 3}, search)
+    t.scoring_profile = ScoringProfile(
+        categories={"core_skills": CategoryProfile(keywords={"engineer": 3}, weight=2.0)},
+        negative=NegativeProfile(keywords=negatives),
+    )
+    return t
+
+
+class TestExclusionAdmitScope:
+    """The audit rule buys exactly one thing: a user asking "why isn't this in
+    my list?" gets an answer. An UNFOLLOWED target has no such user, so
+    applying it catalogue-wide inverts it into a firehose -- every target's
+    NEGATIVE keywords become an ADMIT rule.
+
+    Measured in prod before this fix: 3,957 rows in 9h led by specialist
+    (834), assistant (632), associate (610) -- against 310 engineers and 2
+    frontend roles, which were the point of the change."""
+
+    def test_an_inactive_targets_negatives_do_not_admit(self) -> None:
+        from app.services import poller as poller_mod
+
+        active = _target_with_keywords({"engineer": 3}, ["backend engineer"])
+        inactive = _target_with_negatives(["assistant"], ["director of operations"])
+
+        assert (
+            poller_mod._admits_for_catalog("Administrative Assistant", [active], [active, inactive])
+            is False
+        )
+
+    def test_an_active_targets_negatives_STILL_admit_for_audit(self) -> None:
+        """The rule is preserved where it earns its keep: someone follows this
+        target, so the rejection is explainable in their UI."""
+        from app.services import poller as poller_mod
+
+        active = _target_with_negatives(["assistant"], ["director of operations"])
+
+        assert (
+            poller_mod._admits_for_catalog("Administrative Assistant", [active], [active]) is True
+        )
+
+    def test_a_positive_match_on_an_inactive_target_still_admits(self) -> None:
+        """The widening itself must survive -- this is what #952 was for."""
+        from app.services import poller as poller_mod
+
+        active = _target_with_keywords({"engineer": 3}, ["backend engineer"])
+        inactive = _target_with_keywords({"engineer": 3}, ["frontend engineer"])
+
+        assert (
+            poller_mod._admits_for_catalog("Frontend Engineer", [active], [active, inactive])
+            is True
+        )
+
+    def test_exclusion_admits_flag_is_what_does_it(self) -> None:
+        from app.services import poller as poller_mod
+
+        t = _target_with_negatives(["assistant"], ["director of operations"])
+
+        assert poller_mod._title_matches_any_target("Administrative Assistant", [t]) is True
+        assert (
+            poller_mod._title_matches_any_target(
+                "Administrative Assistant", [t], exclusion_admits=False
+            )
+            is False
+        )
+
+    def test_no_admission_set_falls_back_to_active_rules(self) -> None:
+        """With the widening off, behaviour is exactly what it was."""
+        from app.services import poller as poller_mod
+
+        active = _target_with_negatives(["assistant"], ["director of operations"])
+
+        assert poller_mod._admits_for_catalog("Administrative Assistant", [active], None) is True
