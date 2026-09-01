@@ -328,14 +328,57 @@ def _validate_semaphore() -> asyncio.Semaphore:
 # callers/tests that import it from this module.
 
 
-def _title_matches_any_target(title: str, targets: list[JobTarget]) -> bool:
+def _admits_for_catalog(
+    title: str,
+    active_targets: list[JobTarget],
+    admission_targets: list[JobTarget] | None,
+) -> bool:
+    """Does this title belong in the shared catalog?
+
+    TWO rule sets, because the targets differ in kind:
+
+    * ACTIVE targets get the full rules, including the excluded-so-admit
+      audit rule. Someone is looking at these, so "we found it and filtered
+      it out, here is why" is worth a row.
+    * The WIDER set admits on a POSITIVE match only. Nobody is looking at an
+      unfollowed target, so its negative keywords are just a miss — turning
+      them into an admit rule is what flooded the catalog with assistants and
+      sales reps (see ``_title_matches_any_target``).
+
+    The wider set is a superset of the active one, so the second check is
+    strictly narrower and the ``or`` cannot lose an active-target admit.
+    """
+    if _title_matches_any_target(title, active_targets):
+        return True
+    if not admission_targets:
+        return False
+    return _title_matches_any_target(title, admission_targets, exclusion_admits=False)
+
+
+def _title_matches_any_target(
+    title: str, targets: list[JobTarget], *, exclusion_admits: bool = True
+) -> bool:
     """Check if a job title is worth ingesting for at least one target.
 
     Admission rules per target (any one target admitting → admit):
-      1. Excluded by negative keywords → admit anyway, so the scoring
-         pipeline records the rejection (excluded=True) for audit.
-         Without this, junior-vs-director hits would silently vanish
-         instead of being explainable in the UI.
+      1. Excluded by negative keywords → admit anyway WHEN
+         ``exclusion_admits``, so the scoring pipeline records the
+         rejection (excluded=True) for audit. Without this, junior-vs-
+         director hits would silently vanish instead of being explainable
+         in the UI.
+
+         ``exclusion_admits=False`` turns that off, and the caller must
+         pass it for any target NOBODY IS LOOKING AT. The audit rule buys
+         one thing — a user asking "why isn't this in my list?" gets an
+         answer — and an unfollowed target has no such user. Applied to
+         every target in the catalog it inverts into a firehose: each
+         target's NEGATIVE keywords become an ADMIT rule, so a
+         "Director of CX Operations" target with negatives on assistants
+         and sales pulled every "Administrative Assistant" and "Sales
+         Representative" on the boards into the shared catalog to record
+         a rejection no one would ever read. Measured in prod: 3,957 rows
+         admitted in 9h, led by specialist (834), assistant (632) and
+         associate (610), against 310 engineers and 2 frontend roles.
       2. Matched scoring keywords AND (search_keywords overlap matches
          the title, OR the target has no search_keywords). This is the
          AND-semantics fix from the relevance-matcher research doc:
@@ -351,7 +394,11 @@ def _title_matches_any_target(title: str, targets: list[JobTarget]) -> bool:
             search_keywords=target.search_keywords,
         )
         if result.excluded:
-            return True
+            if exclusion_admits:
+                return True
+            # No user to explain this rejection to — a negative-keyword hit
+            # is just a miss, not a reason to ingest.
+            continue
         if not result.matched_keywords:
             continue
         # Empty search_keywords means we can't gate on role-title intent;
@@ -1697,9 +1744,9 @@ async def _poll_one_source(
             """The two FREE gates, judged on a provider's list entry. Mirrors
             the row-build loop below — keep them in step, or a posting gets
             skipped here that the loop would have kept."""
-            return _title_matches_any_target(title, admission_targets or []) and _is_us_location(
-                location
-            )
+            return _admits_for_catalog(
+                title, active_targets or [], admission_targets
+            ) and _is_us_location(location)
 
         known_postings: dict[str, KnownPosting] = {}
         if provider == "workday":
@@ -2123,7 +2170,7 @@ async def _poll_one_source(
             # means admit nothing" ever needs to be a strict invariant, this is
             # the line to change; it is deliberate today, not truthiness by
             # accident. (Raised in review of #952.)
-            if not _title_matches_any_target(job.title, admission_targets or active_targets):
+            if not _admits_for_catalog(job.title, active_targets, admission_targets):
                 dropped_title_prematch += 1
                 continue
             if not _is_us_location(job.location_name):
