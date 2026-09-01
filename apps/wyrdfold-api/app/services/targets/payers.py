@@ -100,6 +100,40 @@ def block_is_persistent(reason: BlockReason | None) -> bool:
     return reason in PERSISTENT_BLOCK_REASONS
 
 
+# Persistent reasons that must NEVER veto ingestion, whatever the staged
+# rollout says.
+#
+# ``persistent_block_admits_ingestion`` is a RELEASE valve, not a safety one:
+# it ships dark because opening admission for the pre-existing persistent
+# reasons releases a measured ~14,800-row backlog at once, so it wants a ramp
+# and a deliberate flip. That reasoning is about VOLUME.
+#
+# ``over_daily_allowance`` has no backlog behind it. It is a brand-new
+# condition that has never blocked anything, so admitting on it releases
+# nothing and cannot surge — there is simply no staging problem to solve. What
+# there IS, is the opposite risk: a daily ceiling is expected to bind far more
+# often than the monthly one (that is the entire point of adding it), so
+# leaving it behind the flag would make a SPEND control into the pipeline's
+# most frequent ingestion veto, on a flag that is off by default. A listing
+# vetoed this way is gone from the board before the payer's window frees.
+#
+# So the spend rail suppresses paid work and never costs a listing, on its own,
+# without depending on an unrelated rollout being switched on first.
+ALWAYS_ADMITS_INGESTION: frozenset[str] = frozenset({"over_daily_allowance"})
+
+
+def block_admits_ingestion(reason: BlockReason | None, *, staged_rollout: bool) -> bool:
+    """Whether a blocked target should still let a NEW listing be admitted.
+
+    One place for "does this block cost us a listing", so the answer cannot
+    drift from :func:`block_is_persistent`'s classification. ``staged_rollout``
+    is ``settings.persistent_block_admits_ingestion``.
+    """
+    if reason in ALWAYS_ADMITS_INGESTION:
+        return True
+    return staged_rollout and block_is_persistent(reason)
+
+
 async def resolve_target_payers(
     supabase: AsyncClient, target_ids: list[str]
 ) -> dict[str, str | None]:
@@ -244,8 +278,11 @@ class PayerBudgetGate:
 async def build_budget_gate(supabase: AsyncClient, target_ids: list[str]) -> PayerBudgetGate:
     """Build the cycle snapshot: payers, overrides + activity, spends.
 
-    Two IN reads (payers, profiles) plus up to two spend RPCs per distinct
-    payer (monthly, then daily only if monthly did not already block) —
+    Two IN reads (payers, profiles) plus up to THREE aggregate spend reads per
+    distinct payer: one monthly, then — only if monthly did not already block —
+    the daily background figure, which is itself a subtraction of two reads
+    (total minus interactive). A payer short-circuited by disabled/idle/monthly
+    costs fewer. —
     computed once per poll cycle, not per source/job. A monthly limit of 0
     (global or override) disables monthly gating; ``payer_daily_budget_usd=0``
     disables daily gating; ``idle_defer_days=0`` disables idle gating. A NULL ``last_seen_at``

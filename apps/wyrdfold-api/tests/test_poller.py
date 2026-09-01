@@ -2305,9 +2305,7 @@ async def test_transient_block_still_defers_the_listing(monkeypatch) -> None:
     Without this the fix would be indiscriminate: it would also stop deferring
     for the one block that legitimately clears itself.
     """
-    summary, jobs_table = await _run_poll_with_blocked_gate(
-        monkeypatch, reason="over_allowance"
-    )
+    summary, jobs_table = await _run_poll_with_blocked_gate(monkeypatch, reason="over_allowance")
 
     assert summary["error"] is None
     jobs_table.upsert.assert_not_called()
@@ -2616,3 +2614,92 @@ async def test_poll_upserts_a_heterogeneous_batch_in_key_homogeneous_groups(monk
             "one statement mixed key-sets — PostgREST will NULL the omitted key"
         )
     assert len(payloads) == 2
+
+
+# ---------------------------------------------------------------------------
+# A daily spend block must never cost a listing (#947 review)
+# ---------------------------------------------------------------------------
+
+
+async def _poll_with_block_reason(monkeypatch, *, reason: str, staged: bool):
+    """One source, one admissible listing, every target blocked for ``reason``,
+    with the staged persistent-admission rollout at ``staged``."""
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    monkeypatch.setattr(live_settings, "persistent_block_admits_ingestion", staged)
+    monkeypatch.setattr(live_settings, "persistent_block_admission_cap_per_cycle", 50)
+    budget = poller_mod.new_admission_budget()
+    supabase, jobs_table, _sources = _make_poll_supabase([])
+
+    async def one(_token: str) -> list[StandardJob]:
+        return [
+            StandardJob(
+                external_id="new-0",
+                title="Brand New Role 0",
+                location_name="Remote",
+                content="",
+                posted_at="2026-01-01",
+                absolute_url="https://example.com/j/0",
+            )
+        ]
+
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+    monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", one)
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "triage_titles", AsyncMock())
+    monkeypatch.setattr(poller_mod, "_global_budget_exhausted", AsyncMock(return_value=False))
+
+    gate = MagicMock()
+    gate.target_blocked.return_value = True
+    gate.target_block_reason.return_value = reason
+    gate.payer_for.return_value = "u1"
+    await poller_mod._poll_one_source(
+        dict(_GUARD_SOURCE), supabase, budget_gate=gate, admission_budget=budget
+    )
+    return [r for c in jobs_table.upsert.call_args_list for r in c.args[0]]
+
+
+@pytest.mark.asyncio
+async def test_a_daily_spend_block_never_vetoes_a_new_listing(monkeypatch) -> None:
+    """The #947 review blocker. Classifying ``over_daily_allowance`` persistent
+    was NOT enough: persistent blocks only admit when the staged rollout flag
+    ``persistent_block_admits_ingestion`` is on, and it ships OFF by default.
+    So a spend ceiling — one deliberately expected to bind far more often than
+    the monthly one — would have become the pipeline's most frequent ingestion
+    veto, losing listings that are gone from the board before the payer's
+    window frees.
+
+    Asserted with the rollout flag explicitly OFF, which is the configuration
+    the unit-level classification test could not see."""
+    upserted = await _poll_with_block_reason(
+        monkeypatch, reason="over_daily_allowance", staged=False
+    )
+
+    assert [r["external_id"] for r in upserted] == ["new-0"], (
+        "a daily spend block cost us a listing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_staged_rollout_still_gates_the_older_persistent_reasons(
+    monkeypatch,
+) -> None:
+    """Control, and the reason this is an exemption rather than a redesign.
+    ``catalog_ungraded`` has a measured ~14,800-row backlog behind it, so it
+    keeps its ramped, deliberate rollout — the exemption must not quietly
+    open that."""
+    upserted = await _poll_with_block_reason(monkeypatch, reason="catalog_ungraded", staged=False)
+
+    assert upserted == [], "the staged rollout was bypassed for a backlogged reason"
+
+
+@pytest.mark.asyncio
+async def test_the_older_reasons_still_admit_once_the_rollout_is_on(monkeypatch) -> None:
+    """Control for the control: with the flag ON, the old reasons admit as
+    before, so the exemption changed nothing about their behaviour."""
+    upserted = await _poll_with_block_reason(monkeypatch, reason="catalog_ungraded", staged=True)
+
+    assert [r["external_id"] for r in upserted] == ["new-0"]

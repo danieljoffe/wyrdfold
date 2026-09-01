@@ -76,6 +76,7 @@ from app.services.targets import crud
 from app.services.targets.payers import (
     BlockReason,
     PayerBudgetGate,
+    block_admits_ingestion,
     block_is_persistent,
     build_budget_gate,
 )
@@ -1066,15 +1067,12 @@ async def _backfill_qualify_stale(supabase: AsyncClient, limit: int) -> None:
             # a timestamptz carries '+' and ':' which PostgREST would otherwise
             # read as filter syntax.
             q = q.or_(
-                f'cataloged_at.gt."{seen_at}",'
-                f'and(cataloged_at.eq."{seen_at}",id.gt."{seen_id}")'
+                f'cataloged_at.gt."{seen_at}",and(cataloged_at.eq."{seen_at}",id.gt."{seen_id}")'
             )
         return q.order("cataloged_at", desc=False).order("id", desc=False).limit(limit)
 
     try:
-        resp = await poll_db_read(
-            supabase, _select, label="poll qualify-backfill select"
-        )
+        resp = await poll_db_read(supabase, _select, label="poll qualify-backfill select")
     except Exception:
         logger.exception("Qualification backfill: select failed; skipping this cycle")
         return
@@ -1320,9 +1318,7 @@ async def _resolve_payer_client(
             # A lapsed trial stops costing money the moment it lapses: the
             # same defer path as a missing key, so background grading halts
             # without needing a separate sweep (#841).
-            logger.info(
-                "Background grading deferred for payer %s (trial expired)", payer_user_id
-            )
+            logger.info("Background grading deferred for payer %s (trial expired)", payer_user_id)
             cache[payer_user_id] = None
         except MissingUserKeyError:
             logger.info(
@@ -1619,8 +1615,9 @@ async def _poll_one_source(
                     # stays empty and ``_any_target_admits`` falls back to the
                     # deterministic free gates that already passed.
                     reason = gate.target_block_reason(active_target.id)
-                    admits = settings.persistent_block_admits_ingestion and block_is_persistent(
-                        reason
+                    admits = block_admits_ingestion(
+                        reason,
+                        staged_rollout=settings.persistent_block_admits_ingestion,
                     )
                     if admits:
                         persistent_skips += 1
@@ -2518,8 +2515,7 @@ async def _redetect_before_disabling(
     # strength of a heuristic probe, and every one of them should be greppable
     # in the Railway logs (and reversible by hand from this line alone).
     logger.warning(
-        "Source %s RE-POINTED after %d consecutive failures: %s/%s -> %s/%s "
-        "(%d live postings)",
+        "Source %s RE-POINTED after %d consecutive failures: %s/%s -> %s/%s (%d live postings)",
         company,
         failures,
         source.get("provider"),
@@ -3819,8 +3815,7 @@ async def poll_sources_for_target(supabase: AsyncClient, target: JobTarget) -> P
     over = block_reason is not None
     if over:
         logger.info(
-            "poll_sources_for_target: Phase 1 deferred for target %s "
-            "(payer %s blocked: %s)",
+            "poll_sources_for_target: Phase 1 deferred for target %s (payer %s blocked: %s)",
             target.id,
             payer,
             block_reason,

@@ -666,7 +666,7 @@ async def test_unblocked_payer_pays_for_exactly_two_spend_reads(monkeypatch):
     assert daily_since > monthly_since, "daily window must be the tighter one"
 
 
-def test_over_daily_allowance_is_persistent_so_ingestion_keeps_admitting():
+def test_over_daily_allowance_is_classified_persistent():
     """The load-bearing classification. A transient block VETOES admission, and
     a vetoed listing is gone from the board by the time the payer unblocks --
     while a wrongly-admitted one costs a single insert now bounded by
