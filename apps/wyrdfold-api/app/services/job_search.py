@@ -217,13 +217,11 @@ async def search_jobs(
     limit = max(1, min(limit, MAX_PAGE_SIZE))
     offset = max(0, offset)
     tokens = _tokenize(q)
-    if not tokens:
+    if q.strip() and not tokens:
+        # A real query that sanitizes away to nothing (all punctuation) can
+        # match nothing — do NOT fall through to browse, or "),(*:" would
+        # return the whole pool.
         return [], False
-
-    # OR of ``title ILIKE *form*`` across every query token's synonym forms —
-    # index-backed via the title trigram GIN. Tokens are sanitized above.
-    ilike_terms = sorted({form for tok in tokens for form in _forms_for(tok)})
-    or_filter = ",".join(f"title.ilike.*{term}*" for term in ilike_terms)
 
     query = (
         supabase.table("jobs")
@@ -233,8 +231,16 @@ async def search_jobs(
         .is_("archived_at", "null")
         .is_("purged_at", "null")
         .not_.is_("is_us", "false")
-        .or_(or_filter)
     )
+    if tokens:
+        # OR of ``title ILIKE *form*`` across every query token's synonym forms
+        # — index-backed via the title trigram GIN. Tokens are sanitized above.
+        ilike_terms = sorted({form for tok in tokens for form in _forms_for(tok)})
+        query = query.or_(",".join(f"title.ilike.*{term}*" for term in ilike_terms))
+    # A blank query BROWSES the pool (#834): same corpus gate, filters and
+    # capped recency-biased window — just no title clause. With no query
+    # groups every row's overlap is 0, so the ranker below degrades to pure
+    # recency: newest-first, which is exactly what a browse should show.
     if posted_within_days is not None:
         days = max(1, min(posted_within_days, MAX_POSTED_WITHIN_DAYS))
         cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()

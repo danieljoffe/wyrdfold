@@ -74,9 +74,11 @@ describe('GET /api/jobs/search (BFF forwarding)', () => {
     expect(sp.has('posted_within_days')).toBe(false);
   });
 
-  it('400s when q is missing, without calling upstream', async () => {
+  it('forwards a missing q as blank — filters-only browse (#834)', async () => {
     const res = await GET(get('location=Remote'));
-    expect(res.status).toBe(400);
-    expect(mockProxy).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    const sp = forwardedParams();
+    expect(sp.get('q')).toBe('');
+    expect(sp.get('location')).toBe('Remote');
   });
 });

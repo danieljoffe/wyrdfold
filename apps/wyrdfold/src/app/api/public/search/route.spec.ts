@@ -150,16 +150,16 @@ describe('GET /api/public/search (public BFF forwarder)', () => {
     expect(new Headers(init.headers).get('x-forwarded-for')).toBeNull();
   });
 
-  it('requires q — returns 400 BEFORE any upstream round trip', async () => {
+  it('forwards a missing q as blank — browse mode (#834)', async () => {
     const res = await GET(makeRequest('page_size=20'));
-    expect(res.status).toBe(400);
-    expect(mockFetch).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(forwardedParams().get('q')).toBe('');
   });
 
-  it('treats a whitespace-only q as missing (400, no forward)', async () => {
+  it('trims a whitespace-only q to blank and still forwards (#834)', async () => {
     const res = await GET(makeRequest('q=%20%20'));
-    expect(res.status).toBe(400);
-    expect(mockFetch).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(forwardedParams().get('q')).toBe('');
   });
 
   it('passes a backend rate-limit (429) through with Retry-After', async () => {

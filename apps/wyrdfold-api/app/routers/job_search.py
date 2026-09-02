@@ -43,7 +43,11 @@ _CACHE_PREFIX = "jobsearch:"
 @limiter.limit("30/minute;300/hour")
 async def search_jobs_endpoint(
     request: Request,
-    q: str = Query(..., min_length=1, max_length=120, description="Title / keyword query"),
+    q: str = Query(
+        "",
+        max_length=120,
+        description="Title / keyword query; blank browses the pool newest-first (#834)",
+    ),
     page_size: int = Query(job_search.DEFAULT_PAGE_SIZE, ge=1, le=job_search.MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0, le=job_search.MAX_OFFSET, description="Pagination offset"),
     location: str | None = Query(
