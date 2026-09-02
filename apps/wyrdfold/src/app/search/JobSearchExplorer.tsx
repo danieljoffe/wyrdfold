@@ -45,6 +45,11 @@ import type {
 import type { TargetOption, TargetsSource } from './useTargetsSource';
 
 const PAGE_SIZE = 20;
+// The public surface's maximum reachable depth: PUBLIC_MAX_OFFSET (40) + one
+// page (public_search.py's anti-enumeration cap). Used only to decide when
+// the end-of-results line should pitch signing in rather than say nothing —
+// if the caps drift apart the line simply stops appearing; nothing breaks.
+const PUBLIC_RESULT_DEPTH = 60;
 
 /** Recency filter presets. The value is the `posted_within` day-count carried in
  *  the URL + sent to the API (`''` = any time). */
@@ -450,6 +455,12 @@ export default function JobSearchExplorer({
   const [loading, setLoading] = useState(false); // fresh search
   const [loadingMore, setLoadingMore] = useState(false); // "Load more"
   const [error, setError] = useState<string | null>(null);
+  // Pagination failures get their OWN error state: the page-level `error`
+  // gates the whole results section, so routing a "Load more" failure into
+  // it unmounted every result already on screen — a transient blip at the
+  // 4th page wiped the user's whole session of scrolling (#832). This one
+  // renders inline next to the button; the loaded results stay put.
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
 
   // Target-membership for the visible page (#467 §11): which of the caller's
   // targets already contain each listing → the card's pipeline-state badge and
@@ -523,12 +534,14 @@ export default function JobSearchExplorer({
     if (!urlQ) {
       setResults(null);
       setError(null);
+      setLoadMoreError(null);
       setHasMore(false);
       return;
     }
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setLoadMoreError(null);
     setResults(null);
     fetchPage({
       q: urlQ,
@@ -592,7 +605,7 @@ export default function JobSearchExplorer({
   const loadMore = useCallback(async () => {
     if (!results) return;
     setLoadingMore(true);
-    setError(null);
+    setLoadMoreError(null);
     try {
       const data = await fetchPage({
         q: urlQ,
@@ -605,7 +618,11 @@ export default function JobSearchExplorer({
       setHasMore(data.has_more);
       void fetchMembership(data.results); // best-effort, non-blocking
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Network error loading more.');
+      // NEVER the page-level `error` — that unmounts the loaded results
+      // (#832). The button stays rendered, so clicking again is the retry.
+      setLoadMoreError(
+        e instanceof Error ? e.message : 'Network error loading more.'
+      );
     } finally {
       setLoadingMore(false);
     }
@@ -774,7 +791,7 @@ export default function JobSearchExplorer({
                 ))}
               </div>
               {hasMore && (
-                <div className='mt-4 flex justify-center'>
+                <div className='mt-4 flex flex-col items-center gap-2'>
                   <Button
                     name='job-search-load-more'
                     variant='secondary'
@@ -784,8 +801,36 @@ export default function JobSearchExplorer({
                   >
                     {loadingMore ? 'Loading…' : 'Load more'}
                   </Button>
+                  {loadMoreError && !loadingMore && (
+                    <Text variant='error' role='alert'>
+                      {loadMoreError} — your results are still here; try again.
+                    </Text>
+                  )}
                 </div>
               )}
+              {/* The public API stops pagination at its anti-enumeration
+                  ceiling (offset ≤ 40 → 60 rows), and now reports
+                  has_more=false there (#832). Say so honestly — and make
+                  it the conversion moment: signing in searches the full
+                  pool (the authed window pages ~4× deeper). */}
+              {!hasMore &&
+                !isAuthenticated &&
+                results.length >= PUBLIC_RESULT_DEPTH && (
+                  <Text
+                    variant='meta'
+                    as='p'
+                    className='mt-4 text-center text-text-secondary'
+                  >
+                    That’s the first {PUBLIC_RESULT_DEPTH} —{' '}
+                    <Link
+                      href='/login'
+                      className='underline underline-offset-2'
+                    >
+                      sign in
+                    </Link>{' '}
+                    to search the full pool.
+                  </Text>
+                )}
             </>
           )}
         </section>

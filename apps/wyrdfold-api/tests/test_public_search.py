@@ -220,3 +220,27 @@ def test_bff_forwarded_call_is_allowed(monkeypatch) -> None:
     app.dependency_overrides[get_settings] = lambda: Settings(wyrdfold_bff_secret="s3cret")
     r = TestClient(app).get("/public/search?q=frontend", headers={"x-wyrdfold-bff": "s3cret"})
     assert r.status_code == 200
+
+
+# ---- has_more honesty at the public offset ceiling (#832) -------------------
+
+
+def test_has_more_clamped_false_at_the_public_offset_ceiling(monkeypatch) -> None:
+    # The service's has_more reports corpus depth against the AUTHED window,
+    # but offset 40 + page 20 is this surface's last fetchable page — saying
+    # "more" renders a "Load more" whose only possible outcome is a 422.
+    _stub_search(monkeypatch, has_more=True)
+    r = TestClient(app).get(
+        f"/public/search?q=ceiling+clamp+case&offset={public_search.PUBLIC_MAX_OFFSET}"
+    )
+    assert r.status_code == 200
+    assert r.json()["has_more"] is False
+
+
+def test_has_more_passes_through_below_the_ceiling(monkeypatch) -> None:
+    # Precondition for the clamp test to mean anything: the same service
+    # answer survives when the next page IS fetchable.
+    _stub_search(monkeypatch, has_more=True)
+    r = TestClient(app).get("/public/search?q=below+ceiling+case&offset=20")
+    assert r.status_code == 200
+    assert r.json()["has_more"] is True
