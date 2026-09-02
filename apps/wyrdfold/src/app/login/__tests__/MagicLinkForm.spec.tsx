@@ -74,6 +74,33 @@ describe('MagicLinkForm — idle state', () => {
     expect(email).toHaveAttribute('data-sentry-mask');
   });
 
+  it('offers the waitlist while signup is closed (#835)', async () => {
+    render(<MagicLinkForm next={undefined} authError={undefined} />);
+
+    const waitlistLink = await screen.findByRole('link', {
+      name: /join the waitlist/i,
+    });
+    expect(waitlistLink).toHaveAttribute('href', '/');
+  });
+
+  it('shows the waitlist in the not-on-the-beta-list refusal (#835)', async () => {
+    mockSignInWithOtp.mockResolvedValue({
+      error: { message: 'Signups not allowed for otp' },
+    });
+    const user = userEvent.setup();
+    render(<MagicLinkForm next={undefined} authError={undefined} />);
+
+    await user.type(
+      screen.getByRole('textbox', { name: /^email$/i }),
+      'stranger@example.com'
+    );
+    await user.click(screen.getByRole('button', { name: /send magic link/i }));
+
+    expect(
+      await screen.findByText(/isn't on the beta list yet/i)
+    ).toHaveTextContent(/join the waitlist/i);
+  });
+
   it('disables the submit button when the email is empty', () => {
     render(<MagicLinkForm next={undefined} authError={undefined} />);
     expect(
@@ -327,6 +354,10 @@ describe('MagicLinkForm (signup open)', () => {
       })
     ).toBeInTheDocument();
     expect(screen.queryByText(/invite-only/i)).not.toBeInTheDocument();
+    // No waitlist detour once anyone can sign up (#835).
+    expect(
+      screen.queryByRole('link', { name: /join the waitlist/i })
+    ).not.toBeInTheDocument();
 
     await user.type(
       screen.getByRole('textbox', { name: /^email$/i }),
