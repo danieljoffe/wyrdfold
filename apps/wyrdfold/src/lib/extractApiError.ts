@@ -161,5 +161,13 @@ export async function extractApiError(
       : 'You are at your active-target limit — deactivate one first.';
   }
 
+  // BFF proxy routes normalize every failure to a top-level
+  // ``{ error: "..." }`` (e.g. /api/public/search) — a shape none of the
+  // ``detail`` branches above can see, so public-search failures rendered
+  // as bare status codes like "Search failed (422)" (#833). Checked last:
+  // a FastAPI ``detail`` always wins when both keys are present.
+  const error = (body as { error?: unknown }).error;
+  if (typeof error === 'string' && error.trim()) return error;
+
   return statusFallback;
 }
