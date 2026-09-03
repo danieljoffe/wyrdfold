@@ -162,11 +162,12 @@ export default function JobsList({
     }
   }, [activeTargetId]);
 
-  // Per-target filter persistence. localStorage-backed; survives reloads
-  // and out-of-page navigation but not browser-data clears. Writes happen
-  // on every filter change (below). Reads happen on tab change + on first
-  // mount when the URL has no filter params (just below). See
-  // ``useJobsFilterPersistence`` for the storage key scheme.
+  // Per-target filter persistence. SERVER-backed since #866 (scoped to the
+  // account, synced across devices; the old global localStorage key leaked
+  // filters between accounts on shared browsers). Writes happen on every
+  // filter change (below); reads on tab change + on first mount when the
+  // URL has no filter params — gated on ``persistence.ready`` because the
+  // map loads asynchronously now.
   const persistence = useJobsFilterPersistence();
 
   // Track whether we've attempted a restore for the current target so a
@@ -179,9 +180,9 @@ export default function JobsList({
   // search params, so this recomputes only when the URL actually changes.
   const urlFilters = useMemo(() => pickFilters(urlState), [urlState]);
 
-  // Snapshot to localStorage whenever the live filters change. Writes
-  // are keyed by the current target (or the All Jobs sentinel) so each
-  // target remembers its own filter state independently.
+  // Snapshot whenever the live filters change. Writes are keyed by the
+  // current target (or the All Jobs sentinel) so each target remembers its
+  // own filter state independently.
   //
   // Gated on the restore pass having run for this target: this effect is
   // declared first, so on a BARE mount it would otherwise fire with the
