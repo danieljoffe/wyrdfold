@@ -39,6 +39,7 @@ overrides:
   ip-address: ^10.2.1 # GHSA-22jq-vg5j-6vgg (10.2.0 flagged; fix 10.2.1). ^ to stay on the 10.x line. Live-DB OSV moving target.
   dompurify: ^3.4.11 # GHSA ALLOWED_ATTR pollution (<3.4.11; 0504c8ce). Reached transitively via isomorphic-dompurify, AND declared directly in devDependencies because the sanitize specs import it (they bind DOMPurify to jsdom's window rather than pull isomorphic-dompurify's Node-only ESM). This override is the version's single source of truth — keep the devDependency range identical so the two don't read as disagreeing.
   piscina: 4.9.3
+  qs: '>=6.16.0' # GHSA-4mjr-xmp4-gh2g + GHSA-x5fp-wj9c-mxmx (6.15.x flagged; fix 6.16.0). Dev transitive via express (@lhci/cli + @nx toolchain); body-parser pins it exactly, so the override is the only lever. Live-DB OSV moving target.
   webpack-dev-server: 5.2.5
   linkify-it: '^5.0.2' # GHSA-v245-v573-v5vm ReDoS (transitive via markdown-it, which wants ^5; stay on 5.x — bare >=5.0.2 pulled an untested 6.0.0 major)
   sharp: '>=0.35.0' # GHSA-f88m-g3jw-g9cj (transitive 0.34.5 pinned by next; direct dep is already ^0.35.3)
