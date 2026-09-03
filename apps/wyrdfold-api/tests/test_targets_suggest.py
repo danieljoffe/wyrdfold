@@ -96,3 +96,56 @@ async def test_suggest_invalid_json_raises() -> None:
     client = MockLLMClient(scripted={DEFAULT_PURPOSE: "not json at all"})
     with pytest.raises(Exception):
         await suggest_targets(client, payload=_payload())
+
+
+# ---------------------------------------------------------------------------
+# #864 — the endpoint ships the caller's active-target allowance
+# ---------------------------------------------------------------------------
+
+
+def test_suggest_endpoint_ships_the_active_target_allowance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The onboarding wizard pre-selected every suggestion and offered
+    "Create 3 targets" on a 2-target plan (#864). The offer can only fit the
+    plan if the plan travels with the suggestions — cap/active/remaining ride
+    the response."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from fastapi.testclient import TestClient
+
+    from app.dependencies import (
+        enforce_llm_budget,
+        get_async_service_supabase,
+        get_current_user_id,
+        get_llm_client,
+        verify_api_key_or_jwt,
+    )
+    from app.main import app
+    from app.models.targets import MatchedSuggestions
+    from app.routers import targets as router_mod
+
+    doc = MagicMock()
+    doc.payload = _payload()
+    monkeypatch.setattr(router_mod, "_optimized_latest", AsyncMock(return_value=doc))
+    monkeypatch.setattr(
+        router_mod,
+        "suggest_and_match",
+        AsyncMock(return_value=(MatchedSuggestions(matches=[]), MagicMock())),
+    )
+    monkeypatch.setattr(router_mod.cost_log, "record_async", AsyncMock())
+    monkeypatch.setattr(router_mod, "_count_active_for_user_async", AsyncMock(return_value=1))
+    monkeypatch.setattr(router_mod, "_effective_active_target_cap_async", AsyncMock(return_value=2))
+
+    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "jwt"
+    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
+    app.dependency_overrides[get_current_user_id] = lambda: "user-1"
+    app.dependency_overrides[get_llm_client] = lambda: MagicMock()
+    app.dependency_overrides[enforce_llm_budget] = lambda: None
+    try:
+        resp = TestClient(app).post("/targets/suggest")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    assert resp.json()["allowance"] == {"cap": 2, "active": 1, "remaining": 1}
