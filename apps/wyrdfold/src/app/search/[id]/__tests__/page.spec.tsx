@@ -111,10 +111,9 @@ describe('/search/[id] hard-load page (#467 §11.2 fast-follow)', () => {
 
   it('logged out → keeps the soft signup allusion on the full page too (§11.5)', async () => {
     render(await ListingPage(pageProps()));
-    expect(screen.getByRole('link', { name: /sign up free/i })).toHaveAttribute(
-      'href',
-      '/login'
-    );
+    expect(
+      screen.getByRole('link', { name: /get early access/i })
+    ).toHaveAttribute('href', '/login');
     // Never the authed bind/LLM actions.
     expect(screen.queryByText(/unlock fit analysis/i)).not.toBeInTheDocument();
   });
@@ -129,7 +128,7 @@ describe('/search/[id] hard-load page (#467 §11.2 fast-follow)', () => {
       )
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole('link', { name: /sign up free/i })
+      screen.queryByRole('link', { name: /get early access/i })
     ).not.toBeInTheDocument();
   });
 

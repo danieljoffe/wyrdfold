@@ -59,6 +59,34 @@ _MODEL_SLUG_MAP: dict[str, str] = {
 # (function calling) rather than the Anthropic /messages endpoint.
 _OPENAI_SHAPED_MODELS: frozenset[str] = frozenset({"deepseek-v3-2"})
 
+# Provider slugs whose endpoints declare they CANNOT honor a forced NAMED
+# function (``supports_tool_choice.function=false`` in OpenRouter's endpoint
+# metadata — verified live against /models/deepseek/deepseek-v3.2/endpoints,
+# 2026-09-02). The OpenAI-shaped path below forces a named function on every
+# call, so routing to one of these is a request the endpoint has declared it
+# cannot serve — the credible mechanical cause of the deterministic
+# prose-tool-call failures the salvage parsers exist for (#935: whether a call
+# succeeded depended on which endpoint it landed on, invisible because nothing
+# pinned the provider).
+#
+# ``require_parameters`` alone does NOT exclude five of these six (GMICloud,
+# StreamLake, AtlasCloud, Novita, Alibaba): they list ``tool_choice`` as a
+# supported parameter — the refusal is one level finer, on the named-function
+# mode — so the ignore list is load-bearing, not a belt-and-braces duplicate.
+# SambaNova is the exception: it lists neither ``tools`` nor ``tool_choice``,
+# so ``require_parameters`` already filters it; it stays here defensively in
+# case its declared parameters change ahead of its function-mode support
+# (the #980 review's correction). Re-derive the list from the endpoints API
+# when the salvage-parser hit rate moves.
+_NO_FORCED_FUNCTION_PROVIDERS: tuple[str, ...] = (
+    "gmicloud",
+    "streamlake",
+    "atlas-cloud",
+    "novita",
+    "alibaba",
+    "sambanova",
+)
+
 # HTTP statuses worth a retry (transient); others translate + raise immediately.
 _TRANSIENT_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 529})
 
@@ -257,6 +285,12 @@ def _parse_openai_tool_response(
         raise ValueError(f"OpenRouter returned no choices for {tool_name!r}: {str(data)[:300]!r}")
     choice = choices[0]
     finish = choice.get("finish_reason")
+    # OpenRouter names the endpoint that actually served the call on every
+    # response. Logged with each salvage and with the hard failure so the
+    # "prose instead of tool_calls" hit rate is correlatable per provider
+    # (#935) — the routing preference in ``_openai_tool_use`` is derived from
+    # exactly this correlation, and drift shows up here first.
+    provider = data.get("provider")
     message = choice.get("message") or {}
     tool_calls = message.get("tool_calls") or []
     if not tool_calls:
@@ -265,9 +299,10 @@ def _parse_openai_tool_response(
         if salvaged is not None:
             logger.warning(
                 "salvaged %r from a prose tool call — model wrote XML into content "
-                "instead of emitting tool_calls (finish_reason=%r)",
+                "instead of emitting tool_calls (finish_reason=%r, provider=%r)",
                 tool_name,
                 finish,
+                provider,
             )
             return salvaged
         # The other prose shape (#850): reasoning followed by the answer as a
@@ -279,16 +314,18 @@ def _parse_openai_tool_response(
                 logger.warning(
                     "salvaged %r from a prose JSON tool call — model wrote a bare "
                     "JSON object into content instead of emitting tool_calls "
-                    "(finish_reason=%r)",
+                    "(finish_reason=%r, provider=%r)",
                     tool_name,
                     finish,
+                    provider,
                 )
                 return salvaged
         # 600, not 200: the old cap cut every one of these mid-payload, which
         # made a complete-but-misplaced answer look like a truncated one.
         raise MissingToolCallError(
             f"Expected a forced tool_call for {tool_name!r}, got finish_reason="
-            f"{finish!r}, content={str(message.get('content'))[:600]!r}"
+            f"{finish!r}, provider={provider!r}, "
+            f"content={str(message.get('content'))[:600]!r}"
         )
     # A tool call cut off at the token cap emitted a truncated argument string;
     # the parsed dict would be incomplete. Fail loud (matches Anthropic's
@@ -516,6 +553,15 @@ class OpenRouterLLMClient(AnthropicLLMClient):
             # Force exactly this function — the OpenAI analogue of Anthropic's
             # forced tool_choice, so we always get structured arguments back.
             "tool_choice": {"type": "function", "function": {"name": tool_name}},
+            # Provider routing (#935): ``require_parameters`` keeps requests
+            # off endpoints that don't declare tools/tool_choice support at
+            # all; the ignore list removes the ones that declare it but refuse
+            # the forced-named-function mode this path always uses (see
+            # ``_NO_FORCED_FUNCTION_PROVIDERS``).
+            "provider": {
+                "require_parameters": True,
+                "ignore": list(_NO_FORCED_FUNCTION_PROVIDERS),
+            },
             "max_tokens": max_tokens,
         }
         if temperature is not None:

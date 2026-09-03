@@ -2,9 +2,7 @@
 
 import * as Sentry from '@sentry/nextjs';
 import { useEffect } from 'react';
-import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
-import { Heading } from '@danieljoffe/shared-ui/Heading';
-import { Text } from '@danieljoffe/shared-ui/Text';
+import StatusCard from '@/components/StatusCard';
 import Button from '@/components/kit/Button';
 import LinkButton from '@/components/kit/LinkButton';
 
@@ -26,17 +24,12 @@ export default function AppError({
   }, [error]);
 
   return (
-    <div className='flex flex-col gap-6'>
-      <Heading variant='hero' as='h1'>
-        Something went wrong
-      </Heading>
-      <Card>
-        <CardContent className='flex flex-col items-center gap-4 py-12 text-center'>
-          <Text variant='body' as='p' className='max-w-md'>
-            This page failed to load. The error has been reported. Try again, or
-            head back to your dashboard.
-          </Text>
-          <div className='flex gap-2'>
+    <div className='flex min-h-full items-center justify-center py-12'>
+      <StatusCard
+        title='Something went wrong'
+        body='This page failed to load. The error has been reported. Try again, or head back to your dashboard.'
+        actions={
+          <>
             <Button
               name='wyrdfold-error-retry'
               variant='primary'
@@ -53,9 +46,9 @@ export default function AppError({
             >
               Back to dashboard
             </LinkButton>
-          </div>
-        </CardContent>
-      </Card>
+          </>
+        }
+      />
     </div>
   );
 }

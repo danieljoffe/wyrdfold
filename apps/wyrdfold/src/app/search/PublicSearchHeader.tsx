@@ -6,10 +6,18 @@ import WyrdfoldWordmark from '@/components/WyrdfoldWordmark';
 /**
  * Lean public header for the logged-out `/search` surface (#467 §10). Not the
  * full marketing shell (`(public)/layout.tsx`) and not the app sidebar — just a
- * wordmark home-link and one calm "Sign up free" conversion path. The stronger,
- * single conversion moment lives in the listing detail (§11.5); the header stays
- * quiet — a "Sign in" ghost + the "Sign up free" CTA, both to `/login` (signup
- * lives behind the flag; `/login` is the one door for both).
+ * wordmark home-link and one calm conversion path. The stronger, single
+ * conversion moment lives in the listing detail (§11.5); the header stays
+ * quiet — a "Sign in" ghost + the "Get early access" CTA, both to `/login`
+ * (`/login` is the one door for both: invited → sign in, stranger → the
+ * waitlist link, #835).
+ *
+ * Copy note (#971 §3): "Get early access" because signup is CLOSED — the old
+ * "Sign up free" promised something the invite wall refused, and the visitor
+ * met three different promises for one door (free signup → private beta →
+ * waitlist). When the operator flips `signup_mode` to open, restore "Sign up
+ * free" here and in the listing-detail upsell — the prod-cutover runbook
+ * carries the reminder.
  */
 export default function PublicSearchHeader() {
   return (
@@ -37,7 +45,7 @@ export default function PublicSearchHeader() {
             variant='primary'
             size='sm'
           >
-            Sign up free
+            Get early access
           </LinkButton>
         </div>
       </div>

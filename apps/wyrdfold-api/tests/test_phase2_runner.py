@@ -9,6 +9,7 @@ this exercises the policy, not the LLM or DB.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock
@@ -1036,3 +1037,68 @@ def test_manual_backfill_script_selects_every_tagger_input_column() -> None:
     assert captured, "precondition: the select was actually issued"
     selected = {c.strip() for c in captured[0].split(",")}
     assert selected >= TAG_INPUT_COLUMNS, TAG_INPUT_COLUMNS - selected
+
+
+async def test_null_qualified_grading_is_counted(
+    monkeypatch: pytest.MonkeyPatch, _tagging_on: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A row still untagged after the grade-time tagging pass fails OPEN
+    through both keep-null gates and grades anyway — the #921 inversion:
+    tagging (cheap) is unavailable, so grading (expensive) runs on exactly the
+    candidates the tags would have filtered. Deliberately not blocked (#277
+    chose keep-null); the runner must COUNT it so the fail-open leaves
+    evidence instead of being invisible."""
+    jobs = [
+        {"id": "j-tagged", "title": "x", "description_html": ""},
+        {"id": "j-untagged", "title": "x", "description_html": ""},
+    ]
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    _patch_tagger(
+        monkeypatch,
+        effect=lambda r: (
+            r.update({"qualified_at": "2026-09-02T00:00:00+00:00"})
+            if r["id"] == "j-tagged"
+            else None
+        ),
+    )
+    with caplog.at_level(logging.WARNING, logger=_RUNNER):
+        await run_phase2_for_jobs(
+            _supabase(_prom_rows(["j-tagged", "j-untagged"])),
+            MagicMock(),
+            target=_target(1),
+            payload=_payload(),
+            jobs=[dict(j) for j in jobs],
+        )
+
+    # Fail-open is PRESERVED — this change instruments, it does not gate.
+    assert sorted(graded) == ["j-tagged", "j-untagged"]
+    warnings = [r.message for r in caplog.records if "NULL qualification tags" in r.message]
+    assert len(warnings) == 1
+    assert "1/2 (50%)" in warnings[0]
+
+
+async def test_no_null_qualified_warning_when_every_row_tagged(
+    monkeypatch: pytest.MonkeyPatch, _tagging_on: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Control for the counter: when the tagger lands every row, the warning
+    must not fire — it is a stress signal, not a per-cycle status line."""
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    _patch_tagger(
+        monkeypatch,
+        effect=lambda r: r.update({"qualified_at": "2026-09-02T00:00:00+00:00"}),
+    )
+    with caplog.at_level(logging.WARNING, logger=_RUNNER):
+        await run_phase2_for_jobs(
+            _supabase(_prom_rows(["j1", "j2"])),
+            MagicMock(),
+            target=_target(1),
+            payload=_payload(),
+            jobs=[
+                {"id": "j1", "title": "x", "description_html": ""},
+                {"id": "j2", "title": "x", "description_html": ""},
+            ],
+        )
+    assert sorted(graded) == ["j1", "j2"]
+    assert not [r for r in caplog.records if "NULL qualification tags" in r.message]
