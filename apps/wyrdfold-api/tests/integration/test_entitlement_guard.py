@@ -191,6 +191,10 @@ USER_EDITABLE = {
     "sms_score_threshold",
     "sms_daily_limit",
     "resume_style_settings",
+    # #866: /jobs filter snapshots — user-owned UI state written via
+    # PUT /profile/jobs-filters on the user's own RLS row; the backend
+    # never reads it for authorization, entitlement or billing.
+    "jobs_filter_prefs",
     "onboarding_path",
     "onboarding_current_step",
     "onboarding_completed_at",
