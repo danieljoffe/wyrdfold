@@ -131,3 +131,33 @@ class TestBareUsCountryCode:
         """Ordering guard: the non-US hint check runs first, so a string that
         names a foreign city cannot be rescued by a stray US token."""
         assert positively_us_location("Munich, DE - US HQ") is False
+
+
+# ---------------------------------------------------------------------------
+# #950 — the hint list split by consequence
+# ---------------------------------------------------------------------------
+
+
+class TestDisambiguationOnlyHints:
+    """ "stuttgart" and "jerusalem" are needed to stop their countries' ISO
+    codes reading as US states, but both are ALSO real US towns (Stuttgart,
+    Arkansas; Jerusalem, New York/Ohio/Arkansas). While one list served both
+    the ingest gate and the archive-veto disambiguation, the towns were
+    silently rejected at ingest. #950 splits the lists: the ingest gate no
+    longer knows these names; the disambiguation still does."""
+
+    def test_stuttgart_arkansas_ingests(self) -> None:
+        """The spelled-out form was the rejected one — "Stuttgart, AR" always
+        survived because the state-abbreviation check short-circuits first."""
+        assert is_us_location("Stuttgart, Arkansas") is True
+
+    def test_jerusalem_new_york_ingests(self) -> None:
+        assert is_us_location("Jerusalem, New York") is True
+
+    def test_stuttgart_de_still_reads_as_germany_not_delaware(self) -> None:
+        """The half the hint still buys: no archive veto for the German city
+        with Delaware's state code."""
+        assert positively_us_location("Stuttgart, DE") is False
+
+    def test_jerusalem_il_still_reads_as_israel_not_illinois(self) -> None:
+        assert positively_us_location("Jerusalem, IL") is False
