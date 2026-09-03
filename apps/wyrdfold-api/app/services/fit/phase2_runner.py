@@ -355,6 +355,13 @@ async def run_phase2_for_jobs(
         )
         candidates = candidates[:quota]
 
+    # #922: the size of the set that WON its quota slots. The post-tag gates
+    # below can reject freshly-tagged rows without backfilling from the next
+    # candidate (deliberate — refilling re-opens the "tag more than we grade"
+    # hole), so a run can quietly grade under its intended quota. The summary
+    # line after grading pairs this with what actually survived and graded.
+    post_trim = len(candidates)
+
     # ---- Lazy qualification tagging (the ingest tagger's replacement) -------
     # Ingest is $0 LLM now: a listing's intrinsic tags are bought HERE, for
     # exactly the rows about to be graded, because grade time is the only place
@@ -397,9 +404,10 @@ async def run_phase2_for_jobs(
                 len(candidates),
                 target.id,
             )
+        # No early return on an emptied set (#922): "every post-trim candidate
+        # was rejected by the fresh tags" is the maximal underfill — exactly
+        # the run the summary line below must record, not skip.
         candidates = tagged_ok
-        if not candidates:
-            return 0
 
         # #921 instrumentation: a row still untagged after the grade-time
         # tagging pass (``qualified_at`` NULL — the refresh above patched the
@@ -441,4 +449,18 @@ async def run_phase2_for_jobs(
     for batch in _progressive_batches(candidates, first_batch_size, batch_size):
         results = await asyncio.gather(*(_grade_one(jid) for jid in batch), return_exceptions=True)
         graded += sum(1 for r in results if r is True)
+
+    # #922: the underfill funnel in one greppable line, every run. post_trim
+    # won the quota slots; post_tag_accepted survived the re-applied gates
+    # (no backfill — deliberate); graded is what the LLM actually completed.
+    # A persistently large post_trim→graded gap is the evidence for the
+    # bounded reserve tranche (tag quota+N, cull to quota) — not built until
+    # these numbers say it's needed.
+    logger.info(
+        "Phase 2 run summary for target %s: post_trim=%d post_tag_accepted=%d graded=%d",
+        target.id,
+        post_trim,
+        len(candidates),
+        graded,
+    )
     return graded
