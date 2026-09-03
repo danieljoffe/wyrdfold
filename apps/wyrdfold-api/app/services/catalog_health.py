@@ -167,10 +167,19 @@ async def _recorded_recently(supabase: AsyncClient, now: datetime) -> bool:
 async def _baseline_tokens(
     supabase: AsyncClient, window_start: datetime
 ) -> tuple[Counter[str], int]:
-    """(summed top-N token histograms, total titles) of prior rows whose
+    """(final top-N baseline histogram, total titles) from prior rows whose
     windows ended before this one began — zero overlap with the current
-    window, so the comparison is honest. Titles ride each row's ``new_jobs``
-    so the tripwire's sample floor counts jobs, not token occurrences."""
+    window, so the comparison is honest.
+
+    The returned counter is truncated to the SAME top-N the current side
+    uses. Each historical row stores only its own top-N, but the union
+    across up to ``baseline_cycles`` rows can span hundreds of tokens as
+    ranks ~10-20 rotate in and out of each cycle's cut — comparing the
+    current top-N against that wide union reads a perfectly stable
+    population as a shift (the second asymmetry the #974 review caught).
+    Titles ride each row's ``new_jobs`` so the tripwire's sample floor
+    counts jobs, not token occurrences.
+    """
     resp = await (
         supabase.table("catalog_health_cycles")
         .select("top_title_tokens, new_jobs")
@@ -179,7 +188,7 @@ async def _baseline_tokens(
         .limit(settings.catalog_health_baseline_cycles)
         .execute()
     )
-    baseline: Counter[str] = Counter()
+    aggregate: Counter[str] = Counter()
     titles = 0
     for row in cast(list[dict[str, Any]], resp.data or []):
         titles += int(row.get("new_jobs") or 0)
@@ -188,7 +197,10 @@ async def _baseline_tokens(
                 token, count = pair[0], int(pair[1])
             except (TypeError, ValueError, IndexError):
                 continue
-            baseline[str(token)] += count
+            aggregate[str(token)] += count
+    baseline: Counter[str] = Counter(
+        dict(aggregate.most_common(settings.catalog_health_top_tokens))
+    )
     return baseline, titles
 
 

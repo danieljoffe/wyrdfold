@@ -415,7 +415,8 @@ async def _recent_catalog_health(supabase: AsyncClient, limit: int) -> list[dict
     resp = await (
         supabase.table("catalog_health_cycles")
         .select(
-            "computed_at, window_started_at, new_jobs, relevant_jobs, live_total, "
+            "computed_at, window_started_at, new_jobs, relevant_jobs, "
+            "window_truncated, live_total, "
             "pct_ungraded, pct_location_unknown, family_counts, "
             "median_admission_age_hours, top_title_tokens, "
             "tripwire_fired, tripwire_distance, tripwire_reason"

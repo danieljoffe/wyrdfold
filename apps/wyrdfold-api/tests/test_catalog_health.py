@@ -361,6 +361,52 @@ async def test_recorder_compares_top_n_symmetrically(small_samples: None) -> Non
     assert inserted["tripwire_distance"] <= 0.05
 
 
+async def test_recorder_baseline_truncates_across_rotating_tails(
+    small_samples: None,
+) -> None:
+    # The second asymmetry from the #974 review: each historical row stores
+    # only ITS top-15, but ranks ~10-20 rotate between cycles, so the union
+    # across 4 rows spans 45 distinct tokens here. Compared raw, that wide
+    # historical support carries mass the current window can't match and a
+    # STABLE population reads as a regime shift (this fixture scores
+    # tv≈0.55 > 0.5 → false fire). Truncating the aggregate back to top-15
+    # scores tv≈0.33 → quiet. The dominant vocabulary never changed.
+    dominant = {f"domword{i}": 20 for i in range(5)}
+    mid = {f"midword{i}": 5 for i in range(10)}
+    window = []
+    jid = 0
+    for token, count in {**dominant, **mid}.items():
+        for _ in range(count):
+            jid += 1
+            window.append(_job(f"j{jid}", token))
+    baseline_rows = [
+        {
+            "top_title_tokens": (
+                [[t, c] for t, c in dominant.items()]
+                + [[f"noise{r}x{i}", 12] for i in range(10)]
+            ),
+            "new_jobs": 140,
+        }
+        for r in range(4)
+    ]
+    sb = _FakeSupabase(
+        {
+            "catalog_health_cycles": [[], baseline_rows, [], []],
+            "jobs": [{"data": [], "count": len(window)}, window],
+            "scores": [[]],
+        },
+        rpc_data={"live_total": 1, "ungraded": 0, "location_unknown": 0, "family_counts": {}},
+    )
+
+    row = await record_cycle_health(sb)  # type: ignore[arg-type]
+
+    assert row is not None
+    inserted = sb.inserted["catalog_health_cycles"][0]
+    assert inserted["tripwire_fired"] is False
+    assert inserted["tripwire_distance"] is not None
+    assert inserted["tripwire_distance"] < 0.45
+
+
 async def test_recorder_pages_through_a_large_window(
     small_samples: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -463,6 +509,7 @@ def test_admin_catalog_health_returns_recent_rows() -> None:
             "window_started_at": "2026-09-02T10:00:00+00:00",
             "new_jobs": 120,
             "relevant_jobs": 80,
+            "window_truncated": False,
             "live_total": 9000,
             "pct_ungraded": 41.2,
             "pct_location_unknown": 8.0,
@@ -484,3 +531,7 @@ def test_admin_catalog_health_returns_recent_rows() -> None:
     assert body["count"] == 1
     assert body["rows"][0]["new_jobs"] == 120
     assert body["rows"][0]["top_title_tokens"] == [["engineer", 60]]
+    # The truncation flag must reach the operator: relevant_jobs/median/tokens
+    # cover only the collected subset when it is true, and nothing else in
+    # the response says so (#974 review).
+    assert body["rows"][0]["window_truncated"] is False
