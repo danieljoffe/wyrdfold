@@ -65,9 +65,13 @@ gate, not a rubber stamp.
    compatible, the release needs a compatibility bridge or a coordinated
    deployment — flag it, don't pick an order. Two
    things do **not** happen on their own:
-   **(a) the frontend** — Vercel is _not_ git-connected; run `vercel --prod`
+   **(a) the frontend** — Vercel is _not_ git-connected; run
+   `vercel --prod --build-env NEXT_PUBLIC_BUILD_SHA=$(git rev-parse HEAD)`
    from the repo root every release or the OLD frontend stays live against the
-   new API (the #459 skew — `docs/decisions.md`). **(b) the migrations** —
+   new API (the #459 skew — `docs/decisions.md`). The `--build-env` flag is
+   part of the command, not an option: it bakes the checkout's SHA into the
+   FE artifact, and step 7's provenance check reads it back from
+   `/api/version` (#976). **(b) the migrations** —
    apply and **verify** around the merge, migrations-first (they're written
    backward-compatible); see `.claude/rules/api-validation.md` for the
    version-stamp gotcha and `docs/decisions.md` → "RLS policies never reached
@@ -87,16 +91,18 @@ gate, not a rubber stamp.
 7. **After deploy, smoke the running prod app on the changed surface — and
    prove BOTH artifacts correspond to the release commit.** Env vars and
    secrets drift independently of code; no pre-merge check sees them. Hit the
-   changed prod endpoints (authed where it matters) and watch the logs. The
-   API side has `/version` (Railway-injected SHA) — assert it equals the merge
-   commit. The FE has **no build-SHA marker yet** (#971 tracks adding one), so
-   until it exists: record `git rev-parse HEAD` of the checkout at
-   `vercel --prod` time, and verify correspondence behaviorally — probe
-   something only the new FE renders. The strongest discriminators exercise a
-   changed contract through both artifacts at once (the #972 smoke's blank-`q`
-   probe returned 200 only if BOTH the new BFF and the new API were live — the
-   old BFF 400'd it and the old API 422'd it). Why this step exists:
-   `docs/decisions.md` → "disabled legacy anon key".
+   changed prod endpoints (authed where it matters) and watch the logs.
+   Provenance is symmetric now (#976): the API's `/version` carries the
+   Railway-injected SHA and the FE's `/api/version` carries the SHA baked in
+   by step 5(a)'s `--build-env` flag — assert BOTH equal the merge commit. A
+   `commit: null` from the FE means the deploy skipped the flag: provenance
+   is unproven, so re-deploy with it rather than reasoning it away. A
+   behavioral discriminator is still worth one probe — provenance proves
+   which builds are live, while a changed-contract probe proves the two
+   artifacts interoperate (the #972 smoke's blank-`q` probe returned 200 only
+   if BOTH the new BFF and the new API were live — the old BFF 400'd it and
+   the old API 422'd it). Why this step exists: `docs/decisions.md` →
+   "disabled legacy anon key".
 
 The gate proves the release is **correct** (tests + integration), **usable**
 (real flows end-to-end), and **safe** (no widened abuse surface), and leaves
