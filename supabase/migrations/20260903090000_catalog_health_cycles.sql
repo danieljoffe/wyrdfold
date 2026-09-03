@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS public.catalog_health_cycles (
     -- at least one scores row (i.e. relevant to some target's pipeline).
     new_jobs integer NOT NULL DEFAULT 0,
     relevant_jobs integer NOT NULL DEFAULT 0,
+    -- True when the recorder could not collect the whole window (paging
+    -- backstop hit). new_jobs stays the EXACT count; the token histogram,
+    -- relevant_jobs and median cover only the collected subset, and the
+    -- tripwire refuses to evaluate rather than judging a partial sample.
+    window_truncated boolean NOT NULL DEFAULT false,
     -- Corpus-wide quality (from catalog_health_snapshot at computed_at).
     live_total integer,
     pct_ungraded numeric(5, 2),

@@ -35,9 +35,14 @@ from app.services.job_search import _tokenize
 
 logger = logging.getLogger(__name__)
 
-# Hard bound on the window fetch — the hourly intake ceiling keeps real
-# windows far below this; the bound is a runaway backstop, not a sample size.
-_WINDOW_FETCH_CAP = 2000
+# The window fetch pages deterministically (cataloged_at, id) instead of
+# trusting one bounded select: the intake ceiling is HOURLY, so a 24h window
+# can legitimately hold hourly-cap x 24 rows — and a firehose is exactly the
+# regime this telemetry must describe honestly, not silently sample. The page
+# backstop sits above that physical maximum; if it is still hit, the row says
+# so (window_truncated) and the tripwire refuses to judge a partial sample.
+_WINDOW_PAGE = 1000
+_WINDOW_MAX_PAGES = 20
 
 # ``scores`` membership lookups chunk the id list — PostgREST URLs 414 when an
 # ``in_()`` carries more than ~150-200 ids (#57).
@@ -85,21 +90,26 @@ def evaluate_tripwire(
     baseline: Counter[str],
     *,
     threshold: float,
-    min_sample: int,
+    min_titles: int,
+    current_titles: int,
+    baseline_titles: int,
 ) -> tuple[bool, float | None, str | None]:
     """(fired, distance, reason) for the window-vs-baseline comparison.
 
-    Refuses to guess from noise: below ``min_sample`` titles-worth of tokens
-    on either side it records WHY it did not evaluate instead of a verdict —
-    a tripwire that fires on a 3-job Sunday window would train the operator
-    to ignore it.
+    The sample floor counts TITLES (jobs), passed in explicitly — token
+    occurrences would let ten ordinary titles impersonate a 30-strong sample
+    and one absurd title satisfy the floor alone. Below the floor on either
+    side it records WHY it did not evaluate instead of a verdict — a tripwire
+    that fires on a 3-job Sunday window would train the operator to ignore
+    it. Both distributions must be truncated the SAME way by the caller
+    (top-N vs top-N): the persisted baseline is top-N by construction, and
+    comparing it against an untruncated current would read a stable broad
+    vocabulary as a shift.
     """
-    cur_total = sum(current.values())
-    base_total = sum(baseline.values())
-    if cur_total < min_sample:
-        return False, None, f"window sample too small ({cur_total} < {min_sample})"
-    if base_total < min_sample:
-        return False, None, f"baseline too small ({base_total} < {min_sample})"
+    if current_titles < min_titles:
+        return False, None, f"window sample too small ({current_titles} titles < {min_titles})"
+    if baseline_titles < min_titles:
+        return False, None, f"baseline too small ({baseline_titles} titles < {min_titles})"
     distance = tv_distance(current, baseline)
     if distance > threshold:
         return True, distance, f"token distribution shifted (tv={distance:.3f} > {threshold})"
@@ -154,27 +164,73 @@ async def _recorded_recently(supabase: AsyncClient, now: datetime) -> bool:
     return (now - last) < timedelta(minutes=settings.catalog_health_min_interval_minutes)
 
 
-async def _baseline_tokens(supabase: AsyncClient, window_start: datetime) -> Counter[str]:
-    """Summed token histograms of prior rows whose window ended before this
-    window began — zero overlap with the current window, so the comparison
-    is honest."""
+async def _baseline_tokens(
+    supabase: AsyncClient, window_start: datetime
+) -> tuple[Counter[str], int]:
+    """(summed top-N token histograms, total titles) of prior rows whose
+    windows ended before this one began — zero overlap with the current
+    window, so the comparison is honest. Titles ride each row's ``new_jobs``
+    so the tripwire's sample floor counts jobs, not token occurrences."""
     resp = await (
         supabase.table("catalog_health_cycles")
-        .select("top_title_tokens")
+        .select("top_title_tokens, new_jobs")
         .lte("computed_at", window_start.isoformat())
         .order("computed_at", desc=True)
         .limit(settings.catalog_health_baseline_cycles)
         .execute()
     )
     baseline: Counter[str] = Counter()
+    titles = 0
     for row in cast(list[dict[str, Any]], resp.data or []):
+        titles += int(row.get("new_jobs") or 0)
         for pair in row.get("top_title_tokens") or []:
             try:
                 token, count = pair[0], int(pair[1])
             except (TypeError, ValueError, IndexError):
                 continue
             baseline[str(token)] += count
-    return baseline
+    return baseline, titles
+
+
+async def _window_rows(
+    supabase: AsyncClient, window_start: datetime
+) -> tuple[list[dict[str, Any]], int, bool]:
+    """(collected rows, exact count, truncated) for the intake window.
+
+    The filters mirror the corpus gate ``catalog_health_snapshot`` uses
+    (live + US: archived/purged NULL, is_us IS NOT FALSE) so the window
+    metrics and the corpus percentages beside them describe the same
+    catalog. Exact count first, then deterministic pages — ``new_jobs``
+    stays the real count even when the page backstop truncates collection.
+    """
+
+    def _filtered(query: Any) -> Any:
+        return (
+            query.gte("cataloged_at", window_start.isoformat())
+            .is_("archived_at", "null")
+            .is_("purged_at", "null")
+            .not_.is_("is_us", "false")
+        )
+
+    count_resp = await _filtered(
+        supabase.table("jobs").select("id", count="exact", head=True)  # type: ignore[arg-type]
+    ).execute()
+    exact = int(getattr(count_resp, "count", None) or 0)
+
+    rows: list[dict[str, Any]] = []
+    for page in range(_WINDOW_MAX_PAGES):
+        resp = await (
+            _filtered(supabase.table("jobs").select("id, title, cataloged_at, source_posted_at"))
+            .order("cataloged_at", desc=False)
+            .order("id", desc=False)
+            .range(page * _WINDOW_PAGE, (page + 1) * _WINDOW_PAGE - 1)
+            .execute()
+        )
+        batch = cast(list[dict[str, Any]], resp.data or [])
+        rows.extend(batch)
+        if len(batch) < _WINDOW_PAGE:
+            break
+    return rows, exact, len(rows) < exact
 
 
 async def record_cycle_health(supabase: AsyncClient) -> dict[str, Any] | None:
@@ -192,25 +248,34 @@ async def record_cycle_health(supabase: AsyncClient) -> dict[str, Any] | None:
             return None
         window_start = now - timedelta(hours=settings.catalog_health_window_hours)
 
-        resp = await (
-            supabase.table("jobs")
-            .select("id, title, cataloged_at, source_posted_at")
-            .gte("cataloged_at", window_start.isoformat())
-            .is_("archived_at", "null")
-            .is_("purged_at", "null")
-            .limit(_WINDOW_FETCH_CAP)
-            .execute()
-        )
-        window_rows = cast(list[dict[str, Any]], resp.data or [])
+        window_rows, exact_count, truncated = await _window_rows(supabase, window_start)
 
         tokens = tokenize_titles([str(r.get("title") or "") for r in window_rows])
-        baseline = await _baseline_tokens(supabase, window_start)
-        fired, distance, reason = evaluate_tripwire(
-            tokens,
-            baseline,
-            threshold=settings.catalog_health_tripwire_threshold,
-            min_sample=settings.catalog_health_min_sample_titles,
-        )
+        top_pairs = tokens.most_common(settings.catalog_health_top_tokens)
+        # Symmetric comparison: the baseline is reconstructed from persisted
+        # top-N histograms, so the current side must be truncated to the SAME
+        # top-N — full-vs-truncated would read a stable broad vocabulary as a
+        # shift (the long tail vanishing from one side only).
+        current_top: Counter[str] = Counter(dict(top_pairs))
+        baseline, baseline_titles = await _baseline_tokens(supabase, window_start)
+        fired: bool
+        distance: float | None
+        reason: str | None
+        if truncated:
+            fired, distance = False, None
+            reason = (
+                f"window truncated ({len(window_rows)} of {exact_count} rows "
+                "collected) — refusing to judge a partial sample"
+            )
+        else:
+            fired, distance, reason = evaluate_tripwire(
+                current_top,
+                baseline,
+                threshold=settings.catalog_health_tripwire_threshold,
+                min_titles=settings.catalog_health_min_sample_titles,
+                current_titles=len(window_rows),
+                baseline_titles=baseline_titles,
+            )
 
         snapshot_resp = await supabase.rpc("catalog_health_snapshot", {}).execute()
         snapshot = cast(dict[str, Any], snapshot_resp.data or {})
@@ -222,7 +287,10 @@ async def record_cycle_health(supabase: AsyncClient) -> dict[str, Any] | None:
         row: dict[str, Any] = {
             "computed_at": now.isoformat(),
             "window_started_at": window_start.isoformat(),
-            "new_jobs": len(window_rows),
+            # The EXACT count, even when collection truncated — never report
+            # min(actual, backstop) as though it were the real intake.
+            "new_jobs": exact_count,
+            "window_truncated": truncated,
             "relevant_jobs": await _relevant_count(
                 supabase, [str(r["id"]) for r in window_rows]
             ),
@@ -231,9 +299,7 @@ async def record_cycle_health(supabase: AsyncClient) -> dict[str, Any] | None:
             "pct_location_unknown": _pct(snapshot.get("location_unknown")),
             "family_counts": snapshot.get("family_counts") or {},
             "median_admission_age_hours": _median_age_hours(window_rows),
-            "top_title_tokens": [
-                [t, c] for t, c in tokens.most_common(settings.catalog_health_top_tokens)
-            ],
+            "top_title_tokens": [[t, c] for t, c in top_pairs],
             "tripwire_fired": fired,
             "tripwire_distance": round(distance, 3) if distance is not None else None,
             "tripwire_reason": reason,
