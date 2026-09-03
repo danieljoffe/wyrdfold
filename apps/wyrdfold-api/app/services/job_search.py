@@ -179,9 +179,10 @@ async def search_jobs(
 
     Returns ``(page, has_more)``: the ranked results in
     ``[offset, offset + limit)`` and whether more ranked matches remain (up to
-    the candidate window). Empty/whitespace/punctuation-only queries return
-    ``([], False)`` (the honest empty state — see #467). ``limit`` is clamped to
-    ``[1, MAX_PAGE_SIZE]``.
+    the candidate window). Blank/whitespace queries BROWSE the live corpus
+    newest-first (#834); only a non-blank query that sanitizes to no
+    searchable tokens (all punctuation) returns ``([], False)``. ``limit``
+    is clamped to ``[1, MAX_PAGE_SIZE]``.
 
     Optional refinements (both narrow the same candidate window the ranker sees):
     ``posted_within_days`` filters ``created_at`` DB-side (a clean date bound,

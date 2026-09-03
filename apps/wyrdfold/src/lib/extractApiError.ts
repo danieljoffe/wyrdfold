@@ -37,7 +37,7 @@ export async function extractApiError(
   if (!body || typeof body !== 'object') return statusFallback;
   const detail = (body as { detail?: unknown }).detail;
 
-  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (typeof detail === 'string' && detail.trim()) return detail.trim();
 
   // FastAPI pydantic validation errors arrive as
   // ``detail: [{ loc, msg, type, ... }, ...]``. Surface the first
@@ -160,6 +160,14 @@ export async function extractApiError(
       ? `You can have ${d.limit} active target${d.limit === 1 ? '' : 's'} — deactivate one first.`
       : 'You are at your active-target limit — deactivate one first.';
   }
+
+  // BFF proxy routes normalize every failure to a top-level
+  // ``{ error: "..." }`` (e.g. /api/public/search) — a shape none of the
+  // ``detail`` branches above can see, so public-search failures rendered
+  // as bare status codes like "Search failed (422)" (#833). Checked last:
+  // a FastAPI ``detail`` always wins when both keys are present.
+  const error = (body as { error?: unknown }).error;
+  if (typeof error === 'string' && error.trim()) return error.trim();
 
   return statusFallback;
 }
