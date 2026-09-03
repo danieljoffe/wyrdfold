@@ -339,7 +339,10 @@ async def test_source_failure_increments_and_disables_at_threshold(monkeypatch):
     await poller._record_source_failure(
         sb, {"id": "s-1", "company_name": "Dead Co", "consecutive_failures": 9}
     )
-    at = captured[-1]
+    # #962 rides the disable with a url_health escalation write on the SAME
+    # catch-all mock; the failure payload is the last SOURCES-shaped update,
+    # not captured[-1].
+    at = next(p for p in reversed(captured) if "consecutive_failures" in p)
     assert at["consecutive_failures"] == 10
     assert at["enabled"] is False
     assert at["disabled_at"] is not None
