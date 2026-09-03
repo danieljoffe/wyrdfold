@@ -112,6 +112,23 @@ describe('JobDetailModal', () => {
     expect(screen.getByText('Remote')).toBeInTheDocument();
   });
 
+  it('renders the salary chip in the same compact form as the card (#836 §6)', () => {
+    renderModal({
+      job: result({
+        salary_text: '$65000 - $85000 a year',
+        salary_min: 65000,
+        salary_max: 85000,
+        salary_currency: 'USD',
+        salary_period: 'yearly',
+      }),
+    });
+
+    // Structured-first display — never the raw "$65000…" text the card
+    // two clicks earlier already showed as "$65k–$85k".
+    expect(screen.getByText('$65k–$85k')).toBeInTheDocument();
+    expect(screen.queryByText(/\$65000/)).not.toBeInTheDocument();
+  });
+
   // ---- Unbound: the two BIND actions + the hint (no match/tailor) ----------
 
   it('unbound → shows add/create + the unlock hint, and hides match/tailor', () => {

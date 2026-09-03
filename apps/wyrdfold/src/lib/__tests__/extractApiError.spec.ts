@@ -185,3 +185,69 @@ describe('extractApiError — ACTIVE_LIMIT (409)', () => {
     expect(msg).toBe('Activate failed (409)');
   });
 });
+
+// The BFF proxy routes (e.g. /api/public/search) normalize failures to a
+// top-level ``{ error: "..." }`` — no ``detail`` key at all (#833).
+function resWithBody(status: number, body: unknown): Response {
+  const fake = {
+    status,
+    clone() {
+      return { json: async () => body };
+    },
+  };
+  return fake as unknown as Response;
+}
+
+describe('extractApiError — top-level BFF `error` shape (#833)', () => {
+  it('surfaces a top-level error string instead of the bare status', async () => {
+    const msg = await extractApiError(
+      resWithBody(422, { error: 'Search needs a keyword or a filter.' }),
+      'Search failed'
+    );
+    expect(msg).toBe('Search needs a keyword or a filter.');
+  });
+
+  it('lets a FastAPI detail win when both keys are present', async () => {
+    const msg = await extractApiError(
+      resWithBody(422, { detail: 'From the API.', error: 'From the BFF.' }),
+      'Search failed'
+    );
+    expect(msg).toBe('From the API.');
+  });
+
+  it('lets a STRUCTURED detail win over a top-level error too', async () => {
+    // Guards the branch ORDER: hoisting the top-level `error` check above the
+    // structured-detail branches would return the generic BFF string instead
+    // of the formatted cap message — and without this test, silently.
+    const msg = await extractApiError(
+      resWithBody(429, {
+        detail: { code: 'analysis_daily_limit', limit: 20 },
+        error: 'From the BFF.',
+      }),
+      'Analysis failed'
+    );
+    expect(msg).toBe(
+      'Daily deep-analysis limit reached (20/day) — more tomorrow. Already-analyzed jobs stay free to revisit.'
+    );
+  });
+
+  it('trims the surfaced error string', async () => {
+    const msg = await extractApiError(
+      resWithBody(429, { error: '  Rate limited.\n' }),
+      'Search failed'
+    );
+    expect(msg).toBe('Rate limited.');
+  });
+
+  it('still falls back on a non-string or blank error value', async () => {
+    expect(
+      await extractApiError(
+        resWithBody(429, { error: { code: 'RATE_LIMITED' } }),
+        'Search failed'
+      )
+    ).toBe('Search failed (429)');
+    expect(
+      await extractApiError(resWithBody(429, { error: '   ' }), 'Search failed')
+    ).toBe('Search failed (429)');
+  });
+});

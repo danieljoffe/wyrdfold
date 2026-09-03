@@ -13,6 +13,7 @@ import {
 } from '@danieljoffe/shared-ui/styles/formStyles';
 import { cn } from '@/lib/cn';
 import Button from '@/components/kit/Button';
+import LinkButton from '@/components/kit/LinkButton';
 import WyrdfoldLogo from '@/components/WyrdfoldLogo';
 import { createAuthBrowserClient } from '@/lib/supabase/auth-client';
 
@@ -71,7 +72,7 @@ function friendlyAuthError(message: string): string {
     lower.includes('signups not allowed') ||
     lower.includes('user not found')
   ) {
-    return "This email isn't on the beta list yet. If you think it should be, reply to your invitation.";
+    return "This email isn't on the beta list yet. Join the waitlist below, or reply to your invitation if you have one.";
   }
   return message;
 }
@@ -300,6 +301,29 @@ export default function MagicLinkForm({ next, authError }: MagicLinkFormProps) {
                 {formState === 'loading' ? 'Sending…' : 'Send magic link'}
               </Button>
             </form>
+
+            {/* Every public "Sign up free" CTA lands on /login, so while
+                signup is closed this link is the only forward path for a
+                visitor without an invitation (#835). The waitlist form
+                sits in the landing page hero. */}
+            {!signupOpen && (
+              <Text
+                variant='helper'
+                as='p'
+                className='text-text-tertiary text-center'
+              >
+                Not invited yet?{' '}
+                <LinkButton
+                  name='wyrdfold-login-join-waitlist'
+                  href='/'
+                  variant='bare'
+                  size='sm'
+                  className='inline px-0 py-0 text-brand-700 underline underline-offset-4 dark:text-brand-300'
+                >
+                  Join the waitlist
+                </LinkButton>
+              </Text>
+            )}
           </>
         )}
       </div>

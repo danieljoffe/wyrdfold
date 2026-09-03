@@ -1,4 +1,4 @@
-import { type NextRequest, NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
 
 import { proxyToWyrdfoldAPI } from '@/lib/api/proxy';
 import { SEARCH_FILTER_PARAMS } from '@/lib/api/searchFilterParams';
@@ -15,13 +15,9 @@ import { SEARCH_FILTER_PARAMS } from '@/lib/api/searchFilterParams';
  */
 export async function GET(request: NextRequest) {
   const sp = request.nextUrl.searchParams;
-  const q = sp.get('q')?.trim();
-  if (!q) {
-    return NextResponse.json(
-      { error: 'q query param required' },
-      { status: 400 }
-    );
-  }
+  // A blank `q` is a valid request now: the backend browses the pool
+  // newest-first (#834).
+  const q = sp.get('q')?.trim() ?? '';
 
   const searchParams = new URLSearchParams({ q });
   const pageSize = sp.get('page_size');

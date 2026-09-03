@@ -10,9 +10,13 @@ import WyrdfoldSidebar from './(app)/WyrdfoldSidebar';
  * `(app)/not-found.tsx` only fires when a page *inside* the `(app)`
  * group calls `notFound()`. For URLs that match nothing at all (e.g.
  * `/jobs` before that page is ported), Next.js looks for a root-level
- * `not-found.tsx` — this one. The middleware has already redirected
- * unauthenticated users to `/login`, so anyone landing here is signed
- * in and just typed a wrong URL.
+ * `not-found.tsx` — this one. The middleware redirects unauthenticated
+ * users to `/login` for gated paths, so the typical visitor here is
+ * signed in — but NOT every one: unmatched sub-paths under the public
+ * allowlist (e.g. `/search/a/b`, which no route matches) reach this
+ * file logged-out and see the member shell (#831). Dead listing ids —
+ * the common shared-link case — are handled by `search/not-found.tsx`
+ * under the public header; only the unmatched-sub-path oddballs remain.
  *
  * Wrap the content in the same sidebar shell ``(app)/layout.tsx``
  * provides so the user keeps direct nav to every authed route from

@@ -12,7 +12,7 @@ import { formatJobSalary } from '@/lib/formatSalary';
 import { displayTitle } from '@/lib/displayTitle';
 import { formatCompanyName } from '@/lib/formatCompanyName';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
-import { Check, ChevronDown, Plus } from 'lucide-react';
+import { Check, ChevronDown } from 'lucide-react';
 import { Avatar } from '@danieljoffe/shared-ui/Avatar';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import type { ButtonVariant } from '@danieljoffe/shared-ui/Button';
@@ -45,6 +45,11 @@ import type {
 import type { TargetOption, TargetsSource } from './useTargetsSource';
 
 const PAGE_SIZE = 20;
+// The public surface's maximum reachable depth: PUBLIC_MAX_OFFSET (40) + one
+// page (public_search.py's anti-enumeration cap). Used only to decide when
+// the end-of-results line should pitch signing in rather than say nothing —
+// if the caps drift apart the line simply stops appearing; nothing breaks.
+const PUBLIC_RESULT_DEPTH = 60;
 
 /** Recency filter presets. The value is the `posted_within` day-count carried in
  *  the URL + sent to the API (`''` = any time). */
@@ -389,10 +394,12 @@ function JobSearchCard({
           {timeAgo(job.source_posted_at ?? job.cataloged_at)}
         </Text>
       </div>
-      {/* footer: pipeline-state (§11.1), LOGGED-IN ONLY. Bound → the "✓ In
-          <target>" badge; otherwise a quiet "Add to target" affordance. Both are
+      {/* footer: pipeline-state (§11.1), LOGGED-IN ONLY. Both badges are
           presentational — the card itself opens the modal, where the action
-          happens. Logged-out renders no footer: a pure click-target (§11.1). */}
+          happens. The unbound state reads as STATE ("Not in a target"), not
+          as a control: the old "+ Add to target" badge was pixel-identical
+          to the modal's real button and clicking it did nothing (#836 §4).
+          Logged-out renders no footer: a pure click-target (§11.1). */}
       {isAuthenticated && (
         <div className='flex items-center gap-2 border-t border-border pt-3'>
           {bound ? (
@@ -401,9 +408,8 @@ function JobSearchCard({
               <span className='truncate'>In “{inTargets[0].label}”</span>
             </Badge>
           ) : (
-            <Badge variant='default' className='gap-1'>
-              <Plus className='size-3.5 shrink-0' aria-hidden />
-              Add to target
+            <Badge variant='default' className='text-text-tertiary'>
+              Not in a target
             </Badge>
           )}
         </div>
@@ -450,6 +456,12 @@ export default function JobSearchExplorer({
   const [loading, setLoading] = useState(false); // fresh search
   const [loadingMore, setLoadingMore] = useState(false); // "Load more"
   const [error, setError] = useState<string | null>(null);
+  // Pagination failures get their OWN error state: the page-level `error`
+  // gates the whole results section, so routing a "Load more" failure into
+  // it unmounted every result already on screen — a transient blip at the
+  // 4th page wiped the user's whole session of scrolling (#832). This one
+  // renders inline next to the button; the loaded results stay put.
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
 
   // Target-membership for the visible page (#467 §11): which of the caller's
   // targets already contain each listing → the card's pipeline-state badge and
@@ -514,21 +526,18 @@ export default function JobSearchExplorer({
   // Run the search whenever the URL search-state changes: initial mount, a
   // submit/filter change (which commits to the URL), or back/forward. This is
   // the ONLY place a fresh (page-0) search is kicked, so the URL and the results
-  // never drift. An empty query renders the honest empty page.
+  // never drift. An empty query BROWSES the pool newest-first (#834) — bare
+  // /search shows the corpus instead of a blank page, and filters work with
+  // no keyword ("remote, past week, $150k+" is a legitimate first ask).
   useEffect(() => {
     setDraftQ(urlQ);
     setDraftLocation(urlLocation);
     // A fresh search invalidates the previous page's membership map.
     setMembershipByJob({});
-    if (!urlQ) {
-      setResults(null);
-      setError(null);
-      setHasMore(false);
-      return;
-    }
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setLoadMoreError(null);
     setResults(null);
     fetchPage({
       q: urlQ,
@@ -592,7 +601,7 @@ export default function JobSearchExplorer({
   const loadMore = useCallback(async () => {
     if (!results) return;
     setLoadingMore(true);
-    setError(null);
+    setLoadMoreError(null);
     try {
       const data = await fetchPage({
         q: urlQ,
@@ -605,7 +614,11 @@ export default function JobSearchExplorer({
       setHasMore(data.has_more);
       void fetchMembership(data.results); // best-effort, non-blocking
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Network error loading more.');
+      // NEVER the page-level `error` — that unmounts the loaded results
+      // (#832). The button stays rendered, so clicking again is the retry.
+      setLoadMoreError(
+        e instanceof Error ? e.message : 'Network error loading more.'
+      );
     } finally {
       setLoadingMore(false);
     }
@@ -651,7 +664,7 @@ export default function JobSearchExplorer({
         ) : (
           <Text variant='body' className='mt-1 text-text-secondary'>
             Browse the full job pool by keyword — no account needed. Open any
-            role for the details and a link to the original posting.
+            role for a preview and a link to the original posting.
           </Text>
         )}
       </div>
@@ -670,7 +683,7 @@ export default function JobSearchExplorer({
           <Button
             name='job-search-submit'
             onClick={submitSearch}
-            disabled={loading || !draftQ.trim()}
+            disabled={loading}
           >
             Search
           </Button>
@@ -752,8 +765,9 @@ export default function JobSearchExplorer({
           {results.length === 0 ? (
             <div className='space-y-1'>
               <Text variant='body'>
-                No roles match “{urlQ}”
-                {hasActiveFilters ? ' with these filters' : ''} yet.
+                {urlQ
+                  ? `No roles match “${urlQ}”${hasActiveFilters ? ' with these filters' : ''} yet.`
+                  : 'No roles match these filters yet.'}
               </Text>
               <Text variant='meta' className='text-text-secondary'>
                 {hasActiveFilters
@@ -763,6 +777,17 @@ export default function JobSearchExplorer({
             </div>
           ) : (
             <>
+              {/* Honest count (#836): the API deliberately computes no corpus
+                  total (a title-ranked search would need a COUNT query), so
+                  say what we DO know — whether this is everything or just
+                  the first page(s) of more. */}
+              <Text variant='meta' as='p' className='mb-3 text-text-secondary'>
+                {hasMore
+                  ? `Showing the first ${results.length} ${urlQ ? 'matches' : 'roles'}`
+                  : urlQ
+                    ? `${results.length} ${results.length === 1 ? 'match' : 'matches'}`
+                    : `${results.length} roles, newest first`}
+              </Text>
               <div className='grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3'>
                 {results.map(job => (
                   <JobSearchCard
@@ -774,7 +799,7 @@ export default function JobSearchExplorer({
                 ))}
               </div>
               {hasMore && (
-                <div className='mt-4 flex justify-center'>
+                <div className='mt-4 flex flex-col items-center gap-2'>
                   <Button
                     name='job-search-load-more'
                     variant='secondary'
@@ -784,8 +809,36 @@ export default function JobSearchExplorer({
                   >
                     {loadingMore ? 'Loading…' : 'Load more'}
                   </Button>
+                  {loadMoreError && !loadingMore && (
+                    <Text variant='error' role='alert'>
+                      {loadMoreError} — your results are still here; try again.
+                    </Text>
+                  )}
                 </div>
               )}
+              {/* The public API stops pagination at its anti-enumeration
+                  ceiling (offset ≤ 40 → 60 rows), and now reports
+                  has_more=false there (#832). Say so honestly — and make
+                  it the conversion moment: signing in searches the full
+                  pool (the authed window pages ~4× deeper). */}
+              {!hasMore &&
+                !isAuthenticated &&
+                results.length >= PUBLIC_RESULT_DEPTH && (
+                  <Text
+                    variant='meta'
+                    as='p'
+                    className='mt-4 text-center text-text-secondary'
+                  >
+                    That’s the first {PUBLIC_RESULT_DEPTH} —{' '}
+                    <Link
+                      href='/login'
+                      className='underline underline-offset-2'
+                    >
+                      sign in
+                    </Link>{' '}
+                    to search the full pool.
+                  </Text>
+                )}
             </>
           )}
         </section>

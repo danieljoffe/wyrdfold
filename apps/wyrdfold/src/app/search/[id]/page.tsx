@@ -1,6 +1,8 @@
 import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 
+import { displayTitle } from '@/lib/displayTitle';
+import { formatCompanyName } from '@/lib/formatCompanyName';
 import { getOptionalUser } from '@/lib/supabase/getUser';
 
 import { fetchListing } from './fetchListing';
@@ -31,7 +33,10 @@ export async function generateMetadata({
   let title = 'Job listing';
   try {
     const listing = await fetchListing(id);
-    if (listing) title = `${listing.title} at ${listing.company_name}`;
+    // Display forms, not raw slugs (#836 §3): this is the tab title and the
+    // shared-link preview — "at qualified-health-pbc" read as a bug.
+    if (listing)
+      title = `${displayTitle(listing)} at ${formatCompanyName(listing.company_name)}`;
   } catch {
     // keep the fallback title
   }

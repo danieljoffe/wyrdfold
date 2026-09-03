@@ -121,16 +121,23 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockSearchParams = new URLSearchParams();
   mockNavListeners.clear();
+  // Bare mount now browses the pool (#834), so every test begins with a
+  // benign empty page-0 response; tests that care install their own mock.
+  mockSearch([]);
 });
 afterAll(() => {
   global.fetch = ORIGINAL_FETCH;
 });
 
-function typeAndSearch(term: string) {
+async function typeAndSearch(term: string) {
   fireEvent.change(screen.getByLabelText(/search jobs by title or keyword/i), {
     target: { value: term },
   });
-  fireEvent.click(screen.getByRole('button', { name: /search/i }));
+  // Bare mount kicks a browse fetch (#834) which disables Search while in
+  // flight — wait for it to settle so the click isn't swallowed.
+  const submit = screen.getByRole('button', { name: /^search$/i });
+  await waitFor(() => expect(submit).not.toBeDisabled());
+  fireEvent.click(submit);
 }
 
 /** The card is a single link (to `/search/<id>`) whose accessible name is its
@@ -162,7 +169,7 @@ describe('JobSearchExplorer', () => {
   it('searches the authed BFF route and renders result cards (no score)', async () => {
     mockSearch([result()]);
     render(<JobSearchExplorer isAuthenticated />);
-    typeAndSearch('frontend engineer');
+    await typeAndSearch('frontend engineer');
 
     // The whole result is a single link into the listing detail URL.
     const card = await findCard();
@@ -180,7 +187,7 @@ describe('JobSearchExplorer', () => {
   it('renders each card as a link to its shareable detail URL (#467 §11.2 fast-follow)', async () => {
     mockSearch([result({ id: 'abc-123' })]);
     render(<JobSearchExplorer isAuthenticated />);
-    typeAndSearch('frontend');
+    await typeAndSearch('frontend');
 
     // A REAL <a href> — soft-nav opens the intercepted modal over the grid,
     // while copy-link / middle-click / hard load get the standalone page.
@@ -193,7 +200,7 @@ describe('JobSearchExplorer', () => {
   it('emits a card_open funnel tick (authed surface) when a card is opened', async () => {
     mockSearch([result()]);
     render(<JobSearchExplorer isAuthenticated />);
-    typeAndSearch('frontend');
+    await typeAndSearch('frontend');
     fireEvent.click(await findCard());
     expect(mockEmitSearchEvent).toHaveBeenCalledWith({
       event_type: 'card_open',
@@ -231,7 +238,7 @@ describe('JobSearchExplorer', () => {
     }) as unknown as typeof fetch;
 
     render(<JobSearchExplorer isAuthenticated />);
-    typeAndSearch('frontend');
+    await typeAndSearch('frontend');
 
     // The card renders the "✓ In <target>" pipeline-state badge once membership
     // resolves — proving the POST fired and fed the map.
@@ -249,7 +256,7 @@ describe('JobSearchExplorer', () => {
       result({ snippet: 'Build fast, accessible UIs for millions.' }),
     ]);
     render(<JobSearchExplorer isAuthenticated />);
-    typeAndSearch('frontend');
+    await typeAndSearch('frontend');
     expect(
       await screen.findByText('Build fast, accessible UIs for millions.')
     ).toBeInTheDocument();
@@ -279,7 +286,7 @@ describe('JobSearchExplorer', () => {
     }) as unknown as typeof fetch;
 
     render(<JobSearchExplorer isAuthenticated />);
-    typeAndSearch('frontend');
+    await typeAndSearch('frontend');
 
     // Page 1 + a "Load more" affordance.
     expect(await findCard('Frontend Engineer')).toBeInTheDocument();
@@ -302,13 +309,174 @@ describe('JobSearchExplorer', () => {
     );
   });
 
+  it('keeps loaded results on screen when "Load more" fails (#832)', async () => {
+    const page1 = [result({ id: '1', title: 'Frontend Engineer' })];
+    global.fetch = jest.fn().mockImplementation((url: string) => {
+      const isSearch = url.includes('/api/jobs/search');
+      const first = url.includes('offset=0');
+      if (isSearch && !first) {
+        // The pagination request dies (network blip, or a 422 at a cap).
+        return Promise.resolve({
+          ok: false,
+          status: 422,
+          clone: () => ({ json: async () => ({ detail: 'Too deep.' }) }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          query: 'q',
+          count: page1.length,
+          has_more: isSearch,
+          results: isSearch ? page1 : [],
+        }),
+      });
+    }) as unknown as typeof fetch;
+
+    render(<JobSearchExplorer isAuthenticated />);
+    await typeAndSearch('frontend');
+    expect(await findCard('Frontend Engineer')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /load more/i }));
+
+    // The failure surfaces inline…
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /still here; try again/i
+    );
+    // …while the loaded results AND the retry affordance stay on screen —
+    // the old code routed this into the page-level error, unmounting all
+    // results the user had scrolled through.
+    expect(
+      screen.getByRole('link', { name: cardName('Frontend Engineer') })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /load more/i })
+    ).toBeInTheDocument();
+  });
+
+  it('pitches sign-in at the public depth ceiling (#832)', async () => {
+    const sixty = Array.from({ length: 60 }, (_, i) =>
+      result({ id: String(i + 1), title: `Role ${i + 1}` })
+    );
+    mockSearch(sixty, false);
+    render(<JobSearchExplorer isAuthenticated={false} />);
+    await typeAndSearch('frontend');
+
+    expect(await screen.findByText(/that.s the first 60/i)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /sign in/i })).toHaveAttribute(
+      'href',
+      '/login'
+    );
+  });
+
+  it('does not pitch sign-in to signed-in users at depth (#832)', async () => {
+    const sixty = Array.from({ length: 60 }, (_, i) =>
+      result({ id: String(i + 1), title: `Role ${i + 1}` })
+    );
+    mockSearch(sixty, false);
+    render(<JobSearchExplorer isAuthenticated />);
+    await typeAndSearch('frontend');
+
+    expect(await findCard('Role 1')).toBeInTheDocument();
+    expect(screen.queryByText(/that.s the first 60/i)).not.toBeInTheDocument();
+  });
+
   it('shows an honest empty state when nothing matches', async () => {
     mockSearch([]);
     render(<JobSearchExplorer isAuthenticated />);
-    typeAndSearch('nothingmatches');
+    await typeAndSearch('nothingmatches');
 
     expect(await screen.findByText(/no roles match/i)).toBeInTheDocument();
     expect(screen.getByText(/expanding coverage/i)).toBeInTheDocument();
+  });
+
+  it('shows an honest result count above the grid (#836)', async () => {
+    mockSearch(
+      [result({ id: '1' }), result({ id: '2', title: 'Senior FE' })],
+      true // more pages exist
+    );
+    render(<JobSearchExplorer isAuthenticated />);
+    await typeAndSearch('frontend');
+
+    expect(
+      await screen.findByText('Showing the first 2 matches')
+    ).toBeInTheDocument();
+  });
+
+  it('drops the "first" qualifier when the list is complete (#836)', async () => {
+    mockSearch([result()], false);
+    render(<JobSearchExplorer isAuthenticated />);
+    await typeAndSearch('frontend');
+
+    expect(await screen.findByText('1 match')).toBeInTheDocument();
+  });
+
+  it('counts browse-mode results as roles, newest first (#836)', async () => {
+    mockSearch(
+      [result({ id: '1' }), result({ id: '2', title: 'Senior FE' })],
+      false
+    );
+    render(<JobSearchExplorer isAuthenticated />);
+
+    // Bare mount = blank-q browse (#834): the count line must not call
+    // these "matches" — nothing was matched against.
+    expect(
+      await screen.findByText('2 roles, newest first')
+    ).toBeInTheDocument();
+  });
+
+  it('labels an unbound card with state, not a fake control (#836 §4)', async () => {
+    mockSearch([result()]);
+    render(<JobSearchExplorer isAuthenticated />);
+    await typeAndSearch('frontend');
+    await findCard();
+
+    // The old footer badge said "+ Add to target" — pixel-identical to the
+    // modal's REAL button, but clicking it did nothing.
+    expect(screen.getByText('Not in a target')).toBeInTheDocument();
+    expect(screen.queryByText('Add to target')).not.toBeInTheDocument();
+  });
+
+  it('browses the pool on bare mount — no keyword needed (#834)', async () => {
+    mockSearch([result({ id: 'b1', title: 'Browse Me' })]);
+    render(<JobSearchExplorer isAuthenticated />);
+
+    // No typeAndSearch — the mount itself fetches page 0 with a blank q.
+    expect(await findCard('Browse Me')).toBeInTheDocument();
+    expect(global.fetch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/jobs/search?q=&')
+    );
+  });
+
+  it('keeps the Search button clickable with an empty keyword (#834)', async () => {
+    render(<JobSearchExplorer isAuthenticated />);
+    // Disabled only while the mount browse fetch is in flight — never for an
+    // empty keyword (the old hard-disable was the "app answers with silence"
+    // half of #834).
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: /^search$/i })
+      ).not.toBeDisabled()
+    );
+  });
+
+  it('runs filters without a keyword and names the filtered empty state (#834)', async () => {
+    mockSearch([]);
+    render(<JobSearchExplorer isAuthenticated />);
+
+    // Configure a filter with NO keyword — the select commits to the URL
+    // immediately, which must now actually run the (empty) browse + filter.
+    fireEvent.change(screen.getByLabelText(/filter by date posted/i), {
+      target: { value: '7' },
+    });
+
+    expect(
+      await screen.findByText(/no roles match these filters yet/i)
+    ).toBeInTheDocument();
+    expect(global.fetch).toHaveBeenCalledWith(
+      expect.stringContaining('posted_within_days=7')
+    );
   });
 
   it('surfaces an error when the search fails', async () => {
@@ -321,7 +489,7 @@ describe('JobSearchExplorer', () => {
       clone: () => ({ json: async () => payload }),
     }) as unknown as typeof fetch;
     render(<JobSearchExplorer isAuthenticated />);
-    typeAndSearch('frontend');
+    await typeAndSearch('frontend');
 
     expect(await screen.findByText(/search exploded/i)).toBeInTheDocument();
   });
@@ -343,7 +511,7 @@ describe('JobSearchExplorer', () => {
   it('commits the query to the URL on submit', async () => {
     mockSearch([result()]);
     render(<JobSearchExplorer isAuthenticated />);
-    typeAndSearch('backend developer');
+    await typeAndSearch('backend developer');
     await waitFor(() =>
       expect(mockReplace).toHaveBeenCalledWith(
         expect.stringContaining('q=backend+developer'),
@@ -408,7 +576,10 @@ describe('JobSearchExplorer', () => {
     fireEvent.change(screen.getByLabelText(/filter by location/i), {
       target: { value: 'Remote' },
     });
-    fireEvent.click(screen.getByRole('button', { name: /^search$/i }));
+    // Let the mount browse fetch settle so the click isn't swallowed (#834).
+    const submit = screen.getByRole('button', { name: /^search$/i });
+    await waitFor(() => expect(submit).not.toBeDisabled());
+    fireEvent.click(submit);
 
     await waitFor(() =>
       expect(global.fetch).toHaveBeenCalledWith(
@@ -444,7 +615,7 @@ describe('JobSearchExplorer — logged out (public)', () => {
   it('emits a card_open tick with the PUBLIC surface when logged out', async () => {
     mockPublicPage();
     render(<JobSearchExplorer isAuthenticated={false} />);
-    typeAndSearch('frontend');
+    await typeAndSearch('frontend');
     fireEvent.click(await findCard());
     expect(mockEmitSearchEvent).toHaveBeenCalledWith({
       event_type: 'card_open',
@@ -468,7 +639,7 @@ describe('JobSearchExplorer — logged out (public)', () => {
   it('fetches the PUBLIC BFF route — never the authed search or membership', async () => {
     mockPublicPage();
     render(<JobSearchExplorer isAuthenticated={false} />);
-    typeAndSearch('frontend engineer');
+    await typeAndSearch('frontend engineer');
 
     await findCard();
 
@@ -487,7 +658,7 @@ describe('JobSearchExplorer — logged out (public)', () => {
   it('renders a card with NO logged-in footer (pure click-target)', async () => {
     mockPublicPage();
     render(<JobSearchExplorer isAuthenticated={false} />);
-    typeAndSearch('frontend');
+    await typeAndSearch('frontend');
 
     const card = await findCard();
     // The card still links into the detail, but carries no add/badge footer.
@@ -502,7 +673,7 @@ describe('JobSearchExplorer — logged out (public)', () => {
     // the navigation.
     mockPublicPage();
     render(<JobSearchExplorer isAuthenticated={false} />);
-    typeAndSearch('frontend');
+    await typeAndSearch('frontend');
 
     expect(await findCard()).toHaveAttribute('href', '/search/1');
   });

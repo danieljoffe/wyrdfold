@@ -10,6 +10,7 @@ import { Heading } from '@danieljoffe/shared-ui/Heading';
 import { Text } from '@danieljoffe/shared-ui/Text';
 import Button from '@/components/kit/Button';
 import LinkButton from '@/components/kit/LinkButton';
+import { formatJobSalary } from '@/lib/formatSalary';
 import { formatLocation } from '@/lib/formatLocation';
 import { timeAgo } from '@/lib/timeAgo';
 import { useToast } from '@/state/Toast/ToastProvider';
@@ -81,7 +82,9 @@ export default function ListingDetailBody({
     .filter(Boolean)
     .join(' · ');
   const chips: string[] = [
-    job.salary_text || 'Salary not listed',
+    // Same compact form as the card (#836 §6) — the raw salary_text rendered
+    // "$65000–$85000" here while the card two clicks earlier said "$65k–$85k".
+    formatJobSalary(job) || 'Salary not listed',
     `Posted ${timeAgo(job.source_posted_at ?? job.cataloged_at)}`,
     ...(locationDisplay ? [locationDisplay] : []),
   ];
@@ -180,8 +183,8 @@ export default function ListingDetailBody({
             There’s more here when you’re signed in
           </Text>
           <Text variant='meta' as='p' className='text-text-secondary'>
-            Members see how this role matches their profile and can auto-tailor
-            a résumé to it — free with an account.
+            Members read the full description, see how this role matches their
+            profile, and can auto-tailor a résumé to it — free with an account.
           </Text>
           <Link
             href='/login'

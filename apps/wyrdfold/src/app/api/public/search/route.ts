@@ -50,15 +50,9 @@ const FORWARDED_PARAMS = [
 export async function GET(request: NextRequest) {
   const sp = request.nextUrl.searchParams;
 
-  // `q` is required — mirror the authed route and short-circuit an obviously
-  // pointless round trip (the backend also 422s on a missing/empty query).
-  const q = sp.get('q')?.trim();
-  if (!q) {
-    return NextResponse.json(
-      { error: 'q query param required' },
-      { status: 400 }
-    );
-  }
+  // A blank `q` is a valid request now: the backend browses the pool
+  // newest-first (#834), so no short-circuit — mirror the authed route.
+  const q = sp.get('q')?.trim() ?? '';
 
   // Relay only the known search params (allowlist), trimming `q`. The backend is
   // the source of truth for validation + the hard depth caps.
