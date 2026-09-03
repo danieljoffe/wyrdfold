@@ -34,6 +34,7 @@ from app.models.user_profile import (
     IdentityFields,
     IdentityFieldsUpdate,
     JobsFilterPrefs,
+    JobsFilterPrefsPatch,
     LlmUsageResponse,
     LlmUsageWindow,
     NotificationPreferences,
@@ -521,23 +522,41 @@ async def get_jobs_filter_prefs(
     return JobsFilterPrefs(filters=row.get("jobs_filter_prefs") or {})
 
 
-@router.put("/jobs-filters", response_model=JobsFilterPrefs)
-async def put_jobs_filter_prefs(
-    body: JobsFilterPrefs,
+@router.patch("/jobs-filters", response_model=JobsFilterPrefs)
+async def patch_jobs_filter_prefs(
+    body: JobsFilterPrefsPatch,
     user_id: str = Depends(get_current_user_id),
     user_email: str | None = Depends(get_current_user_email),
     supabase: AsyncClient = Depends(get_async_user_supabase),
 ) -> JobsFilterPrefs:
-    """Replace the caller's /jobs filter snapshots (#866).
+    """Merge a per-key patch into the caller's /jobs filter snapshots (#866).
 
-    Whole-map PUT, not a per-key PATCH: the client owns the map (it debounces
-    writes of its in-memory copy), the blob is small (model-capped at 16KB /
-    64 keys), and replace semantics make "clear filters" a plain write
-    instead of a delete protocol.
+    PATCH-merge (value = replace, None = delete), NOT a whole-map PUT: with
+    replace semantics the client had to hydrate the server map before any
+    write was safe to send, which put the entire write path behind a GET
+    round-trip — and the e2e re-entry spec proved a fast navigation outran
+    it, silently persisting nothing. A patch of only the changed keys is
+    safe from the first render.
+
+    Merged server-side against the caller's own row; the merged map is
+    re-capped (64 keys) so patches can't accrete past the whole-map bound.
     """
-    await _get_or_create_profile(supabase, user_id, "jobs_filter_prefs", seed_email=user_email)
-    await _update_profile(supabase, user_id, {"jobs_filter_prefs": body.filters})
-    return body
+    row = await _get_or_create_profile(
+        supabase, user_id, "jobs_filter_prefs", seed_email=user_email
+    )
+    merged: dict[str, Any] = dict(row.get("jobs_filter_prefs") or {})
+    for key, snapshot in body.filters.items():
+        if snapshot is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = snapshot
+    if len(merged) > 64:
+        raise HTTPException(
+            status_code=422,
+            detail="too many filter snapshots after merge (max 64)",
+        )
+    await _update_profile(supabase, user_id, {"jobs_filter_prefs": merged})
+    return JobsFilterPrefs(filters=merged)
 
 
 @router.get("/llm-usage", response_model=LlmUsageResponse)

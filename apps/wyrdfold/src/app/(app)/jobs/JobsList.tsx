@@ -191,7 +191,17 @@ export default function JobsList({
   // restore pass, writes flow normally, including the deliberate
   // "cleared all filters" removeItem.
   useEffect(() => {
-    if (restoredForTargetRef.current !== activeTargetId) return;
+    // The restore-first guard exists so a BARE mount's empty URL can't
+    // delete the saved snapshot before the restore pass reads it. A
+    // POPULATED URL is different (#866 e2e lesson): deep-linked filters are
+    // safe to persist immediately, and waiting for the hydrate round-trip
+    // let a fast navigation outrun the write entirely.
+    if (
+      restoredForTargetRef.current !== activeTargetId &&
+      isFilterStateEmpty(urlFilters)
+    ) {
+      return;
+    }
     persistence.write(activeTargetId, urlFilters);
   }, [persistence, activeTargetId, urlFilters]);
 

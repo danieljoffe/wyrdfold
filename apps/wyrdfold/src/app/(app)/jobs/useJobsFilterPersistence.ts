@@ -73,26 +73,35 @@ export function useJobsFilterPersistence(): JobsFilterPersistence {
   const [ready, setReady] = useState(false);
   const mapRef = useRef<Record<string, JobsFilterState>>({});
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // True while an accepted write has not reached the server yet.
-  const dirtyRef = useRef(false);
+  // Writes not yet acknowledged by the server: key → snapshot (replace) or
+  // null (delete). Safe to flush at ANY time — the server merges per key,
+  // so a patch never clobbers entries this client hasn't seen.
+  const pendingRef = useRef<Record<string, JobsFilterState | null>>({});
+  // EVERY write this session, never cleared by a flush: the hydrate GET can
+  // race an already-flushed patch (GET computed before the PATCH landed),
+  // and overlaying only the still-pending writes would roll the local view
+  // back to the stale server snapshot.
+  const sessionWritesRef = useRef<Record<string, JobsFilterState | null>>({});
 
   const flushNow = useCallback((): void => {
     if (timerRef.current) {
       clearTimeout(timerRef.current);
       timerRef.current = null;
     }
-    if (!dirtyRef.current) return;
-    dirtyRef.current = false;
+    if (Object.keys(pendingRef.current).length === 0) return;
+    const patch = pendingRef.current;
+    pendingRef.current = {};
     fetch('/api/profile/jobs-filters', {
-      method: 'PUT',
+      method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filters: mapRef.current }),
+      body: JSON.stringify({ filters: patch }),
       // Survive unload/navigation — this is the synchronous-write guarantee
       // the localStorage layer gave for free.
       keepalive: true,
     }).catch(() => {
-      // Best-effort — the in-memory copy stays authoritative for this
-      // session; the next successful flush carries the full map anyway.
+      // Re-queue what was in flight (newer pending entries win) so the next
+      // flush retries; a terminal loss stays best-effort, as before.
+      pendingRef.current = { ...patch, ...pendingRef.current };
     });
   }, []);
 
@@ -109,6 +118,13 @@ export function useJobsFilterPersistence(): JobsFilterPersistence {
             if (filters && !isFilterStateEmpty(filters)) {
               coerced[key] = filters;
             }
+          }
+          // Anything written this session wins over the server snapshot —
+          // including writes already flushed, whose PATCH may postdate the
+          // data this GET was computed from.
+          for (const [key, value] of Object.entries(sessionWritesRef.current)) {
+            if (value === null) delete coerced[key];
+            else coerced[key] = value;
           }
           mapRef.current = coerced;
           dropLegacyLocalStorageKeys();
@@ -132,7 +148,6 @@ export function useJobsFilterPersistence(): JobsFilterPersistence {
   }, [flushNow]);
 
   const scheduleFlush = useCallback((): void => {
-    dirtyRef.current = true;
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = setTimeout(() => {
       timerRef.current = null;
@@ -148,13 +163,18 @@ export function useJobsFilterPersistence(): JobsFilterPersistence {
 
   const write = useCallback(
     (targetId: string | undefined, filters: JobsFilterState): void => {
+      const key = mapKey(targetId);
       // Drop the entry entirely when all fields are empty so "clear all
       // filters" doesn't leave a stale snapshot that re-applies next visit.
       if (isFilterStateEmpty(filters)) {
-        if (!(mapKey(targetId) in mapRef.current)) return;
-        delete mapRef.current[mapKey(targetId)];
+        if (!(key in mapRef.current) && !(key in pendingRef.current)) return;
+        delete mapRef.current[key];
+        pendingRef.current[key] = null;
+        sessionWritesRef.current[key] = null;
       } else {
-        mapRef.current = { ...mapRef.current, [mapKey(targetId)]: filters };
+        mapRef.current = { ...mapRef.current, [key]: filters };
+        pendingRef.current[key] = filters;
+        sessionWritesRef.current[key] = filters;
       }
       scheduleFlush();
     },
@@ -163,8 +183,11 @@ export function useJobsFilterPersistence(): JobsFilterPersistence {
 
   const clear = useCallback(
     (targetId: string | undefined): void => {
-      if (!(mapKey(targetId) in mapRef.current)) return;
-      delete mapRef.current[mapKey(targetId)];
+      const key = mapKey(targetId);
+      if (!(key in mapRef.current) && !(key in pendingRef.current)) return;
+      delete mapRef.current[key];
+      pendingRef.current[key] = null;
+      sessionWritesRef.current[key] = null;
       scheduleFlush();
     },
     [scheduleFlush]

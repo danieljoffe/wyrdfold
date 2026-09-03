@@ -174,29 +174,58 @@ def test_jobs_filters_get_null_column_is_empty_map(client_factory):
     assert r.json() == {"filters": {}}
 
 
-def test_jobs_filters_put_replaces_the_map(client_factory):
+def test_jobs_filters_patch_merges_and_deletes(client_factory):
+    # PATCH-merge (#866 e2e lesson): a patch of only the CHANGED keys must be
+    # safe to send without ever having read the map — value replaces, None
+    # deletes, untouched keys survive.
+    stored = {"t-old": {"search": "react"}, "t-gone": {"search": "x"}}
     sb = MagicMock()
     sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
-        AsyncMock(return_value=_Resp([_filters_row({})]))
+        AsyncMock(return_value=_Resp([_filters_row(stored)]))
     )
     update_chain = sb.table.return_value.update
     update_chain.return_value.eq.return_value.execute = AsyncMock(return_value=_Resp(None))
     client = client_factory(sb)
 
-    payload = {"filters": {"t-1": {"search": "python", "remoteOnly": "true"}}}
-    r = client.put("/profile/jobs-filters", json=payload)
+    r = client.patch(
+        "/profile/jobs-filters",
+        json={"filters": {"t-new": {"search": "python"}, "t-gone": None}},
+    )
 
     assert r.status_code == 200
-    assert r.json() == payload
-    update_chain.assert_called_once_with({"jobs_filter_prefs": payload["filters"]})
+    merged = {"t-old": {"search": "react"}, "t-new": {"search": "python"}}
+    assert r.json() == {"filters": merged}
+    update_chain.assert_called_once_with({"jobs_filter_prefs": merged})
 
 
-def test_jobs_filters_put_rejects_too_many_keys(client_factory):
+def test_jobs_filters_patch_rejects_merge_past_the_map_cap(client_factory):
+    # Patches must not accrete past the whole-map bound: 60 stored + 5 new
+    # distinct keys = 65 > 64 -> refused, nothing written.
+    stored = {f"t-{i}": {"search": "x"} for i in range(60)}
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([_filters_row(stored)]))
+    )
+    update_chain = sb.table.return_value.update
+    update_chain.return_value.eq.return_value.execute = AsyncMock(return_value=_Resp(None))
+    client = client_factory(sb)
+
+    r = client.patch(
+        "/profile/jobs-filters",
+        json={"filters": {f"n-{i}": {"search": "y"} for i in range(5)}},
+    )
+
+    assert r.status_code == 422
+    assert "after merge" in r.text
+    update_chain.assert_not_called()
+
+
+def test_jobs_filters_patch_rejects_too_many_keys(client_factory):
     # The caps keep the column from becoming an unbounded dumping ground —
     # prove the guard actually refuses, not just that valid input passes.
     sb = MagicMock()
     client = client_factory(sb)
-    r = client.put(
+    r = client.patch(
         "/profile/jobs-filters",
         json={"filters": {f"t-{i}": {"search": "x"} for i in range(65)}},
     )
@@ -204,10 +233,10 @@ def test_jobs_filters_put_rejects_too_many_keys(client_factory):
     assert "too many" in r.text
 
 
-def test_jobs_filters_put_rejects_oversized_blob(client_factory):
+def test_jobs_filters_patch_rejects_oversized_blob(client_factory):
     sb = MagicMock()
     client = client_factory(sb)
-    r = client.put(
+    r = client.patch(
         "/profile/jobs-filters",
         json={"filters": {"t-1": {"search": "x" * 17_000}}},
     )
