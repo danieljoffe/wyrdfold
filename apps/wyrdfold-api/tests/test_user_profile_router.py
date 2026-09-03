@@ -139,3 +139,77 @@ def test_patch_allows_disabling_email_even_when_unconfigured(
         json={"job_notifications_enabled": False},
     )
     assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# #866 — /profile/jobs-filters (server-side /jobs filter snapshots)
+# ---------------------------------------------------------------------------
+
+
+def _filters_row(prefs: Any) -> dict[str, Any]:
+    return {"jobs_filter_prefs": prefs}
+
+
+def test_jobs_filters_get_returns_stored_map(client_factory):
+    stored = {"t-1": {"search": "react"}, "__all__": {"country": "US"}}
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([_filters_row(stored)]))
+    )
+    client = client_factory(sb)
+    r = client.get("/profile/jobs-filters")
+    assert r.status_code == 200
+    assert r.json() == {"filters": stored}
+
+
+def test_jobs_filters_get_null_column_is_empty_map(client_factory):
+    # Rows predating the #866 column (or an explicit NULL) must serve {}.
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([_filters_row(None)]))
+    )
+    client = client_factory(sb)
+    r = client.get("/profile/jobs-filters")
+    assert r.status_code == 200
+    assert r.json() == {"filters": {}}
+
+
+def test_jobs_filters_put_replaces_the_map(client_factory):
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([_filters_row({})]))
+    )
+    update_chain = sb.table.return_value.update
+    update_chain.return_value.eq.return_value.execute = AsyncMock(return_value=_Resp(None))
+    client = client_factory(sb)
+
+    payload = {"filters": {"t-1": {"search": "python", "remoteOnly": "true"}}}
+    r = client.put("/profile/jobs-filters", json=payload)
+
+    assert r.status_code == 200
+    assert r.json() == payload
+    update_chain.assert_called_once_with({"jobs_filter_prefs": payload["filters"]})
+
+
+def test_jobs_filters_put_rejects_too_many_keys(client_factory):
+    # The caps keep the column from becoming an unbounded dumping ground —
+    # prove the guard actually refuses, not just that valid input passes.
+    sb = MagicMock()
+    client = client_factory(sb)
+    r = client.put(
+        "/profile/jobs-filters",
+        json={"filters": {f"t-{i}": {"search": "x"} for i in range(65)}},
+    )
+    assert r.status_code == 422
+    assert "too many" in r.text
+
+
+def test_jobs_filters_put_rejects_oversized_blob(client_factory):
+    sb = MagicMock()
+    client = client_factory(sb)
+    r = client.put(
+        "/profile/jobs-filters",
+        json={"filters": {"t-1": {"search": "x" * 17_000}}},
+    )
+    assert r.status_code == 422
+    assert "too large" in r.text

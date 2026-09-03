@@ -56,6 +56,19 @@ jest.mock('next/navigation', () => {
   };
 });
 
+// #866: the persistence hook now fetches the server prefs map on mount;
+// these tests choreograph global.fetch per-call for the ACTIVATION poll, so
+// that fetch would silently consume queued mock responses. The hook has its
+// own spec — stub it ready+empty here.
+jest.mock('../useJobsFilterPersistence', () => ({
+  useJobsFilterPersistence: () => ({
+    ready: true,
+    read: () => null,
+    write: () => undefined,
+    clear: () => undefined,
+  }),
+}));
+
 jest.mock('@/state/Toast/ToastProvider', () => ({
   useToast: () => ({
     toast: (...args: unknown[]) => mockToast(...args),

@@ -33,6 +33,7 @@ from app.dependencies import (
 from app.models.user_profile import (
     IdentityFields,
     IdentityFieldsUpdate,
+    JobsFilterPrefs,
     LlmUsageResponse,
     LlmUsageWindow,
     NotificationPreferences,
@@ -498,6 +499,45 @@ async def reset_onboarding(
         supabase, user_id, _ONBOARDING_COLUMNS, seed_email=user_email
     )
     return _read_onboarding(fresh)
+
+
+@router.get("/jobs-filters", response_model=JobsFilterPrefs)
+async def get_jobs_filter_prefs(
+    user_id: str = Depends(get_current_user_id),
+    user_email: str | None = Depends(get_current_user_email),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+) -> JobsFilterPrefs:
+    """The caller's saved /jobs filter snapshots (#866).
+
+    Server-side so filter memory is scoped to the ACCOUNT: the old
+    localStorage persistence used a global key, so a shared browser leaked
+    one user's filters into the next account's first render ("No jobs
+    found" on an account with matches). Rides the caller's own RLS row —
+    the read cannot see anyone else's snapshots by construction.
+    """
+    row = await _get_or_create_profile(
+        supabase, user_id, "jobs_filter_prefs", seed_email=user_email
+    )
+    return JobsFilterPrefs(filters=row.get("jobs_filter_prefs") or {})
+
+
+@router.put("/jobs-filters", response_model=JobsFilterPrefs)
+async def put_jobs_filter_prefs(
+    body: JobsFilterPrefs,
+    user_id: str = Depends(get_current_user_id),
+    user_email: str | None = Depends(get_current_user_email),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+) -> JobsFilterPrefs:
+    """Replace the caller's /jobs filter snapshots (#866).
+
+    Whole-map PUT, not a per-key PATCH: the client owns the map (it debounces
+    writes of its in-memory copy), the blob is small (model-capped at 16KB /
+    64 keys), and replace semantics make "clear filters" a plain write
+    instead of a delete protocol.
+    """
+    await _get_or_create_profile(supabase, user_id, "jobs_filter_prefs", seed_email=user_email)
+    await _update_profile(supabase, user_id, {"jobs_filter_prefs": body.filters})
+    return body
 
 
 @router.get("/llm-usage", response_model=LlmUsageResponse)

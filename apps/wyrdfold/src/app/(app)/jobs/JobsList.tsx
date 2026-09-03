@@ -198,6 +198,10 @@ export default function JobsList({
   // no filter params. Deep links (``/jobs?q=react``) win over the
   // stored snapshot — the URL is always authoritative when populated.
   useEffect(() => {
+    // #866: the snapshots load from the server now — restoring (and, via
+    // the ref, writing) waits for that load, or a bare first render would
+    // mark the target restored before the saved filters could apply.
+    if (!persistence.ready) return;
     if (restoredForTargetRef.current === activeTargetId) return;
     restoredForTargetRef.current = activeTargetId;
 
@@ -208,8 +212,8 @@ export default function JobsList({
 
     setUrlState(filtersToUrlPatch(saved));
     // Intentionally narrow deps: we only want this to fire on the first
-    // render per target. Including ``urlState`` would re-trigger after
-    // the restore writes its own values back into the URL, which is
+    // ready render per target. Including ``urlState`` would re-trigger
+    // after the restore writes its own values back into the URL, which is
     // already guarded by the ref check above but reads more clearly
     // with a small dep array.
   }, [activeTargetId, persistence, setUrlState]);
@@ -227,7 +231,11 @@ export default function JobsList({
   );
 
   const onTableSortChange = useCallback(
-    (sort: JobsSortColumn, order: 'asc' | 'desc', meta?: { reset: boolean }) => {
+    (
+      sort: JobsSortColumn,
+      order: 'asc' | 'desc',
+      meta?: { reset: boolean }
+    ) => {
       // Sort changes create a history entry so back restores the old sort.
       // The hook re-fetches the first page when sort changes.
       //
@@ -235,7 +243,10 @@ export default function JobsList({
       // default values. Writing `sort=score&order=desc` would look identical
       // to the user but leaves a URL that survives a change of default — and
       // "cleared" should mean "whatever the app ranks by", not "score, frozen".
-      setUrlState(meta?.reset ? { sort: null, order: null } : { sort, order }, 'push');
+      setUrlState(
+        meta?.reset ? { sort: null, order: null } : { sort, order },
+        'push'
+      );
     },
     [setUrlState]
   );
