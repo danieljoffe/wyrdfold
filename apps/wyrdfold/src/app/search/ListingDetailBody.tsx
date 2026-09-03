@@ -200,7 +200,7 @@ export default function ListingDetailBody({
             }}
             className='mt-1 inline-flex items-center gap-1 self-start text-sm font-semibold text-text-brand underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2'
           >
-            Sign up free
+            Get early access
             <ArrowRight className='size-3.5 shrink-0' aria-hidden />
           </Link>
         </div>

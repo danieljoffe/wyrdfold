@@ -150,3 +150,15 @@ Reuse what the release gate already does, against the new stack:
   requested it — the only test that proves the `token_hash` path (#856, #860)
 - `GET /targets/mine` returns 200 for an unsubscribed user while
   `POST /targets/suggest` still 402s (#893)
+
+## When `signup_mode` flips to open
+
+The public surfaces adjust in two ways — one automatic, one not:
+
+- **Automatic:** `/login` drops the "Not invited yet? Join the waitlist" link
+  and the closed-beta warning on its own (it probes `/api/signup-mode`, #963).
+- **Manual copy pass (#971 §3):** the public CTAs deliberately read
+  **"Get early access"** while signup is closed (`PublicSearchHeader` and the
+  listing-detail upsell in `ListingDetailBody`) — restore **"Sign up free"**
+  when the promise becomes true, and update the `JobDetailModal` spec's
+  link-name assertions in the same commit.
