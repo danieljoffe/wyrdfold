@@ -38,6 +38,7 @@ import type {
 } from '../../types';
 import { useTailorDocument } from '../../useTailorDocument';
 import { LocalDateTime, LocalNumber } from '@/components/LocalFormat';
+import GenerationCostLine from '@/components/GenerationCostLine';
 
 interface ResumeReviewPageProps {
   jobPostingId: string;
@@ -778,18 +779,18 @@ export default function ResumeReviewPage({
         </div>
       )}
 
-      {/* Cost only — tokens/model/latency are developer telemetry (ux-sweep
-          2026-08-12 §C12); they stay reachable in the native tooltip. */}
+      {/* Payer-aware cost line (#867): raw provider cost + model for BYOK
+          (it's their spend); allowance framing for managed plans. Tokens and
+          latency stay reachable in the native tooltip (ux-sweep 2026-08-12
+          §C12). */}
       <div className='flex flex-wrap gap-x-4 gap-y-1 rounded-md bg-surface-secondary px-3 py-2'>
-        <Text
-          variant='meta'
-          as='span'
-          title={`${record.input_tokens + record.output_tokens} tokens · ${
-            record.model ?? 'unknown model'
-          } · ${(record.latency_ms / 1000).toFixed(1)}s`}
-        >
-          Generated for ${record.cost_usd.toFixed(4)}
-        </Text>
+        <GenerationCostLine
+          costUsd={record.cost_usd}
+          inputTokens={record.input_tokens}
+          outputTokens={record.output_tokens}
+          model={record.model ?? null}
+          latencyMs={record.latency_ms}
+        />
       </div>
 
       <div className='rounded-md border border-border'>
@@ -1046,13 +1047,11 @@ export default function ResumeReviewPage({
         onClose={() => setConfirmReadaptOpen(false)}
         onConfirm={handleReadapt}
         title='Re-adapt resume?'
-        message={
-          `${
-            isApproved
-              ? 'Generate a new resume from scratch? This will replace the approved resume — the current one stays in version history but will no longer be the active draft.'
-              : 'Re-generate this resume from scratch? Current draft is saved as a version first.'
-          } Target length: ${readaptPages === 1 ? 'one page' : 'two pages'}.`
-        }
+        message={`${
+          isApproved
+            ? 'Generate a new resume from scratch? This will replace the approved resume — the current one stays in version history but will no longer be the active draft.'
+            : 'Re-generate this resume from scratch? Current draft is saved as a version first.'
+        } Target length: ${readaptPages === 1 ? 'one page' : 'two pages'}.`}
         confirmLabel='Regenerate'
         loading={generating}
         loadingLabel='Regenerating…'
