@@ -19,7 +19,7 @@ from app.http_client import BoardFetchError
 from app.models.experience import OptimizedDoc
 from app.models.schemas import PollResult
 from app.models.targets import JobTarget
-from app.services import notify
+from app.services import catalog_health, notify
 from app.services.ashby import fetch_ashby_jobs
 from app.services.board_metadata import board_columns, board_us_verdict
 from app.services.date_normalize import normalize_posted_at
@@ -3530,6 +3530,13 @@ async def poll_all_sources(
 
     await asyncio.gather(*(_worker(s) for s in sources))
     logger.info("poll cycle finished: %s %s", admission_budget.report(), intake_budget.report())
+    # Product-level catalog health (#958). Telemetry only: record_cycle_health
+    # swallows its own failures, and the try/except here is the belt to that
+    # braces — a health bug must never cost a poll cycle.
+    try:
+        await catalog_health.record_cycle_health(supabase)
+    except Exception:
+        logger.exception("catalog_health hook failed (cycle unaffected)")
     return result
 
 
@@ -3700,6 +3707,13 @@ async def poll_due_sources(
             phase1_store_stats["hits"],
             phase1_store_stats["misses"],
         )
+    # Product-level catalog health (#958) — same belt-and-braces as the full
+    # cycle path; the recorder's own min-interval throttle keeps the frequent
+    # due-source ticks from writing duplicate rows.
+    try:
+        await catalog_health.record_cycle_health(supabase)
+    except Exception:
+        logger.exception("catalog_health hook failed (cycle unaffected)")
     return result
 
 

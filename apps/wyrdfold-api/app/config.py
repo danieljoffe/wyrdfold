@@ -362,6 +362,35 @@ class Settings(BaseSettings):
     # count, exactly as Phase 1 is today.
     phase1_backfill_cap_fraction: float = Field(default=0.25, ge=0.0, le=1.0)
 
+    # ---- Catalog-health observability (#958) --------------------------------
+    # Product-level eyes on the intake funnel: one catalog_health_cycles row
+    # per recorded poll cycle (window intake, corpus quality, admitted-title
+    # token histogram) plus a distribution tripwire that would have caught the
+    # #952 class ("thousands ingested, none relevant") within a cycle or two.
+    catalog_health_enabled: bool = True
+    # Trailing intake window each row measures. 24h keeps the token sample
+    # large enough to be stable at current intake rates (~hundreds/day).
+    catalog_health_window_hours: int = Field(default=24, ge=1)
+    # Rows are recorded at most this often — the due-source path can tick far
+    # more frequently than the 30-minute poll cadence.
+    catalog_health_min_interval_minutes: int = Field(default=30, ge=0)
+    # Token histogram size stored per row and compared by the tripwire.
+    catalog_health_top_tokens: int = Field(default=15, ge=1)
+    # Baseline = up to this many prior rows whose window ended before the
+    # current window began (zero overlap, so the comparison is honest).
+    catalog_health_baseline_cycles: int = Field(default=48, ge=1)
+    # Tripwire fires when the total-variation distance between the window's
+    # and the baseline's normalized token distributions exceeds this. TV is in
+    # [0, 1]; 0.5 means "half the probability mass moved" — a regime change,
+    # not noise. Deliberately loud-only: a WARNING log + a flagged row.
+    catalog_health_tripwire_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Below these sample sizes the tripwire records "not evaluated" instead of
+    # guessing from noise (title counts, current window / baseline combined).
+    catalog_health_min_sample_titles: int = Field(default=20, ge=1)
+    # Rows older than this are pruned by the recorder itself (48/day → tiny,
+    # but unbounded tables are how "temporary" telemetry becomes debt).
+    catalog_health_retention_days: int = Field(default=90, ge=1)
+
     # How often to RESUME Phase-1 backfills that stopped early. 0 disables the
     # sweep entirely (the activation-time pass still runs).
     #
