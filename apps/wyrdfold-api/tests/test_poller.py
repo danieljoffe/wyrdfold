@@ -3284,3 +3284,38 @@ class TestIntakeCeilingsAreCoherent:
             f"~{measured_eligible_per_cycle} eligible listings a cycle actually "
             "produces, so listings queue forever instead of draining"
         )
+
+
+@pytest.mark.asyncio
+async def test_reaped_target_stops_scoring_and_phase2(monkeypatch, caplog):
+    """#869: a target reaped mid-cycle (account erasure) used to raise an
+    unhandled FK-23503 traceback per remaining job, and Stage 3 still paid
+    for LLM grades the write would discard. The first TargetReapedError must
+    mark the target; Stage 2 drops its items and Phase 2 never runs."""
+    import logging
+
+    from app.services import poller as poller_mod
+    from app.services.target_scoring import TargetReapedError
+
+    supabase, fake_phase2, _fake_legacy, target = _wire_targeted_stage3(
+        monkeypatch, phase2_enabled=True
+    )
+    title_mock = AsyncMock(side_effect=TargetReapedError(target.id))
+    monkeypatch.setattr(poller_mod, "target_title_score_and_upsert", title_mock)
+    stage2_mock = AsyncMock()
+    monkeypatch.setattr(poller_mod, "target_score_and_upsert", stage2_mock)
+
+    with caplog.at_level(logging.WARNING, logger="app.services.poller"):
+        summary = await poller_mod._poll_one_source_for_target(
+            dict(_GUARD_SOURCE), supabase, target, payer_user_id="payer-1"
+        )
+
+    # The cycle itself is unaffected — a reap is a drop, not an error.
+    assert summary["error"] is None
+    assert title_mock.await_count == 1
+    # Stage 2 dropped every item for the reaped target...
+    assert stage2_mock.await_count == 0
+    # ...and the PAID stage never ran (the LLM-spend half of #869).
+    assert fake_phase2.await_count == 0
+    warnings = [r.message for r in caplog.records if "reaped mid-cycle" in r.message]
+    assert len(warnings) == 1

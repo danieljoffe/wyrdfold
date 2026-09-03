@@ -68,6 +68,7 @@ from app.services.scoring import score_title_against_profile
 from app.services.smartrecruiters import fetch_smartrecruiters_jobs
 from app.services.source_redetect import redetect_source
 from app.services.standard_job import StandardJob
+from app.services.target_scoring import TargetReapedError
 from app.services.target_scoring import (
     score_and_upsert as target_score_and_upsert,
 )
@@ -2352,12 +2353,21 @@ async def _poll_one_source(
             # runner materializes vectors for exactly the candidate set
             # about to be read ("only a few will ever be read").
 
+            # Targets whose scores upsert hit the target-FK 23503 this cycle:
+            # the target was reaped (account erasure / last-follower unlink)
+            # after this cycle snapshotted active_targets (#869). One typed
+            # error marks it here; every later stage skips it instead of
+            # paying per-row for work the write must discard.
+            reaped_targets: set[str] = set()
+
             # ---- Stage 1: Title scoring per target ----
             for active_target in active_targets:
 
                 async def _title_score_one(
                     row_data: dict[str, Any], target: JobTarget = active_target
                 ) -> None:
+                    if target.id in reaped_targets:
+                        return
                     try:
                         await target_title_score_and_upsert(
                             supabase,
@@ -2365,6 +2375,14 @@ async def _poll_one_source(
                             title=row_data.get("title", ""),
                             target=target,
                         )
+                    except TargetReapedError:
+                        if target.id not in reaped_targets:
+                            reaped_targets.add(target.id)
+                            logger.warning(
+                                "Target %s was reaped mid-cycle; dropping its remaining "
+                                "scoring for this cycle",
+                                target.id,
+                            )
                     except Exception:
                         logger.exception("Stage 1 scoring failed for job %s", row_data.get("id"))
 
@@ -2377,6 +2395,8 @@ async def _poll_one_source(
                 jd_cache[rd["id"]] = parse_jd(rd.get("description_html") or "")
 
             for active_target in active_targets:
+                if active_target.id in reaped_targets:
+                    continue
                 # Per-target Phase 1 verdicts (None when flag off): keyed by
                 # the 1-based job idx assigned during the candidate-build
                 # loop above. Each upserted row carries an
@@ -2413,6 +2433,8 @@ async def _poll_one_source(
                     verdicts: dict[int, TitleVerdict] = target_verdicts,
                     floor: dict[str, bool | None] = promising_floor,
                 ) -> None:
+                    if target.id in reaped_targets:
+                        return
                     try:
                         ext_id = row_data.get("external_id", "")
                         promising: bool | None
@@ -2457,6 +2479,14 @@ async def _poll_one_source(
                             promising=promising_arg,
                             phase1_confidence=phase1_confidence,
                         )
+                    except TargetReapedError:
+                        if target.id not in reaped_targets:
+                            reaped_targets.add(target.id)
+                            logger.warning(
+                                "Target %s was reaped mid-cycle; dropping its remaining "
+                                "scoring for this cycle",
+                                target.id,
+                            )
                     except Exception:
                         logger.exception("Stage 2 scoring failed for job %s", row_data.get("id"))
 
@@ -2493,6 +2523,17 @@ async def _poll_one_source(
                 # placeholder until graded).
                 cycle_rows = list(upserted_rows)
                 for uid, p2_target in primary_by_user.items():
+                    if p2_target.id in reaped_targets:
+                        # #869: the whole point of marking the reap in stage
+                        # 1/2 — Phase 2 is the expensive LLM stage, and every
+                        # grade for a reaped target is paid and then discarded
+                        # at the write.
+                        logger.info(
+                            "Phase 2 skipped for user %s / target %s (target reaped mid-cycle)",
+                            uid,
+                            p2_target.id,
+                        )
+                        continue
                     p2_reason = gate.user_block_reason(uid)
                     if p2_reason is not None:
                         # Defer. Jobs keep promising=True/score=NULL and get
@@ -4115,8 +4156,15 @@ async def _poll_one_source_for_target(
             # Job embeddings likewise: ensure_job_vectors materializes exactly
             # the read set.
 
+            # Single-target twin of the shared path's reap guard (#869): the
+            # first target-FK 23503 marks the target reaped; every later item
+            # and stage drops instead of paying per-row for a discarded write.
+            reaped_targets: set[str] = set()
+
             # Stage 1: Title scoring
             async def _title_score_one(row_data: dict[str, Any]) -> None:
+                if target.id in reaped_targets:
+                    return
                 try:
                     await target_title_score_and_upsert(
                         supabase,
@@ -4124,6 +4172,14 @@ async def _poll_one_source_for_target(
                         title=row_data.get("title", ""),
                         target=target,
                     )
+                except TargetReapedError:
+                    if target.id not in reaped_targets:
+                        reaped_targets.add(target.id)
+                        logger.warning(
+                            "Target %s was reaped mid-cycle; dropping its remaining "
+                            "scoring for this cycle",
+                            target.id,
+                        )
                 except Exception:
                     logger.exception("Stage 1 scoring failed for job %s", row_data.get("id"))
 
@@ -4156,6 +4212,8 @@ async def _poll_one_source_for_target(
                     promising_floor[floor_row["job_posting_id"]] = floor_row.get("promising")
 
             async def _full_score_one(row_data: dict[str, Any]) -> None:
+                if target.id in reaped_targets:
+                    return
                 try:
                     # Phase 1 verdict for this (job, this-target) pair.
                     # The gate already filtered out non-promising jobs
@@ -4198,20 +4256,35 @@ async def _poll_one_source_for_target(
                         promising=promising_arg,
                         phase1_confidence=phase1_confidence,
                     )
+                except TargetReapedError:
+                    if target.id not in reaped_targets:
+                        reaped_targets.add(target.id)
+                        logger.warning(
+                            "Target %s was reaped mid-cycle; dropping its remaining "
+                            "scoring for this cycle",
+                            target.id,
+                        )
                 except Exception:
                     logger.exception("Stage 2 scoring failed for job %s", row_data.get("id"))
 
             await asyncio.gather(*(_full_score_one(r) for r in upserted_rows))
 
-            # Stage 3: LLM scoring for qualified jobs (concurrent).
-            # JobTarget is a global row with no user_id — resolve owning
-            # users via the user_targets junction, then fetch each user's
-            # optimized doc. The pre-fix ``get_latest(None)`` returned
-            # nothing since no system-wide doc exists in the multi-user
-            # schema.
-            primary_by_user, user_optimized = await _resolve_user_targets_for_stage3(
-                supabase, [target], company_name
-            )
+            if target.id in reaped_targets:
+                # #869: the target is gone — Stage 3 is the paid LLM stage,
+                # and every grade for it would be discarded at the write.
+                logger.info("Stage 3 skipped for target %s (target reaped mid-cycle)", target.id)
+                primary_by_user: dict[str, JobTarget] = {}
+                user_optimized: dict[str, OptimizedDoc] = {}
+            else:
+                # Stage 3: LLM scoring for qualified jobs (concurrent).
+                # JobTarget is a global row with no user_id — resolve owning
+                # users via the user_targets junction, then fetch each user's
+                # optimized doc. The pre-fix ``get_latest(None)`` returned
+                # nothing since no system-wide doc exists in the multi-user
+                # schema.
+                primary_by_user, user_optimized = await _resolve_user_targets_for_stage3(
+                    supabase, [target], company_name
+                )
             if primary_by_user and payer_block_reason is not None:
                 logger.info(
                     "Stage 3 deferred for target %s (payer %s blocked: %s)",

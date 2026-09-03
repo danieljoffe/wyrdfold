@@ -148,6 +148,21 @@ async def _fetch_phase2_state(
     return state
 
 
+async def _target_exists(supabase: AsyncClient, target_id: str) -> bool:
+    """One PK read before the paid grading batch (#869): a target reaped
+    mid-cycle (account erasure / last-follower unlink) leaves the batch
+    grading against a row that is gone — every grade is paid for and then
+    discarded at the persist, which swallows per-job failures. Fail-OPEN on a
+    read error: a flaky read must not block grading; the worst case is the
+    pre-#869 behavior for one run."""
+    try:
+        resp = await supabase.table("targets").select("id").eq("id", target_id).limit(1).execute()
+        return bool(resp.data)
+    except Exception:
+        logger.exception("Phase 2 target-existence check failed (fail-open)")
+        return True
+
+
 def _progressive_batches(items: list[str], first: int, rest: int) -> list[list[str]]:
     """Split ``items`` into a small first batch then larger chunks."""
     if not items:
@@ -419,6 +434,17 @@ async def run_phase2_for_jobs(
                 100.0 * null_qualified / len(candidates),
                 target.id,
             )
+
+    # #869: last check before money is spent. The stages before this are
+    # deterministic; the batch below pays per job.
+    if candidates and not await _target_exists(supabase, target.id):
+        logger.warning(
+            "Phase 2: target %s no longer exists (reaped mid-cycle); "
+            "skipping %d candidate grade(s)",
+            target.id,
+            len(candidates),
+        )
+        return 0
 
     sem = asyncio.Semaphore(concurrency)
 
