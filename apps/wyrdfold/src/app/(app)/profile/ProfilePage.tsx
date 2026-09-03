@@ -568,13 +568,22 @@ export default function ProfilePage() {
               </CircleBadge>
             </div>
           </CardHeader>
-          <CardContent>
+          <CardContent className='flex flex-col gap-2'>
             <ProgressBar
               value={Math.round(100 - gapHealth.gap_pct)}
               variant={tierToProgressVariant(gapHealth.tier)}
               size='sm'
               aria-label='Document completeness'
             />
+            {/* #844 §2: a headline percentage with no explanation of what's
+                being scored. The metric is gap_health() — a weighted
+                completeness score over the master document — and the Gaps
+                card below IS the itemized answer; say so. */}
+            <Text variant='caption' className='text-text-tertiary'>
+              How complete your master document is — roles missing outcomes or
+              summaries, outcomes without a quantified metric, skills without
+              evidence. Filling the gaps listed below is what raises it.
+            </Text>
           </CardContent>
         </Card>
       )}
@@ -865,7 +874,11 @@ function GapsList({
   // the user usually wants the count + "answer questions" CTA at a glance,
   // not a wall of every gap.
   const [open, setOpen] = useState(false);
-  const visible = gaps.slice(0, 10);
+  // #844 §1: "+18 more gaps" was a dead <p> — the user was told 28 problems
+  // exist and could only ever read 10 of them (the only route to the rest
+  // was the one-at-a-time question flow). The tail is now expandable.
+  const [showAll, setShowAll] = useState(false);
+  const visible = showAll ? gaps : gaps.slice(0, 10);
   const count = gaps.length;
   const cta = (
     <Button
@@ -928,9 +941,16 @@ function GapsList({
               </div>
             ))}
             {gaps.length > 10 && (
-              <Text variant='caption' className='pt-2 text-text-tertiary'>
-                +{gaps.length - 10} more gaps
-              </Text>
+              <button
+                type='button'
+                onClick={() => setShowAll(s => !s)}
+                aria-expanded={showAll}
+                className='pt-2 text-left text-sm text-text-secondary underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500'
+              >
+                {showAll
+                  ? 'Show fewer'
+                  : `Show all ${gaps.length} gaps (+${gaps.length - 10} more)`}
+              </button>
             )}
           </div>
           {tier === 'red' ? (

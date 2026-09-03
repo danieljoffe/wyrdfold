@@ -48,10 +48,24 @@ export default function TargetComparisonChart({
       columns={columns}
       rowKey={row => row.target_id}
     >
-      <ResponsiveContainer width='100%' height={250}>
+      <ResponsiveContainer width='100%' height={290}>
         <BarChart data={formatted}>
           <CartesianGrid strokeDasharray='3 3' stroke={CHART_COLORS.grid} />
-          <XAxis dataKey='target_label' tick={CHART_AXIS_TICK} />
+          {/* #844 §6: recharts' default tick thinning labeled 3 of 8 bars,
+              so most bars couldn't be attributed. interval={0} forces one
+              label per bar; angled + truncated so eight fit. Full names
+              stay in the tooltip and the accessible table below. */}
+          <XAxis
+            dataKey='target_label'
+            tick={CHART_AXIS_TICK}
+            interval={0}
+            angle={-30}
+            textAnchor='end'
+            height={64}
+            tickFormatter={(label: string) =>
+              label.length > 16 ? `${label.slice(0, 15)}…` : label
+            }
+          />
           <YAxis yAxisId='score' tick={CHART_AXIS_TICK} />
           <YAxis
             yAxisId='pct'

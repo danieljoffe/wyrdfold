@@ -27,6 +27,12 @@ export default function ConversationChatModal({
           onClose();
         }}
         onSkip={onClose}
+        /* #844 §3: this modal opens from an ESTABLISHED profile (the Gaps
+           card), where the wizard's "Build my profile" / "Skip for now"
+           read like the first-run flow reused without relabelling. */
+        skipLabel='Close'
+        finishLabel='Update my profile'
+        finishingLabel='Updating...'
       />
     </Modal>
   );
