@@ -113,6 +113,7 @@ def test_sources_toggle_flips_enabled(client_factory):
 
 def test_sources_seed_inserts_all(client_factory):
     sb = MagicMock()
+    sb.table.return_value.select.return_value.execute.return_value = _Resp([])
     sb.table.return_value.upsert.return_value.execute.return_value = _Resp(None)
     client = client_factory(sb)
     r = client.post("/sources/seed")
@@ -120,10 +121,54 @@ def test_sources_seed_inserts_all(client_factory):
     body = r.json()
     assert body["success"] is True
     assert body["seeded"] == len(COMPANY_SEED)
+    assert body["skipped_repointed"] == []
     assert sb.table.return_value.upsert.call_count == 1
     call_args, call_kwargs = sb.table.return_value.upsert.call_args
     assert len(call_args[0]) == len(COMPANY_SEED)
     assert call_kwargs["on_conflict"] == "board_token"
+
+
+def test_sources_seed_skips_repointed_company(client_factory):
+    """#938: ATS re-detection (#937) rewrites a migrated company's board_token
+    IN PLACE, so the row no longer matches its seeded token. A blind re-run of
+    the seed would insert the retired dead token as a brand-new source next to
+    the live one. A company present under a DIFFERENT token must be skipped —
+    whatever its enabled state, since a re-pointed board can itself be disabled
+    later and the dead token must still not come back."""
+    sb = MagicMock()
+    # Stripe was re-pointed: same company, new token. The seeded token
+    # ("stripe") no longer exists on any row.
+    sb.table.return_value.select.return_value.execute.return_value = _Resp(
+        [{"board_token": "stripe-ashby-8f2", "company_name": "Stripe"}]
+    )
+    sb.table.return_value.upsert.return_value.execute.return_value = _Resp(None)
+    client = client_factory(sb)
+    r = client.post("/sources/seed")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["success"] is True
+    assert body["seeded"] == len(COMPANY_SEED) - 1
+    assert body["skipped_repointed"] == ["Stripe"]
+    call_args, _call_kwargs = sb.table.return_value.upsert.call_args
+    seeded_tokens = {e["board_token"] for e in call_args[0]}
+    assert "stripe" not in seeded_tokens  # the dead token stays retired
+
+
+def test_sources_seed_still_refreshes_a_matching_token(client_factory):
+    """Control: a company whose row still carries its seeded token is NOT
+    skipped — the upsert matches the existing row on board_token, refreshing
+    metadata without touching ``enabled``. Only the re-pointed case skips."""
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.execute.return_value = _Resp(
+        [{"board_token": "stripe", "company_name": "Stripe"}]
+    )
+    sb.table.return_value.upsert.return_value.execute.return_value = _Resp(None)
+    client = client_factory(sb)
+    r = client.post("/sources/seed")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["seeded"] == len(COMPANY_SEED)
+    assert body["skipped_repointed"] == []
 
 
 # --- GET /sources/verify ---

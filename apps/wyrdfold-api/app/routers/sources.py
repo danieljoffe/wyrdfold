@@ -8,6 +8,7 @@ authenticated users must not be able to add/remove/toggle the global
 source list.
 """
 
+import logging
 from typing import Any, cast
 
 import httpx
@@ -25,6 +26,8 @@ from app.seed.company_seed import COMPANY_SEED
 from app.services.ats_detect import detect_ats
 from app.services.db_read import fetch_one
 from app.services.greenhouse import GREENHOUSE_BASE
+
+logger = logging.getLogger(__name__)
 
 # Default dependency = read auth (JWT or api-key). Write endpoints below
 # layer on `verify_api_key` to restrict to operator/cron callers.
@@ -89,8 +92,45 @@ async def _set_source_enabled(supabase: AsyncClient, *, board_token: str, enable
     )
 
 
-async def _seed_source_catalog(supabase: AsyncClient) -> None:
-    await supabase.table("sources").upsert(list(COMPANY_SEED), on_conflict="board_token").execute()
+async def _seed_source_catalog(supabase: AsyncClient) -> tuple[int, list[str]]:
+    """Upsert the ``COMPANY_SEED`` catalog, skipping re-pointed companies (#938).
+
+    The seed upserts on ``board_token``, but ATS re-detection (#937) rewrites a
+    migrated company's ``provider`` + ``board_token`` IN PLACE — so after a
+    re-point the row no longer matches its seeded token, and a blind re-run
+    would insert the retired dead token as a brand-new source alongside the
+    live one, resurrecting exactly the board re-detection retired.
+
+    A seed entry applies only when its exact token still exists (a harmless
+    metadata refresh of the same row — the upsert never touches ``enabled``)
+    or when its company has no source row at all (a genuinely new seed). A
+    company present under a DIFFERENT token — re-pointed, whatever its
+    enabled state today — is skipped and reported.
+
+    Returns ``(seeded_count, skipped_company_names)``.
+    """
+    resp = await supabase.table("sources").select("board_token, company_name").execute()
+    existing = cast(list[dict[str, Any]], resp.data or [])
+    existing_tokens = {r.get("board_token") for r in existing}
+    existing_names = {r.get("company_name") for r in existing}
+
+    to_seed: list[dict[str, str]] = []
+    skipped: list[str] = []
+    for entry in COMPANY_SEED:
+        if entry["board_token"] in existing_tokens or entry["company_name"] not in existing_names:
+            to_seed.append(entry)
+        else:
+            skipped.append(entry["company_name"])
+    if skipped:
+        logger.warning(
+            "Source seed: skipping %d compan(y/ies) whose source was re-pointed "
+            "to a different board_token: %s",
+            len(skipped),
+            ", ".join(skipped),
+        )
+    if to_seed:
+        await supabase.table("sources").upsert(to_seed, on_conflict="board_token").execute()
+    return len(to_seed), skipped
 
 
 # Native async handlers (#57 slice 4): DB round-trips run on the event loop via
@@ -174,5 +214,5 @@ async def detect_provider(
 async def seed_sources(
     supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> dict[str, Any]:
-    await _seed_source_catalog(supabase)
-    return {"success": True, "seeded": len(COMPANY_SEED)}
+    seeded, skipped = await _seed_source_catalog(supabase)
+    return {"success": True, "seeded": seeded, "skipped_repointed": skipped}
