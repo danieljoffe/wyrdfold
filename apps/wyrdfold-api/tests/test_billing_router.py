@@ -437,6 +437,9 @@ def test_billing_account_reports_plan_and_state(
         "plan": "starter",
         "has_billing_account": True,
         "byok": True,
+        # #858: server capability, distinct from the user's byok state above;
+        # the test env has no BYOK_MASTER_KEY, mirroring prod saas.
+        "byok_available": False,
     }
 
 
@@ -460,6 +463,7 @@ def test_billing_account_defaults_free_no_account(
         "plan": "free",
         "has_billing_account": False,
         "byok": False,
+        "byok_available": False,
     }
 
 

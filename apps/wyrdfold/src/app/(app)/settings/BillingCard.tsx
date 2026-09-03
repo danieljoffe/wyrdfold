@@ -19,7 +19,10 @@ import { useToast } from '@/state/Toast/ToastProvider';
 // Phase 3 tiers (pricing locked 2026-07-03). Copy only — the backend maps
 // plans to Stripe Prices; a drifted label here can't change what's billed.
 const PLAN_LABELS: Record<string, string> = {
-  free: 'Free (bring your own key)',
+  // Plain "Free" (#858): the old "(bring your own key)" clause contradicted
+  // servers where BYOK is not offered — the branched copy below explains
+  // what free means on THIS server instead.
+  free: 'Free',
   // NOT "Free trial" (#887). `trial` is the stamp an unsubscribed account
   // carries, with an already-elapsed clock — naming it a trial promises a
   // window that never opens.
@@ -32,6 +35,10 @@ interface BillingAccount {
   plan: string;
   has_billing_account: boolean;
   byok: boolean;
+  /** Whether this SERVER offers BYOK at all (#858) — distinct from `byok`
+   *  (this user has a key). Absent on pre-#858 API responses (mixed-deploy
+   *  window): treated as available, i.e. the old copy. */
+  byok_available?: boolean;
 }
 
 export default function BillingCard() {
@@ -212,6 +219,18 @@ export default function BillingCard() {
           <Text variant='meta' className='text-text-secondary'>
             AI features need an active subscription. Choose a plan below to
             start job matching and tailored resumes.
+          </Text>
+        ) : account.byok_available === false ? (
+          /* #858: on a server with no BYOK_MASTER_KEY the key fields above
+             are disabled — "add one above" pointed at a control the API-keys
+             card had just said doesn't exist. This is also the screen every
+             canceled or payment-failed subscriber lands on (billing.py sets
+             plan="free" on any non-active status), so it must tell one
+             coherent story. */
+          <Text variant='meta' className='text-text-secondary'>
+            AI features aren&apos;t included on the free plan, and
+            bring-your-own-key isn&apos;t offered on this server — choose a plan
+            below to enable job matching and tailored resumes.
           </Text>
         ) : (
           <Text variant='meta' className='text-text-secondary'>

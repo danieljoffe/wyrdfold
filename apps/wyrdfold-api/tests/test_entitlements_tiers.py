@@ -89,7 +89,7 @@ def test_quota_self_host_is_pre_tier_behavior(
         has_key=True,  # even with a key: self_host semantics unchanged
         rows=[{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "free"}],
     )
-    assert q == budget.ResolvedQuota(settings.user_llm_monthly_budget_usd, True, None)
+    assert q == budget.ResolvedQuota(settings.user_llm_monthly_budget_usd, True, None, "host")
 
     q = _quota(
         monkeypatch,
@@ -112,7 +112,7 @@ def test_quota_saas_byok_payer_has_no_managed_monthly_cap(
         has_key=True,
         rows=[{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "pro"}],
     )
-    assert q == budget.ResolvedQuota(0.0, True, None)
+    assert q == budget.ResolvedQuota(0.0, True, None, "user")
 
 
 def test_quota_saas_managed_tier_gets_interactive_only_budget(
@@ -207,6 +207,11 @@ def test_quota_saas_free_without_key_keeps_default_cap(
     )
     assert q.monthly_cap_usd == settings.user_llm_monthly_budget_usd
     assert q.monthly_excluded_purposes is None
+    # #858: nobody CAN pay here — saas byok-tier with no usable key 402s at
+    # get_client, so this cap is a never-consulted fallback. The /settings
+    # allowance widget renders from this field; "host" here would resurrect
+    # the phantom "$0.00 of $5.00" a free account can never spend.
+    assert q.key_source == "none"
 
 
 # ---- resolve_llm_quota_async / get_llm_account_async (#57 PR-G2c) ------------
@@ -246,7 +251,7 @@ async def test_quota_async_self_host_matches_sync(monkeypatch: pytest.MonkeyPatc
         has_key=True,  # ignored in self_host
         rows=[{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "free"}],
     )
-    assert q == budget.ResolvedQuota(settings.user_llm_monthly_budget_usd, True, None)
+    assert q == budget.ResolvedQuota(settings.user_llm_monthly_budget_usd, True, None, "host")
 
 
 @pytest.mark.asyncio
@@ -258,7 +263,7 @@ async def test_quota_async_saas_byok_payer_has_no_cap(monkeypatch: pytest.Monkey
         has_key=True,
         rows=[{"llm_monthly_budget_usd": None, "llm_enabled": True, "plan": "pro"}],
     )
-    assert q == budget.ResolvedQuota(0.0, True, None)
+    assert q == budget.ResolvedQuota(0.0, True, None, "user")
 
 
 @pytest.mark.asyncio
