@@ -235,3 +235,32 @@ describe('InsightsDashboard', () => {
     );
   });
 });
+
+describe('Trends empty state (#844 §7)', () => {
+  it('names the empty state when there is no application activity', () => {
+    mockUseInsights.mockReturnValue({
+      ...READY_STATE,
+      pipeline: {
+        ...READY_STATE.pipeline,
+        total_applications: 0,
+        total_interviews: 0,
+        response_rate: null,
+        avg_days_to_response: null,
+      },
+    });
+    render(<InsightsDashboard />);
+    expect(screen.getByText(/nothing to chart yet/i)).toBeInTheDocument();
+  });
+
+  it('stays silent once there is any activity', () => {
+    mockUseInsights.mockReturnValue(READY_STATE);
+    render(<InsightsDashboard />);
+    expect(screen.queryByText(/nothing to chart yet/i)).not.toBeInTheDocument();
+  });
+
+  it('stays silent while loading and on the error path (pipeline undefined)', () => {
+    mockUseInsights.mockReturnValue(LOADING_STATE);
+    render(<InsightsDashboard />);
+    expect(screen.queryByText(/nothing to chart yet/i)).not.toBeInTheDocument();
+  });
+});

@@ -20,6 +20,12 @@ interface ConversationChatProps {
    * keeps the default, where skipping dismisses the chat entirely.
    */
   skipLabel?: string;
+  /** #844 §3: the finish CTA reads "Build my profile" in the first-run
+   *  wizard; an established profile's gap-filling flow passes an
+   *  update-flavored pair instead, so onboarding copy stops leaking into
+   *  the steady-state surface. */
+  finishLabel?: string;
+  finishingLabel?: string;
 }
 
 interface Message {
@@ -39,6 +45,8 @@ export default function ConversationChat({
   onComplete,
   onSkip,
   skipLabel = 'Skip for now',
+  finishLabel = 'Build my profile',
+  finishingLabel = 'Building...',
 }: ConversationChatProps) {
   const idPrefix = useId();
   const msgCountRef = useRef(0);
@@ -421,7 +429,7 @@ export default function ConversationChat({
             onClick={handleFinishNow}
             disabled={loading || sending || deriving || messages.length < 2}
           >
-            {deriving ? 'Building...' : 'Build my profile'}
+            {deriving ? finishingLabel : finishLabel}
           </Button>
           <Button
             name='onboarding-skip-conversation'
