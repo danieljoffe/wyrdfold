@@ -92,9 +92,11 @@ async def test_frontend_engineer_outranks_backend_developer() -> None:
     assert ids[-1] == "be-dev"
 
 
-async def test_empty_query_returns_empty_without_hitting_db() -> None:
+async def test_blank_and_garbage_queries_split_between_browse_and_empty() -> None:
+    # #834 changed the blank-q contract: whitespace-only now BROWSES the pool
+    # (the browse tests below pin that), while a real query that sanitizes
+    # away to nothing still returns empty without a DB round trip.
     supabase = _mock_supabase([_row("x", "Anything", "2026-01-01")])
-    assert await job_search.search_jobs(supabase, q="   ") == ([], False)
     assert await job_search.search_jobs(supabase, q="*,()") == ([], False)
     supabase.table.assert_not_called()
 
@@ -195,7 +197,7 @@ def test_search_endpoint_requires_auth() -> None:
     assert resp.status_code in (401, 403)
 
 
-def test_search_endpoint_requires_a_query() -> None:
+def test_search_endpoint_still_validates_query_length() -> None:
     from fastapi.testclient import TestClient
 
     from app.dependencies import get_async_service_supabase, verify_api_key_or_jwt
@@ -204,7 +206,9 @@ def test_search_endpoint_requires_a_query() -> None:
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test-user"
     try:
-        assert TestClient(app).get("/search").status_code == 422  # q is required
+        # #834 made a missing/blank q legal (browse mode) — the length cap
+        # is the validation that survives.
+        assert TestClient(app).get(f"/search?q={'x' * 121}").status_code == 422
     finally:
         app.dependency_overrides.clear()
 
@@ -476,3 +480,49 @@ async def test_no_salary_floor_adds_no_salary_predicate() -> None:
     qb = supabase.table.return_value
     assert all(c.args[0] != "salary_currency" for c in qb.eq.call_args_list)
     assert all("salary_max" not in c.args[0] for c in qb.or_.call_args_list)
+
+
+# --- blank-q browse mode (#834) --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_blank_q_browses_without_a_title_clause() -> None:
+    # A blank query returns the recency-biased window with the corpus gate and
+    # filters intact — but NO title ilike clause (there is nothing to match).
+    supabase = _mock_supabase([_row("n1", "Anything At All", "2026-08-30")])
+    results, has_more = await job_search.search_jobs(supabase, q="")
+    assert [r.id for r in results] == ["n1"]
+    assert has_more is False
+    qb = supabase.table.return_value
+    title_clauses = [
+        c.args[0] for c in qb.or_.call_args_list if "title.ilike" in str(c.args[0])
+    ]
+    assert title_clauses == []
+
+
+@pytest.mark.asyncio
+async def test_punctuation_only_q_still_returns_nothing() -> None:
+    # A REAL query that sanitizes away to nothing must NOT fall through to
+    # browse — "),(*:" returning the whole pool would be a lie.
+    supabase = _mock_supabase([_row("n1", "Anything", "2026-08-30")])
+    results, has_more = await job_search.search_jobs(supabase, q="),(*:")
+    assert results == []
+    assert has_more is False
+    supabase.table.assert_not_called()
+
+
+def test_search_endpoint_accepts_a_blank_q() -> None:
+    from fastapi.testclient import TestClient
+
+    from app.dependencies import get_async_service_supabase, verify_api_key_or_jwt
+    from app.main import app
+
+    supabase = _mock_supabase([_row("n1", "Newest Role", "2026-08-30")])
+    app.dependency_overrides[get_async_service_supabase] = lambda: supabase
+    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test-user"
+    try:
+        resp = TestClient(app).get("/search?q=")
+        assert resp.status_code == 200
+        assert [r["title"] for r in resp.json()["results"]] == ["Newest Role"]
+    finally:
+        app.dependency_overrides.clear()

@@ -525,19 +525,14 @@ export default function JobSearchExplorer({
   // Run the search whenever the URL search-state changes: initial mount, a
   // submit/filter change (which commits to the URL), or back/forward. This is
   // the ONLY place a fresh (page-0) search is kicked, so the URL and the results
-  // never drift. An empty query renders the honest empty page.
+  // never drift. An empty query BROWSES the pool newest-first (#834) — bare
+  // /search shows the corpus instead of a blank page, and filters work with
+  // no keyword ("remote, past week, $150k+" is a legitimate first ask).
   useEffect(() => {
     setDraftQ(urlQ);
     setDraftLocation(urlLocation);
     // A fresh search invalidates the previous page's membership map.
     setMembershipByJob({});
-    if (!urlQ) {
-      setResults(null);
-      setError(null);
-      setLoadMoreError(null);
-      setHasMore(false);
-      return;
-    }
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -687,7 +682,7 @@ export default function JobSearchExplorer({
           <Button
             name='job-search-submit'
             onClick={submitSearch}
-            disabled={loading || !draftQ.trim()}
+            disabled={loading}
           >
             Search
           </Button>
@@ -769,8 +764,9 @@ export default function JobSearchExplorer({
           {results.length === 0 ? (
             <div className='space-y-1'>
               <Text variant='body'>
-                No roles match “{urlQ}”
-                {hasActiveFilters ? ' with these filters' : ''} yet.
+                {urlQ
+                  ? `No roles match “${urlQ}”${hasActiveFilters ? ' with these filters' : ''} yet.`
+                  : 'No roles match these filters yet.'}
               </Text>
               <Text variant='meta' className='text-text-secondary'>
                 {hasActiveFilters

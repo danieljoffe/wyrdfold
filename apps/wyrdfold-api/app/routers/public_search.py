@@ -71,7 +71,11 @@ _LISTING_CACHE_PREFIX = "publiclisting:"
 @limiter.limit("10/minute;60/hour")
 async def public_search_endpoint(
     request: Request,
-    q: str = Query(..., min_length=1, max_length=120, description="Title / keyword query"),
+    q: str = Query(
+        "",
+        max_length=120,
+        description="Title / keyword query; blank browses the pool newest-first (#834)",
+    ),
     page_size: int = Query(
         PUBLIC_MAX_PAGE_SIZE,
         ge=1,

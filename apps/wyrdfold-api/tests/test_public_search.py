@@ -159,9 +159,11 @@ def test_forwards_query_and_filters_to_the_service(monkeypatch) -> None:
     assert captured["posted_within_days"] == 7
 
 
-def test_requires_a_query(monkeypatch) -> None:
+def test_query_length_is_still_validated(monkeypatch) -> None:
+    # #834 made a missing/blank q legal (browse mode) — but the length cap
+    # survives: q remains bounded input, not a free channel.
     _stub_search(monkeypatch)
-    assert TestClient(app).get("/public/search").status_code == 422  # q is required
+    assert TestClient(app).get(f"/public/search?q={'x' * 121}").status_code == 422
 
 
 # ---- snippet (the public-only JD preview) ----------------------------------
@@ -244,3 +246,14 @@ def test_has_more_passes_through_below_the_ceiling(monkeypatch) -> None:
     r = TestClient(app).get("/public/search?q=below+ceiling+case&offset=20")
     assert r.status_code == 200
     assert r.json()["has_more"] is True
+
+
+def test_blank_q_browses_the_pool(monkeypatch) -> None:
+    # #834: the public surface accepts a blank query — filters-only browsing —
+    # instead of 422ing on min_length.
+    captured: dict[str, Any] = {}
+    _stub_search(monkeypatch, captured=captured)
+    r = TestClient(app).get("/public/search?q=&posted_within_days=7")
+    assert r.status_code == 200
+    assert captured["q"] == ""
+    assert captured["posted_within_days"] == 7
