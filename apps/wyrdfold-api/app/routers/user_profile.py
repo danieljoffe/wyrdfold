@@ -521,6 +521,7 @@ async def get_llm_usage(
     """
     from datetime import timedelta
 
+    from app.services import keys as keys_service
     from app.services.analysis.analyze import DEFAULT_PURPOSE
     from app.services.llm import budget, cost_log
 
@@ -605,6 +606,10 @@ async def get_llm_usage(
         monthly_resets_at=resets_at,
         analysis_daily_used=analysis_used,
         analysis_daily_limit=settings.analysis_daily_limit,
+        # #858: the same resolution the gates enforce names who pays, so the
+        # FE can stop rendering an allowance a free account can never spend.
+        key_source=quota.key_source,
+        byok_available=keys_service.is_configured(),
     )
 
 

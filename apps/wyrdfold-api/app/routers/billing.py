@@ -162,7 +162,11 @@ class BillingAccountResponse(BaseModel):
     has_billing_account: bool
     #: The user's own usable OpenRouter key pays inference (no managed
     #: quota applies) — drives the "your key pays" presentation.
+    #: (byok_available below is the SERVER capability; this is the user state.)
     byok: bool
+    #: Whether this server offers BYOK at all (#858) — the free-plan copy
+    #: must not say "add one above" when the key fields are disabled.
+    byok_available: bool
 
 
 # `async def` (#57 PR-G2c): every read runs on the pooled async service client —
@@ -181,6 +185,7 @@ async def get_billing_account(
     supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> BillingAccountResponse:
     """The settings card's read: plan + billing/BYOK state in one call."""
+    from app.services import keys as keys_service
     from app.services.keys import store as keys_store
     from app.services.llm import budget
 
@@ -191,6 +196,9 @@ async def get_billing_account(
         plan=account.plan or "free",
         has_billing_account=has_billing_account,
         byok=byok,
+        # #858: the free-plan copy branches on whether this server offers
+        # BYOK at all — "add your own key" is a dead end when it doesn't.
+        byok_available=keys_service.is_configured(),
     )
 
 
@@ -440,9 +448,7 @@ async def stripe_webhook(
     try:
         # Verification only — the handler below works on the (identical,
         # now-authenticated) raw JSON rather than stripe's typed objects.
-        stripe.Webhook.construct_event(
-            payload, signature, settings.stripe_webhook_secret
-        )
+        stripe.Webhook.construct_event(payload, signature, settings.stripe_webhook_secret)
     except (ValueError, stripe.SignatureVerificationError) as exc:
         raise HTTPException(status_code=400, detail="Invalid signature") from exc
 

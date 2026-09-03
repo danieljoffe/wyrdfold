@@ -13,7 +13,7 @@ hourly window bounds the worst-case overshoot.
 
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Any, NamedTuple, cast
+from typing import Any, Literal, NamedTuple, cast
 
 from fastapi import HTTPException
 from supabase import AsyncClient, Client
@@ -108,6 +108,15 @@ class ResolvedQuota(NamedTuple):
     #: Purposes EXCLUDED from the monthly sum (managed tiers count
     #: interactive spend only); None = count everything (legacy behavior).
     monthly_excluded_purposes: tuple[str, ...] | None
+    #: Who actually pays when this user spends (#858): "host" = the instance
+    #: key with this quota enforced; "user" = their own BYOK key (cap 0.0 is
+    #: "uncapped by us", not "no budget"); "none" = nobody CAN pay — a saas
+    #: byok-tier account with no usable key 402s before any quota is read, so
+    #: the cap above is the legacy fallback and never consulted. REQUIRED (no
+    #: default) so every resolution branch names its payer explicitly — the
+    #: /settings allowance widget renders from this, and a silently-defaulted
+    #: "host" would resurrect the phantom $5 allowance this field removes.
+    key_source: Literal["host", "user", "none"]
 
 
 def resolve_llm_quota(supabase: Client, *, user_id: str) -> ResolvedQuota:
@@ -140,13 +149,13 @@ def resolve_llm_quota(supabase: Client, *, user_id: str) -> ResolvedQuota:
             if account.monthly_override_usd is not None
             else s.user_llm_monthly_budget_usd
         )
-        return ResolvedQuota(cap, account.llm_enabled, None)
+        return ResolvedQuota(cap, account.llm_enabled, None, "host")
 
     # "Who pays" must match what get_client will actually do: only a key
     # that exists AND decrypts routes spend to the user; a broken row
     # falls back to the host key and must stay metered.
     if keys_store.has_usable_key(supabase, user_id=user_id, provider="openrouter"):
-        return ResolvedQuota(0.0, account.llm_enabled, None)
+        return ResolvedQuota(0.0, account.llm_enabled, None, "user")
 
     entitlement = ent.entitlements_for(account.plan)
     if entitlement.llm_key_source == "host":
@@ -155,14 +164,14 @@ def resolve_llm_quota(supabase: Client, *, user_id: str) -> ResolvedQuota:
             if account.monthly_override_usd is not None
             else cast(float, entitlement.monthly_billable_budget_usd)
         )
-        return ResolvedQuota(cap, account.llm_enabled, entitlement.quota_excluded_purposes)
+        return ResolvedQuota(cap, account.llm_enabled, entitlement.quota_excluded_purposes, "host")
 
     cap = (
         account.monthly_override_usd
         if account.monthly_override_usd is not None
         else s.user_llm_monthly_budget_usd
     )
-    return ResolvedQuota(cap, account.llm_enabled, None)
+    return ResolvedQuota(cap, account.llm_enabled, None, "none")
 
 
 async def resolve_llm_quota_async(supabase: AsyncClient, *, user_id: str) -> ResolvedQuota:
@@ -185,10 +194,10 @@ async def resolve_llm_quota_async(supabase: AsyncClient, *, user_id: str) -> Res
             if account.monthly_override_usd is not None
             else s.user_llm_monthly_budget_usd
         )
-        return ResolvedQuota(cap, account.llm_enabled, None)
+        return ResolvedQuota(cap, account.llm_enabled, None, "host")
 
     if await keys_store.has_usable_key_async(supabase, user_id=user_id, provider="openrouter"):
-        return ResolvedQuota(0.0, account.llm_enabled, None)
+        return ResolvedQuota(0.0, account.llm_enabled, None, "user")
 
     entitlement = ent.entitlements_for(account.plan)
     if entitlement.llm_key_source == "host":
@@ -197,14 +206,14 @@ async def resolve_llm_quota_async(supabase: AsyncClient, *, user_id: str) -> Res
             if account.monthly_override_usd is not None
             else cast(float, entitlement.monthly_billable_budget_usd)
         )
-        return ResolvedQuota(cap, account.llm_enabled, entitlement.quota_excluded_purposes)
+        return ResolvedQuota(cap, account.llm_enabled, entitlement.quota_excluded_purposes, "host")
 
     cap = (
         account.monthly_override_usd
         if account.monthly_override_usd is not None
         else s.user_llm_monthly_budget_usd
     )
-    return ResolvedQuota(cap, account.llm_enabled, None)
+    return ResolvedQuota(cap, account.llm_enabled, None, "none")
 
 
 def raise_if_llm_disabled(enabled: bool) -> None:

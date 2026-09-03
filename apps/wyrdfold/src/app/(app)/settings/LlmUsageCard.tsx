@@ -25,6 +25,12 @@ interface LlmUsage {
   monthly_resets_at: string | null;
   analysis_daily_used: number;
   analysis_daily_limit: number;
+  /** Who pays when this account spends (#858) — the same resolution the
+   *  budget gates enforce. Absent on pre-#858 API responses (mixed-deploy
+   *  window): treated as "host", i.e. the old always-render behavior. */
+  key_source?: 'host' | 'user' | 'none';
+  /** Whether this server offers BYOK at all — picks the honest "none" copy. */
+  byok_available?: boolean;
 }
 
 /** The roll-off line earns its place only when the date says something a
@@ -92,30 +98,61 @@ export default function LlmUsageCard() {
             <Skeleton width='40%' size='sm' />
             <Skeleton variant='rectangular' height={8} />
           </div>
+        ) : (usage.key_source ?? 'host') === 'none' ? (
+          /* #858: a saas free account with no usable key 402s before any
+             quota is read — rendering "$0.00 of $5.00" here told the user
+             they had hosted budget they could never spend, and told an
+             operator that free accounts draw host money. Say the true state
+             instead, matching the Plan & billing card's copy. */
+          <Text variant='caption' className='text-text-secondary'>
+            {usage.byok_available
+              ? 'AI features are off for this account — add your own OpenRouter key above, or subscribe to a plan, to enable them.'
+              : 'AI features require a paid plan on this server — no allowance applies to the free plan.'}
+          </Text>
         ) : (
           <>
-            <div className='flex items-baseline justify-between'>
-              <Text variant='caption' className='text-text-secondary'>
-                30-day allowance
-              </Text>
-              <Text variant='caption'>
-                ${usage.monthly.spent_usd.toFixed(2)} of $
-                {usage.monthly.limit_usd.toFixed(2)}
-              </Text>
-            </div>
-            <ProgressBar
-              // A 0 limit would make ProgressBar read 100% (value/max → ∞,
-              // clamped to full); the old meter showed an EMPTY bar for a
-              // no-limit account, so pin the zero-limit case to 0%.
-              value={usage.monthly.limit_usd > 0 ? usage.monthly.spent_usd : 0}
-              max={usage.monthly.limit_usd > 0 ? usage.monthly.limit_usd : 100}
-              variant={usageVariant(
-                usage.monthly.spent_usd,
-                usage.monthly.limit_usd
-              )}
-              size='md'
-              aria-label='30-day allowance used'
-            />
+            {usage.key_source === 'user' ? (
+              /* BYOK: the numbers below are the user's own key's spend —
+                 there is no managed allowance to burn down, so no cap bar. */
+              <div className='flex items-baseline justify-between'>
+                <Text variant='caption' className='text-text-secondary'>
+                  Your key&apos;s 30-day spend
+                </Text>
+                <Text variant='caption'>
+                  ${usage.monthly.spent_usd.toFixed(2)} — your own OpenRouter
+                  key pays; no managed allowance applies
+                </Text>
+              </div>
+            ) : (
+              <>
+                <div className='flex items-baseline justify-between'>
+                  <Text variant='caption' className='text-text-secondary'>
+                    30-day allowance
+                  </Text>
+                  <Text variant='caption'>
+                    ${usage.monthly.spent_usd.toFixed(2)} of $
+                    {usage.monthly.limit_usd.toFixed(2)}
+                  </Text>
+                </div>
+                <ProgressBar
+                  // A 0 limit would make ProgressBar read 100% (value/max → ∞,
+                  // clamped to full); the old meter showed an EMPTY bar for a
+                  // no-limit account, so pin the zero-limit case to 0%.
+                  value={
+                    usage.monthly.limit_usd > 0 ? usage.monthly.spent_usd : 0
+                  }
+                  max={
+                    usage.monthly.limit_usd > 0 ? usage.monthly.limit_usd : 100
+                  }
+                  variant={usageVariant(
+                    usage.monthly.spent_usd,
+                    usage.monthly.limit_usd
+                  )}
+                  size='md'
+                  aria-label='30-day allowance used'
+                />
+              </>
+            )}
             <div className='flex items-baseline justify-between'>
               <Text variant='caption' className='text-text-secondary'>
                 Deep analyses today

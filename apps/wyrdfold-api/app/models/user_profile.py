@@ -236,3 +236,13 @@ class LlmUsageResponse(BaseModel):
     monthly_resets_at: datetime | None = None
     analysis_daily_used: int
     analysis_daily_limit: int
+    # Who pays when this user spends (#858) — the SAME resolution the budget
+    # gates enforce (ResolvedQuota.key_source). The allowance widget renders
+    # only for "host": for "user" the numbers are their own key's spend with
+    # no managed cap, and for "none" (saas free, no usable key) every AI call
+    # 402s before a quota is read, so showing "$0.00 of $5.00" told a free
+    # user they had hosted budget they could never spend.
+    key_source: Literal["host", "user", "none"]
+    # Whether this server offers BYOK at all (BYOK_MASTER_KEY configured) —
+    # lets the "none" copy honestly say "add a key" vs "requires a paid plan".
+    byok_available: bool
