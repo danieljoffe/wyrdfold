@@ -7,6 +7,7 @@ then engages) rather than leak a silently-wrong dict into scoring.
 """
 
 import json
+import logging
 
 import httpx
 import pytest
@@ -31,12 +32,21 @@ def _tool_calls(args_str: str) -> list[dict]:
     return [{"function": {"name": "return_X", "arguments": args_str}}]
 
 
-def _resp(tool_calls: list[dict], *, finish: str = "tool_calls", content: object = None) -> dict:
-    return {
+def _resp(
+    tool_calls: list[dict],
+    *,
+    finish: str = "tool_calls",
+    content: object = None,
+    provider: str | None = None,
+) -> dict:
+    data: dict = {
         "choices": [
             {"finish_reason": finish, "message": {"content": content, "tool_calls": tool_calls}}
         ]
     }
+    if provider is not None:
+        data["provider"] = provider
+    return data
 
 
 # ---- _parse_openai_tool_response edge battery -------------------------------
@@ -215,6 +225,16 @@ async def test_deepseek_routes_through_openai_path(monkeypatch) -> None:
     assert body["tool_choice"] == {"type": "function", "function": {"name": "return_X"}}
     assert body["temperature"] == 0.0
     assert body["messages"][0] == {"role": "system", "content": "S"}
+    # #935 provider routing. The ignore list is pinned as a LITERAL on
+    # purpose: every slug here declared supports_tool_choice.function=false
+    # on OpenRouter's endpoint metadata (2026-09-02), and this path forces a
+    # named function on every call. require_parameters alone would NOT
+    # exclude them — they list tool_choice as supported; the refusal is one
+    # level finer. Editing the source list must be a conscious act here too.
+    assert body["provider"] == {
+        "require_parameters": True,
+        "ignore": ["gmicloud", "streamlake", "atlas-cloud", "novita", "alibaba", "sambanova"],
+    }
 
 
 @pytest.mark.asyncio
@@ -532,6 +552,29 @@ def test_prose_tool_call_is_salvaged_not_discarded() -> None:
             }
         ]
     }
+
+
+def test_prose_salvage_names_the_responding_provider(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#935: the deterministic prose-tool-call failures track which endpoint
+    served the call. Every salvage names the provider so the hit rate is
+    correlatable per provider — that correlation is what the routing
+    ignore-list was derived from, and drift in the endpoint pool shows up in
+    these lines first."""
+    data = _resp([], finish="stop", content=_REAL_TRIAGE_CONTENT, provider="GMICloud")
+    with caplog.at_level(logging.WARNING, logger="app.services.llm.openrouter_client"):
+        _parse_openai_tool_response(data, tool_name="return_TitleTriageResponse", max_tokens=1000)
+    assert any("provider='GMICloud'" in r.message for r in caplog.records)
+
+
+def test_missing_tool_call_failure_names_the_responding_provider() -> None:
+    """The unsalvageable case carries the provider too — the paid retry was
+    'a coin flip on a deterministic failure', and provider-labelled failures
+    are how that determinism becomes visible in prod logs."""
+    data = _resp([], finish="stop", content="I refuse.", provider="SambaNova")
+    with pytest.raises(MissingToolCallError, match="provider='SambaNova'"):
+        _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
 
 
 def test_prose_salvage_decodes_json_and_string_parameters() -> None:
