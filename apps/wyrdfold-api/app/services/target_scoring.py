@@ -25,6 +25,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, cast
 
+from postgrest.exceptions import APIError
 from supabase import AsyncClient
 
 from app.models.schemas import JobTargetScore, ScoreBreakdown, ScoreResult, ScoringStatus
@@ -38,6 +39,18 @@ from app.services.supabase_retry import execute_with_retry
 logger = logging.getLogger(__name__)
 
 TABLE = "scores"
+
+
+class TargetReapedError(Exception):
+    """The scores upsert hit FK 23503 on ``target_id`` — the target row is
+    gone. Account erasure (or a last-follower unlink) reaped it while a poll
+    cycle was still scoring against its pre-reap targets snapshot (#869).
+    There is nothing to write and nothing to fix: callers drop the item and
+    stop spending on that target for the rest of the cycle."""
+
+    def __init__(self, target_id: str) -> None:
+        super().__init__(f"target {target_id} was reaped mid-cycle")
+        self.target_id = target_id
 
 
 def _parse_score(row: dict[str, Any]) -> JobTargetScore:
@@ -167,11 +180,25 @@ async def _upsert_score(
         promising=promising,
         phase1_confidence=phase1_confidence,
     )
-    resp = await poll_db_write(
-        supabase,
-        lambda c: c.table(TABLE).upsert(row, on_conflict="job_posting_id,target_id"),
-        label="scores upsert",
-    )
+    try:
+        resp = await poll_db_write(
+            supabase,
+            lambda c: c.table(TABLE).upsert(row, on_conflict="job_posting_id,target_id"),
+            label="scores upsert",
+        )
+    except APIError as exc:
+        # FK 23503 naming the TARGET constraint means the target row is gone —
+        # account erasure (or an unlink) reaped it while this cycle was still
+        # scoring against its pre-reap snapshot (#869). Typed so callers can
+        # drop the item and stop paying for that target, instead of an
+        # unhandled traceback per remaining job. Any other constraint (the
+        # job-side FK included) stays an APIError: those are not "the target
+        # went away" and must keep failing loud.
+        if getattr(exc, "code", None) == "23503" and "target_id_fkey" in str(
+            getattr(exc, "message", "") or ""
+        ):
+            raise TargetReapedError(target_id) from exc
+        raise
     return _parse_upsert_response(resp)
 
 
@@ -627,9 +654,7 @@ async def bulk_title_score_for_target(
         # every activation that ever matches it. Budget-gated through the
         # injected predicate and chunked inside ``ensure_job_tags``; anything it
         # cannot reach stays NULL and is no worse off than before.
-        surfacing = {
-            r["job_posting_id"] for r in rows_to_upsert if not r.get("excluded")
-        }
+        surfacing = {r["job_posting_id"] for r in rows_to_upsert if not r.get("excluded")}
         if surfacing:
             await ensure_job_tags(
                 supabase,
