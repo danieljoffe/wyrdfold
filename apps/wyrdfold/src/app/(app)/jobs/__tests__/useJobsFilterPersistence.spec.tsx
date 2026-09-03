@@ -160,3 +160,50 @@ describe('useJobsFilterPersistence (server-backed, #866)', () => {
     expect(result.current.read('target-1')).toEqual(POPULATED);
   });
 });
+
+describe('flush-on-exit (#866 — the e2e re-entry regression)', () => {
+  // The first cut only debounced; the timer died with the page and the
+  // snapshot was silently lost — caught by authed-filters-persist.spec.ts.
+  it('an unmount with a pending write SENDS it (keepalive), never drops it', async () => {
+    mockServer({});
+    const { result, unmount } = renderHook(() => useJobsFilterPersistence());
+    await waitFor(() => expect(result.current.ready).toBe(true));
+
+    act(() => {
+      result.current.write('target-1', POPULATED);
+    });
+    expect(lastPutBody()).toBeNull(); // debounce pending
+    unmount();
+
+    const body = lastPutBody();
+    expect(body).not.toBeNull();
+    expect(Object.keys(body!.filters)).toEqual(['target-1']);
+    const putInit = [...fetchMock.mock.calls]
+      .reverse()
+      .find(
+        ([, init]) => (init as RequestInit | undefined)?.method === 'PUT'
+      )![1] as RequestInit;
+    expect(putInit.keepalive).toBe(true);
+  });
+
+  it('pagehide flushes a pending write — hard navigations persist too', async () => {
+    mockServer({});
+    const { result } = renderHook(() => useJobsFilterPersistence());
+    await waitFor(() => expect(result.current.ready).toBe(true));
+
+    act(() => {
+      result.current.write('target-1', POPULATED);
+      window.dispatchEvent(new Event('pagehide'));
+    });
+
+    expect(lastPutBody()).not.toBeNull();
+  });
+
+  it('a clean exit sends nothing', async () => {
+    mockServer({ 'target-1': POPULATED });
+    const { result, unmount } = renderHook(() => useJobsFilterPersistence());
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    unmount();
+    expect(lastPutBody()).toBeNull();
+  });
+});

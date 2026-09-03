@@ -19,9 +19,14 @@
  *
  * Failure posture: if the load fails, the page runs with session-only
  * in-memory persistence (works, just forgets on reload) — same "loses the
- * convenience, never the page" contract the localStorage layer had. Writes
- * are debounced ~600ms; a navigation inside that window can lose the last
- * snapshot, which is the same class of best-effort the old layer accepted.
+ * convenience, never the page" contract the localStorage layer had.
+ *
+ * Writes coalesce for ~300ms, and a PENDING write is flushed immediately —
+ * with ``keepalive`` so the request survives the page — on unmount and on
+ * ``pagehide``. The first cut only debounced, and the e2e re-entry spec
+ * caught the loss: the localStorage layer wrote synchronously, so
+ * "set a filter, click away" persisted; a debounce whose timer dies with
+ * the page did not.
  *
  * Legacy cleanup: on a successful first load the old global
  * ``wyrdfold.filters.*`` keys are deleted. They are deliberately NOT
@@ -36,7 +41,7 @@ import type { JobsFilterState } from './types';
 
 const LEGACY_STORAGE_PREFIX = 'wyrdfold.filters.';
 const ALL_JOBS_KEY = '__all__';
-const WRITE_DEBOUNCE_MS = 600;
+const WRITE_DEBOUNCE_MS = 300;
 
 function mapKey(targetId: string | undefined): string {
   return targetId ?? ALL_JOBS_KEY;
@@ -68,6 +73,28 @@ export function useJobsFilterPersistence(): JobsFilterPersistence {
   const [ready, setReady] = useState(false);
   const mapRef = useRef<Record<string, JobsFilterState>>({});
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // True while an accepted write has not reached the server yet.
+  const dirtyRef = useRef(false);
+
+  const flushNow = useCallback((): void => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    if (!dirtyRef.current) return;
+    dirtyRef.current = false;
+    fetch('/api/profile/jobs-filters', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filters: mapRef.current }),
+      // Survive unload/navigation — this is the synchronous-write guarantee
+      // the localStorage layer gave for free.
+      keepalive: true,
+    }).catch(() => {
+      // Best-effort — the in-memory copy stays authoritative for this
+      // session; the next successful flush carries the full map anyway.
+    });
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -93,26 +120,25 @@ export function useJobsFilterPersistence(): JobsFilterPersistence {
         // mount; nothing persists. The page must not block on prefs.
         if (!cancelled) setReady(true);
       });
+    const onPageHide = () => flushNow();
+    window.addEventListener('pagehide', onPageHide);
     return () => {
       cancelled = true;
-      if (timerRef.current) clearTimeout(timerRef.current);
+      window.removeEventListener('pagehide', onPageHide);
+      // An unmount with a pending write must SEND it, not drop it — the
+      // sidebar navigation away from /jobs is the main write moment.
+      flushNow();
     };
-  }, []);
+  }, [flushNow]);
 
   const scheduleFlush = useCallback((): void => {
+    dirtyRef.current = true;
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = setTimeout(() => {
       timerRef.current = null;
-      fetch('/api/profile/jobs-filters', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filters: mapRef.current }),
-      }).catch(() => {
-        // Best-effort — the in-memory copy stays authoritative for this
-        // session; the next successful flush carries the full map anyway.
-      });
+      flushNow();
     }, WRITE_DEBOUNCE_MS);
-  }, []);
+  }, [flushNow]);
 
   const read = useCallback(
     (targetId: string | undefined): JobsFilterState | null =>
