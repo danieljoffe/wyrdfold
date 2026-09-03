@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -406,3 +406,39 @@ async def skills_candidates(limit: int = Query(40, ge=1, le=200)) -> dict[str, A
     if aclient is None:
         raise HTTPException(status_code=503, detail="async supabase client not initialized")
     return await vocabulary_candidates(aclient, limit=limit)
+
+
+# Module-level async helper so the handler holds no inline ``.execute()`` on
+# the loop (the AST guard in test_no_blocking_supabase_in_async_handlers scans
+# handler bodies; this is the documented convention above).
+async def _recent_catalog_health(supabase: AsyncClient, limit: int) -> list[dict[str, Any]]:
+    resp = await (
+        supabase.table("catalog_health_cycles")
+        .select(
+            "computed_at, window_started_at, new_jobs, relevant_jobs, "
+            "window_truncated, live_total, "
+            "pct_ungraded, pct_location_unknown, family_counts, "
+            "median_admission_age_hours, top_title_tokens, "
+            "tripwire_fired, tripwire_distance, tripwire_reason"
+        )
+        .order("computed_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return cast(list[dict[str, Any]], resp.data or [])
+
+
+@router.get("/catalog-health")
+async def catalog_health_rows(
+    limit: int = Query(48, ge=1, le=500),
+    supabase: AsyncClient = Depends(get_async_service_supabase),
+) -> dict[str, Any]:
+    """Recent catalog-health rows, newest first (#958).
+
+    The product-level intake funnel without a DB console: window intake vs
+    relevance, corpus quality percentages, the admitted-title token
+    histogram, and whether the distribution tripwire fired. One row per
+    recorded poll cycle; written by the poller, read here.
+    """
+    rows = await _recent_catalog_health(supabase, limit)
+    return {"count": len(rows), "rows": rows}
