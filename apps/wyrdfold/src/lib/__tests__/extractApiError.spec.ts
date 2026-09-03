@@ -215,6 +215,30 @@ describe('extractApiError — top-level BFF `error` shape (#833)', () => {
     expect(msg).toBe('From the API.');
   });
 
+  it('lets a STRUCTURED detail win over a top-level error too', async () => {
+    // Guards the branch ORDER: hoisting the top-level `error` check above the
+    // structured-detail branches would return the generic BFF string instead
+    // of the formatted cap message — and without this test, silently.
+    const msg = await extractApiError(
+      resWithBody(429, {
+        detail: { code: 'analysis_daily_limit', limit: 20 },
+        error: 'From the BFF.',
+      }),
+      'Analysis failed'
+    );
+    expect(msg).toBe(
+      'Daily deep-analysis limit reached (20/day) — more tomorrow. Already-analyzed jobs stay free to revisit.'
+    );
+  });
+
+  it('trims the surfaced error string', async () => {
+    const msg = await extractApiError(
+      resWithBody(429, { error: '  Rate limited.\n' }),
+      'Search failed'
+    );
+    expect(msg).toBe('Rate limited.');
+  });
+
   it('still falls back on a non-string or blank error value', async () => {
     expect(
       await extractApiError(

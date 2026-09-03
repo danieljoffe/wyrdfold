@@ -37,7 +37,7 @@ export async function extractApiError(
   if (!body || typeof body !== 'object') return statusFallback;
   const detail = (body as { detail?: unknown }).detail;
 
-  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (typeof detail === 'string' && detail.trim()) return detail.trim();
 
   // FastAPI pydantic validation errors arrive as
   // ``detail: [{ loc, msg, type, ... }, ...]``. Surface the first
@@ -167,7 +167,7 @@ export async function extractApiError(
   // as bare status codes like "Search failed (422)" (#833). Checked last:
   // a FastAPI ``detail`` always wins when both keys are present.
   const error = (body as { error?: unknown }).error;
-  if (typeof error === 'string' && error.trim()) return error;
+  if (typeof error === 'string' && error.trim()) return error.trim();
 
   return statusFallback;
 }
