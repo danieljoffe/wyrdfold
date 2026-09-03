@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -759,3 +759,85 @@ async def test_health_lock_check_fails_soft_on_rpc_error(monkeypatch) -> None:
 
     assert report.alerts == []
     assert captured == []
+
+
+# ---------------------------------------------------------------------------
+# #962 — disable-time url_health escalation + cycle outcome counters
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_disable_escalates_listings_and_counts(monkeypatch) -> None:
+    """At the auto-disable threshold the source's live listings jump to the
+    front of the url_health queue, and the count lands in the cycle's
+    redetect-outcome aggregate."""
+    monkeypatch.setattr(live_settings, "source_failure_disable_threshold", 1)
+    monkeypatch.setattr(live_settings, "source_redetect_on_disable_enabled", False)
+    poller_mod._redetect_cycle_counts.clear()
+    escalate = AsyncMock(return_value=42)
+    monkeypatch.setattr(poller_mod, "escalate_source_listings", escalate)
+    sb, captured = _capture_source_update()
+    source = {"id": "s1", "company_name": "Acme", "consecutive_failures": 0}
+
+    await poller_mod._record_source_failure(sb, source, error="HTTP 404")
+
+    assert captured["enabled"] is False
+    escalate.assert_awaited_once_with(sb, "s1")
+    assert poller_mod._redetect_cycle_counts["listings_escalated"] == 42
+    poller_mod._redetect_cycle_counts.clear()
+
+
+@pytest.mark.asyncio
+async def test_below_threshold_never_escalates(monkeypatch) -> None:
+    """Escalation is tied to the DISABLE, not to failures: a still-enabled
+    source's listings stay on the normal rotation."""
+    monkeypatch.setattr(live_settings, "source_failure_disable_threshold", 10)
+    escalate = AsyncMock()
+    monkeypatch.setattr(poller_mod, "escalate_source_listings", escalate)
+    sb, captured = _capture_source_update()
+    source = {"id": "s1", "company_name": "Acme", "consecutive_failures": 2}
+
+    await poller_mod._record_source_failure(sb, source, error="HTTP 503")
+
+    assert "enabled" not in captured
+    escalate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_redetect_verdicts_are_counted_per_cycle(monkeypatch) -> None:
+    """The per-event lines exist; the aggregate is what makes drift (an ATS
+    migration wave) visible without log archaeology. A suppress verdict must
+    count AND still leave the source enabled."""
+    monkeypatch.setattr(live_settings, "source_failure_disable_threshold", 1)
+    monkeypatch.setattr(live_settings, "source_redetect_on_disable_enabled", True)
+    poller_mod._redetect_cycle_counts.clear()
+    monkeypatch.setattr(
+        poller_mod, "_redetect_before_disabling", AsyncMock(return_value="suppress")
+    )
+    monkeypatch.setattr(poller_mod, "escalate_source_listings", AsyncMock())
+    sb, captured = _capture_source_update()
+    source = {"id": "s1", "company_name": "Acme", "consecutive_failures": 0}
+
+    await poller_mod._record_source_failure(sb, source, error="HTTP 503")
+
+    assert poller_mod._redetect_cycle_counts["suppress"] == 1
+    assert "enabled" not in captured  # suppressed — failure recorded, not disabled
+    poller_mod._redetect_cycle_counts.clear()
+
+
+def test_redetect_cycle_summary_logs_and_clears(caplog) -> None:
+    import logging
+
+    poller_mod._redetect_cycle_counts.clear()
+    poller_mod._redetect_cycle_counts.update({"repointed": 3, "disable": 2})
+    with caplog.at_level(logging.INFO, logger="app.services.poller"):
+        poller_mod._log_redetect_cycle_summary()
+    lines = [r.message for r in caplog.records if "redetect outcomes" in r.message]
+    assert len(lines) == 1
+    assert "'repointed': 3" in lines[0] and "'disable': 2" in lines[0]
+    # Cleared: the next cycle starts from zero, and an empty cycle is silent.
+    assert not poller_mod._redetect_cycle_counts
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="app.services.poller"):
+        poller_mod._log_redetect_cycle_summary()
+    assert not [r for r in caplog.records if "redetect outcomes" in r.message]
