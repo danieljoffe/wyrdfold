@@ -412,6 +412,20 @@ describe('JobSearchExplorer', () => {
     expect(await screen.findByText('1 match')).toBeInTheDocument();
   });
 
+  it('counts browse-mode results as roles, newest first (#836)', async () => {
+    mockSearch(
+      [result({ id: '1' }), result({ id: '2', title: 'Senior FE' })],
+      false
+    );
+    render(<JobSearchExplorer isAuthenticated />);
+
+    // Bare mount = blank-q browse (#834): the count line must not call
+    // these "matches" — nothing was matched against.
+    expect(
+      await screen.findByText('2 roles, newest first')
+    ).toBeInTheDocument();
+  });
+
   it('labels an unbound card with state, not a fake control (#836 §4)', async () => {
     mockSearch([result()]);
     render(<JobSearchExplorer isAuthenticated />);
