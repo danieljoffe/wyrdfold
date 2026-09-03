@@ -401,6 +401,25 @@ async def run_phase2_for_jobs(
         if not candidates:
             return 0
 
+        # #921 instrumentation: a row still untagged after the grade-time
+        # tagging pass (``qualified_at`` NULL — the refresh above patched the
+        # DB truth back into these dicts) fails OPEN through both keep-null
+        # gates, so the expensive grade proceeds on exactly the candidates the
+        # tags would have filtered. Counted, not blocked: #277 chose keep-null
+        # deliberately, and this line is the evidence for whether the
+        # inversion is negligible or needs a fail-closed gate.
+        null_qualified = sum(1 for jid in candidates if not job_by_id[jid].get("qualified_at"))
+        if null_qualified:
+            logger.warning(
+                "Phase 2: %d/%d (%.0f%%) candidate(s) proceed to grading with "
+                "NULL qualification tags for target %s (still untagged after "
+                "the grade-time tagging pass; keep-null gates fail open)",
+                null_qualified,
+                len(candidates),
+                100.0 * null_qualified / len(candidates),
+                target.id,
+            )
+
     sem = asyncio.Semaphore(concurrency)
 
     async def _grade_one(job_id: str) -> bool:

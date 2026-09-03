@@ -450,7 +450,7 @@ async def _refresh_job_tags(supabase: AsyncClient, rows: list[dict[str, Any]]) -
             resp = await poll_db_read(
                 supabase,
                 lambda c, _chunk=chunk: (
-                    c.table("jobs").select("id, role_family, is_us").in_("id", _chunk)
+                    c.table("jobs").select("id, role_family, is_us, qualified_at").in_("id", _chunk)
                 ),
                 label="qualify tag refresh",
             )
@@ -459,6 +459,10 @@ async def _refresh_job_tags(supabase: AsyncClient, rows: list[dict[str, Any]]) -
                 if row is not None:
                     row["role_family"] = raw.get("role_family")
                     row["is_us"] = raw.get("is_us")
+                    # ``qualified_at`` rides along so callers can tell a row the
+                    # tagger just landed from one it could NOT tag — the #921
+                    # counter in the Phase-2 runner reads it after this refresh.
+                    row["qualified_at"] = raw.get("qualified_at")
     except Exception:
         logger.exception("Qualification tag refresh failed (best-effort; dicts stay stale)")
 
