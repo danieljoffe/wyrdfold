@@ -36,18 +36,30 @@ from bs4 import BeautifulSoup
 # on a known non-US whole-word hint with no explicit US marker present.
 # ---------------------------------------------------------------------------
 
-# Substrings that flag a location as non-US. Whole-word matched (see
-# ``_NON_US_RE``) so US locations that merely *contain* a hint ("india" ⊂
+# Substrings that flag a location as non-US. Whole-word matched (see the
+# regexes below) so US locations that merely *contain* a hint ("india" ⊂
 # "Indianapolis, Indiana") are not falsely dropped.
 #
-# This is the poller's original ingestion-gate hint list, moved here verbatim
-# (every entry preserved so the pinned poller US-gate behaviour in
-# ``tests/test_poller.py`` is unchanged), with a small ``# --- #60 additions``
-# block of cities the qualification firewall's dry-run surfaced that the
-# original list missed (Taichung, Calgary, Bulgaria, ...). Additions only widen
-# the non-US set; they never flip a previously-US location to non-US for any
-# string the existing tests assert on.
-_NON_US_HINTS: tuple[str, ...] = (
+# TWO LISTS, split by consequence (#950). A hint does two unrelated jobs:
+#
+# - **Ingest admission** (``is_us_location``): a hint with no US marker
+#   present REJECTS the listing — it silently never enters the catalog. Every
+#   entry here must survive the US-place-name screen, because a collision
+#   loses real listings ("Stuttgart, Arkansas" is a real town).
+# - **State-code disambiguation** (``positively_us_location``): a hint only
+#   stops a trailing ", XX" from being read as a US state, declining to veto
+#   an archive. The superset: ingest entries plus names that are ALSO real US
+#   places and therefore must never reject at ingest.
+#
+# ``_FOREIGN_HINTS_FOR_INGEST`` is the poller's original ingestion-gate hint
+# list, moved here verbatim (every entry preserved so the pinned poller
+# US-gate behaviour in ``tests/test_poller.py`` is unchanged), with a small
+# ``# --- #60 additions`` block of cities the qualification firewall's
+# dry-run surfaced that the original list missed (Taichung, Calgary,
+# Bulgaria, ...). Additions only widen the non-US set; they never flip a
+# previously-US location to non-US for any string the existing tests assert
+# on.
+_FOREIGN_HINTS_FOR_INGEST: tuple[str, ...] = (
     "united kingdom",
     "england",
     "scotland",
@@ -162,14 +174,19 @@ _NON_US_HINTS: tuple[str, ...] = (
     # Ahmedabad, so ``Chennai, IN`` read as Indiana and VETOED the non-US
     # archive for a genuinely Indian posting. Observed 3 times in 30 days.
     #
-    # DELIBERATELY EXCLUDED, because each is also a real US place name and a
-    # hint here REJECTS AT INGEST (``is_us_location``) as well as lifting the
-    # archive veto: "georgia" (the state), "panama" (Panama City, FL),
+    # DELIBERATELY EXCLUDED FROM BOTH LISTS, because each is also a real US
+    # place name: "georgia" (the state), "panama" (Panama City, FL),
     # "hamburg" (Hamburg, NY/PA), "cologne" (Cologne, MN), "malta" (Malta,
     # NY/IL), "morocco" (Morocco, IN), "sudan" (Sudan, TX), "waterloo"
     # (Waterloo, IA), plain "bogota" (Bogota, NJ). The accented "bogotá" is
     # safe and included; the unaccented form is not. "frankfurt" is included —
     # the Kentucky capital is spelled "Frankfort".
+    #
+    # They stay out of the DISAMBIGUATION list too: ``positively_us_location``
+    # checks the hint BEFORE the positive US markers, so a US-colliding hint
+    # would strip the archive veto from genuine US strings that spell the
+    # marker out ("Augusta, Georgia, USA" would lose the veto that exists to
+    # protect exactly it).
     "chennai",
     "ahmedabad",
     "kolkata",
@@ -177,7 +194,6 @@ _NON_US_HINTS: tuple[str, ...] = (
     "gurugram",
     "noida",
     "jaipur",
-    "stuttgart",
     "dusseldorf",
     "d\u00fcsseldorf",
     "leipzig",
@@ -187,7 +203,6 @@ _NON_US_HINTS: tuple[str, ...] = (
     "valletta",
     "indonesia",
     "jakarta",
-    "jerusalem",
     "haifa",
     "chisinau",
     "chi\u0219in\u0103u",
@@ -203,10 +218,34 @@ _NON_US_HINTS: tuple[str, ...] = (
     "bogot\u00e1",
 )
 
-# Word-boundary pattern over the hints. Plain substring matching produced
-# false drops on US locations that merely *contain* a hint: "india" ⊂
-# "Indianapolis, Indiana", "rome" ⊂ "Rome, GA", etc.
-_NON_US_RE = re.compile(r"\b(?:" + "|".join(re.escape(h) for h in _NON_US_HINTS) + r")\b")
+# Foreign names that are ALSO real US place names, so they must never reject
+# at ingest — but are still needed to stop their country's ISO code from
+# reading as a US state ("Stuttgart, DE" is Germany, not Delaware). Both were
+# merged into the single list by #949 and silently rejected the US towns at
+# ingest (#950): Stuttgart, Arkansas (~9,000 people, Riceland Foods HQ);
+# Jerusalem, New York / Ohio / Arkansas. The abbreviated US forms
+# ("Stuttgart, AR") were never affected — the state-abbreviation check
+# short-circuits before the hint is consulted — but the spelled-out forms
+# ("Stuttgart, Arkansas") and the bare names were rejected.
+_DISAMBIGUATION_ONLY_HINTS: tuple[str, ...] = (
+    "stuttgart",
+    "jerusalem",
+)
+
+_FOREIGN_HINTS_FOR_STATE_DISAMBIGUATION: tuple[str, ...] = (
+    _FOREIGN_HINTS_FOR_INGEST + _DISAMBIGUATION_ONLY_HINTS
+)
+
+
+def _word_boundary_re(hints: tuple[str, ...]) -> re.Pattern[str]:
+    """Word-boundary pattern over the hints. Plain substring matching produced
+    false drops on US locations that merely *contain* a hint: "india" ⊂
+    "Indianapolis, Indiana", "rome" ⊂ "Rome, GA", etc."""
+    return re.compile(r"\b(?:" + "|".join(re.escape(h) for h in hints) + r")\b")
+
+
+_NON_US_INGEST_RE = _word_boundary_re(_FOREIGN_HINTS_FOR_INGEST)
+_NON_US_DISAMBIGUATION_RE = _word_boundary_re(_FOREIGN_HINTS_FOR_STATE_DISAMBIGUATION)
 
 # Explicit US markers that short-circuit the non-US rejection. Needed for
 # US cities that share a name with a non-US hint city: "Dublin, OH",
@@ -302,6 +341,10 @@ def is_us_location(location: str | None) -> bool:
     A multi-location string that includes ANY explicit US marker (e.g.
     "New York, Stamford, London") is treated as US — the US marker
     short-circuits before the non-US hint is even consulted.
+
+    Consults the CONSERVATIVE hint list (``_FOREIGN_HINTS_FOR_INGEST``): a
+    hint here rejects the listing at ingest, so US-place-name collisions
+    (Stuttgart, Arkansas) are kept out of it (#950).
     """
     if not location:
         return True
@@ -309,7 +352,7 @@ def is_us_location(location: str | None) -> bool:
         return True
     if any(m.group(1) in _US_STATE_ABBREVS for m in _US_STATE_ABBREV_RE.finditer(location)):
         return True
-    return not _NON_US_RE.search(location.lower())
+    return not _NON_US_INGEST_RE.search(location.lower())
 
 
 def positively_us_location(location: str | None) -> bool:
@@ -326,10 +369,15 @@ def positively_us_location(location: str | None) -> bool:
     vetoing collision cases the state-abbrev alone would trip — ``Munich, DE``
     (Delaware), ``Bangalore, IN`` (Indiana), ``Toronto, ON, CA`` (California)
     all carry a non-US hint, so they still archive.
+
+    Consults the SUPERSET hint list
+    (``_FOREIGN_HINTS_FOR_STATE_DISAMBIGUATION``): a hint here only declines
+    to veto an archive, so it can carry US-colliding names like "stuttgart"
+    that the ingest gate must not (#950).
     """
     if not location:
         return False
-    if _NON_US_RE.search(location.lower()):
+    if _NON_US_DISAMBIGUATION_RE.search(location.lower()):
         return False
     if _US_COUNTRY_RE.search(location) or _US_CODE_RE.search(location):
         return True
