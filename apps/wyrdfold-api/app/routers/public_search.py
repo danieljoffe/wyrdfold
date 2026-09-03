@@ -160,6 +160,14 @@ async def public_search_endpoint(
         salary_floor=salary_floor,
         skills=skill,
     )
+    # The service's ``has_more`` reports corpus depth against the AUTHED
+    # candidate window; this surface refuses any offset past
+    # ``PUBLIC_MAX_OFFSET``. Past the last fetchable page the honest answer
+    # is "no more" — otherwise the client renders a "Load more" whose only
+    # possible outcome is a 422 (#832). Clamped before caching so cached
+    # pages carry the same answer.
+    if offset + page_size > PUBLIC_MAX_OFFSET:
+        has_more = False
     response = JobSearchResponse(query=q, count=len(results), has_more=has_more, results=results)
     job_list_cache.set(cache_key, response)
     _instrument(response)

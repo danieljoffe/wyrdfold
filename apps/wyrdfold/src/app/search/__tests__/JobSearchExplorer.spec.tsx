@@ -302,6 +302,79 @@ describe('JobSearchExplorer', () => {
     );
   });
 
+  it('keeps loaded results on screen when "Load more" fails (#832)', async () => {
+    const page1 = [result({ id: '1', title: 'Frontend Engineer' })];
+    global.fetch = jest.fn().mockImplementation((url: string) => {
+      const isSearch = url.includes('/api/jobs/search');
+      const first = url.includes('offset=0');
+      if (isSearch && !first) {
+        // The pagination request dies (network blip, or a 422 at a cap).
+        return Promise.resolve({
+          ok: false,
+          status: 422,
+          clone: () => ({ json: async () => ({ detail: 'Too deep.' }) }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          query: 'q',
+          count: page1.length,
+          has_more: isSearch,
+          results: isSearch ? page1 : [],
+        }),
+      });
+    }) as unknown as typeof fetch;
+
+    render(<JobSearchExplorer isAuthenticated />);
+    typeAndSearch('frontend');
+    expect(await findCard('Frontend Engineer')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /load more/i }));
+
+    // The failure surfaces inline…
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /still here; try again/i
+    );
+    // …while the loaded results AND the retry affordance stay on screen —
+    // the old code routed this into the page-level error, unmounting all
+    // results the user had scrolled through.
+    expect(
+      screen.getByRole('link', { name: cardName('Frontend Engineer') })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /load more/i })
+    ).toBeInTheDocument();
+  });
+
+  it('pitches sign-in at the public depth ceiling (#832)', async () => {
+    const sixty = Array.from({ length: 60 }, (_, i) =>
+      result({ id: String(i + 1), title: `Role ${i + 1}` })
+    );
+    mockSearch(sixty, false);
+    render(<JobSearchExplorer isAuthenticated={false} />);
+    typeAndSearch('frontend');
+
+    expect(await screen.findByText(/that.s the first 60/i)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /sign in/i })).toHaveAttribute(
+      'href',
+      '/login'
+    );
+  });
+
+  it('does not pitch sign-in to signed-in users at depth (#832)', async () => {
+    const sixty = Array.from({ length: 60 }, (_, i) =>
+      result({ id: String(i + 1), title: `Role ${i + 1}` })
+    );
+    mockSearch(sixty, false);
+    render(<JobSearchExplorer isAuthenticated />);
+    typeAndSearch('frontend');
+
+    expect(await findCard('Role 1')).toBeInTheDocument();
+    expect(screen.queryByText(/that.s the first 60/i)).not.toBeInTheDocument();
+  });
+
   it('shows an honest empty state when nothing matches', async () => {
     mockSearch([]);
     render(<JobSearchExplorer isAuthenticated />);
