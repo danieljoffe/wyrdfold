@@ -391,6 +391,53 @@ describe('JobSearchExplorer', () => {
     expect(screen.getByText(/expanding coverage/i)).toBeInTheDocument();
   });
 
+  it('shows an honest result count above the grid (#836)', async () => {
+    mockSearch(
+      [result({ id: '1' }), result({ id: '2', title: 'Senior FE' })],
+      true // more pages exist
+    );
+    render(<JobSearchExplorer isAuthenticated />);
+    await typeAndSearch('frontend');
+
+    expect(
+      await screen.findByText('Showing the first 2 matches')
+    ).toBeInTheDocument();
+  });
+
+  it('drops the "first" qualifier when the list is complete (#836)', async () => {
+    mockSearch([result()], false);
+    render(<JobSearchExplorer isAuthenticated />);
+    await typeAndSearch('frontend');
+
+    expect(await screen.findByText('1 match')).toBeInTheDocument();
+  });
+
+  it('counts browse-mode results as roles, newest first (#836)', async () => {
+    mockSearch(
+      [result({ id: '1' }), result({ id: '2', title: 'Senior FE' })],
+      false
+    );
+    render(<JobSearchExplorer isAuthenticated />);
+
+    // Bare mount = blank-q browse (#834): the count line must not call
+    // these "matches" — nothing was matched against.
+    expect(
+      await screen.findByText('2 roles, newest first')
+    ).toBeInTheDocument();
+  });
+
+  it('labels an unbound card with state, not a fake control (#836 §4)', async () => {
+    mockSearch([result()]);
+    render(<JobSearchExplorer isAuthenticated />);
+    await typeAndSearch('frontend');
+    await findCard();
+
+    // The old footer badge said "+ Add to target" — pixel-identical to the
+    // modal's REAL button, but clicking it did nothing.
+    expect(screen.getByText('Not in a target')).toBeInTheDocument();
+    expect(screen.queryByText('Add to target')).not.toBeInTheDocument();
+  });
+
   it('browses the pool on bare mount — no keyword needed (#834)', async () => {
     mockSearch([result({ id: 'b1', title: 'Browse Me' })]);
     render(<JobSearchExplorer isAuthenticated />);

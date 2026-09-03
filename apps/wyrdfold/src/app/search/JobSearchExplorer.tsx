@@ -12,7 +12,7 @@ import { formatJobSalary } from '@/lib/formatSalary';
 import { displayTitle } from '@/lib/displayTitle';
 import { formatCompanyName } from '@/lib/formatCompanyName';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
-import { Check, ChevronDown, Plus } from 'lucide-react';
+import { Check, ChevronDown } from 'lucide-react';
 import { Avatar } from '@danieljoffe/shared-ui/Avatar';
 import { Badge } from '@danieljoffe/shared-ui/Badge';
 import type { ButtonVariant } from '@danieljoffe/shared-ui/Button';
@@ -394,10 +394,12 @@ function JobSearchCard({
           {timeAgo(job.source_posted_at ?? job.cataloged_at)}
         </Text>
       </div>
-      {/* footer: pipeline-state (§11.1), LOGGED-IN ONLY. Bound → the "✓ In
-          <target>" badge; otherwise a quiet "Add to target" affordance. Both are
+      {/* footer: pipeline-state (§11.1), LOGGED-IN ONLY. Both badges are
           presentational — the card itself opens the modal, where the action
-          happens. Logged-out renders no footer: a pure click-target (§11.1). */}
+          happens. The unbound state reads as STATE ("Not in a target"), not
+          as a control: the old "+ Add to target" badge was pixel-identical
+          to the modal's real button and clicking it did nothing (#836 §4).
+          Logged-out renders no footer: a pure click-target (§11.1). */}
       {isAuthenticated && (
         <div className='flex items-center gap-2 border-t border-border pt-3'>
           {bound ? (
@@ -406,9 +408,8 @@ function JobSearchCard({
               <span className='truncate'>In “{inTargets[0].label}”</span>
             </Badge>
           ) : (
-            <Badge variant='default' className='gap-1'>
-              <Plus className='size-3.5 shrink-0' aria-hidden />
-              Add to target
+            <Badge variant='default' className='text-text-tertiary'>
+              Not in a target
             </Badge>
           )}
         </div>
@@ -663,7 +664,7 @@ export default function JobSearchExplorer({
         ) : (
           <Text variant='body' className='mt-1 text-text-secondary'>
             Browse the full job pool by keyword — no account needed. Open any
-            role for the details and a link to the original posting.
+            role for a preview and a link to the original posting.
           </Text>
         )}
       </div>
@@ -776,6 +777,17 @@ export default function JobSearchExplorer({
             </div>
           ) : (
             <>
+              {/* Honest count (#836): the API deliberately computes no corpus
+                  total (a title-ranked search would need a COUNT query), so
+                  say what we DO know — whether this is everything or just
+                  the first page(s) of more. */}
+              <Text variant='meta' as='p' className='mb-3 text-text-secondary'>
+                {hasMore
+                  ? `Showing the first ${results.length} ${urlQ ? 'matches' : 'roles'}`
+                  : urlQ
+                    ? `${results.length} ${results.length === 1 ? 'match' : 'matches'}`
+                    : `${results.length} roles, newest first`}
+              </Text>
               <div className='grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3'>
                 {results.map(job => (
                   <JobSearchCard
