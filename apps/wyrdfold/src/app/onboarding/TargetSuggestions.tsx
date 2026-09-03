@@ -14,7 +14,7 @@ import { extractApiError } from '@/lib/extractApiError';
 import { cn } from '@/lib/cn';
 import {
   activateTargetInBackground,
-  createBareTarget,
+  createOrLinkTarget,
   linkTarget,
 } from '@/app/(app)/targets/targetFlows';
 import type {
@@ -82,9 +82,15 @@ const SUGGESTIONS_CACHE_TTL_MS = 30 * 60 * 1000;
 interface CachedSuggestions {
   cachedAt: number;
   matches: MatchedSuggestion[];
+  /** Active-target headroom captured with the set (#864). Absent on
+   *  pre-#864 cache entries — treated as "unknown", i.e. no cap. */
+  remaining?: number | null;
 }
 
-function readSuggestionsCache(): MatchedSuggestion[] | null {
+function readSuggestionsCache(): {
+  matches: MatchedSuggestion[];
+  remaining: number | null;
+} | null {
   try {
     const raw = sessionStorage.getItem(SUGGESTIONS_CACHE_KEY);
     if (!raw) return null;
@@ -93,17 +99,20 @@ function readSuggestionsCache(): MatchedSuggestion[] | null {
       return null;
     }
     if (Date.now() - parsed.cachedAt > SUGGESTIONS_CACHE_TTL_MS) return null;
-    return parsed.matches;
+    return { matches: parsed.matches, remaining: parsed.remaining ?? null };
   } catch {
     return null; // corrupt / unavailable storage — treat as no cache
   }
 }
 
-function writeSuggestionsCache(matches: MatchedSuggestion[]): void {
+function writeSuggestionsCache(
+  matches: MatchedSuggestion[],
+  remaining: number | null
+): void {
   try {
     sessionStorage.setItem(
       SUGGESTIONS_CACHE_KEY,
-      JSON.stringify({ cachedAt: Date.now(), matches })
+      JSON.stringify({ cachedAt: Date.now(), matches, remaining })
     );
   } catch {
     // Quota / unavailable storage — the cache is best-effort.
@@ -149,6 +158,9 @@ export default function TargetSuggestions({
   const [createdLabel, setCreatedLabel] = useState<string | null>(null);
   const [draftingResume, setDraftingResume] = useState(false);
   const [suggestions, setSuggestions] = useState<MatchedSuggestion[]>([]);
+  // Active-target headroom from the suggest response (#864). null = unknown
+  // (older cache entry / older API) — behave as before: no client-side cap.
+  const [remaining, setRemaining] = useState<number | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [creating, setCreating] = useState(false);
   const [createdCount, setCreatedCount] = useState(0);
@@ -263,8 +275,15 @@ export default function TargetSuggestions({
     if (refreshNonce === 0) {
       const cached = readSuggestionsCache();
       if (cached) {
-        setSuggestions(cached);
-        setSelected(new Set(cached.map(m => m.suggestion.label)));
+        setSuggestions(cached.matches);
+        setRemaining(cached.remaining);
+        setSelected(
+          new Set(
+            cached.matches
+              .slice(0, cached.remaining ?? cached.matches.length)
+              .map(m => m.suggestion.label)
+          )
+        );
         setLoading(false);
         return;
       }
@@ -280,9 +299,21 @@ export default function TargetSuggestions({
         const data = (await res.json()) as MatchedSuggestions;
         if (!cancelled && data.matches?.length > 0) {
           setSuggestions(data.matches);
-          // Pre-select all suggestions
-          setSelected(new Set(data.matches.map(m => m.suggestion.label)));
-          writeSuggestionsCache(data.matches);
+          // Pre-select what the plan can actually hold (#864): the wizard
+          // used to pre-select everything and offer "Create 3 targets" on a
+          // 2-target plan — the third then bounced off the cap mid-loop.
+          // The suggest response carries the headroom; unknown (null) keeps
+          // the old select-everything behavior.
+          const headroom = data.allowance?.remaining ?? null;
+          setRemaining(headroom);
+          setSelected(
+            new Set(
+              data.matches
+                .slice(0, headroom ?? data.matches.length)
+                .map(m => m.suggestion.label)
+            )
+          );
+          writeSuggestionsCache(data.matches, headroom);
         }
       } catch (err) {
         if (!cancelled) {
@@ -317,17 +348,24 @@ export default function TargetSuggestions({
     };
   }, [jobData, refreshNonce]);
 
-  const toggleSelection = useCallback((label: string) => {
-    setSelected(prev => {
-      const next = new Set(prev);
-      if (next.has(label)) {
-        next.delete(label);
-      } else {
-        next.add(label);
-      }
-      return next;
-    });
-  }, []);
+  const toggleSelection = useCallback(
+    (label: string) => {
+      setSelected(prev => {
+        const next = new Set(prev);
+        if (next.has(label)) {
+          next.delete(label);
+        } else {
+          // Selecting beyond the plan's headroom would only queue a refusal
+          // (#864) — refuse the selection instead, and the hint above the
+          // cards says why. Deselect one to pick another.
+          if (remaining !== null && next.size >= remaining) return prev;
+          next.add(label);
+        }
+        return next;
+      });
+    },
+    [remaining]
+  );
 
   const handleRefreshSuggestions = useCallback(() => {
     // Deliberate reroll: drop the cached set and re-run the (billed)
@@ -335,6 +373,7 @@ export default function TargetSuggestions({
     clearSuggestionsCache();
     setError(null);
     setSuggestions([]);
+    setRemaining(null);
     setSelected(new Set());
     setLoading(true);
     setRefreshNonce(n => n + 1);
@@ -362,24 +401,30 @@ export default function TargetSuggestions({
         let targetId: string;
 
         if (match.is_new) {
-          // Bare create, NOT from-manual: these suggestions already went
-          // through LLM matching in ``/targets/suggest`` — re-running the
-          // create-or-link endpoint would repeat that call per target.
-          // Label only — the suggestion's description is résumé-informed
-          // ("…given your work at <employer>") and `targets` is the SHARED
-          // catalog, readable by every co-follower and outliving the author's
-          // account (#868). Activation fills `description` with the
-          // role-generic form derived from the label alone. The rationale
-          // still shows on the card above; it just stops being persisted.
-          const createdTarget = await createBareTarget({
-            label: match.suggestion.label,
-          });
-          targetId = createdTarget.id;
+          // Server-side create-or-link (#864): the old bare-create → link
+          // dance orphaned a catalog row whenever the link was refused
+          // (create 201, link 409) — and DELETE /targets is membership-
+          // scoped, so the orphan was unreachable even by its creator.
+          // ``/from-suggestion`` fits this call exactly: the label is
+          // already canonical (the suggest pass produced it), so no
+          // re-normalization LLM call runs — the objection that ruled out
+          // ``/from-manual`` here. Label only — the suggestion's description
+          // is résumé-informed ("…given your work at <employer>") and
+          // `targets` is the SHARED catalog, readable by every co-follower
+          // and outliving the author's account (#868). The link lands
+          // inactive; the background activation below flips it, same end
+          // state as before.
+          const result = await createOrLinkTarget(
+            '/api/targets/from-suggestion',
+            { label: match.suggestion.label },
+            'Failed to create target'
+          );
+          targetId = result.target.id;
         } else {
           targetId = match.matched_target!.id;
+          await linkTarget(targetId);
         }
 
-        await linkTarget(targetId);
         created++;
 
         // Fire the activation pipeline without awaiting — onboarded
@@ -413,11 +458,15 @@ export default function TargetSuggestions({
         );
         return;
       }
-      // Partial success: say plainly what landed and what didn't, then let
-      // the wizard finish — the targets that were created are real.
+      // Partial success: the created targets are real, but do NOT
+      // auto-advance (#864) — the success panel used to render OVER this
+      // banner, so the reason never displayed and 1.5s later the wizard
+      // said "You're all set!" about a request it had partly refused. The
+      // panel now shows the banner and an explicit Continue.
       setError(
         `Created ${created} of ${selected.size} targets.${reason ? ` ${reason}` : ''}`
       );
+      return;
     }
 
     timerRef.current = setTimeout(onComplete, 1500);
@@ -479,7 +528,9 @@ export default function TargetSuggestions({
     );
   }
 
-  // Post-creation success
+  // Post-creation success — full or partial. On a partial refusal the
+  // banner carries the API's reason and advancing is the user's explicit
+  // click, never a timer (#864).
   if (createdCount > 0) {
     return (
       <div className='flex flex-col items-center gap-6'>
@@ -495,6 +546,21 @@ export default function TargetSuggestions({
             </div>
           </div>
         </Card>
+        {error && (
+          <>
+            <Alert variant='error' className='w-full'>
+              {error}
+            </Alert>
+            <Button
+              name='onboarding-continue-after-partial'
+              variant='primary'
+              size='sm'
+              onClick={onComplete}
+            >
+              Continue
+            </Button>
+          </>
+        )}
       </div>
     );
   }
@@ -511,6 +577,13 @@ export default function TargetSuggestions({
             Based on your experience, we suggest these role targets. Select the
             ones you&apos;d like to track.
           </Text>
+          {remaining !== null && suggestions.length > remaining && (
+            <Text variant='caption' className='mt-1 text-text-secondary'>
+              Your plan has room for {remaining} active{' '}
+              {remaining === 1 ? 'target' : 'targets'} right now, so you can
+              select up to {remaining} here — deselect one to pick another.
+            </Text>
+          )}
         </div>
 
         <div className='flex flex-col gap-3'>

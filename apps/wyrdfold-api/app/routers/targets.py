@@ -49,6 +49,7 @@ from app.models.targets import (
     ReferenceJDVote,
     ScoringProfile,
     SuggestFromQueryRequest,
+    TargetAllowance,
     TargetCreate,
     TargetFromManual,
     TargetFromSuggestion,
@@ -793,9 +794,7 @@ async def _effective_active_target_cap_async(supabase: AsyncClient, user_id: str
     return crud.MAX_ACTIVE_TARGETS_PER_USER
 
 
-async def _raise_if_active_limit_async(
-    supabase: AsyncClient, user_id: str, target_id: str
-) -> None:
+async def _raise_if_active_limit_async(supabase: AsyncClient, user_id: str, target_id: str) -> None:
     """Raise ``ActiveTargetLimitError`` if activating this link exceeds the cap.
 
     Extracted so it can be called BEFORE expensive work as well as at the
@@ -1338,6 +1337,13 @@ async def suggest(
         result=result,
         metadata={"user_id": user_id},
     )
+    # #864: ship the caller's active-target headroom with the offer, so the
+    # onboarding wizard can pre-select what the plan can actually hold
+    # instead of offering "Create 3 targets" to a 2-target plan and hitting
+    # the cap 409 mid-loop.
+    active = await _count_active_for_user_async(supabase, user_id)
+    cap = await _effective_active_target_cap_async(supabase, user_id)
+    matched.allowance = TargetAllowance(cap=cap, active=active, remaining=max(0, cap - active))
     return matched
 
 
