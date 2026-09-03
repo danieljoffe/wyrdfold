@@ -765,13 +765,23 @@ async def test_refresh_job_tags_patches_stale_row_dicts() -> None:
     the refresh must overwrite their tag columns with the post-tagger DB
     state so the Phase-2 family/US gates see this cycle's verdicts."""
     sb, _writes = _closer_sb(
-        jobs=[{"id": "job-1", "role_family": "customer_experience", "is_us": True}]
+        jobs=[
+            {
+                "id": "job-1",
+                "role_family": "customer_experience",
+                "is_us": True,
+                "qualified_at": "2026-09-02T00:00:00+00:00",
+            }
+        ]
     )
     rows: list[dict[str, Any]] = [{"id": "job-1", "title": "Support Specialist"}]
     await materialize._refresh_job_tags(sb, rows)
 
     assert rows[0]["role_family"] == "customer_experience"
     assert rows[0]["is_us"] is True
+    # ``qualified_at`` distinguishes a row the tagger landed from one it could
+    # not tag — the Phase-2 runner's #921 counter reads it after this refresh.
+    assert rows[0]["qualified_at"] == "2026-09-02T00:00:00+00:00"
 
 
 @pytest.mark.asyncio
