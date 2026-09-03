@@ -54,7 +54,7 @@ gate, not a rubber stamp.
    the _exact_ state you proved. (A genuine **bug** is different: fix it on
    `develop` and re-run the gate — or, if already deployed, ship the fix as an
    immediate follow-up release.)
-5. **A merge is not a deploy — ship the frontend, then the migrations.**
+5. **A merge is not a deploy — the frontend and the migrations ship by hand, in an order you derive.**
    Merging `develop → main` auto-deploys only the **API** (Railway is
    git-connected to `main`). **Derive the FE/API deploy ORDER per release from
    the contract change**, not from precedent — choose the order that keeps the
