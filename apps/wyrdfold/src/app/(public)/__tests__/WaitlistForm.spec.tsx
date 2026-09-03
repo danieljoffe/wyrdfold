@@ -87,11 +87,17 @@ describe('WaitlistForm', () => {
   });
 
   it('surfaces a server error message and stays on the form', async () => {
+    // extractApiError reads the body via `.clone()` (so callers can re-read),
+    // hence the mock exposes it.
     mockFetch(async () => ({
       ok: false,
-      json: async () => ({
-        error: 'Too many requests. Please try again later.',
-      }),
+      status: 429,
+      clone: () =>
+        ({
+          json: async () => ({
+            error: 'Too many requests. Please try again later.',
+          }),
+        }) as unknown as Response,
     }));
     const user = userEvent.setup();
     render(<WaitlistForm />);

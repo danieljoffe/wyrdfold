@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from 'next/server';
 import * as Sentry from '@sentry/nextjs';
 
 import { bffSecretHeader } from '@/lib/api/bffSecret';
+import { pickErrorMessage } from '@/lib/api/pickErrorMessage';
 import { clientIp } from '@/lib/api/clientIp';
 
 /**
@@ -111,14 +112,7 @@ export async function POST(request: NextRequest) {
     // message when present, else the generic string. Never leak raw upstream.
     let message = GENERIC_ERROR;
     try {
-      const data = JSON.parse(text) as { detail?: unknown; error?: unknown };
-      const detail =
-        typeof data.detail === 'string'
-          ? data.detail
-          : typeof data.error === 'string'
-            ? data.error
-            : null;
-      if (detail) message = detail;
+      message = pickErrorMessage(JSON.parse(text), GENERIC_ERROR);
     } catch {
       // Non-JSON upstream body — keep the generic message.
     }

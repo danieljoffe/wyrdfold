@@ -9,6 +9,7 @@ import {
   FIELD_PLACEHOLDER,
 } from '@danieljoffe/shared-ui/styles/formStyles';
 import { cn } from '@/lib/cn';
+import { extractApiError } from '@/lib/extractApiError';
 import Button from '@/components/kit/Button';
 
 type FormState = 'idle' | 'loading' | 'success' | 'error';
@@ -52,14 +53,13 @@ export default function WaitlistForm() {
         return;
       }
 
-      let message = GENERIC_ERROR;
-      try {
-        const data = (await res.json()) as { error?: unknown };
-        if (typeof data.error === 'string' && data.error) message = data.error;
-      } catch {
-        // Non-JSON error body — keep the generic message.
-      }
-      setError(message);
+      // Shared parse (#971 §2): the BFF route emits top-level `{ error }`,
+      // which extractApiError now reads — the private copy here didn't trim
+      // (a whitespace-only error rendered a blank alert) and drifted from the
+      // one implementation everything else uses. Behavior delta accepted in
+      // review: the non-JSON/blank fallback now carries the status suffix
+      // ("… (502)") instead of the bare generic sentence.
+      setError(await extractApiError(res, GENERIC_ERROR));
       setFormState('error');
     } catch {
       setError(GENERIC_ERROR);
