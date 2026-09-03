@@ -167,6 +167,12 @@ class BillingAccountResponse(BaseModel):
     #: Whether this server offers BYOK at all (#858) — the free-plan copy
     #: must not say "add one above" when the key fields are disabled.
     byok_available: bool
+    #: Who pays when this user spends (#867/#991) — the SAME resolution the
+    #: budget gates enforce (ResolvedQuota.key_source), not reconstructed
+    #: from booleans: "byok: false" alone conflates a managed payer with the
+    #: payer-less saas-free state, which is how a canceled subscriber almost
+    #: got told historical generations "used your monthly allowance".
+    key_source: Literal["host", "user", "none"]
 
 
 # `async def` (#57 PR-G2c): every read runs on the pooled async service client —
@@ -186,19 +192,23 @@ async def get_billing_account(
 ) -> BillingAccountResponse:
     """The settings card's read: plan + billing/BYOK state in one call."""
     from app.services import keys as keys_service
-    from app.services.keys import store as keys_store
     from app.services.llm import budget
 
     account = await budget.get_llm_account_async(supabase, user_id=user_id)
     has_billing_account = (await _get_stripe_customer_id(supabase, user_id)) is not None
-    byok = await keys_store.has_usable_key_async(supabase, user_id=user_id, provider="openrouter")
+    # Payer identity comes from the enforcement resolver (#991), never
+    # re-derived here. This endpoint is saas-only (require_billing), and in
+    # saas key_source == "user" iff a usable BYOK key exists — so ``byok``
+    # collapses to that equivalence and the standalone key check goes away.
+    quota = await budget.resolve_llm_quota_async(supabase, user_id=user_id)
     return BillingAccountResponse(
         plan=account.plan or "free",
         has_billing_account=has_billing_account,
-        byok=byok,
+        byok=quota.key_source == "user",
         # #858: the free-plan copy branches on whether this server offers
         # BYOK at all — "add your own key" is a dead end when it doesn't.
         byok_available=keys_service.is_configured(),
+        key_source=quota.key_source,
     )
 
 

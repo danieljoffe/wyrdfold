@@ -7,19 +7,23 @@ import { Text } from '@danieljoffe/shared-ui/Text';
  * The per-generation cost line on the resume / cover-letter review pages,
  * extracted from the two identical copies and made payer-aware (#867).
  *
- * What a generation "cost" MEANS depends on who paid:
- * - BYOK: the user's own OpenRouter key was billed — the raw provider cost
- *   and model name are genuinely theirs to see (unchanged presentation).
- * - Managed (starter/pro/trial): the user pays a subscription, not
- *   per-generation; the same number is the OPERATOR's provider cost. Frame
- *   it as allowance consumption and keep the model name out of the tooltip
- *   (unit economics on a public-repo product; the user-relevant telemetry —
- *   tokens and latency — stays).
- * - Billing endpoint 404 (self-host / billing not configured): the operator
- *   and the user are typically the same person; keep the raw display.
+ * The payer state is #991's ``key_source`` — the same resolution the budget
+ * gates enforce — NOT reconstructed from the ``byok`` boolean: byok=false
+ * alone conflates a managed payer with the payer-less saas-free state, and
+ * the first cut of this component told a canceled subscriber that historical
+ * generations "used your monthly allowance" their account no longer has
+ * (the #993 review's blocker).
  *
- * The payer read is best-effort: until it resolves (or on failure) the raw
- * form renders, matching the pre-#867 behavior.
+ * - "user" (BYOK): the user's own OpenRouter key was billed — raw provider
+ *   cost and model name are genuinely theirs to see.
+ * - "host" (managed/trial): the user pays a subscription, not
+ *   per-generation; frame the number as allowance consumption and keep the
+ *   model name out of the tooltip (unit economics on a public-repo product;
+ *   tokens and latency stay).
+ * - "none" (saas free, no usable key): NO allowance exists — state the
+ *   historical cost neutrally without calling it one.
+ * - key_source absent (pre-#991 API in a mixed-deploy window), endpoint 404
+ *   (self-host / billing off), or fetch failure: the raw pre-#867 display.
  */
 export default function GenerationCostLine({
   costUsd,
@@ -34,15 +38,18 @@ export default function GenerationCostLine({
   model: string | null;
   latencyMs: number;
 }) {
-  const [byokPays, setByokPays] = useState<boolean | null>(null);
+  const [keySource, setKeySource] = useState<'host' | 'user' | 'none' | null>(
+    null
+  );
 
   useEffect(() => {
     let cancelled = false;
     fetch('/api/billing/account')
       .then(res => (res.ok ? res.json() : null))
-      .then((data: { byok?: boolean } | null) => {
-        if (!cancelled && data && typeof data.byok === 'boolean') {
-          setByokPays(data.byok);
+      .then((data: { key_source?: string } | null) => {
+        const ks = data?.key_source;
+        if (!cancelled && (ks === 'host' || ks === 'user' || ks === 'none')) {
+          setKeySource(ks);
         }
       })
       .catch(() => {
@@ -56,10 +63,22 @@ export default function GenerationCostLine({
   const tokens = `${inputTokens + outputTokens} tokens`;
   const latency = `${(latencyMs / 1000).toFixed(1)}s`;
 
-  if (byokPays === false) {
+  if (keySource === 'host') {
     return (
       <Text variant='meta' as='span' title={`${tokens} · ${latency}`}>
         Used ${costUsd.toFixed(4)} of your monthly AI allowance
+      </Text>
+    );
+  }
+
+  if (keySource === 'none') {
+    // Historical host-paid generation viewed by an account with no payer
+    // today (e.g. a canceled subscriber): a true statement of what it cost,
+    // never an allowance claim. Model name stays out — same operator-
+    // internals reasoning as the host branch.
+    return (
+      <Text variant='meta' as='span' title={`${tokens} · ${latency}`}>
+        Generation cost: ${costUsd.toFixed(4)}
       </Text>
     );
   }
