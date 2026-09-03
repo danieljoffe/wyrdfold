@@ -69,11 +69,15 @@ _OPENAI_SHAPED_MODELS: frozenset[str] = frozenset({"deepseek-v3-2"})
 # succeeded depended on which endpoint it landed on, invisible because nothing
 # pinned the provider).
 #
-# ``require_parameters`` alone does NOT exclude these six: they all list
-# ``tool_choice`` as a supported parameter — the refusal is one level finer,
-# on the named-function mode — so the ignore list is load-bearing, not a
-# belt-and-braces duplicate. Re-derive it from the endpoints API when the
-# salvage-parser hit rate moves.
+# ``require_parameters`` alone does NOT exclude five of these six (GMICloud,
+# StreamLake, AtlasCloud, Novita, Alibaba): they list ``tool_choice`` as a
+# supported parameter — the refusal is one level finer, on the named-function
+# mode — so the ignore list is load-bearing, not a belt-and-braces duplicate.
+# SambaNova is the exception: it lists neither ``tools`` nor ``tool_choice``,
+# so ``require_parameters`` already filters it; it stays here defensively in
+# case its declared parameters change ahead of its function-mode support
+# (the #980 review's correction). Re-derive the list from the endpoints API
+# when the salvage-parser hit rate moves.
 _NO_FORCED_FUNCTION_PROVIDERS: tuple[str, ...] = (
     "gmicloud",
     "streamlake",
