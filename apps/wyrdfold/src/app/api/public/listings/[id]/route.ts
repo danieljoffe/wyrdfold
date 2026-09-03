@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from 'next/server';
 import * as Sentry from '@sentry/nextjs';
 
 import { bffSecretHeader } from '@/lib/api/bffSecret';
+import { pickErrorMessage } from '@/lib/api/pickErrorMessage';
 import { clientIp } from '@/lib/api/clientIp';
 
 /**
@@ -94,12 +95,7 @@ export async function GET(
     // preserve `Retry-After` so a 429 stays actionable for the client. The
     // status passes through — a backend 404 (missing OR delisted) reaches the
     // detail routes as a 404 so they render "listing unavailable"/notFound.
-    let message = GENERIC_ERROR;
-    if (data && typeof data === 'object') {
-      const { detail, error } = data as { detail?: unknown; error?: unknown };
-      if (typeof detail === 'string') message = detail;
-      else if (typeof error === 'string') message = error;
-    }
+    const message = pickErrorMessage(data, GENERIC_ERROR);
     const headers: Record<string, string> = {};
     const retryAfter = res.headers.get('retry-after');
     if (retryAfter) headers['Retry-After'] = retryAfter;

@@ -336,16 +336,15 @@ describe('JobDetailModal', () => {
     expect(
       screen.getByText(/how this role matches their profile/i)
     ).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /sign up free/i })).toHaveAttribute(
-      'href',
-      '/login'
-    );
+    expect(
+      screen.getByRole('link', { name: /get early access/i })
+    ).toHaveAttribute('href', '/login');
   });
 
-  it('logged-out → clicking "Sign up free" emits the signup_click conversion tick', () => {
+  it('logged-out → clicking "Get early access" emits the signup_click conversion tick', () => {
     mockEmitSearchEvent.mockClear();
     renderModal({ isAuthenticated: false });
-    fireEvent.click(screen.getByRole('link', { name: /sign up free/i }));
+    fireEvent.click(screen.getByRole('link', { name: /get early access/i }));
     expect(mockEmitSearchEvent).toHaveBeenCalledWith({
       event_type: 'signup_click',
       surface: 'public',

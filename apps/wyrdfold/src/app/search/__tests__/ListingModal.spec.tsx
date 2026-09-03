@@ -127,7 +127,7 @@ describe('ListingModal (intercepted /search/[id] — #467 §11.2 fast-follow)', 
     render(<ListingModal id='1' isAuthenticated={false} />);
 
     expect(
-      await screen.findByRole('link', { name: /sign up free/i })
+      await screen.findByRole('link', { name: /get early access/i })
     ).toHaveAttribute('href', '/login');
     // Membership is a per-user concept — the logged-out modal must not call it.
     expect(

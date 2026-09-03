@@ -4,6 +4,7 @@ import { SEARCH_FILTER_PARAMS } from '@/lib/api/searchFilterParams';
 import * as Sentry from '@sentry/nextjs';
 
 import { bffSecretHeader } from '@/lib/api/bffSecret';
+import { pickErrorMessage } from '@/lib/api/pickErrorMessage';
 import { clientIp } from '@/lib/api/clientIp';
 
 /**
@@ -114,12 +115,7 @@ export async function GET(request: NextRequest) {
     // Non-2xx: relay a generic, body-shaped error (never raw upstream text).
     // Prefer the backend's JSON `detail`/`error` string when present, and
     // preserve `Retry-After` so a 429 stays actionable for the client.
-    let message = GENERIC_ERROR;
-    if (data && typeof data === 'object') {
-      const { detail, error } = data as { detail?: unknown; error?: unknown };
-      if (typeof detail === 'string') message = detail;
-      else if (typeof error === 'string') message = error;
-    }
+    const message = pickErrorMessage(data, GENERIC_ERROR);
     const headers: Record<string, string> = {};
     const retryAfter = res.headers.get('retry-after');
     if (retryAfter) headers['Retry-After'] = retryAfter;

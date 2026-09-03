@@ -1,6 +1,4 @@
-import { Card, CardContent } from '@danieljoffe/shared-ui/Card';
-import { Heading } from '@danieljoffe/shared-ui/Heading';
-import { Text } from '@danieljoffe/shared-ui/Text';
+import StatusCard from '@/components/StatusCard';
 import LinkButton from '@/components/kit/LinkButton';
 import WyrdfoldSidebar from './(app)/WyrdfoldSidebar';
 
@@ -32,15 +30,12 @@ export default function NotFound() {
         className='flex-1 overflow-x-hidden p-4 pb-[calc(theme(spacing.16)+env(safe-area-inset-bottom)+1rem)] md:p-6'
       >
         <div className='flex min-h-full items-center justify-center'>
-          <Card className='max-w-md w-full'>
-            <CardContent className='flex flex-col items-center gap-4 py-12 text-center'>
-              <Heading variant='hero' as='h1'>
-                Page not found
-              </Heading>
-              <Text variant='body' as='p' className='max-w-sm'>
-                We couldn&apos;t find that page. It may have moved, been
-                removed, or never existed.
-              </Text>
+          <StatusCard
+            title='Page not found'
+            body={
+              "We couldn't find that page. It may have moved, been removed, or never existed."
+            }
+            actions={
               <LinkButton
                 name='wyrdfold-root-not-found-home'
                 variant='primary'
@@ -49,8 +44,8 @@ export default function NotFound() {
               >
                 Back to dashboard
               </LinkButton>
-            </CardContent>
-          </Card>
+            }
+          />
         </div>
       </main>
     </div>
