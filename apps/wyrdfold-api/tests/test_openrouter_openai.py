@@ -229,8 +229,11 @@ async def test_deepseek_routes_through_openai_path(monkeypatch) -> None:
     # purpose: every slug here declared supports_tool_choice.function=false
     # on OpenRouter's endpoint metadata (2026-09-02), and this path forces a
     # named function on every call. require_parameters alone would NOT
-    # exclude them — they list tool_choice as supported; the refusal is one
-    # level finer. Editing the source list must be a conscious act here too.
+    # exclude five of the six — they list tool_choice as supported; the
+    # refusal is one level finer. (SambaNova lists neither tools nor
+    # tool_choice, so require_parameters already filters it; kept in the
+    # ignore defensively — the #980 review's correction.) Editing the source
+    # list must be a conscious act here too.
     assert body["provider"] == {
         "require_parameters": True,
         "ignore": ["gmicloud", "streamlake", "atlas-cloud", "novita", "alibaba", "sambanova"],
