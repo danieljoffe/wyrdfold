@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from app.services import url_health
 from app.services.url_health import (
     _STATUS_NETWORK_ERROR,
     _archive_with_data_drop,
@@ -382,3 +383,61 @@ async def test_run_url_health_check_does_not_archive_below_threshold() -> None:
     assert summary["failures"] == 1
     assert summary["archived"] == 0
     archive.assert_called_once_with(sb, [])
+
+
+# ---------------------------------------------------------------------------
+# #962 — escalation of a disabled source's listings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_escalate_clears_the_stamp_for_the_sources_live_rows() -> None:
+    """Clearing ``last_url_check_at`` IS the escalation: the due-jobs RPC
+    orders NULLS FIRST within the no-strike band, so the disabled board's
+    listings get per-listing verdicts promptly instead of waiting out the
+    background rotation. Only live rows — archived/purged listings have
+    nothing left to verdict."""
+    captured: dict[str, Any] = {}
+
+    class _Chain:
+        def update(self, payload: dict[str, Any]) -> _Chain:
+            captured["payload"] = payload
+            return self
+
+        def eq(self, col: str, val: str) -> _Chain:
+            captured["eq"] = (col, val)
+            return self
+
+        def is_(self, col: str, val: str) -> _Chain:
+            captured.setdefault("is_", []).append((col, val))
+            return self
+
+        async def execute(self) -> Any:
+            return MagicMock(data=[{"id": "j1"}, {"id": "j2"}, {"id": "j3"}])
+
+    sb = MagicMock()
+    sb.table.side_effect = lambda name: (captured.__setitem__("table", name), _Chain())[1]
+
+    n = await url_health.escalate_source_listings(sb, "src-dead")
+
+    assert n == 3
+    assert captured["table"] == "jobs"
+    assert captured["payload"] == {"last_url_check_at": None}
+    assert captured["eq"] == ("source_id", "src-dead")
+    assert sorted(captured["is_"]) == [("archived_at", "null"), ("purged_at", "null")]
+
+
+@pytest.mark.asyncio
+async def test_escalate_is_best_effort() -> None:
+    """A failed escalation returns 0 and never raises — the disable flow it
+    rides in must not be broken by telemetry-adjacent work; the background
+    rotation still reaches the listings."""
+
+    class _Boom:
+        def update(self, *_a: Any, **_kw: Any) -> Any:
+            raise RuntimeError("db unavailable")
+
+    sb = MagicMock()
+    sb.table.return_value = _Boom()
+
+    assert await url_health.escalate_source_listings(sb, "src-dead") == 0

@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import logging
 import time
+from collections import Counter
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -84,6 +85,7 @@ from app.services.targets.payers import (
     build_budget_gate,
 )
 from app.services.titles import clean_title_display
+from app.services.url_health import escalate_source_listings
 from app.services.validate import liveness_verdict, validate_job_url
 from app.services.workday import KnownPosting, fetch_workday_jobs
 from app.supabase_pool import get_async_supabase
@@ -2739,6 +2741,24 @@ async def _poll_one_source(
 # the row (the column is queryable signal, not a log store).
 _SOURCE_LAST_ERROR_MAX_LEN = 500
 
+# #962: re-detection outcomes accumulated across a cycle. Per-event log lines
+# exist (RE-POINTED / still-live / collision), but spotting drift -- a new ATS
+# migration wave, a cohort of boards dying at once -- from individual lines is
+# log archaeology. Each cycle end logs-and-clears the aggregate. Keys are the
+# _redetect_before_disabling verdicts plus listings_escalated.
+_redetect_cycle_counts: Counter[str] = Counter()
+
+
+def _log_redetect_cycle_summary() -> None:
+    """Emit and reset the cycle's re-detection outcome counters (#962).
+
+    Called from both cycle ends (full + due-source). Silent when the cycle
+    had no threshold-crossing sources -- most cycles -- so the line only
+    appears when there is something to aggregate."""
+    if _redetect_cycle_counts:
+        logger.info("redetect outcomes this cycle: %s", dict(_redetect_cycle_counts))
+        _redetect_cycle_counts.clear()
+
 
 async def _record_source_failure(
     supabase: AsyncClient, source: dict[str, Any], *, error: str | None = None
@@ -2795,6 +2815,7 @@ async def _record_source_failure(
             # every failure, so the probing is bounded to the handful of
             # sources that would otherwise be disabled this cycle.
             verdict = await _redetect_before_disabling(supabase, source, failures=failures)
+            _redetect_cycle_counts[verdict] += 1
             if verdict == "repointed":
                 # The row now points at the live board and the failure is
                 # resolved — the failure/disable write below would undo it.
@@ -2813,6 +2834,19 @@ async def _record_source_failure(
             lambda c: c.table("sources").update(updates).eq("id", source_id),
             label="poll source-failure update",
         )
+        if disabling:
+            # #962: the disabled board's listings are the likeliest dead URLs
+            # in the corpus — get them per-listing verdicts promptly instead
+            # of on the background rotation. Internally best-effort.
+            escalated = await escalate_source_listings(supabase, source_id)
+            if escalated:
+                _redetect_cycle_counts["listings_escalated"] += escalated
+                logger.info(
+                    "Escalated %d live listing(s) of disabled source %s to the "
+                    "front of the url_health queue",
+                    escalated,
+                    company,
+                )
         if disabling and settings.sentry_dsn:
             try:
                 import sentry_sdk
@@ -3571,6 +3605,7 @@ async def poll_all_sources(
 
     await asyncio.gather(*(_worker(s) for s in sources))
     logger.info("poll cycle finished: %s %s", admission_budget.report(), intake_budget.report())
+    _log_redetect_cycle_summary()
     # Product-level catalog health (#958). Telemetry only: record_cycle_health
     # swallows its own failures, and the try/except here is the belt to that
     # braces — a health bug must never cost a poll cycle.
@@ -3742,6 +3777,7 @@ async def poll_due_sources(
 
     await asyncio.gather(*(_worker(s) for s in due))
     logger.info("poll cycle finished: %s %s", admission_budget.report(), intake_budget.report())
+    _log_redetect_cycle_summary()
     if phase1_store_stats["hits"] or phase1_store_stats["misses"]:
         logger.info(
             "phase1 rejection store: %d LLM verdict(s) avoided, %d sent to the model this cycle",

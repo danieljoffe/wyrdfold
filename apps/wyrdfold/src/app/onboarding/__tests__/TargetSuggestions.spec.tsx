@@ -429,11 +429,15 @@ describe('TargetSuggestions — Path B/C (no jobData)', () => {
         });
       }
       // /api/targets POST returns the created target with an id
-      if (typeof url === 'string' && url === '/api/targets') {
+      if (typeof url === 'string' && url === '/api/targets/from-suggestion') {
         return Promise.resolve({
           ok: true,
-          json: async () =>
-            makeTarget({ id: `t-${Math.random().toString(36).slice(2, 6)}` }),
+          json: async () => ({
+            target: makeTarget({
+              id: `t-${Math.random().toString(36).slice(2, 6)}`,
+            }),
+            user_target: {},
+          }),
         });
       }
       // /link POST succeeds
@@ -476,14 +480,26 @@ describe('TargetSuggestions — Path B/C (no jobData)', () => {
         return Promise.resolve({
           ok: true,
           json: async () => ({
-            matches: [makeSuggestion('Frontend Engineer', true, null)],
+            // A MATCHED suggestion: the cap 409 fires on /link, which only
+            // matched items hit now — new labels go through the atomic
+            // /from-suggestion and link inactive (#864).
+            matches: [
+              makeSuggestion(
+                'Frontend Engineer',
+                false,
+                makeTarget({ id: 't-cap', label: 'Frontend Engineer' })
+              ),
+            ],
           }),
         });
       }
-      if (typeof url === 'string' && url === '/api/targets') {
+      if (typeof url === 'string' && url === '/api/targets/from-suggestion') {
         return Promise.resolve({
           ok: true,
-          json: async () => makeTarget({ id: 't-1' }),
+          json: async () => ({
+            target: makeTarget({ id: 't-1' }),
+            user_target: {},
+          }),
         });
       }
       if (typeof url === 'string' && /\/link$/.test(url)) {
@@ -534,11 +550,15 @@ describe('TargetSuggestions — Path B/C (no jobData)', () => {
           }),
         });
       }
-      if (typeof url === 'string' && url === '/api/targets') {
+      if (typeof url === 'string' && url === '/api/targets/from-suggestion') {
         return Promise.resolve({
           ok: true,
-          json: async () =>
-            makeTarget({ id: `t-${Math.random().toString(36).slice(2, 6)}` }),
+          json: async () => ({
+            target: makeTarget({
+              id: `t-${Math.random().toString(36).slice(2, 6)}`,
+            }),
+            user_target: {},
+          }),
         });
       }
       return Promise.resolve({ ok: true, json: async () => ({}) });
@@ -630,10 +650,13 @@ describe('TargetSuggestions — Path B/C (no jobData)', () => {
           }),
         });
       }
-      if (typeof url === 'string' && url === '/api/targets') {
+      if (typeof url === 'string' && url === '/api/targets/from-suggestion') {
         return Promise.resolve({
           ok: true,
-          json: async () => makeTarget({ id: 't-1' }),
+          json: async () => ({
+            target: makeTarget({ id: 't-1' }),
+            user_target: {},
+          }),
         });
       }
       return Promise.resolve({ ok: true, json: async () => ({}) });
@@ -651,7 +674,7 @@ describe('TargetSuggestions — Path B/C (no jobData)', () => {
     await waitFor(() => {
       const post = fetchMock.mock.calls.find(
         ([url, init]: [string, RequestInit | undefined]) =>
-          url === '/api/targets' && init?.method === 'POST'
+          url === '/api/targets/from-suggestion' && init?.method === 'POST'
       );
       expect(post).toBeDefined();
       const body = JSON.parse((post![1] as RequestInit).body as string);
@@ -874,5 +897,124 @@ describe('after the resume step was skipped', () => {
     expect(
       screen.queryByText(/built from your resume, and that step was skipped/i)
     ).not.toBeInTheDocument();
+  });
+});
+
+describe('TargetSuggestions — the offer fits the plan (#864)', () => {
+  it('pre-selects only the allowance and says why', async () => {
+    // The wizard offered "Create 3 targets" on a 2-target plan, then hit
+    // the cap 409 mid-loop. The suggest response now carries the headroom.
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        matches: [
+          makeSuggestion('A'),
+          makeSuggestion('B'),
+          makeSuggestion('C'),
+        ],
+        allowance: { cap: 2, active: 0, remaining: 2 },
+      }),
+    });
+    render(<TargetSuggestions onComplete={jest.fn()} onSkip={jest.fn()} />);
+
+    expect(
+      await screen.findByRole('button', { name: /create 2 targets/i })
+    ).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'A' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'B' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'C' })).not.toBeChecked();
+    expect(
+      screen.getByText(/room for 2 active targets right now/i)
+    ).toBeInTheDocument();
+  });
+
+  it('refuses selecting past the allowance until something is deselected', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        matches: [
+          makeSuggestion('A'),
+          makeSuggestion('B'),
+          makeSuggestion('C'),
+        ],
+        allowance: { cap: 2, active: 0, remaining: 2 },
+      }),
+    });
+    const user = userEvent.setup();
+    render(<TargetSuggestions onComplete={jest.fn()} onSkip={jest.fn()} />);
+    await screen.findByRole('button', { name: /create 2 targets/i });
+
+    // Selecting a third would only queue a refusal — the click is a no-op.
+    await user.click(screen.getByRole('checkbox', { name: 'C' }));
+    expect(screen.getByRole('checkbox', { name: 'C' })).not.toBeChecked();
+
+    // Deselect one, and the slot frees up.
+    await user.click(screen.getByRole('checkbox', { name: 'A' }));
+    await user.click(screen.getByRole('checkbox', { name: 'C' }));
+    expect(screen.getByRole('checkbox', { name: 'C' })).toBeChecked();
+    expect(
+      screen.getByRole('button', { name: /create 2 targets/i })
+    ).toBeInTheDocument();
+  });
+
+  it('shows the refusal on partial success and only advances on an explicit click', async () => {
+    // The old flow set the banner, rendered the success panel OVER it, and
+    // auto-advanced 1.5s later — "You're all set!" about a half-refused
+    // request. Now the panel carries the reason and Continue is a click.
+    const onComplete = jest.fn();
+    fetchMock.mockImplementation((url: string) => {
+      if (typeof url === 'string' && url.endsWith('/api/targets/suggest')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            matches: [
+              makeSuggestion('New Role', true, null),
+              makeSuggestion(
+                'Capped Role',
+                false,
+                makeTarget({ id: 't-cap', label: 'Capped Role' })
+              ),
+            ],
+          }),
+        });
+      }
+      if (typeof url === 'string' && url === '/api/targets/from-suggestion') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            target: makeTarget({ id: 't-new' }),
+            user_target: {},
+          }),
+        });
+      }
+      if (typeof url === 'string' && /\/link$/.test(url)) {
+        const detail = "You're on Starter, which allows 2 active targets.";
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          clone: () => ({ json: async () => ({ detail }) }),
+          json: async () => ({ detail }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+
+    const user = userEvent.setup();
+    render(<TargetSuggestions onComplete={onComplete} onSkip={jest.fn()} />);
+    await screen.findByRole('button', { name: /create 2 targets/i });
+    await user.click(screen.getByRole('button', { name: /create 2 targets/i }));
+
+    // The panel reports what landed AND what was refused, verbatim reason.
+    expect(await screen.findByText(/1 target created/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/created 1 of 2 targets\..*allows 2 active targets/i)
+    ).toBeInTheDocument();
+
+    // No timer advance — past the old 1500ms so this can't pass by luck.
+    await new Promise(r => setTimeout(r, 1800));
+    expect(onComplete).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: /^continue$/i }));
+    expect(onComplete).toHaveBeenCalledTimes(1);
   });
 });
