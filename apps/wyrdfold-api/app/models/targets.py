@@ -720,7 +720,22 @@ class MatchedSuggestion(BaseModel):
     is_new: bool = True
 
 
+class TargetAllowance(BaseModel):
+    """The caller's active-target headroom, served with the suggestions so the
+    OFFER can fit the plan (#864): the wizard pre-selected every suggestion
+    and offered "Create 3 targets" on a 2-target plan, then hit the cap 409
+    mid-loop. ``remaining`` is what the client may sensibly offer; ``cap`` and
+    ``active`` let it say why."""
+
+    cap: int
+    active: int
+    remaining: int
+
+
 class MatchedSuggestions(BaseModel):
     """Result of suggest_and_match: suggestions with match info."""
 
     matches: list[MatchedSuggestion] = Field(default_factory=list)
+    # None only for payloads predating #864 (e.g. a client-side cache) — the
+    # endpoint always fills it.
+    allowance: TargetAllowance | None = None

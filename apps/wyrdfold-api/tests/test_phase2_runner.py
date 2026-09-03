@@ -120,6 +120,9 @@ class _StateChain:
     def in_(self, *_a: Any, **_kw: Any) -> _StateChain:
         return self
 
+    def limit(self, *_a: Any, **_kw: Any) -> _StateChain:
+        return self
+
     async def execute(self) -> Any:
         return MagicMock(data=self._rows)
 
@@ -1102,3 +1105,113 @@ async def test_no_null_qualified_warning_when_every_row_tagged(
         )
     assert sorted(graded) == ["j1", "j2"]
     assert not [r for r in caplog.records if "NULL qualification tags" in r.message]
+
+
+async def test_reaped_target_skips_the_paid_batch(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#869's Phase-2 half: the persist swallows per-job failures, so grading
+    a reaped target burns the whole batch's LLM spend silently. One PK read
+    before money is spent skips the batch when the target row is gone."""
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    sb = MagicMock()
+    sb.table.side_effect = lambda name: _StateChain([] if name == "targets" else _prom_rows(["j1"]))
+    with caplog.at_level(logging.WARNING, logger=_RUNNER):
+        n = await run_phase2_for_jobs(
+            sb,
+            MagicMock(),
+            target=_target(1),
+            payload=_payload(),
+            jobs=[{"id": "j1", "title": "x", "description_html": ""}],
+        )
+    assert n == 0
+    assert graded == []
+    assert any("no longer exists" in r.message for r in caplog.records)
+
+
+async def test_target_existence_check_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A flaky existence read must not block grading — the worst case of
+    failing open is one run of the pre-#869 behavior, while failing closed
+    would silently stop all grading on a transient read error."""
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+
+    class _BoomChain:
+        def select(self, *_a: Any, **_kw: Any) -> Any:
+            raise RuntimeError("transient read failure")
+
+    sb = MagicMock()
+    sb.table.side_effect = lambda name: (
+        _BoomChain() if name == "targets" else _StateChain(_prom_rows(["j1"]))
+    )
+    n = await run_phase2_for_jobs(
+        sb,
+        MagicMock(),
+        target=_target(1),
+        payload=_payload(),
+        jobs=[{"id": "j1", "title": "x", "description_html": ""}],
+    )
+    assert n == 1
+    assert graded == ["j1"]
+async def test_run_summary_reports_the_underfill_funnel(
+    monkeypatch: pytest.MonkeyPatch, _tagging_on: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#922: a post-tag rejection is NOT backfilled (deliberate), so a run can
+    grade under its intended quota with nothing saying so. Every run now ends
+    with one greppable funnel line: post_trim (won the quota slots) →
+    post_tag_accepted (survived the re-applied gates) → graded."""
+    jobs = [
+        {"id": "j-ok", "title": "x", "description_html": ""},
+        {"id": "j-nonus", "title": "x", "description_html": ""},
+    ]
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    _patch_tagger(
+        monkeypatch,
+        effect=lambda r: r.update(
+            {"qualified_at": "2026-09-03T00:00:00+00:00"}
+            | ({"is_us": False} if r["id"] == "j-nonus" else {"is_us": True})
+        ),
+    )
+    with caplog.at_level(logging.INFO, logger=_RUNNER):
+        n = await run_phase2_for_jobs(
+            _supabase(_prom_rows(["j-ok", "j-nonus"])),
+            MagicMock(),
+            target=_target(1),
+            payload=_payload(),
+            jobs=[dict(j) for j in jobs],
+        )
+    assert n == 1
+    assert graded == ["j-ok"]
+    summaries = [r.message for r in caplog.records if "Phase 2 run summary" in r.message]
+    assert len(summaries) == 1
+    assert "post_trim=2 post_tag_accepted=1 graded=1" in summaries[0]
+
+
+async def test_full_post_tag_rejection_still_logs_the_summary(
+    monkeypatch: pytest.MonkeyPatch, _tagging_on: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The maximal underfill — every quota winner rejected by its fresh tags —
+    used to exit early with only the drop log. That is exactly the run the
+    funnel line must record, so the early return is gone and the summary
+    reports post_tag_accepted=0."""
+    graded = _patch_grader(monkeypatch)
+    _patch_quota(monkeypatch, 100)
+    _patch_tagger(monkeypatch, effect=lambda r: r.update({"is_us": False}))
+    with caplog.at_level(logging.INFO, logger=_RUNNER):
+        n = await run_phase2_for_jobs(
+            _supabase(_prom_rows(["j1", "j2"])),
+            MagicMock(),
+            target=_target(1),
+            payload=_payload(),
+            jobs=[
+                {"id": "j1", "title": "x", "description_html": ""},
+                {"id": "j2", "title": "x", "description_html": ""},
+            ],
+        )
+    assert n == 0
+    assert graded == []
+    summaries = [r.message for r in caplog.records if "Phase 2 run summary" in r.message]
+    assert len(summaries) == 1
+    assert "post_trim=2 post_tag_accepted=0 graded=0" in summaries[0]

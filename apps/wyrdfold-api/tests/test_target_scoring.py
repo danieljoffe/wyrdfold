@@ -1269,3 +1269,73 @@ async def test_unclassified_target_withholds_nothing(
     upserted = {r["job_posting_id"] for c in supabase.upsert_calls for r in c}
     assert {"j01", "j05", "j06"} == upserted
     assert written == 3
+
+
+# ---------------------------------------------------------------------------
+# #869 — a reaped target's FK 23503 becomes a typed drop signal
+# ---------------------------------------------------------------------------
+
+
+def _fk_api_error(constraint: str) -> Any:
+    from postgrest.exceptions import APIError
+
+    return APIError(
+        {
+            "message": (
+                f'insert or update on table "scores" violates foreign key constraint "{constraint}"'
+            ),
+            "code": "23503",
+            "hint": None,
+            "details": None,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_target_fk_23503_raises_target_reaped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Account erasure reaps a target while a poll cycle still scores against
+    its pre-reap snapshot; every write then 23503s on the TARGET FK. Typed so
+    the poller drops the item and stops spending on that target, instead of
+    an unhandled traceback per remaining job (18 in ~53s observed)."""
+    from app.services import target_scoring as ts
+
+    async def boom(*_a: Any, **_kw: Any) -> Any:
+        raise _fk_api_error("job_target_scores_target_id_fkey")
+
+    monkeypatch.setattr(ts, "poll_db_write", boom)
+    target = _target(core={"React": 3, "TypeScript": 3})
+
+    with pytest.raises(ts.TargetReapedError) as excinfo:
+        await score_and_upsert(
+            MagicMock(),
+            job_posting_id="job-1",
+            title="Senior Frontend Engineer",
+            description_html="<p>React and TypeScript required.</p>",
+            target=target,
+        )
+    assert excinfo.value.target_id == target.id
+
+
+@pytest.mark.asyncio
+async def test_job_side_23503_stays_an_api_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the TARGET constraint means 'the target went away'. A 23503 on
+    the job-side FK (or any other constraint) is a different defect and must
+    keep failing loud, not be silently dropped as a reap."""
+    from postgrest.exceptions import APIError
+
+    from app.services import target_scoring as ts
+
+    async def boom(*_a: Any, **_kw: Any) -> Any:
+        raise _fk_api_error("job_target_scores_job_posting_id_fkey")
+
+    monkeypatch.setattr(ts, "poll_db_write", boom)
+    target = _target(core={"React": 3, "TypeScript": 3})
+
+    with pytest.raises(APIError):
+        await score_and_upsert(
+            MagicMock(),
+            job_posting_id="job-1",
+            title="Senior Frontend Engineer",
+            description_html="<p>React and TypeScript required.</p>",
+            target=target,
+        )

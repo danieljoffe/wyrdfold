@@ -206,8 +206,18 @@ export interface MatchedSuggestion {
   is_new: boolean;
 }
 
+/** The caller's active-target headroom, served with the suggestions so the
+ * OFFER can fit the plan (#864). Mirrors the API's `TargetAllowance`. */
+export interface TargetAllowance {
+  cap: number;
+  active: number;
+  remaining: number;
+}
+
 export interface MatchedSuggestions {
   matches: MatchedSuggestion[];
+  /** Absent only on pre-#864 payloads (e.g. an old per-tab cache entry). */
+  allowance?: TargetAllowance | null;
 }
 
 /** Seniority bands the lateral-suggestion miner returns. Mirrors the API's

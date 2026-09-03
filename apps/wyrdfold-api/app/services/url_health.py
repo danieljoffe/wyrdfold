@@ -254,6 +254,41 @@ async def _archive_with_data_drop(supabase: AsyncClient, job_ids: list[str]) -> 
     return len(job_ids)
 
 
+async def escalate_source_listings(supabase: AsyncClient, source_id: str) -> int:
+    """Push one source's live listings to the front of the health queue (#962).
+
+    Called when a failing board is auto-disabled (re-detection found nothing,
+    or found a board another source already owns): the board is gone, so its
+    listings' outbound URLs are the likeliest in the corpus to be dead, and
+    waiting for the background rotation leaves them serving for days.
+
+    No new mechanism: ``due_url_health_jobs`` orders by
+    ``(url_check_failure_count > 0) DESC, last_url_check_at ASC NULLS FIRST``,
+    so clearing the stamp IS the escalation — the rows jump to the front of
+    the no-strike band, behind only URLs already mid-confirmation (which
+    should keep their spots). Returns the number of listings escalated.
+    Best-effort: a failure logs and returns 0; the rotation still reaches
+    them eventually, exactly as before.
+    """
+    try:
+        resp = await (
+            supabase.table("jobs")
+            .update({"last_url_check_at": None})
+            .eq("source_id", source_id)
+            .is_("archived_at", "null")
+            .is_("purged_at", "null")
+            .execute()
+        )
+        return len(cast("list[dict[str, Any]]", resp.data or []))
+    except Exception:
+        logger.exception(
+            "url_health escalation failed for source %s (best-effort; the "
+            "background rotation still covers its listings)",
+            source_id,
+        )
+        return 0
+
+
 async def run_url_health_check(
     supabase: AsyncClient,
     *,
