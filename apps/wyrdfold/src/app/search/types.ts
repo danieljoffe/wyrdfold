@@ -23,6 +23,10 @@ export interface JobSearchResult {
   /** Verified company web domain (#470) — build logo links from it; the
    *  initials monogram is the fallback when absent or on image error. */
   company_domain?: string | null;
+  /** #836 §7: did this row match every term in the query? Absent on older
+   *  API builds and on the single-listing read — treat absent as strong so
+   *  a skew window renders one ungrouped list rather than demoting all. */
+  is_strong_match?: boolean | null;
   salary_min?: number | null;
   salary_max?: number | null;
   salary_currency?: string | null;

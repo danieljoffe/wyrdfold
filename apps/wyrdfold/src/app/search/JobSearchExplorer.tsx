@@ -2,6 +2,7 @@
 
 import {
   type CSSProperties,
+  useMemo,
   type KeyboardEvent as ReactKeyboardEvent,
   useCallback,
   useEffect,
@@ -535,6 +536,16 @@ export default function JobSearchExplorer({
   const [draftLocation, setDraftLocation] = useState(urlLocation);
 
   const [results, setResults] = useState<JobSearchResult[] | null>(null);
+  // #836 §7 buckets. `is_strong_match` is absent on older API builds, so
+  // treat undefined as strong — a deploy-skew window must degrade to today's
+  // single ungrouped list, never to everything filed under "Related".
+  const [strongResults, relatedResults] = useMemo(() => {
+    const all = results ?? [];
+    return [
+      all.filter((j: JobSearchResult) => j.is_strong_match !== false),
+      all.filter((j: JobSearchResult) => j.is_strong_match === false),
+    ];
+  }, [results]);
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(false); // fresh search
   const [loadingMore, setLoadingMore] = useState(false); // "Load more"
@@ -871,8 +882,15 @@ export default function JobSearchExplorer({
                     ? `${results.length} ${results.length === 1 ? 'match' : 'matches'}`
                     : `${results.length} roles, newest first`}
               </Text>
+              {/* #836 §7: the ranker has always sorted partial-term matches
+                  BELOW full ones, but said nothing — so "DevOps Engineer"
+                  under "frontend engineer" read as a broken search rather
+                  than a weak match in its right place. Split on the server's
+                  `is_strong_match` (it owns the synonym policy) and name the
+                  boundary. Nothing is dropped: a thin query still returns
+                  its long tail, the user just knows which part is which. */}
               <div className='grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3'>
-                {results.map(job => (
+                {strongResults.map(job => (
                   <JobSearchCard
                     key={job.id}
                     job={job}
@@ -881,6 +899,44 @@ export default function JobSearchExplorer({
                   />
                 ))}
               </div>
+              {relatedResults.length > 0 && (
+                <>
+                  <div className='mt-6 mb-3 flex items-center gap-3'>
+                    {/* A real heading, not styled text: this is a section
+                        boundary, and a screen-reader user navigating by
+                        heading needs to land on it to know the list changed
+                        character. `Text` renders no heading elements, so it
+                        supplies the type token inside one. */}
+                    <h2 className='shrink-0'>
+                      <Text
+                        variant='meta'
+                        as='span'
+                        className='text-text-secondary'
+                      >
+                        Related roles
+                      </Text>
+                    </h2>
+                    <span className='h-px flex-1 bg-border' aria-hidden />
+                  </div>
+                  <Text
+                    variant='meta'
+                    as='p'
+                    className='mb-3 text-text-tertiary'
+                  >
+                    These match some of your search terms, not all of them.
+                  </Text>
+                  <div className='grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3'>
+                    {relatedResults.map(job => (
+                      <JobSearchCard
+                        key={job.id}
+                        job={job}
+                        inTargets={membershipByJob[job.id] ?? []}
+                        isAuthenticated={isAuthenticated}
+                      />
+                    ))}
+                  </div>
+                </>
+              )}
               {hasMore && (
                 <div className='mt-4 flex flex-col items-center gap-2'>
                   <Button
