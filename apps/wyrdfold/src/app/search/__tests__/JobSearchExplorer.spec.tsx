@@ -713,6 +713,70 @@ describe('weak-match grouping (#836 §7)', () => {
     expect(order & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
+  it('regroups across pages: page 2 strong matches join the main grid (#1007 review)', async () => {
+    // The buckets are derived from the WHOLE accumulated list, not per page.
+    // So a strong match arriving on page 2 belongs above page 1's related
+    // ones — if grouping were applied per page, the list would degrade into
+    // alternating strong/related blocks as the user paged.
+    const page1 = [
+      result({
+        id: '1',
+        title: 'Senior Frontend Engineer',
+        is_strong_match: true,
+      }),
+      result({
+        id: '2',
+        title: 'DevOps Engineer, Senior',
+        is_strong_match: false,
+      }),
+    ];
+    const page2 = [
+      result({
+        id: '3',
+        title: 'Staff Frontend Engineer',
+        is_strong_match: true,
+      }),
+      result({ id: '4', title: 'Data Engineer', is_strong_match: false }),
+    ];
+    global.fetch = jest.fn().mockImplementation((url: string) => {
+      const isSearch = url.includes('/api/jobs/search');
+      const first = url.includes('offset=0');
+      const results = isSearch ? (first ? page1 : page2) : [];
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          query: 'q',
+          count: results.length,
+          has_more: isSearch && first,
+          results,
+        }),
+      });
+    }) as unknown as typeof fetch;
+
+    render(<JobSearchExplorer isAuthenticated />);
+    await typeAndSearch('frontend engineer');
+    expect(await findCard('Senior Frontend Engineer')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /load more/i }));
+    expect(await findCard('Staff Frontend Engineer')).toBeInTheDocument();
+
+    // One divider, not one per page.
+    expect(
+      screen.getAllByRole('heading', { name: /related roles/i })
+    ).toHaveLength(1);
+    const heading = screen.getByRole('heading', { name: /related roles/i });
+    const before = (el: HTMLElement) =>
+      Boolean(
+        heading.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_PRECEDING
+      );
+    // Page 2's STRONG match sits above the divider, next to page 1's.
+    expect(before(screen.getByText('Staff Frontend Engineer'))).toBe(true);
+    expect(before(screen.getByText('Senior Frontend Engineer'))).toBe(true);
+    // Both pages' weak matches sit below it.
+    expect(before(screen.getByText('DevOps Engineer, Senior'))).toBe(false);
+    expect(before(screen.getByText('Data Engineer'))).toBe(false);
+  });
+
   it('shows no divider when every result matched every term', async () => {
     mockSearch([
       result({
