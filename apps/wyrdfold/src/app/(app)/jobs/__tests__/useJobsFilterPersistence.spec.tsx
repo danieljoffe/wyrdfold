@@ -1,10 +1,13 @@
-import { renderHook } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 
 import { emptyFilters } from '../jobsFilterFields';
 import type { JobsFilterState } from '../types';
 import { useJobsFilterPersistence } from '../useJobsFilterPersistence';
 
-const EMPTY: JobsFilterState = emptyFilters();
+// #866: persistence moved server-side — the localStorage layer's global key
+// leaked one account's filters into the next on shared browsers. The hook
+// now hydrates once from /api/profile/jobs-filters, serves reads from
+// memory, and write-through-debounces the whole map back.
 
 const POPULATED: JobsFilterState = {
   ...emptyFilters(),
@@ -18,121 +21,234 @@ const POPULATED: JobsFilterState = {
   country: 'US',
 };
 
-describe('useJobsFilterPersistence', () => {
-  beforeEach(() => {
-    window.localStorage.clear();
+const originalFetch = global.fetch;
+let fetchMock: jest.Mock;
+
+function mockServer(filters: Record<string, unknown> | null, ok = true) {
+  fetchMock = jest
+    .fn()
+    .mockImplementation((_url: string, init?: RequestInit) => {
+      if (init?.method === 'PATCH') {
+        return Promise.resolve({ ok: true, json: async () => ({}) });
+      }
+      if (!ok) return Promise.reject(new Error('network'));
+      return Promise.resolve({ ok: true, json: async () => ({ filters }) });
+    });
+  global.fetch = fetchMock as unknown as typeof fetch;
+}
+
+function lastPatch(): {
+  body: { filters: Record<string, unknown> };
+  init: RequestInit;
+} | null {
+  const call = [...fetchMock.mock.calls]
+    .reverse()
+    .find(([, init]) => (init as RequestInit | undefined)?.method === 'PATCH');
+  if (!call) return null;
+  const init = call[1] as RequestInit;
+  return { body: JSON.parse(init.body as string), init };
+}
+
+function lastPatchBody(): { filters: Record<string, unknown> } | null {
+  return lastPatch()?.body ?? null;
+}
+
+beforeEach(() => {
+  jest.useFakeTimers();
+  window.localStorage.clear();
+});
+
+afterEach(() => {
+  jest.runOnlyPendingTimers();
+  jest.useRealTimers();
+  global.fetch = originalFetch;
+  jest.clearAllMocks();
+});
+
+describe('useJobsFilterPersistence (server-backed, #866)', () => {
+  it('hydrates from the server and serves reads per key, __all__ for undefined', async () => {
+    mockServer({
+      'target-1': POPULATED,
+      __all__: { ...POPULATED, search: 'all' },
+    });
+    const { result } = renderHook(() => useJobsFilterPersistence());
+    await waitFor(() => expect(result.current.ready).toBe(true));
+
+    expect(result.current.read('target-1')).toEqual(POPULATED);
+    expect(result.current.read(undefined)?.search).toBe('all');
+    expect(result.current.read('target-unknown')).toBeNull();
   });
 
-  it('round-trips a populated snapshot keyed by target', () => {
+  it('is not ready before the server map lands — restore must wait', () => {
+    mockServer({ 'target-1': POPULATED });
     const { result } = renderHook(() => useJobsFilterPersistence());
-    result.current.write('target-1', POPULATED);
+    expect(result.current.ready).toBe(false);
+    expect(result.current.read('target-1')).toBeNull();
+  });
 
+  it('drops malformed server entries instead of serving them', async () => {
+    mockServer({ 'target-1': 'not-an-object', 'target-2': POPULATED });
+    const { result } = renderHook(() => useJobsFilterPersistence());
+    await waitFor(() => expect(result.current.ready).toBe(true));
+
+    expect(result.current.read('target-1')).toBeNull();
+    expect(result.current.read('target-2')).toEqual(POPULATED);
+  });
+
+  it('write debounces one PATCH carrying only the changed keys', async () => {
+    mockServer({});
+    const { result } = renderHook(() => useJobsFilterPersistence());
+    await waitFor(() => expect(result.current.ready).toBe(true));
+
+    act(() => {
+      result.current.write('target-1', POPULATED);
+      result.current.write(undefined, { ...POPULATED, search: 'all' });
+    });
+    expect(lastPatchBody()).toBeNull(); // still inside the debounce window
+    act(() => {
+      jest.advanceTimersByTime(700);
+    });
+
+    const body = lastPatchBody();
+    expect(body).not.toBeNull();
+    expect(Object.keys(body!.filters).sort()).toEqual(['__all__', 'target-1']);
+  });
+
+  it('a write BEFORE hydration completes still persists — the e2e re-entry class', async () => {
+    // The whole-map-PUT design made every write wait on the hydrate GET,
+    // and authed-filters-persist.spec.ts proved a fast navigation outran
+    // it. A per-key patch is safe to send from the first render.
+    let resolveGet!: (v: unknown) => void;
+    fetchMock = jest
+      .fn()
+      .mockImplementation((_url: string, init?: RequestInit) => {
+        if (init?.method === 'PATCH') {
+          return Promise.resolve({ ok: true, json: async () => ({}) });
+        }
+        return new Promise(res => {
+          resolveGet = res; // hydrate GET intentionally left hanging
+        });
+      });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const { result } = renderHook(() => useJobsFilterPersistence());
+    expect(result.current.ready).toBe(false);
+
+    act(() => {
+      result.current.write('target-1', POPULATED);
+      jest.advanceTimersByTime(400);
+    });
+
+    const sent = lastPatchBody();
+    expect(sent).not.toBeNull();
+    expect(Object.keys(sent!.filters)).toEqual(['target-1']);
+
+    // Hydration lands afterwards: the pending write must win the overlay.
+    await act(async () => {
+      resolveGet({
+        ok: true,
+        json: async () => ({
+          filters: { 'target-1': { ...POPULATED, search: 'stale-server' } },
+        }),
+      });
+    });
+    await waitFor(() => expect(result.current.ready).toBe(true));
     expect(result.current.read('target-1')).toEqual(POPULATED);
   });
 
-  it('uses the __all__ sentinel for undefined targets', () => {
+  it('an all-empty write deletes the snapshot so cleared filters stay cleared', async () => {
+    mockServer({ 'target-1': POPULATED });
     const { result } = renderHook(() => useJobsFilterPersistence());
-    result.current.write(undefined, POPULATED);
+    await waitFor(() => expect(result.current.ready).toBe(true));
 
-    // Snapshot stored under the All Jobs key, isolated from per-target entries.
-    expect(window.localStorage.getItem('wyrdfold.filters.__all__')).toContain(
-      'react'
-    );
+    act(() => {
+      result.current.write('target-1', emptyFilters());
+      jest.advanceTimersByTime(700);
+    });
+
     expect(result.current.read('target-1')).toBeNull();
-    expect(result.current.read(undefined)).toEqual(POPULATED);
+    expect(lastPatchBody()!.filters).toEqual({ 'target-1': null });
   });
 
-  it('returns null for a missing target', () => {
+  it('clear removes the entry and flushes', async () => {
+    mockServer({ 'target-1': POPULATED });
     const { result } = renderHook(() => useJobsFilterPersistence());
+    await waitFor(() => expect(result.current.ready).toBe(true));
 
-    expect(result.current.read('never-seen')).toBeNull();
+    act(() => {
+      result.current.clear('target-1');
+      jest.advanceTimersByTime(700);
+    });
+
+    expect(result.current.read('target-1')).toBeNull();
+    expect(lastPatchBody()!.filters).toEqual({ 'target-1': null });
   });
 
-  it('returns null when the stored snapshot has no populated fields', () => {
-    // Defensive: a stale "all empty" entry shouldn't trigger a restore
-    // that overwrites a deep link with nothing.
-    window.localStorage.setItem('wyrdfold.filters.t', JSON.stringify(EMPTY));
-    const { result } = renderHook(() => useJobsFilterPersistence());
-
-    expect(result.current.read('t')).toBeNull();
-  });
-
-  it('write removes the entry when all fields are empty', () => {
+  it('deletes the legacy global localStorage keys and does NOT import them', async () => {
+    // On a shared browser those keys belong to whoever wrote them —
+    // importing would persist the exact cross-account leak #866 fixes.
     window.localStorage.setItem(
-      'wyrdfold.filters.t',
+      'wyrdfold.filters.__all__',
       JSON.stringify(POPULATED)
     );
+    mockServer({});
     const { result } = renderHook(() => useJobsFilterPersistence());
-    result.current.write('t', EMPTY);
+    await waitFor(() => expect(result.current.ready).toBe(true));
 
-    // Clearing all filters should NOT leave a stale snapshot that
-    // re-applies on the next visit.
-    expect(window.localStorage.getItem('wyrdfold.filters.t')).toBeNull();
+    expect(window.localStorage.getItem('wyrdfold.filters.__all__')).toBeNull();
+    expect(result.current.read(undefined)).toBeNull();
   });
 
-  it('survives malformed JSON in storage', () => {
-    window.localStorage.setItem('wyrdfold.filters.t', '{not valid json');
+  it('load failure degrades to session-only memory, never blocks the page', async () => {
+    mockServer(null, false);
     const { result } = renderHook(() => useJobsFilterPersistence());
+    await waitFor(() => expect(result.current.ready).toBe(true));
 
-    expect(result.current.read('t')).toBeNull();
-  });
-
-  it('drops non-string fields on read (forward-compat)', () => {
-    // A future version could store a number / array / object for a
-    // field we haven't taught the coerce step about — fall through to
-    // empty string for that field rather than throwing.
-    window.localStorage.setItem(
-      'wyrdfold.filters.t',
-      JSON.stringify({
-        search: 'react',
-        status: 42, // wrong type
-        minScore: ['junk'], // wrong type
-        excludeLocations: 'UK',
-        onlyLocations: 'US',
-      })
-    );
-    const { result } = renderHook(() => useJobsFilterPersistence());
-
-    expect(result.current.read('t')).toEqual({
-      ...emptyFilters(),
-      search: 'react',
-      excludeLocations: 'UK',
-      onlyLocations: 'US',
+    act(() => {
+      result.current.write('target-1', POPULATED);
     });
+    expect(result.current.read('target-1')).toEqual(POPULATED);
   });
+});
 
-  it('restores a pre-logistics v1 snapshot with the newer dimensions empty', () => {
-    // Snapshots written before the logistics filters joined persistence
-    // hold only the original five fields. They must keep restoring those
-    // five — with remote/salary/country simply inactive, not poisoned.
-    window.localStorage.setItem(
-      'wyrdfold.filters.t-legacy',
-      JSON.stringify({
-        search: 'react',
-        status: 'new',
-        minScore: '60',
-        excludeLocations: 'UK',
-        onlyLocations: 'US',
-      })
-    );
-    const { result } = renderHook(() => useJobsFilterPersistence());
-    expect(result.current.read('t-legacy')).toEqual({
-      search: 'react',
-      status: 'new',
-      minScore: '60',
-      excludeLocations: 'UK',
-      onlyLocations: 'US',
-      remoteOnly: '',
-      minSalary: '',
-      country: '',
+describe('flush-on-exit (#866 — the e2e re-entry regression)', () => {
+  // The first cut only debounced; the timer died with the page and the
+  // snapshot was silently lost — caught by authed-filters-persist.spec.ts.
+  it('an unmount with a pending write SENDS it (keepalive), never drops it', async () => {
+    mockServer({});
+    const { result, unmount } = renderHook(() => useJobsFilterPersistence());
+    await waitFor(() => expect(result.current.ready).toBe(true));
+
+    act(() => {
+      result.current.write('target-1', POPULATED);
     });
+    expect(lastPatchBody()).toBeNull(); // debounce pending
+    unmount();
+
+    const body = lastPatchBody();
+    expect(body).not.toBeNull();
+    expect(Object.keys(body!.filters)).toEqual(['target-1']);
+    expect(lastPatch()!.init.keepalive).toBe(true);
   });
 
-  it('clear removes the entry', () => {
+  it('pagehide flushes a pending write — hard navigations persist too', async () => {
+    mockServer({});
     const { result } = renderHook(() => useJobsFilterPersistence());
-    result.current.write('t', POPULATED);
-    result.current.clear('t');
+    await waitFor(() => expect(result.current.ready).toBe(true));
 
-    expect(result.current.read('t')).toBeNull();
+    act(() => {
+      result.current.write('target-1', POPULATED);
+      window.dispatchEvent(new Event('pagehide'));
+    });
+
+    expect(lastPatchBody()).not.toBeNull();
+  });
+
+  it('a clean exit sends nothing', async () => {
+    mockServer({ 'target-1': POPULATED });
+    const { result, unmount } = renderHook(() => useJobsFilterPersistence());
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    unmount();
+    expect(lastPatchBody()).toBeNull();
   });
 });

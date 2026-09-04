@@ -162,11 +162,12 @@ export default function JobsList({
     }
   }, [activeTargetId]);
 
-  // Per-target filter persistence. localStorage-backed; survives reloads
-  // and out-of-page navigation but not browser-data clears. Writes happen
-  // on every filter change (below). Reads happen on tab change + on first
-  // mount when the URL has no filter params (just below). See
-  // ``useJobsFilterPersistence`` for the storage key scheme.
+  // Per-target filter persistence. SERVER-backed since #866 (scoped to the
+  // account, synced across devices; the old global localStorage key leaked
+  // filters between accounts on shared browsers). Writes happen on every
+  // filter change (below); reads on tab change + on first mount when the
+  // URL has no filter params — gated on ``persistence.ready`` because the
+  // map loads asynchronously now.
   const persistence = useJobsFilterPersistence();
 
   // Track whether we've attempted a restore for the current target so a
@@ -179,9 +180,9 @@ export default function JobsList({
   // search params, so this recomputes only when the URL actually changes.
   const urlFilters = useMemo(() => pickFilters(urlState), [urlState]);
 
-  // Snapshot to localStorage whenever the live filters change. Writes
-  // are keyed by the current target (or the All Jobs sentinel) so each
-  // target remembers its own filter state independently.
+  // Snapshot whenever the live filters change. Writes are keyed by the
+  // current target (or the All Jobs sentinel) so each target remembers its
+  // own filter state independently.
   //
   // Gated on the restore pass having run for this target: this effect is
   // declared first, so on a BARE mount it would otherwise fire with the
@@ -190,7 +191,17 @@ export default function JobsList({
   // restore pass, writes flow normally, including the deliberate
   // "cleared all filters" removeItem.
   useEffect(() => {
-    if (restoredForTargetRef.current !== activeTargetId) return;
+    // The restore-first guard exists so a BARE mount's empty URL can't
+    // delete the saved snapshot before the restore pass reads it. A
+    // POPULATED URL is different (#866 e2e lesson): deep-linked filters are
+    // safe to persist immediately, and waiting for the hydrate round-trip
+    // let a fast navigation outrun the write entirely.
+    if (
+      restoredForTargetRef.current !== activeTargetId &&
+      isFilterStateEmpty(urlFilters)
+    ) {
+      return;
+    }
     persistence.write(activeTargetId, urlFilters);
   }, [persistence, activeTargetId, urlFilters]);
 
@@ -198,6 +209,10 @@ export default function JobsList({
   // no filter params. Deep links (``/jobs?q=react``) win over the
   // stored snapshot — the URL is always authoritative when populated.
   useEffect(() => {
+    // #866: the snapshots load from the server now — restoring (and, via
+    // the ref, writing) waits for that load, or a bare first render would
+    // mark the target restored before the saved filters could apply.
+    if (!persistence.ready) return;
     if (restoredForTargetRef.current === activeTargetId) return;
     restoredForTargetRef.current = activeTargetId;
 
@@ -208,8 +223,8 @@ export default function JobsList({
 
     setUrlState(filtersToUrlPatch(saved));
     // Intentionally narrow deps: we only want this to fire on the first
-    // render per target. Including ``urlState`` would re-trigger after
-    // the restore writes its own values back into the URL, which is
+    // ready render per target. Including ``urlState`` would re-trigger
+    // after the restore writes its own values back into the URL, which is
     // already guarded by the ref check above but reads more clearly
     // with a small dep array.
   }, [activeTargetId, persistence, setUrlState]);
@@ -227,7 +242,11 @@ export default function JobsList({
   );
 
   const onTableSortChange = useCallback(
-    (sort: JobsSortColumn, order: 'asc' | 'desc', meta?: { reset: boolean }) => {
+    (
+      sort: JobsSortColumn,
+      order: 'asc' | 'desc',
+      meta?: { reset: boolean }
+    ) => {
       // Sort changes create a history entry so back restores the old sort.
       // The hook re-fetches the first page when sort changes.
       //
@@ -235,7 +254,10 @@ export default function JobsList({
       // default values. Writing `sort=score&order=desc` would look identical
       // to the user but leaves a URL that survives a change of default — and
       // "cleared" should mean "whatever the app ranks by", not "score, frozen".
-      setUrlState(meta?.reset ? { sort: null, order: null } : { sort, order }, 'push');
+      setUrlState(
+        meta?.reset ? { sort: null, order: null } : { sort, order },
+        'push'
+      );
     },
     [setUrlState]
   );

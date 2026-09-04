@@ -2,7 +2,7 @@
 
 import re
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -220,6 +220,66 @@ class LlmUsageWindow(BaseModel):
 
     spent_usd: float
     limit_usd: float
+
+
+class JobsFilterPrefsPatch(BaseModel):
+    """Per-key merge patch for the /jobs filter snapshots (#866).
+
+    ``filters`` maps snapshot keys to either a replacement snapshot or None
+    (delete). PATCH-merge exists so the CLIENT never needs the server map
+    before writing: the first cut made every write wait on the hydrate GET,
+    and the e2e re-entry spec proved a fast navigation could outrun the
+    round-trip — the whole write path silently did nothing. A patch of only
+    the changed keys is always safe to send, however little the client has
+    seen.
+    """
+
+    filters: dict[str, dict[str, Any] | None] = Field(default_factory=dict)
+
+    @field_validator("filters")
+    @classmethod
+    def _bounded_patch(
+        cls, v: dict[str, dict[str, Any] | None]
+    ) -> dict[str, dict[str, Any] | None]:
+        if len(v) > 64:
+            raise ValueError("too many filter snapshots in one patch (max 64)")
+        for key in v:
+            if not key or len(key) > 64:
+                raise ValueError("filter snapshot keys must be 1-64 characters")
+        import json as _json
+
+        if len(_json.dumps(v)) > 16_000:
+            raise ValueError("filter patch too large (max 16KB serialized)")
+        return v
+
+
+class JobsFilterPrefs(BaseModel):
+    """The /jobs page's per-target filter snapshots (#866).
+
+    One map of ``{target_id | "__all__": JobsFilterState}``, treated as an
+    OPAQUE client-owned blob: the server never reads inside it, and the
+    client re-validates each entry on read (``coerceStoredFilters``), so the
+    only server-side concerns are ownership (RLS) and size. The caps below
+    stop the column becoming an unbounded dumping ground: a user can follow
+    at most a few dozen targets, and one snapshot is a handful of short
+    scalar fields.
+    """
+
+    filters: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    @field_validator("filters")
+    @classmethod
+    def _bounded(cls, v: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        if len(v) > 64:
+            raise ValueError("too many filter snapshots (max 64)")
+        for key in v:
+            if not key or len(key) > 64:
+                raise ValueError("filter snapshot keys must be 1-64 characters")
+        import json as _json
+
+        if len(_json.dumps(v)) > 16_000:
+            raise ValueError("filter snapshots too large (max 16KB serialized)")
+        return v
 
 
 class LlmUsageResponse(BaseModel):
