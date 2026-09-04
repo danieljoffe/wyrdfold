@@ -658,122 +658,116 @@ def test_display_value_still_decays_at_read_time_for_custom_weights(
     assert value != 35
 
 
-# ---- refresh_all_recency_scores (full sweep) -------------------------------
+# ---- refresh_all_recency_scores (full sweep, set-based #604) ---------------
+#
+# The sweep is now a keyset loop over the ``sweep_recency_scores`` RPC — the
+# decay arithmetic lives in SQL, so these pin the LOOP mechanics (cursor
+# advance, termination, fail-soft, and that the module's constants are what
+# ride the wire). Value parity between the SQL and
+# ``compute_recency_score`` is pinned against real Postgres in
+# tests/integration/test_recency_sweep_parity.py.
 
 
-class _SweepChain:
-    """Minimal paged-query chain: returns a ``.range()`` slice of the table's
-    rows (async client — the sweep runs on ``AsyncClient``, #57 slice 1).
-    The sweep fits the test corpus in one page (< 1000 rows)."""
-
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
-        self._rows = rows
-        self._start = 0
-        self._end: int | None = None
-
-    def select(self, *_a: Any, **_kw: Any) -> _SweepChain:
-        return self
-
-    def eq(self, *_a: Any, **_kw: Any) -> _SweepChain:
-        return self
-
-    def is_(self, *_a: Any, **_kw: Any) -> _SweepChain:
-        return self
-
-    def order(self, *_a: Any, **_kw: Any) -> _SweepChain:
-        return self
-
-    def range(self, start: int, end: int) -> _SweepChain:
-        self._start, self._end = start, end
-        return self
+class _SweepRpcChain:
+    def __init__(self, result: Any) -> None:
+        self._result = result
 
     async def execute(self) -> _Resp:
-        end = self._end if self._end is not None else len(self._rows)
-        return _Resp(self._rows[self._start : end + 1])
-
-
-class _AsyncRpcChain:
-    """Async twin of ``_RpcChain`` for the sweep's ``AsyncClient`` RPC flush."""
-
-    def __init__(self, sink: list[dict[str, Any]]) -> None:
-        self._sink = sink
-
-    async def execute(self) -> _Resp:
-        return _Resp([])
+        if isinstance(self._result, Exception):
+            raise self._result
+        return _Resp(self._result)
 
 
 def _sweep_supabase(
-    jobs: list[dict[str, Any]],
-    scores: list[dict[str, Any]],
+    batches: list[Any],
     rpc_calls: list[tuple[str, dict[str, Any]]],
 ) -> MagicMock:
-    by_table = {"jobs": jobs, "scores": scores}
+    """Fake AsyncClient whose ``sweep_recency_scores`` RPC serves ``batches``
+    in order — each entry a response ``data`` list, or an Exception to raise."""
     sb = MagicMock()
-    sb.table.side_effect = lambda name: _SweepChain(by_table[name])
+    remaining = list(batches)
 
-    def _rpc(name: str, params: dict[str, Any]) -> _AsyncRpcChain:
+    def _rpc(name: str, params: dict[str, Any]) -> _SweepRpcChain:
         rpc_calls.append((name, params))
-        return _AsyncRpcChain([])
+        return _SweepRpcChain(remaining.pop(0) if remaining else [])
 
     sb.rpc.side_effect = _rpc
     return sb
 
 
+def _batch(scanned: int, written: int, last_id: str | None) -> list[dict[str, Any]]:
+    return [{"scanned": scanned, "written": written, "last_id": last_id}]
+
+
 @pytest.mark.asyncio
-async def test_refresh_all_sweeps_live_scores_and_skips_archived(
+async def test_refresh_all_pages_the_sweep_rpc_with_a_keyset_cursor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
-    old = (datetime.now(UTC) - timedelta(days=27)).isoformat()
-    fresh = datetime.now(UTC).isoformat()
-    # Only live (non-archived) jobs come back from the jobs walk.
-    jobs = [
-        {"id": "j-old", "cataloged_at": old},
-        {"id": "j-fresh", "cataloged_at": fresh},
-    ]
-    scores = [
-        {"id": "s1", "job_posting_id": "j-old", "score": 90},
-        {"id": "s2", "job_posting_id": "j-fresh", "score": 80},
-        # Score for a job not in the live set (archived) → must be skipped.
-        {"id": "s3", "job_posting_id": "j-archived", "score": 100},
-    ]
+    monkeypatch.setattr(recency_mod, "_SWEEP_BATCH_SIZE", 2)
     rpc_calls: list[tuple[str, dict[str, Any]]] = []
-    sb = _sweep_supabase(jobs, scores, rpc_calls)
+    sb = _sweep_supabase(
+        [_batch(2, 1, "id-a"), _batch(2, 2, "id-b"), _batch(1, 0, "id-c")],
+        rpc_calls,
+    )
 
     written = await refresh_all_recency_scores(sb)
 
-    assert written == 2  # archived score skipped
-    assert len(rpc_calls) == 1
-    by_id = {u["id"]: u["recency_score"] for u in rpc_calls[0][1]["p_updates"]}
-    assert by_id["s1"] == 63  # round(90 * 0.70)
-    assert by_id["s2"] == 80  # fresh → no decay
-    assert "s3" not in by_id
+    assert written == 3  # only CHANGED rows count — no-op writes are gone
+    assert [name for name, _ in rpc_calls] == ["sweep_recency_scores"] * 3
+    # The cursor is the previous batch's last_id; the loop ends on the short
+    # batch (scanned < batch size ⇒ the id range is exhausted).
+    assert [p["p_after_id"] for _, p in rpc_calls] == [
+        "00000000-0000-0000-0000-000000000000",
+        "id-a",
+        "id-b",
+    ]
+    # The module constants are the single source of truth for the decay
+    # curve — they must be what rides to SQL.
+    _, params = rpc_calls[0]
+    assert params["p_enabled"] is True
+    assert params["p_batch_size"] == 2
+    assert params["p_grace_days"] == float(recency_mod.RECENCY_GRACE_DAYS)
+    assert params["p_daily_decay"] == recency_mod.RECENCY_DAILY_DECAY
+    assert params["p_floor"] == recency_mod.RECENCY_FLOOR
 
 
 @pytest.mark.asyncio
-async def test_refresh_all_mirrors_score_when_disabled(
+async def test_refresh_all_passes_the_flag_off_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
-    old = (datetime.now(UTC) - timedelta(days=100)).isoformat()
-    jobs = [{"id": "j-old", "cataloged_at": old}]
-    scores = [{"id": "s1", "job_posting_id": "j-old", "score": 90}]
     rpc_calls: list[tuple[str, dict[str, Any]]] = []
-    sb = _sweep_supabase(jobs, scores, rpc_calls)
+    sb = _sweep_supabase([_batch(0, 0, None)], rpc_calls)
 
     await refresh_all_recency_scores(sb)
 
-    by_id = {u["id"]: u["recency_score"] for u in rpc_calls[0][1]["p_updates"]}
-    assert by_id["s1"] == 90  # flag off → recency mirrors raw score
+    assert rpc_calls[0][1]["p_enabled"] is False
 
 
 @pytest.mark.asyncio
-async def test_refresh_all_noop_when_no_live_scores() -> None:
+async def test_refresh_all_keeps_partial_progress_on_a_failed_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-sweep error must not raise (APScheduler would swallow the
+    trace) and must not discard the batches already written — the next tick
+    finishes the rest."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    monkeypatch.setattr(recency_mod, "_SWEEP_BATCH_SIZE", 2)
     rpc_calls: list[tuple[str, dict[str, Any]]] = []
-    sb = _sweep_supabase([], [], rpc_calls)
+    sb = _sweep_supabase([_batch(2, 5, "id-a"), RuntimeError("57014")], rpc_calls)
+
+    assert await refresh_all_recency_scores(sb) == 5
+    assert len(rpc_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_refresh_all_handles_an_empty_response() -> None:
+    rpc_calls: list[tuple[str, dict[str, Any]]] = []
+    sb = _sweep_supabase([[]], rpc_calls)
 
     assert await refresh_all_recency_scores(sb) == 0
-    assert rpc_calls == []
+    assert len(rpc_calls) == 1
 
 
 @pytest.mark.asyncio
