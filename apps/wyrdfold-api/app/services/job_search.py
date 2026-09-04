@@ -165,6 +165,20 @@ def _forms_for(token: str) -> set[str]:
     return _SYNONYMS.get(canon, {token})
 
 
+def _is_strong_match(query_groups: set[str], row: dict[str, Any]) -> bool:
+    """Did the title match EVERY canonical group in the query? (#836 §7)
+
+    The same overlap ``_rank_key`` sorts by, expressed as the bucket the UI
+    groups on. A blank browse has no groups, so every row is strong — there
+    is nothing to have missed, and the list must not sprout a "Related"
+    divider when the user asked for everything.
+    """
+    if not query_groups:
+        return True
+    title_groups = _groups(_tokenize(str(row.get("title") or "")))
+    return query_groups.issubset(title_groups)
+
+
 def _rank_key(query_groups: set[str], row: dict[str, Any]) -> tuple[int, str]:
     """Sort key: more overlapping query groups first, then most-recent.
 
@@ -312,7 +326,12 @@ async def search_jobs(
     rows.sort(key=lambda r: _rank_key(query_groups, r), reverse=True)
     page = rows[offset : offset + limit]
     has_more = len(rows) > offset + limit
-    return [JobSearchResult.model_validate(_flatten_source_domain(r)) for r in page], has_more
+    return [
+        JobSearchResult.model_validate(
+            _flatten_source_domain(r) | {"is_strong_match": _is_strong_match(query_groups, r)}
+        )
+        for r in page
+    ], has_more
 
 
 async def get_listing(supabase: AsyncClient, listing_id: str) -> JobSearchResult | None:

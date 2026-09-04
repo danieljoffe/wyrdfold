@@ -678,3 +678,80 @@ describe('JobSearchExplorer — logged out (public)', () => {
     expect(await findCard()).toHaveAttribute('href', '/search/1');
   });
 });
+
+describe('weak-match grouping (#836 §7)', () => {
+  it('splits partial matches under a "Related roles" heading', async () => {
+    mockSearch([
+      result({
+        id: '1',
+        title: 'Senior Frontend Engineer',
+        is_strong_match: true,
+      }),
+      result({
+        id: '2',
+        title: 'DevOps Engineer, Senior',
+        is_strong_match: false,
+      }),
+    ]);
+    render(<JobSearchExplorer isAuthenticated={false} />);
+
+    await waitFor(() =>
+      expect(screen.getByText('Senior Frontend Engineer')).toBeInTheDocument()
+    );
+    // A real heading, so a screen-reader user can navigate to the boundary.
+    const heading = screen.getByRole('heading', { name: /related roles/i });
+    expect(heading).toBeInTheDocument();
+    expect(
+      screen.getByText(/match some of your search terms, not all/i)
+    ).toBeInTheDocument();
+    // Nothing is dropped — the weak match is still on the page.
+    expect(screen.getByText('DevOps Engineer, Senior')).toBeInTheDocument();
+    // ...and it sits AFTER the divider, not among the strong results.
+    const order = heading.compareDocumentPosition(
+      screen.getByText('DevOps Engineer, Senior')
+    );
+    expect(order & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('shows no divider when every result matched every term', async () => {
+    mockSearch([
+      result({
+        id: '1',
+        title: 'Senior Frontend Engineer',
+        is_strong_match: true,
+      }),
+      result({
+        id: '2',
+        title: 'Frontend Engineer, Platform',
+        is_strong_match: true,
+      }),
+    ]);
+    render(<JobSearchExplorer isAuthenticated={false} />);
+
+    await waitFor(() =>
+      expect(screen.getByText('Senior Frontend Engineer')).toBeInTheDocument()
+    );
+    expect(
+      screen.queryByRole('heading', { name: /related roles/i })
+    ).not.toBeInTheDocument();
+  });
+
+  it('treats an absent flag as strong — a deploy-skew window stays ungrouped', async () => {
+    // Old API + new FE: `is_strong_match` is missing. Every row must render
+    // as it does today; filing them all under "Related" would be worse than
+    // the problem this fixes.
+    mockSearch([
+      result({ id: '1', title: 'Senior Frontend Engineer' }),
+      result({ id: '2', title: 'DevOps Engineer, Senior' }),
+    ]);
+    render(<JobSearchExplorer isAuthenticated={false} />);
+
+    await waitFor(() =>
+      expect(screen.getByText('Senior Frontend Engineer')).toBeInTheDocument()
+    );
+    expect(screen.getByText('DevOps Engineer, Senior')).toBeInTheDocument();
+    expect(
+      screen.queryByRole('heading', { name: /related roles/i })
+    ).not.toBeInTheDocument();
+  });
+});

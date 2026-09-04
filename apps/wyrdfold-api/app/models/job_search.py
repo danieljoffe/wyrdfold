@@ -38,6 +38,15 @@ class JobSearchResult(BaseModel):
     salary_max: float | None = None
     salary_currency: str | None = None
     salary_period: str | None = None
+    # #836 §7: did this row match EVERY canonical group in the query?
+    # The ranker has always sorted by group overlap, but the UI showed
+    # nothing — so a one-of-two-token match ("DevOps Engineer" for "frontend
+    # engineer") looked like a broken search rather than a weak match sorted
+    # correctly beneath the strong ones. Clients group on this instead of
+    # re-deriving it, because the synonym policy lives here. None on the
+    # single-listing read (no query to be strong or weak against); True for
+    # every row of a blank browse, which has no terms to miss.
+    is_strong_match: bool | None = None
     # Verified company web domain from the source row (#470) — clients BUILD
     # logo links from it (Brandfetch/favicon cascade) and fall back to the
     # initials monogram when absent or when the image errors. Never an image.
