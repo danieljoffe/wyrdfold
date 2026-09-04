@@ -248,13 +248,36 @@ export default function InsightsDashboard({
         </div>
       )}
 
+      {/* #842: insights aggregate ACTIVE targets only — the same scope the
+          score-distribution chips link into on /jobs. With zero active
+          targets every endpoint returns its empty payload; name the state
+          and point at the fix, instead of a wall of zeroed charts that
+          reads as data loss. (Charts still render below, per the #844
+          precedent — the shape of what's coming stays visible.) */}
+      {!showTargetCmpSkeleton &&
+        targets != null &&
+        targets.targets.length === 0 && (
+          <div className='rounded-md border border-border bg-surface-tertiary p-3'>
+            <Text variant='caption' className='text-text-secondary'>
+              No active targets — these numbers cover the targets you're
+              actively matching against. Activate one on the{' '}
+              <a className='underline' href='/targets'>
+                Targets page
+              </a>{' '}
+              to start seeing your trends.
+            </Text>
+          </div>
+        )}
+
       {/* #844 §7: with no applications yet this view was a grid of zeros
           and empty axes — the first thing behind the Trends tab for a new
           user, reading as breakage. Name the state and what fills it. The
           charts still render below so the shape of what's coming is
-          visible. */}
+          visible. (Gated on having active targets — with none, the #842
+          banner above already names the more fundamental state.) */}
       {!showKpiSkeleton &&
         pipeline != null &&
+        (targets == null || targets.targets.length > 0) &&
         (pipeline.total_applications ?? 0) === 0 &&
         (pipeline.total_interviews ?? 0) === 0 && (
           <div className='rounded-md border border-border bg-surface-tertiary p-3'>
