@@ -122,6 +122,14 @@ class ScoresQuery:
             self._graded = bool(value)
         elif col == "jobs.company_name":
             self._company = value
+        elif col == "job_is_live" and value is True:
+            # #604: the scores-side liveness filter. Lenient on ABSENT cells —
+            # legacy fixtures predate the column and their rows are all
+            # implicitly live — so only a row that explicitly says
+            # ``job_is_live: False`` is dropped. That is the assertable
+            # behavior: remove the filter from the query and such a row
+            # comes back.
+            self._filters.append(lambda r: r.get("job_is_live") is not False)
         return self
 
     def in_(self, *_a: Any, **_kw: Any) -> ScoresQuery:

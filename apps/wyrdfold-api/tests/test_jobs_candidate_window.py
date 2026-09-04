@@ -468,3 +468,19 @@ async def test_other_sorts_do_not_split_on_the_posted_date(
     ids = [p["id"] for p in result["postings"]]
     assert sorted(ids) == ["a", "b"], ids
     assert len(ids) == len(set(ids))
+
+
+async def test_window_drops_rows_whose_job_died_via_the_scores_side_flag() -> None:
+    """#604: the candidate query filters on the denormalized ``job_is_live``
+    at the SCORES layer (it is what lets the partial window indexes serve the
+    query LIMIT-driven). A row explicitly marked dead must not reach the
+    window even though its embed is present — remove the ``.eq("job_is_live",
+    True)`` from ``_scores_live_join`` and this row comes back.
+    """
+    live = _score_row("j-live", score=80, graded=True, first_seen="2026-07-01")
+    dead = _score_row("j-dead", score=99, graded=True, first_seen="2026-07-02")
+    dead["job_is_live"] = False
+
+    result = await _list(_supabase([live, dead]))
+
+    assert [p["id"] for p in result["postings"]] == ["j-live"]
