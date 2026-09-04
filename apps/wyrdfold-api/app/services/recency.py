@@ -57,9 +57,14 @@ _RECENCY_CHUNK_SIZE = 500
 # guard).
 _RECENCY_READ_CHUNK_SIZE = 150
 
-# Page size for the full sweep's table walks. PostgREST caps a single
-# response at 1000 rows by default, so the sweep pages with ``.range()``.
-_RECENCY_SWEEP_PAGE_SIZE = 1000
+# Batch size for the set-based sweep RPC (#604): bounds each UPDATE's
+# transaction/lock window, nothing else — the response is a single summary
+# row regardless. 10k keeps a batch in the low hundreds of ms on the prod
+# instance while finishing the full corpus in a few dozen calls.
+_SWEEP_BATCH_SIZE = 10_000
+
+# Keyset start for the sweep's uuid cursor.
+_SWEEP_CURSOR_START = "00000000-0000-0000-0000-000000000000"
 
 
 def compute_recency_multiplier(age_days: float) -> float:
@@ -212,106 +217,65 @@ async def refresh_recency_scores_poll(supabase: AsyncClient, job_posting_ids: li
     return written
 
 
-async def _flush_recency_updates(supabase: AsyncClient, updates: list[dict[str, Any]]) -> int:
-    """Push one ``bulk_update_recency_scores`` RPC chunk; return rows written.
-
-    A failed chunk is logged and counted as zero — one bad batch must not
-    abort the rest of a sweep.
-    """
-    if not updates:
-        return 0
-    try:
-        await supabase.rpc("bulk_update_recency_scores", {"p_updates": updates}).execute()
-        return len(updates)
-    except Exception:
-        logger.exception("refresh recency bulk update failed")
-        return 0
-
-
 async def refresh_all_recency_scores(supabase: AsyncClient) -> int:
     """Rewrite ``recency_score`` for every live (non-excluded) scores row from
-    the current date.
+    the current date — set-based, in the database (#604).
 
     ``refresh_recency_scores_poll`` only touches the jobs a poll cycle
     re-fetched, so a posting that ages off the boards freezes at its
     last-refresh decay while its true age keeps climbing — and the /jobs
     list sorts by that stored column, so stale rows drift out of order
-    relative to the read-time displayed decay. This sweep walks ALL live jobs to build a current age
-    map, then walks ALL live score rows and recomputes ``recency_score``,
-    keeping the sort key consistent with what users see.
+    relative to the read-time displayed decay. This sweep keeps the sort key
+    current for ALL live rows.
 
-    Paginates both table walks with ``.range()`` (PostgREST caps a single
-    response at 1000 rows) ordered by ``id`` for stable paging. Flushes
-    updates in RPC-sized chunks as it goes so memory stays bounded on a large
-    corpus. Idempotent and safe to run on a schedule; a page-fetch error is
-    logged and ends that walk early (partial progress is kept — the next tick
-    finishes the rest). Returns the number of score rows written.
+    It used to do that by walking BOTH tables through PostgREST (OFFSET-paged)
+    and round-tripping every row back through ``bulk_update_recency_scores``
+    — measured on prod as the DB's #1 and #2 statements by total time
+    (~200k row-updates per night, most of them writing the value already
+    stored). Now each batch is one ``sweep_recency_scores`` call: a
+    keyset-paged, set-based UPDATE computed in SQL that skips rows whose
+    stored value wouldn't change (grace-window and floored rows stop being
+    rewritten nightly). The decay constants ride in as arguments, so this
+    module stays their single source of truth; parity of the SQL arithmetic
+    with :func:`compute_recency_score` is pinned by
+    ``tests/integration/test_recency_sweep_parity.py``.
+
+    Idempotent and safe to run on a schedule; a failed batch is logged and
+    ends the sweep early (partial progress is kept — the next tick finishes
+    the rest). Returns the number of rows whose stored value actually
+    CHANGED — the no-op writes the old walk counted are no longer performed,
+    so the scheduler's cache invalidation only fires when ordering moved.
     """
     enabled = settings.recency_decay_enabled
-    now = datetime.now(UTC)
-
-    # 1. Current age per live (non-archived) job.
-    age_by_job: dict[str, float] = {}
-    start = 0
-    while True:
-        try:
-            resp = await (
-                supabase.table("jobs")
-                .select("id, source_posted_at, cataloged_at")
-                .is_("archived_at", "null")
-                .order("id")
-                .range(start, start + _RECENCY_SWEEP_PAGE_SIZE - 1)
-                .execute()
-            )
-        except Exception:
-            logger.exception("refresh_all_recency_scores: jobs page fetch failed")
-            return 0
-        rows = cast(list[dict[str, Any]], resp.data or [])
-        for row in rows:
-            posted = row.get("source_posted_at") or row.get("cataloged_at")
-            age_by_job[row["id"]] = _age_days(posted, now)
-        if len(rows) < _RECENCY_SWEEP_PAGE_SIZE:
-            break
-        start += _RECENCY_SWEEP_PAGE_SIZE
-
-    # 2. Walk live score rows; recompute recency_score; flush in chunks.
-    updates: list[dict[str, Any]] = []
     written = 0
-    start = 0
+    cursor = _SWEEP_CURSOR_START
     while True:
         try:
-            resp = await (
-                supabase.table("scores")
-                .select("id, job_posting_id, score")
-                .eq("excluded", False)
-                .order("id")
-                .range(start, start + _RECENCY_SWEEP_PAGE_SIZE - 1)
-                .execute()
-            )
+            resp = await supabase.rpc(
+                "sweep_recency_scores",
+                {
+                    "p_enabled": enabled,
+                    "p_after_id": cursor,
+                    "p_batch_size": _SWEEP_BATCH_SIZE,
+                    "p_grace_days": float(RECENCY_GRACE_DAYS),
+                    "p_daily_decay": RECENCY_DAILY_DECAY,
+                    "p_floor": RECENCY_FLOOR,
+                },
+            ).execute()
         except Exception:
-            logger.exception("refresh_all_recency_scores: scores page fetch failed")
+            logger.exception("refresh_all_recency_scores: sweep batch failed")
             break
         rows = cast(list[dict[str, Any]], resp.data or [])
-        for row in rows:
-            age = age_by_job.get(row["job_posting_id"])
-            if age is None:
-                # Score for an archived/absent job — never shown in a list,
-                # so leave its stored recency_score untouched.
-                continue
-            updates.append(
-                {
-                    "id": row["id"],
-                    "recency_score": compute_recency_score(
-                        row.get("score") or 0, age, enabled=enabled
-                    ),
-                }
-            )
-        while len(updates) >= _RECENCY_CHUNK_SIZE:
-            written += await _flush_recency_updates(supabase, updates[:_RECENCY_CHUNK_SIZE])
-            del updates[:_RECENCY_CHUNK_SIZE]
-        if len(rows) < _RECENCY_SWEEP_PAGE_SIZE:
+        if not rows:
             break
-        start += _RECENCY_SWEEP_PAGE_SIZE
-
-    written += await _flush_recency_updates(supabase, updates)
+        batch = rows[0]
+        written += int(batch.get("written") or 0)
+        scanned = int(batch.get("scanned") or 0)
+        last_id = batch.get("last_id")
+        # The function's LIMIT applies after its liveness join, so a short
+        # batch means the id range is exhausted, not that dead rows thinned
+        # this page.
+        if scanned < _SWEEP_BATCH_SIZE or not last_id:
+            break
+        cursor = str(last_id)
     return written
