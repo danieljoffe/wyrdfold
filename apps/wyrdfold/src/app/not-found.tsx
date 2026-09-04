@@ -8,8 +8,8 @@ import WyrdfoldSidebar from './(app)/WyrdfoldSidebar';
  * `(app)/not-found.tsx` only fires when a page *inside* the `(app)`
  * group calls `notFound()`. For URLs that match nothing at all (e.g.
  * `/jobs` before that page is ported), Next.js looks for a root-level
- * `not-found.tsx` — this one. Every visitor here is signed in: the
- * proxy walls ALL unmatched paths behind /login for anonymous
+ * `not-found.tsx` — this one. For gated unmatched paths every visitor
+ * here is signed in: the proxy walls them behind /login for anonymous
  * visitors — including sub-paths of public prefixes (`/search/a/b`
  * fails the UUID-shaped allowlist and redirects; probed live for
  * #985, correcting an earlier claim here that such paths leaked the
