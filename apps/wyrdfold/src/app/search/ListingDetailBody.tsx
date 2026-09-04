@@ -128,7 +128,11 @@ export default function ListingDetailBody({
           clears the Modal's absolute ✕ (top-4 right-4) when framed as a modal;
           on the full page it's harmless breathing room. */}
       <div className='flex items-start gap-3 pr-8'>
-        <CompanyAvatar name={formatCompanyName(job.company_name)} size='lg' />
+        <CompanyAvatar
+          name={formatCompanyName(job.company_name)}
+          domain={job.company_domain}
+          size='lg'
+        />
         <div className='min-w-0 flex-1'>
           <Heading variant='component' as='h2' className='text-balance'>
             {displayTitle(job)}

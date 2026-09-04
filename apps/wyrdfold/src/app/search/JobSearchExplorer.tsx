@@ -91,12 +91,68 @@ function hueFor(name: string): number {
   return h;
 }
 
+/** Ordered logo-link tiers for a company domain (#470) — links only, per
+ *  the owner's constraint; nothing is stored. Brandfetch leads WHEN a client
+ *  id is configured (NEXT_PUBLIC_BRANDFETCH_CLIENT_ID — inlined at build
+ *  time), the token-free favicon endpoints follow, and the caller falls back
+ *  to the initials monogram when every tier errors. */
+export function logoUrlTiers(domain: string): string[] {
+  const tiers: string[] = [];
+  const clientId = process.env.NEXT_PUBLIC_BRANDFETCH_CLIENT_ID;
+  if (clientId) {
+    tiers.push(
+      `https://cdn.brandfetch.io/${encodeURIComponent(domain)}?c=${encodeURIComponent(clientId)}`
+    );
+  }
+  tiers.push(
+    `https://icons.duckduckgo.com/ip3/${encodeURIComponent(domain)}.ico`
+  );
+  tiers.push(
+    `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=64`
+  );
+  return tiers;
+}
+
 export function CompanyAvatar({
+  name,
+  domain,
+  size = 'md',
+}: {
+  name: string;
+  /** Verified company domain (#470); absent → initials monogram, as ever. */
+  domain?: string | null | undefined;
+  /** `md` on the card grid, `lg` in the detail modal header (#467 §11.2). */
+  size?: 'md' | 'lg';
+}) {
+  // Logo cascade state: index into logoUrlTiers; past the end → initials.
+  // Keyed resets via the img key below, so a new domain restarts the cascade.
+  const [tier, setTier] = useState(0);
+  const tiers = domain ? logoUrlTiers(domain) : [];
+  if (domain && tier < tiers.length) {
+    const px = size === 'lg' ? 48 : 40;
+    return (
+      <img
+        key={`${domain}:${tier}`}
+        src={tiers[tier]}
+        alt=''
+        aria-hidden
+        width={px}
+        height={px}
+        loading='lazy'
+        referrerPolicy='no-referrer'
+        className='shrink-0 rounded-md object-contain bg-white'
+        onError={() => setTier(t => t + 1)}
+      />
+    );
+  }
+  return <CompanyInitialsAvatar name={name} size={size} />;
+}
+
+function CompanyInitialsAvatar({
   name,
   size = 'md',
 }: {
   name: string;
-  /** `md` on the card grid, `lg` in the detail modal header (#467 §11.2). */
   size?: 'md' | 'lg';
 }) {
   // Shared-ui Avatar (square) carrying the deterministic per-company hue. Avatar
@@ -357,7 +413,10 @@ function JobSearchCard({
     >
       {/* header: company avatar, then role over company · location */}
       <div className='flex items-start gap-3'>
-        <CompanyAvatar name={formatCompanyName(job.company_name)} />
+        <CompanyAvatar
+          name={formatCompanyName(job.company_name)}
+          domain={job.company_domain}
+        />
         <div className='min-w-0 flex-1'>
           <span className='font-semibold transition-colors group-hover:text-text-brand'>
             {displayTitle(job)}

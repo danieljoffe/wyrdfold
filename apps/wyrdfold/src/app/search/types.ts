@@ -20,6 +20,9 @@ export interface JobSearchResult {
   // Structured salary parsed from salary_text at ingest (query-grade; the raw
   // text stays the display value; the salary filter applies server-side).
   // Optional until the FE consumes them. period: 'yearly' | 'hourly' | null.
+  /** Verified company web domain (#470) — build logo links from it; the
+   *  initials monogram is the fallback when absent or on image error. */
+  company_domain?: string | null;
   salary_min?: number | null;
   salary_max?: number | null;
   salary_currency?: string | null;
