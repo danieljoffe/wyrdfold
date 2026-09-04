@@ -219,6 +219,46 @@ describe('TargetCard', () => {
     expect(onActivate).not.toHaveBeenCalled();
   });
 
+  it('exposes an accessible name on every action-menu item (#837)', async () => {
+    // #837 observed three UNNAMED menuitems on prod (2026-08-17) — Delete
+    // sat one unlabelled row below Activate for screen-reader users. The
+    // defect lived in the shared-ui Dropdown and was fixed by a later bump;
+    // re-probed live 2026-09-04 and every item names itself from its label
+    // text. This pins the contract so a Dropdown regression (e.g. the label
+    // span going aria-hidden, or a content/label refactor) fails HERE
+    // instead of resurfacing as an unlabelled destructive action.
+    const user = userEvent.setup();
+    const { container } = render(
+      <TargetCard
+        target={makeTarget()}
+        fitScore={null}
+        fitScoreReasoning={null}
+        isActive={false}
+        onActivate={noop}
+        onRetry={noop}
+        retrying={false}
+        onDeactivate={noop}
+        onDelete={noop}
+        onViewJobs={noop}
+      />
+    );
+    await user.click(
+      container.querySelector('[aria-haspopup="menu"]') as HTMLElement
+    );
+    const items = screen.getAllByRole('menuitem');
+    expect(items).toHaveLength(3);
+    // Exact, position-independent names — the destructive one included.
+    expect(
+      screen.getByRole('menuitem', { name: 'View jobs' })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('menuitem', { name: 'Activate' })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('menuitem', { name: 'Delete' })
+    ).toBeInTheDocument();
+  });
+
   it('keeps "View jobs" enabled on a deactivated target (saved jobs stay viewable)', async () => {
     const user = userEvent.setup();
     const onViewJobs = jest.fn();
