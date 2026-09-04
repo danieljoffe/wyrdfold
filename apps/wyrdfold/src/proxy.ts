@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createServerClient } from '@supabase/ssr';
-import { allowedOrigins, allowedImageOrigins } from '@/utils/constants';
+import {
+  allowedOrigins,
+  allowedImageOrigins,
+  logoImageOrigins,
+} from '@/utils/constants';
 import { isProduction } from '@/utils/helpers';
 
 // Default post-auth destination for signed-in users. The marketing landing
@@ -51,7 +55,7 @@ function buildCspValue(
         : ''
     }
     connect-src 'self' ${[...allowedOrigins, ...extraConnectOrigins].join(' ')};
-    img-src 'self' blob: data: ${allowedImageOrigins.join(' ')};
+    img-src 'self' blob: data: ${[...allowedImageOrigins, ...logoImageOrigins].join(' ')};
 `;
   return cspHeader.replace(/\s{2,}/g, ' ').trim();
 }
@@ -98,7 +102,7 @@ function buildReportOnlyCspValue(
     form-action 'self';
     frame-ancestors 'none';
     connect-src 'self' ${[...allowedOrigins, ...extraConnectOrigins].join(' ')};
-    img-src 'self' blob: data: ${allowedImageOrigins.join(' ')};
+    img-src 'self' blob: data: ${[...allowedImageOrigins, ...logoImageOrigins].join(' ')};
 `;
   return cspHeader.replace(/\s{2,}/g, ' ').trim();
 }

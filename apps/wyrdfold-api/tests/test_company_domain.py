@@ -1,0 +1,214 @@
+"""#470: domain enrichment — candidate generation, probe ordering, writes.
+
+The probe fake answers per-domain so ordering assertions are real; the
+supabase fake records the update chain so the never-clobber guard is
+assertable (and its absence fails — see the guard test).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+import app.services.company_domain as cd
+from app.services.company_domain import (
+    candidate_domains,
+    enrich_missing_source_domains,
+    resolve_company_domain,
+)
+
+pytestmark = pytest.mark.asyncio
+
+
+# ---- candidate generation (pure) -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "slug", "expected"),
+    [
+        # Name and slug agree after normalization → one stem, two TLDs.
+        ("dbt Labs", "dbtlabs", ["dbtlabs.com", "dbtlabs.io"]),
+        # Slug carries ATS digit noise → stripped; name stem leads.
+        ("Datadog", "datadog81", ["datadog.com", "datadog.io"]),
+        # Distinct stems → name-derived first (what a human would type).
+        ("Storybook / Chromatic", "chromatic", [
+            "storybookchromatic.com",
+            "storybookchromatic.io",
+            "chromatic.com",
+            "chromatic.io",
+        ]),
+        # The pooled manual pseudo-source gets NO candidates — any domain
+        # stored there would be wrong for most of its jobs.
+        ("Manually Added", "manual", []),
+        # Too-short stems are squatter bait, not candidates.
+        ("X", "x1", []),
+    ],
+)
+def test_candidate_domains(name: str, slug: str, expected: list[str]) -> None:
+    assert candidate_domains(name, slug) == expected
+
+
+# ---- probe ordering ---------------------------------------------------------
+
+
+class _FakeHttp:
+    """Answers only the domains it's told to; records probe order."""
+
+    def __init__(self, alive: set[str], status: int = 200) -> None:
+        self._alive = alive
+        self._status = status
+        self.probed: list[str] = []
+
+    async def get(self, url: str, follow_redirects: bool = True) -> Any:
+        domain = url.removeprefix("https://")
+        self.probed.append(domain)
+        if domain not in self._alive:
+            raise ConnectionError(domain)
+        return MagicMock(status_code=self._status)
+
+
+async def test_first_answering_candidate_wins_and_stops_probing() -> None:
+    http = _FakeHttp(alive={"datadog.com", "datadog.io"})
+    got = await resolve_company_domain("Datadog", "datadog81", client=http)  # type: ignore[arg-type]
+    assert got == "datadog.com"
+    assert http.probed == ["datadog.com"]  # first hit ends the cascade
+
+
+async def test_all_misses_resolve_to_none() -> None:
+    http = _FakeHttp(alive=set())
+    assert await resolve_company_domain("Datadog", "datadog81", client=http) is None  # type: ignore[arg-type]
+    assert http.probed == ["datadog.com", "datadog.io"]
+
+
+async def test_4xx_counts_as_answering_but_5xx_does_not() -> None:
+    bot_blocked = _FakeHttp(alive={"datadog.com"}, status=403)
+    assert (
+        await resolve_company_domain("Datadog", "d", client=bot_blocked)  # type: ignore[arg-type]
+        == "datadog.com"
+    )
+    erroring = _FakeHttp(alive={"datadog.com"}, status=503)
+    assert await resolve_company_domain("Datadog", "d", client=erroring) is None  # type: ignore[arg-type]
+
+
+# ---- enrichment batch -------------------------------------------------------
+
+
+class _SourcesQuery:
+    def __init__(self, store: _FakeSupabase) -> None:
+        self._store = store
+        self._rows = list(store.rows)
+        self._update_payload: dict[str, Any] | None = None
+        self._update_id: Any = None
+        self._null_guard = False
+
+    def select(self, *_a: Any, **_kw: Any) -> _SourcesQuery:
+        return self
+
+    def is_(self, col: str, val: str) -> _SourcesQuery:
+        if self._update_payload is not None and col == "domain" and val == "null":
+            self._null_guard = True
+        else:
+            self._rows = [r for r in self._rows if r.get(col) is None]
+        return self
+
+    def gt(self, col: str, val: Any) -> _SourcesQuery:
+        self._rows = [r for r in self._rows if r[col] > val]
+        return self
+
+    def order(self, col: str) -> _SourcesQuery:
+        self._rows.sort(key=lambda r: r[col])
+        return self
+
+    def limit(self, n: int) -> _SourcesQuery:
+        self._rows = self._rows[:n]
+        return self
+
+    def update(self, payload: dict[str, Any]) -> _SourcesQuery:
+        self._update_payload = payload
+        return self
+
+    def eq(self, col: str, val: Any) -> _SourcesQuery:
+        assert col == "id"
+        self._update_id = val
+        return self
+
+    async def execute(self) -> Any:
+        if self._update_payload is not None:
+            self._store.updates.append(
+                (self._update_id, dict(self._update_payload), self._null_guard)
+            )
+            for r in self._store.rows:
+                if r["id"] == self._update_id and (not self._null_guard or r.get("domain") is None):
+                    r.update(self._update_payload)
+            return MagicMock(data=[])
+        return MagicMock(data=[dict(r) for r in self._rows])
+
+
+class _FakeSupabase:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.updates: list[tuple[Any, dict[str, Any], bool]] = []
+
+    def table(self, name: str) -> _SourcesQuery:
+        assert name == "sources"
+        return _SourcesQuery(self)
+
+
+async def test_enrich_writes_hits_with_the_never_clobber_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sb = _FakeSupabase(
+        [
+            {"id": "s1", "company_name": "Datadog", "board_token": "datadog81", "domain": None},
+            {"id": "s2", "company_name": "Deadco", "board_token": "deadco", "domain": None},
+            {"id": "s3", "company_name": "Linear", "board_token": "linear56", "domain": None},
+            {"id": "s4", "company_name": "Done", "board_token": "done", "domain": "done.com"},
+        ]
+    )
+
+    async def _fake_resolve(name: str, slug: str, *, client: Any = None) -> str | None:
+        return {"Datadog": "datadog.com", "Linear": "linear.app"}.get(name)
+
+    monkeypatch.setattr(cd, "resolve_company_domain", _fake_resolve)
+
+    examined, enriched, last_id = await enrich_missing_source_domains(sb, limit=10)  # type: ignore[arg-type]
+
+    assert (examined, enriched) == (3, 2)  # s4 already enriched → not examined
+    assert last_id == "s3"
+    assert {(u[0], u[1]["domain"]) for u in sb.updates} == {
+        ("s1", "datadog.com"),
+        ("s3", "linear.app"),
+    }
+    # Every write carried the domain-IS-NULL guard — the concurrent-write
+    # protection is part of the chain, not an accident of the fake.
+    assert all(guard for _, _, guard in sb.updates)
+
+
+async def test_enrich_keyset_cursor_skips_already_examined_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sb = _FakeSupabase(
+        [
+            {"id": "s1", "company_name": "Missville", "board_token": "m1x", "domain": None},
+            {"id": "s2", "company_name": "Hitco", "board_token": "hitco", "domain": None},
+        ]
+    )
+
+    async def _fake_resolve(name: str, slug: str, *, client: Any = None) -> str | None:
+        return "hitco.com" if name == "Hitco" else None
+
+    monkeypatch.setattr(cd, "resolve_company_domain", _fake_resolve)
+
+    examined1, enriched1, cursor = await enrich_missing_source_domains(sb, limit=1)  # type: ignore[arg-type]
+    assert (examined1, enriched1, cursor) == (1, 0, "s1")  # the miss stays NULL
+    examined2, enriched2, cursor2 = await enrich_missing_source_domains(
+        sb, limit=1, after_id=cursor  # type: ignore[arg-type]
+    )
+    assert (examined2, enriched2, cursor2) == (1, 1, "s2")  # cursor moved past the miss
+
+
+async def test_enrich_empty_null_set_is_a_noop() -> None:
+    sb = _FakeSupabase([{"id": "s1", "company_name": "A", "board_token": "a1", "domain": "a.com"}])
+    assert await enrich_missing_source_domains(sb, limit=10) == (0, 0, None)  # type: ignore[arg-type]

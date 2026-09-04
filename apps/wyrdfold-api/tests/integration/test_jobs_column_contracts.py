@@ -118,3 +118,14 @@ def test_score_floor_predicate_resolves(service_client: Client) -> None:
         .execute()
     )
     assert isinstance(resp.data, list)
+
+
+def test_search_cols_with_sources_domain_embed(service_client: Client) -> None:
+    """#470: the search projection embeds ``sources(domain)`` — a STRING
+    select PostgREST resolves at request time, i.e. the exact class the R2
+    rename broke silently. Run the real shape against live Postgres so a
+    future sources-column change fails HERE, not as a swallowed 400 in prod."""
+    from app.services.job_search import _SEARCH_COLS
+
+    resp = service_client.table("jobs").select(_SEARCH_COLS).limit(1).execute()
+    assert isinstance(resp.data, list)

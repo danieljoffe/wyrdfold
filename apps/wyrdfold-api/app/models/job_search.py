@@ -38,6 +38,10 @@ class JobSearchResult(BaseModel):
     salary_max: float | None = None
     salary_currency: str | None = None
     salary_period: str | None = None
+    # Verified company web domain from the source row (#470) — clients BUILD
+    # logo links from it (Brandfetch/favicon cascade) and fall back to the
+    # initials monogram when absent or when the image errors. Never an image.
+    company_domain: str | None = None
     # Link to the ORIGINAL posting (Greenhouse/Ashby/…). Public results point at
     # the source rather than republishing the full JD.
     absolute_url: str | None = None
