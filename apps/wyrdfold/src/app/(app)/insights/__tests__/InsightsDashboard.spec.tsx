@@ -236,10 +236,18 @@ describe('InsightsDashboard', () => {
   });
 });
 
+// Minimal target-comparison row; charts are dynamic-mocked, so only the
+// list's presence matters to the banners under test.
+const TARGET_ROW = { id: 't1', label: 'Target One' } as never;
+
 describe('Trends empty state (#844 §7)', () => {
   it('names the empty state when there is no application activity', () => {
     mockUseInsights.mockReturnValue({
       ...READY_STATE,
+      // An active target exists (#842's banner would otherwise take over —
+      // with no active targets the missing-activation state is the more
+      // fundamental one to name).
+      targets: { ...READY_STATE.targets, targets: [TARGET_ROW] },
       pipeline: {
         ...READY_STATE.pipeline,
         total_applications: 0,
@@ -262,5 +270,34 @@ describe('Trends empty state (#844 §7)', () => {
     mockUseInsights.mockReturnValue(LOADING_STATE);
     render(<InsightsDashboard />);
     expect(screen.queryByText(/nothing to chart yet/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('No-active-targets state (#842)', () => {
+  it('names the missing-activation state and links to /targets', () => {
+    mockUseInsights.mockReturnValue(READY_STATE); // targets: []
+    render(<InsightsDashboard />);
+    expect(screen.getByText(/no active targets/i)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /targets page/i })).toHaveAttribute(
+      'href',
+      '/targets'
+    );
+    // It replaces — not stacks with — the #844 pipeline banner.
+    expect(screen.queryByText(/nothing to chart yet/i)).not.toBeInTheDocument();
+  });
+
+  it('stays silent when an active target exists', () => {
+    mockUseInsights.mockReturnValue({
+      ...READY_STATE,
+      targets: { ...READY_STATE.targets, targets: [TARGET_ROW] },
+    });
+    render(<InsightsDashboard />);
+    expect(screen.queryByText(/no active targets/i)).not.toBeInTheDocument();
+  });
+
+  it('stays silent while the targets payload is still loading', () => {
+    mockUseInsights.mockReturnValue(LOADING_STATE);
+    render(<InsightsDashboard />);
+    expect(screen.queryByText(/no active targets/i)).not.toBeInTheDocument();
   });
 });
