@@ -16,6 +16,8 @@ import app.services.company_domain as cd
 from app.services.company_domain import (
     candidate_domains,
     enrich_missing_source_domains,
+    homepage_is_usable,
+    page_title,
     resolve_company_domain,
 )
 
@@ -33,12 +35,16 @@ pytestmark = pytest.mark.asyncio
         # Slug carries ATS digit noise → stripped; name stem leads.
         ("Datadog", "datadog81", ["datadog.com", "datadog.io"]),
         # Distinct stems → name-derived first (what a human would type).
-        ("Storybook / Chromatic", "chromatic", [
-            "storybookchromatic.com",
-            "storybookchromatic.io",
-            "chromatic.com",
-            "chromatic.io",
-        ]),
+        (
+            "Storybook / Chromatic",
+            "chromatic",
+            [
+                "storybookchromatic.com",
+                "storybookchromatic.io",
+                "chromatic.com",
+                "chromatic.io",
+            ],
+        ),
         # The pooled manual pseudo-source gets NO candidates — any domain
         # stored there would be wrong for most of its jobs.
         ("Manually Added", "manual", []),
@@ -56,9 +62,10 @@ def test_candidate_domains(name: str, slug: str, expected: list[str]) -> None:
 class _FakeHttp:
     """Answers only the domains it's told to; records probe order."""
 
-    def __init__(self, alive: set[str], status: int = 200) -> None:
+    def __init__(self, alive: set[str], status: int = 200, title: str = "Acme") -> None:
         self._alive = alive
         self._status = status
+        self._title = title
         self.probed: list[str] = []
 
     async def get(self, url: str, follow_redirects: bool = True) -> Any:
@@ -66,7 +73,8 @@ class _FakeHttp:
         self.probed.append(domain)
         if domain not in self._alive:
             raise ConnectionError(domain)
-        return MagicMock(status_code=self._status)
+        # Real responses carry a body; the resolver reads <title> from it.
+        return MagicMock(status_code=self._status, text=f"<title>{self._title}</title>")
 
 
 async def test_first_answering_candidate_wins_and_stops_probing() -> None:
@@ -82,7 +90,7 @@ async def test_all_misses_resolve_to_none() -> None:
     assert http.probed == ["datadog.com", "datadog.io"]
 
 
-async def test_4xx_counts_as_answering_but_5xx_does_not() -> None:
+async def test_bot_blocked_4xx_still_answers_but_5xx_does_not() -> None:
     bot_blocked = _FakeHttp(alive={"datadog.com"}, status=403)
     assert (
         await resolve_company_domain("Datadog", "d", client=bot_blocked)  # type: ignore[arg-type]
@@ -204,7 +212,9 @@ async def test_enrich_keyset_cursor_skips_already_examined_rows(
     examined1, enriched1, cursor = await enrich_missing_source_domains(sb, limit=1)  # type: ignore[arg-type]
     assert (examined1, enriched1, cursor) == (1, 0, "s1")  # the miss stays NULL
     examined2, enriched2, cursor2 = await enrich_missing_source_domains(
-        sb, limit=1, after_id=cursor  # type: ignore[arg-type]
+        sb,
+        limit=1,
+        after_id=cursor,  # type: ignore[arg-type]
     )
     assert (examined2, enriched2, cursor2) == (1, 1, "s2")  # cursor moved past the miss
 
@@ -212,3 +222,89 @@ async def test_enrich_keyset_cursor_skips_already_examined_rows(
 async def test_enrich_empty_null_set_is_a_noop() -> None:
     sb = _FakeSupabase([{"id": "s1", "company_name": "A", "board_token": "a1", "domain": "a.com"}])
     assert await enrich_missing_source_domains(sb, limit=10) == (0, 0, None)  # type: ignore[arg-type]
+
+
+# ---- accuracy fixes, from the 250-source prod measurement -------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "slug", "expected_first"),
+    [
+        # Every one of these mapped to a SQUATTER before the rule: stripping
+        # the dot yields a stem squatters register precisely because the real
+        # company exists.
+        ("Proton.ai", "proton", "proton.ai"),
+        ("primer.io", "primerio", "primer.io"),
+        ("Covariance.ai", "covariance", "covariance.ai"),
+    ],
+)
+def test_a_name_carrying_its_own_tld_is_the_first_candidate(
+    name: str, slug: str, expected_first: str
+) -> None:
+    cands = candidate_domains(name, slug)
+    assert cands[0] == expected_first
+    # ...and the squatter-shaped guess is still available as a fallback, just
+    # never ahead of the real thing.
+    assert expected_first.replace(".", "") + ".com" in cands
+
+
+def test_a_trailing_dot_or_unknown_suffix_is_not_treated_as_a_domain() -> None:
+    # "Acme Inc." must not become the domain "acme.inc".
+    assert candidate_domains("Acme Inc.", "acme")[0] == "acmeinc.com"
+
+
+@pytest.mark.parametrize(
+    ("status", "title", "usable"),
+    [
+        # Registrar parking — the costly class: it 200s and serves a
+        # REGISTRAR's favicon where an employer's logo belongs.
+        (200, "ProtonAI.com for sale | Spaceship.com", False),
+        (200, "Covariance.io is for sale | HugeDomains", False),
+        # Answered, but not a homepage.
+        (200, "Index of /", False),
+        (404, "Page not found", False),
+        (410, "", False),
+        (503, "", False),
+        # Bot defences on the CORRECT domain — accepted, because rejecting
+        # these throws away right answers (mastercard.com, littelfuse.com and
+        # onemedical.com all look like this).
+        (403, "Access Denied", True),
+        (200, "Just a moment...", True),
+        (401, "", True),
+        # Plenty of real sites ship no title at all.
+        (200, "", True),
+        (200, "Datadog Cloud Monitoring as a Service", True),
+    ],
+)
+def test_homepage_usability_rules(status: int, title: str, usable: bool) -> None:
+    assert homepage_is_usable(status, title) is usable
+
+
+def test_page_title_extracts_and_collapses() -> None:
+    assert page_title("<html><head><TITLE>  Acme\n  Corp </TITLE>") == "Acme Corp"
+    assert page_title("<html><body>no title</body></html>") == ""
+
+
+async def test_resolver_skips_a_parked_domain_and_takes_the_next_candidate() -> None:
+    """End-to-end over the probe: a parking page must not win, and the
+    cascade must continue rather than giving up on the company."""
+
+    class _Http:
+        def __init__(self) -> None:
+            self.seen: list[str] = []
+
+        async def get(self, url: str, follow_redirects: bool = True) -> Any:
+            d = url.removeprefix("https://")
+            self.seen.append(d)
+            if d == "acme.com":
+                return MagicMock(
+                    status_code=200, text="<title>Acme.com is for sale | HugeDomains</title>"
+                )
+            if d == "acme.io":
+                return MagicMock(status_code=200, text="<title>Acme — we make things</title>")
+            raise ConnectionError(d)
+
+    http = _Http()
+    got = await resolve_company_domain("Acme", "acme", client=http)  # type: ignore[arg-type]
+    assert got == "acme.io"
+    assert http.seen == ["acme.com", "acme.io"]

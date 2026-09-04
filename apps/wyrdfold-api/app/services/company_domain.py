@@ -16,14 +16,14 @@ Design constraints (docs/research-wyrdfold-company-logos.md):
 
 - **Links only, ever** — nothing here fetches or stores an image; the
   client builds provider URLs from the stored domain.
-- **Verification is "answers HTTP", and that is WEAK.** Any non-5xx
-  response counts — 403, 404, a parking page, or an unrelated live site
-  that happens to own the guessed stem. When the guess is wrong, the
-  consequence is NOT "falls back to initials": if that wrong domain
-  serves a valid favicon, the UI renders ANOTHER COMPANY'S LOGO, and
-  only a domain whose logo requests all fail lands on the monogram.
-  Measured example: ``Linear`` resolves to ``linear.io``; the real
-  company is ``linear.app``.
+- **Verification is best-effort, and a wrong guess is NOT harmless.** If a
+  wrong-but-live domain serves a valid favicon the UI renders ANOTHER
+  COMPANY'S LOGO — only a domain whose logo requests all fail lands on the
+  monogram. Measured example that survives even the checks below:
+  ``Linear`` resolves to ``linear.io``; the real company is ``linear.app``.
+  A 250-source prod sample put the error rate at ~7-8% of stored domains
+  before :func:`homepage_is_usable` and the name-is-domain rule; the
+  residual is quieter mistakes rather than parking pages.
 
   This is why the enrichment does not run itself. There is no scheduled
   tick and no source-creation hook — a human runs the backfill script
@@ -70,6 +70,55 @@ _PSEUDO_SOURCE_NAMES = frozenset({"manually added"})
 # ``x`` collide with squatters far more often than they hit the company).
 _STEM_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 
+# TLDs a company name may carry as part of its BRAND ("Proton.ai",
+# "primer.io"). Measured on 250 prod sources: every such name was mapped to a
+# domain SQUATTER, because stripping the dot yields a stem
+# ("protonai") that squatters register precisely BECAUSE the real company
+# exists. The name is the domain; try it before inventing anything.
+_BRAND_TLDS = ("ai", "io", "com", "co", "app", "dev", "so", "sh", "xyz", "tech")
+_NAME_IS_DOMAIN_RE = re.compile(r"^([a-z0-9][a-z0-9-]{1,62})\.(" + "|".join(_BRAND_TLDS) + r")$")
+
+# A homepage that answers but is not the company's. Registrar parking pages
+# are the costly class: they resolve, they 200, and they serve a REGISTRAR's
+# favicon — so the UI renders a for-sale page's branding as an employer's
+# logo. Measured: 5 of 216 stored domains on the 250-source sample.
+_PARKED_TITLE_RE = re.compile(
+    r"for sale|hugedomains|buy this domain|domain (?:is )?(?:for sale|broker)|"
+    r"parked (?:free )?(?:at|by)|spaceship\.com|afternic|sedo|dan\.com",
+    re.I,
+)
+# Answered, but it is not a homepage at all.
+_NOT_A_HOMEPAGE_RE = re.compile(r"^\s*(?:index of\s*/|page not found|404\b|not found)", re.I)
+_TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+
+
+def page_title(html: str) -> str:
+    """The document <title>, collapsed; "" when absent. Bounded read — a
+    homepage's title is in the first few KB and some sites are enormous."""
+    m = _TITLE_TAG_RE.search(html[:200_000])
+    return re.sub(r"\s+", " ", m.group(1)).strip()[:200] if m else ""
+
+
+def homepage_is_usable(status: int, title: str) -> bool:
+    """Is this response the company's own homepage? (pure, so the resolver
+    and the accuracy measurement cannot drift apart)
+
+    Deliberately asymmetric, from the 250-source measurement:
+
+    - **4xx-that-means-blocked is ACCEPTED.** ``mastercard.com``,
+      ``littelfuse.com`` and ``onemedical.com`` all answered "Access Denied"
+      or 403 — correct domains behind bot protection. Rejecting those would
+      throw away right answers to punish a defence.
+    - **404/410 is REJECTED.** A homepage that does not exist is not a
+      company site (``ttmtech.com`` → "Page not found").
+    - **Registrar / for-sale titles are REJECTED** — the parked-domain class.
+    - **An empty or echoing title is ACCEPTED.** Plenty of real sites ship no
+      title, and demanding one would cost more right answers than it saves.
+    """
+    if status >= 500 or status in (404, 410):
+        return False
+    return not (_PARKED_TITLE_RE.search(title) or _NOT_A_HOMEPAGE_RE.search(title))
+
 
 def _stem_from_name(company_name: str) -> str | None:
     """``"dbt Labs"`` -> ``dbtlabs``; None when nothing plausible remains."""
@@ -96,25 +145,35 @@ def candidate_domains(company_name: str, board_token: str) -> list[str]:
     """
     if company_name.strip().lower() in _PSEUDO_SOURCE_NAMES:
         return []
+    out: list[str] = []
+    # The name already carries its TLD → it IS the domain, and guessing past
+    # it lands on a squatter (measured 3/3). Always first.
+    branded = _NAME_IS_DOMAIN_RE.match(company_name.strip().lower())
+    if branded:
+        out.append(branded.group(0))
     stems: list[str] = []
     for stem in (_stem_from_name(company_name), _stem_from_slug(board_token)):
         if stem and stem not in stems:
             stems.append(stem)
-    return [f"{stem}{tld}" for stem in stems for tld in _CANDIDATE_TLDS]
+    for stem in stems:
+        for tld in _CANDIDATE_TLDS:
+            cand = f"{stem}{tld}"
+            if cand not in out:
+                out.append(cand)
+    return out
 
 
 async def _answers_http(client: httpx.AsyncClient, domain: str) -> bool:
-    """True when ``https://{domain}`` answers with any non-5xx status.
-
-    4xx counts as answering — a site that 403s bots still exists and its
-    logo endpoints usually work. Connection/TLS/DNS failures and 5xx do
-    not. Never raises.
-    """
+    """True when ``https://{domain}`` serves something that looks like the
+    company's own homepage — see :func:`homepage_is_usable` for the rules and
+    the measurements behind them. Never raises."""
     try:
         resp = await client.get(f"https://{domain}", follow_redirects=True)
+        # Body decode is inside the try on purpose: a homepage that serves
+        # undecodable bytes must fail this candidate, not the whole sweep.
+        return homepage_is_usable(resp.status_code, page_title(resp.text))
     except Exception:
         return False
-    return resp.status_code < 500
 
 
 async def resolve_company_domain(
