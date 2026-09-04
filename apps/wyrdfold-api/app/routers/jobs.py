@@ -782,8 +782,19 @@ def _scores_live_join(query: Any, *, archived_view: bool) -> Any:
     """
     if archived_view:
         return query
+    # ``job_is_live`` is the trigger-maintained twin of the embed gate below
+    # (jobs_sync_scores_denorm keeps it equal to ``archived_at IS NULL AND
+    # purged_at IS NULL AND is_us IS NOT FALSE``; prod-verified zero drift over
+    # all live rows, #604). Filtering on it HERE — at the scores layer — is
+    # what lets the candidate-window indexes (partial on ``job_is_live AND NOT
+    # excluded``, ordered like the window) serve the query LIMIT-driven.
+    # Without it the planner derived liveness through the join and walked
+    # every live job probing scores (measured 2.8s / ~89k buffers per window).
+    # The embed gate stays: if the denorm column ever drifts, the join keeps
+    # the intersection — a stale row hides rather than resurfaces.
     return (
-        query.is_("jobs.archived_at", "null")
+        query.eq("job_is_live", True)
+        .is_("jobs.archived_at", "null")
         .is_("jobs.purged_at", "null")
         .not_.is_("jobs.is_us", "false")
     )
