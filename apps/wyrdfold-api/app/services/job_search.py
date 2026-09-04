@@ -42,8 +42,24 @@ logger = logging.getLogger(__name__)
 _SEARCH_COLS = (
     "id, title, title_display, company_name, location, city, state, country, location_remote, "
     "salary_text, salary_min, salary_max, salary_currency, "
-    "salary_period, absolute_url, source_posted_at, cataloged_at"
+    "salary_period, absolute_url, source_posted_at, cataloged_at, "
+    # #470: the source row's verified company domain rides the existing
+    # jobs.source_id FK as a (left-join) embed — clients build logo links
+    # from it. Flattened to ``company_domain`` before model validation.
+    "sources(domain)"
 )
+
+
+def _flatten_source_domain(row: dict[str, Any]) -> dict[str, Any]:
+    """``{"sources": {"domain": d}}`` -> ``{"company_domain": d}`` (#470).
+
+    The embed is a LEFT join (no ``!inner`` — a job must never vanish from
+    search because its source lacks a domain), so ``sources`` may be None.
+    """
+    embedded = row.pop("sources", None)
+    row["company_domain"] = embedded.get("domain") if isinstance(embedded, dict) else None
+    return row
+
 
 # Salary-floor ceiling — mirrors the parser's plausibility cap (no real posted
 # salary exceeds $5M/yr), so the router bound and the data agree.
@@ -296,7 +312,7 @@ async def search_jobs(
     rows.sort(key=lambda r: _rank_key(query_groups, r), reverse=True)
     page = rows[offset : offset + limit]
     has_more = len(rows) > offset + limit
-    return [JobSearchResult.model_validate(r) for r in page], has_more
+    return [JobSearchResult.model_validate(_flatten_source_domain(r)) for r in page], has_more
 
 
 async def get_listing(supabase: AsyncClient, listing_id: str) -> JobSearchResult | None:
@@ -327,7 +343,7 @@ async def get_listing(supabase: AsyncClient, listing_id: str) -> JobSearchResult
     rows = cast(list[dict[str, Any]], resp.data or [])
     if not rows:
         return None
-    result = JobSearchResult.model_validate(rows[0])
+    result = JobSearchResult.model_validate(_flatten_source_domain(rows[0]))
     await attach_snippets(supabase, [result])
     return result
 

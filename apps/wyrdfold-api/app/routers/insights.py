@@ -106,11 +106,30 @@ def _empty_skills_cost() -> SkillsCostInsights:
 
 
 async def _user_target_ids(supabase: AsyncClient, user_id: str) -> set[str]:
-    """Any-status target ids for the user. An async inline of
-    ``crud.get_user_target_ids`` (which stays sync for its sync callers) — an
-    async handler holds the async user client and can't hand it to that sync
-    helper (#57 slice 3)."""
-    resp = await supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
+    """ACTIVE target ids for the user — the scope every insights surface
+    aggregates over.
+
+    Active-only since #842: these feed the dashboard's advertised counts
+    (score distribution chips, target comparison), and those counts link
+    into /jobs — which lists ACTIVE targets only. Aggregating any-status
+    memberships here made the dashboard promise numbers the destination
+    couldn't honour (2,096 jobs one click from "No active targets"), and
+    jobs are only matched against active targets anyway, so any-status
+    counts described work that wasn't happening. The zero-ACTIVE case
+    reuses each endpoint's existing empty payload; the FE names the state
+    and points at activation.
+
+    An async inline of ``crud.get_user_target_ids`` (which stays sync for
+    its sync callers) — an async handler holds the async user client and
+    can't hand it to that sync helper (#57 slice 3).
+    """
+    resp = await (
+        supabase.table("user_targets")
+        .select("target_id")
+        .eq("user_id", user_id)
+        .eq("is_active", True)
+        .execute()
+    )
     rows = cast(list[dict[str, Any]], resp.data or [])
     return {r["target_id"] for r in rows}
 

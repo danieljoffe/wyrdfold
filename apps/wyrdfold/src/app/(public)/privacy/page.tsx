@@ -455,6 +455,16 @@ const SECTIONS: LegalSection[] = [
           your browser and does not track you between sites.
         </p>
         <p>
+          <b>Company logos</b> on job listings are images loaded directly by
+          your browser from <b>Brandfetch</b> and <b>DuckDuckGo</b>, addressed
+          by the employer&rsquo;s web domain. Those providers therefore see your
+          IP address, your browser type, and which company&rsquo;s logo was
+          requested. We send them no account identifier and no referring page,
+          they set no cookies we use, and we store no images ourselves — only
+          the employer domain the link is built from. If a logo does not load,
+          the listing falls back to a plain initials tile.
+        </p>
+        <p>
           You can control cookies through your browser. WyrdFold does not
           currently respond to browser “Do Not Track” signals.
         </p>

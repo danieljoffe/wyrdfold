@@ -154,9 +154,10 @@ async def test_route_returns_empty_shape_for_user_with_no_targets():
     from app.routers.insights import near_miss_insights
 
     caller = MagicMock()
-    # user_targets membership read → no rows.
-    caller.table.return_value.select.return_value.eq.return_value.execute = MagicMock(
-        return_value=_awaitable(MagicMock(data=[]))
+    # user_targets membership read → no rows. The chain ends with TWO ``.eq``
+    # calls since #842 (user_id + is_active) — mock the second link.
+    caller.table.return_value.select.return_value.eq.return_value.eq.return_value.execute = (
+        MagicMock(return_value=_awaitable(MagicMock(data=[])))
     )
     service = MagicMock()
 
