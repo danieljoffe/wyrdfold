@@ -198,6 +198,32 @@ def test_jobs_filters_patch_merges_and_deletes(client_factory):
     update_chain.assert_called_once_with({"jobs_filter_prefs": merged})
 
 
+def test_jobs_filters_patch_rejects_accretion_past_16kb(client_factory):
+    # The #994 review's blocker: each patch was size-checked individually,
+    # so several valid patches could grow the stored map past the 16KB
+    # whole-map invariant — and the response model's own validator would
+    # then 500 AFTER the write. The merged map now validates through the
+    # canonical model BEFORE anything persists: stored ~12KB + a valid
+    # ~8KB patch -> merged >16KB -> 422, update never called.
+    stored = {f"t-{i}": {"search": "x" * 900} for i in range(13)}  # ~12KB
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([_filters_row(stored)]))
+    )
+    update_chain = sb.table.return_value.update
+    update_chain.return_value.eq.return_value.execute = AsyncMock(return_value=_Resp(None))
+    client = client_factory(sb)
+
+    r = client.patch(
+        "/profile/jobs-filters",
+        json={"filters": {f"n-{i}": {"search": "y" * 900} for i in range(8)}},  # ~8KB
+    )
+
+    assert r.status_code == 422
+    assert "after merge" in r.text and "too large" in r.text
+    update_chain.assert_not_called()
+
+
 def test_jobs_filters_patch_rejects_merge_past_the_map_cap(client_factory):
     # Patches must not accrete past the whole-map bound: 60 stored + 5 new
     # distinct keys = 65 > 64 -> refused, nothing written.
@@ -216,7 +242,7 @@ def test_jobs_filters_patch_rejects_merge_past_the_map_cap(client_factory):
     )
 
     assert r.status_code == 422
-    assert "after merge" in r.text
+    assert "after merge" in r.text and "too many" in r.text
     update_chain.assert_not_called()
 
 

@@ -20,6 +20,7 @@ from typing import Any, cast, get_args
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 from supabase import AsyncClient
 
 from app.config import settings
@@ -550,13 +551,22 @@ async def patch_jobs_filter_prefs(
             merged.pop(key, None)
         else:
             merged[key] = snapshot
-    if len(merged) > 64:
+    # The MERGED map must satisfy the canonical whole-map invariant (64 keys
+    # AND 16KB serialized) BEFORE anything persists — validated through the
+    # same model the GET serves, so the two bounds can't drift. The first
+    # cut re-capped only the key count: individually-valid patches could
+    # accrete past 16KB, and the response model's own validator would then
+    # reject the map AFTER the write — a 500 on state already persisted
+    # (the #994 review's blocker).
+    try:
+        validated = JobsFilterPrefs(filters=merged)
+    except ValidationError as exc:
         raise HTTPException(
             status_code=422,
-            detail="too many filter snapshots after merge (max 64)",
-        )
-    await _update_profile(supabase, user_id, {"jobs_filter_prefs": merged})
-    return JobsFilterPrefs(filters=merged)
+            detail=f"filter snapshots invalid after merge: {exc.errors()[0]['msg']}",
+        ) from exc
+    await _update_profile(supabase, user_id, {"jobs_filter_prefs": validated.filters})
+    return validated
 
 
 @router.get("/llm-usage", response_model=LlmUsageResponse)
