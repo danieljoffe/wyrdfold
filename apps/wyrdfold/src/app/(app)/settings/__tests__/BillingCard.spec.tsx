@@ -126,7 +126,7 @@ describe('BillingCard', () => {
   it('says nothing when there is no billing param', async () => {
     (global.fetch as jest.Mock).mockResolvedValue(jsonOk(account()));
     render(<BillingCard />);
-    await screen.findByText(/Free \(bring your own key\)/);
+    await screen.findByText(/^Free$/);
     expect(mockToast).not.toHaveBeenCalled();
     expect(mockReplace).not.toHaveBeenCalled();
   });
@@ -170,9 +170,7 @@ describe('BillingCard', () => {
     (global.fetch as jest.Mock).mockResolvedValueOnce(jsonOk(account()));
     render(<BillingCard />);
 
-    expect(
-      await screen.findByText(/Free \(bring your own key\)/)
-    ).toBeInTheDocument();
+    expect(await screen.findByText(/^Free$/)).toBeInTheDocument();
     expect(
       screen.getByRole('button', { name: /Get Starter/ })
     ).toBeInTheDocument();
@@ -258,5 +256,59 @@ describe('BillingCard', () => {
     expect(
       await screen.findByText(/Your own OpenRouter key pays/)
     ).toBeInTheDocument();
+  });
+});
+
+describe('BillingCard free-plan copy vs server BYOK capability (#858)', () => {
+  beforeEach(() => {
+    searchParamsValue = new URLSearchParams();
+    global.fetch = jest.fn() as jest.Mock;
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('no-BYOK server: stops saying "add one above" and points at plans', async () => {
+    // #858: "add one above" pointed at key fields the API-keys card had just
+    // said are unavailable — and this screen is what every canceled or
+    // payment-failed subscriber lands on (plan="free" on any non-active
+    // status).
+    (global.fetch as jest.Mock).mockResolvedValue(
+      jsonOk({
+        plan: 'free',
+        has_billing_account: false,
+        byok: false,
+        byok_available: false,
+      })
+    );
+    render(<BillingCard />);
+    expect(
+      await screen.findByText(
+        /bring-your-own-key isn't offered on this server/i
+      )
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/add one above/i)).not.toBeInTheDocument();
+  });
+
+  it('BYOK-capable server keeps the add-a-key path', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(
+      jsonOk({
+        plan: 'free',
+        has_billing_account: false,
+        byok: false,
+        byok_available: true,
+      })
+    );
+    render(<BillingCard />);
+    expect(await screen.findByText(/add one above/i)).toBeInTheDocument();
+  });
+
+  it('pre-#858 API payload (no byok_available) keeps the old copy — mixed-deploy window', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue(
+      jsonOk(account({ plan: 'free' }))
+    );
+    render(<BillingCard />);
+    expect(await screen.findByText(/add one above/i)).toBeInTheDocument();
   });
 });

@@ -139,3 +139,132 @@ def test_patch_allows_disabling_email_even_when_unconfigured(
         json={"job_notifications_enabled": False},
     )
     assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# #866 — /profile/jobs-filters (server-side /jobs filter snapshots)
+# ---------------------------------------------------------------------------
+
+
+def _filters_row(prefs: Any) -> dict[str, Any]:
+    return {"jobs_filter_prefs": prefs}
+
+
+def test_jobs_filters_get_returns_stored_map(client_factory):
+    stored = {"t-1": {"search": "react"}, "__all__": {"country": "US"}}
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([_filters_row(stored)]))
+    )
+    client = client_factory(sb)
+    r = client.get("/profile/jobs-filters")
+    assert r.status_code == 200
+    assert r.json() == {"filters": stored}
+
+
+def test_jobs_filters_get_null_column_is_empty_map(client_factory):
+    # Rows predating the #866 column (or an explicit NULL) must serve {}.
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([_filters_row(None)]))
+    )
+    client = client_factory(sb)
+    r = client.get("/profile/jobs-filters")
+    assert r.status_code == 200
+    assert r.json() == {"filters": {}}
+
+
+def test_jobs_filters_patch_merges_and_deletes(client_factory):
+    # PATCH-merge (#866 e2e lesson): a patch of only the CHANGED keys must be
+    # safe to send without ever having read the map — value replaces, None
+    # deletes, untouched keys survive.
+    stored = {"t-old": {"search": "react"}, "t-gone": {"search": "x"}}
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([_filters_row(stored)]))
+    )
+    update_chain = sb.table.return_value.update
+    update_chain.return_value.eq.return_value.execute = AsyncMock(return_value=_Resp(None))
+    client = client_factory(sb)
+
+    r = client.patch(
+        "/profile/jobs-filters",
+        json={"filters": {"t-new": {"search": "python"}, "t-gone": None}},
+    )
+
+    assert r.status_code == 200
+    merged = {"t-old": {"search": "react"}, "t-new": {"search": "python"}}
+    assert r.json() == {"filters": merged}
+    update_chain.assert_called_once_with({"jobs_filter_prefs": merged})
+
+
+def test_jobs_filters_patch_rejects_accretion_past_16kb(client_factory):
+    # The #994 review's blocker: each patch was size-checked individually,
+    # so several valid patches could grow the stored map past the 16KB
+    # whole-map invariant — and the response model's own validator would
+    # then 500 AFTER the write. The merged map now validates through the
+    # canonical model BEFORE anything persists: stored ~12KB + a valid
+    # ~8KB patch -> merged >16KB -> 422, update never called.
+    stored = {f"t-{i}": {"search": "x" * 900} for i in range(13)}  # ~12KB
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([_filters_row(stored)]))
+    )
+    update_chain = sb.table.return_value.update
+    update_chain.return_value.eq.return_value.execute = AsyncMock(return_value=_Resp(None))
+    client = client_factory(sb)
+
+    r = client.patch(
+        "/profile/jobs-filters",
+        json={"filters": {f"n-{i}": {"search": "y" * 900} for i in range(8)}},  # ~8KB
+    )
+
+    assert r.status_code == 422
+    assert "after merge" in r.text and "too large" in r.text
+    update_chain.assert_not_called()
+
+
+def test_jobs_filters_patch_rejects_merge_past_the_map_cap(client_factory):
+    # Patches must not accrete past the whole-map bound: 60 stored + 5 new
+    # distinct keys = 65 > 64 -> refused, nothing written.
+    stored = {f"t-{i}": {"search": "x"} for i in range(60)}
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute = (
+        AsyncMock(return_value=_Resp([_filters_row(stored)]))
+    )
+    update_chain = sb.table.return_value.update
+    update_chain.return_value.eq.return_value.execute = AsyncMock(return_value=_Resp(None))
+    client = client_factory(sb)
+
+    r = client.patch(
+        "/profile/jobs-filters",
+        json={"filters": {f"n-{i}": {"search": "y"} for i in range(5)}},
+    )
+
+    assert r.status_code == 422
+    assert "after merge" in r.text and "too many" in r.text
+    update_chain.assert_not_called()
+
+
+def test_jobs_filters_patch_rejects_too_many_keys(client_factory):
+    # The caps keep the column from becoming an unbounded dumping ground —
+    # prove the guard actually refuses, not just that valid input passes.
+    sb = MagicMock()
+    client = client_factory(sb)
+    r = client.patch(
+        "/profile/jobs-filters",
+        json={"filters": {f"t-{i}": {"search": "x"} for i in range(65)}},
+    )
+    assert r.status_code == 422
+    assert "too many" in r.text
+
+
+def test_jobs_filters_patch_rejects_oversized_blob(client_factory):
+    sb = MagicMock()
+    client = client_factory(sb)
+    r = client.patch(
+        "/profile/jobs-filters",
+        json={"filters": {"t-1": {"search": "x" * 17_000}}},
+    )
+    assert r.status_code == 422
+    assert "too large" in r.text

@@ -174,6 +174,34 @@ export default function SettingsPage() {
   const [smsDailyLimit, setSmsDailyLimit] = useState('5');
   const [listMinScoreRaw, setListMinScoreRaw] = useState('');
   const [savingStyle, setSavingStyle] = useState(false);
+  // #844 §4: the export-style preview shows YOUR identity when it's on file
+  // (one route away on /profile) instead of a placeholder person. Best-effort
+  // read — null keeps the per-field sample fallbacks.
+  const [previewIdentity, setPreviewIdentity] = useState<{
+    name?: string | null;
+    email?: string | null;
+    location?: string | null;
+  } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/profile/identity')
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => {
+        if (!cancelled && data) {
+          setPreviewIdentity({
+            name: data.name,
+            email: data.email,
+            location: data.location,
+          });
+        }
+      })
+      .catch(() => {
+        // Preview identity is a nicety — the sample fallback is fine.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const [stylePreset, setStylePreset] = useState<ResumeStylePreset>(
     DEFAULT_RESUME_STYLE.preset
   );
@@ -510,7 +538,11 @@ export default function SettingsPage() {
                   options={ACCENT_OPTIONS}
                 />
               </div>
-              <ResumeStylePreview preset={stylePreset} accent={styleAccent} />
+              <ResumeStylePreview
+                preset={stylePreset}
+                accent={styleAccent}
+                identity={previewIdentity}
+              />
             </CardContent>
           </Card>
 

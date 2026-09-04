@@ -8,6 +8,14 @@ import {
 interface ResumeStylePreviewProps {
   preset: ResumeStylePreset;
   accent: ResumeStyleAccent;
+  /** #844 §4: the control's job is "see how YOUR export will look", and it
+   *  rendered someone else's name. Real identity fields when on file; each
+   *  falls back to the sample per-field (a fresh account has none). */
+  identity?: {
+    name?: string | null;
+    email?: string | null;
+    location?: string | null;
+  } | null;
 }
 
 /**
@@ -22,7 +30,13 @@ interface ResumeStylePreviewProps {
 export function ResumeStylePreview({
   preset,
   accent,
+  identity,
 }: ResumeStylePreviewProps) {
+  const name = identity?.name?.trim() || 'Name LastName';
+  const contactLine = [
+    identity?.location?.trim() || 'Remote, USA',
+    identity?.email?.trim() || 'user@example.com',
+  ].join(' · ');
   const p = PRESET_PREVIEW[preset];
   const color = ACCENT_HEX[accent];
   // pt → px (CSS px ≈ pt × 96/72).
@@ -42,10 +56,10 @@ export function ResumeStylePreview({
       }}
     >
       <div style={{ fontSize: px(p.namePt), color, fontWeight: 700 }}>
-        Name LastName
+        {name}
       </div>
       <div style={{ fontSize: px(p.bodyPt), color: '#555555' }}>
-        Remote, USA · user@example.com
+        {contactLine}
       </div>
       <div
         style={{

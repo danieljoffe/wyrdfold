@@ -1,94 +1,197 @@
 'use client';
 
 /**
- * Per-target filter persistence in localStorage.
+ * Per-target /jobs filter persistence — SERVER-SIDE since #866.
  *
- * The /jobs page used to lose filter state any time the user navigated
- * away and returned via a link that didn't preserve the query string
- * (e.g. the sidebar's /jobs link, the dashboard's "view all" links).
- * URL was the SoT but the URL wasn't always carried back in.
+ * The original localStorage layer used a global key, so on a shared browser
+ * a new account inherited the previous user's filters and opened /jobs on
+ * "No jobs found" despite having matches. The page deliberately exposes no
+ * user id to scope client storage by, so the snapshots now live on the
+ * caller's own `user_profiles` row (owner's call on #866: server-side
+ * prefs over auth-change clearing or a hashed-id storage key) — scoped to
+ * the ACCOUNT by RLS, synced across devices for free.
  *
- * This hook layers localStorage on top: every time the URL filter
- * state changes, snapshot it into ``localStorage[wyrdfold.filters.<key>]``.
- * On entry — if the URL is bare AND a snapshot exists for the current
- * target — restore the snapshot into the URL via the caller's setter.
+ * Shape is unchanged: a map of ``{targetId | "__all__": JobsFilterState}``.
+ * The hook loads the whole map once (`ready` flips when it lands), serves
+ * reads from memory, and write-through-debounces the full map back via
+ * ``PUT /api/profile/jobs-filters``. Sort/order/page/targetId are still
+ * NOT persisted — navigation state, not filter state.
  *
- * Keyed per target so each target remembers its own filters. The All
- * Jobs view uses the ``__all__`` sentinel. The persisted payload is the
- * full ``JobsFilterState`` — every dimension in ``JOBS_FILTER_FIELDS``
- * (a v1 payload holding only the original five fields still restores
- * those five; see ``coerceStoredFilters``). Sort/order/page/targetId are
- * NOT persisted — those are navigation state, not filter state.
+ * Failure posture: if the load fails, the page runs with session-only
+ * in-memory persistence (works, just forgets on reload) — same "loses the
+ * convenience, never the page" contract the localStorage layer had.
  *
- * Failures (SSR, quota exceeded, disabled storage) are silent: read
- * returns ``null``, write becomes a no-op. The page works without
- * persistence; it just loses the convenience.
+ * Writes coalesce for ~300ms, and a PENDING write is flushed immediately —
+ * with ``keepalive`` so the request survives the page — on unmount and on
+ * ``pagehide``. The first cut only debounced, and the e2e re-entry spec
+ * caught the loss: the localStorage layer wrote synchronously, so
+ * "set a filter, click away" persisted; a debounce whose timer dies with
+ * the page did not.
+ *
+ * Legacy cleanup: on a successful first load the old global
+ * ``wyrdfold.filters.*`` keys are deleted. They are deliberately NOT
+ * imported — on a shared browser those keys belong to whoever wrote them,
+ * and importing would persist the very cross-account leak this fixes.
  */
 
-import { useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { coerceStoredFilters, isFilterStateEmpty } from './jobsFilterFields';
 import type { JobsFilterState } from './types';
 
-const STORAGE_PREFIX = 'wyrdfold.filters.';
+const LEGACY_STORAGE_PREFIX = 'wyrdfold.filters.';
 const ALL_JOBS_KEY = '__all__';
+const WRITE_DEBOUNCE_MS = 300;
 
-function storageKey(targetId: string | undefined): string {
-  return `${STORAGE_PREFIX}${targetId ?? ALL_JOBS_KEY}`;
+function mapKey(targetId: string | undefined): string {
+  return targetId ?? ALL_JOBS_KEY;
+}
+
+function dropLegacyLocalStorageKeys(): void {
+  try {
+    const doomed: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const k = window.localStorage.key(i);
+      if (k && k.startsWith(LEGACY_STORAGE_PREFIX)) doomed.push(k);
+    }
+    doomed.forEach(k => window.localStorage.removeItem(k));
+  } catch {
+    // Storage disabled — nothing to clean.
+  }
 }
 
 interface JobsFilterPersistence {
+  /** False until the server map has loaded (or the load failed and the
+   *  session-only fallback engaged). Callers gate restore-on-entry on it. */
+  ready: boolean;
   read: (targetId: string | undefined) => JobsFilterState | null;
   write: (targetId: string | undefined, filters: JobsFilterState) => void;
   clear: (targetId: string | undefined) => void;
 }
 
 export function useJobsFilterPersistence(): JobsFilterPersistence {
+  const [ready, setReady] = useState(false);
+  const mapRef = useRef<Record<string, JobsFilterState>>({});
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Writes not yet acknowledged by the server: key → snapshot (replace) or
+  // null (delete). Safe to flush at ANY time — the server merges per key,
+  // so a patch never clobbers entries this client hasn't seen.
+  const pendingRef = useRef<Record<string, JobsFilterState | null>>({});
+  // EVERY write this session, never cleared by a flush: the hydrate GET can
+  // race an already-flushed patch (GET computed before the PATCH landed),
+  // and overlaying only the still-pending writes would roll the local view
+  // back to the stale server snapshot.
+  const sessionWritesRef = useRef<Record<string, JobsFilterState | null>>({});
+
+  const flushNow = useCallback((): void => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    if (Object.keys(pendingRef.current).length === 0) return;
+    const patch = pendingRef.current;
+    pendingRef.current = {};
+    fetch('/api/profile/jobs-filters', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filters: patch }),
+      // Survive unload/navigation — this is the synchronous-write guarantee
+      // the localStorage layer gave for free.
+      keepalive: true,
+    }).catch(() => {
+      // Re-queue what was in flight (newer pending entries win) so the next
+      // flush retries; a terminal loss stays best-effort, as before.
+      pendingRef.current = { ...patch, ...pendingRef.current };
+    });
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/profile/jobs-filters')
+      .then(res => (res.ok ? res.json() : null))
+      .then((data: { filters?: Record<string, unknown> } | null) => {
+        if (cancelled) return;
+        if (data && data.filters && typeof data.filters === 'object') {
+          const coerced: Record<string, JobsFilterState> = {};
+          for (const [key, value] of Object.entries(data.filters)) {
+            const filters = coerceStoredFilters(value);
+            if (filters && !isFilterStateEmpty(filters)) {
+              coerced[key] = filters;
+            }
+          }
+          // Anything written this session wins over the server snapshot —
+          // including writes already flushed, whose PATCH may postdate the
+          // data this GET was computed from.
+          for (const [key, value] of Object.entries(sessionWritesRef.current)) {
+            if (value === null) delete coerced[key];
+            else coerced[key] = value;
+          }
+          mapRef.current = coerced;
+          dropLegacyLocalStorageKeys();
+        }
+        setReady(true);
+      })
+      .catch(() => {
+        // Session-only fallback: reads/writes work in memory for this
+        // mount; nothing persists. The page must not block on prefs.
+        if (!cancelled) setReady(true);
+      });
+    const onPageHide = () => flushNow();
+    window.addEventListener('pagehide', onPageHide);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('pagehide', onPageHide);
+      // An unmount with a pending write must SEND it, not drop it — the
+      // sidebar navigation away from /jobs is the main write moment.
+      flushNow();
+    };
+  }, [flushNow]);
+
+  const scheduleFlush = useCallback((): void => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null;
+      flushNow();
+    }, WRITE_DEBOUNCE_MS);
+  }, [flushNow]);
+
   const read = useCallback(
-    (targetId: string | undefined): JobsFilterState | null => {
-      if (typeof window === 'undefined') return null;
-      try {
-        const raw = window.localStorage.getItem(storageKey(targetId));
-        if (!raw) return null;
-        return coerceStoredFilters(JSON.parse(raw));
-      } catch {
-        // Malformed JSON, parser error, etc. — treat as missing.
-        return null;
-      }
-    },
+    (targetId: string | undefined): JobsFilterState | null =>
+      mapRef.current[mapKey(targetId)] ?? null,
     []
   );
 
   const write = useCallback(
     (targetId: string | undefined, filters: JobsFilterState): void => {
-      if (typeof window === 'undefined') return;
-      try {
-        // Drop the entry entirely when all fields are empty so a "clear
-        // all filters" action doesn't leave a stale snapshot that would
-        // re-apply on the next visit.
-        if (isFilterStateEmpty(filters)) {
-          window.localStorage.removeItem(storageKey(targetId));
-          return;
-        }
-        window.localStorage.setItem(
-          storageKey(targetId),
-          JSON.stringify(filters)
-        );
-      } catch {
-        // Quota exceeded / storage disabled — silent.
+      const key = mapKey(targetId);
+      // Drop the entry entirely when all fields are empty so "clear all
+      // filters" doesn't leave a stale snapshot that re-applies next visit.
+      if (isFilterStateEmpty(filters)) {
+        if (!(key in mapRef.current) && !(key in pendingRef.current)) return;
+        delete mapRef.current[key];
+        pendingRef.current[key] = null;
+        sessionWritesRef.current[key] = null;
+      } else {
+        mapRef.current = { ...mapRef.current, [key]: filters };
+        pendingRef.current[key] = filters;
+        sessionWritesRef.current[key] = filters;
       }
+      scheduleFlush();
     },
-    []
+    [scheduleFlush]
   );
 
-  const clear = useCallback((targetId: string | undefined): void => {
-    if (typeof window === 'undefined') return;
-    try {
-      window.localStorage.removeItem(storageKey(targetId));
-    } catch {
-      // ignore
-    }
-  }, []);
+  const clear = useCallback(
+    (targetId: string | undefined): void => {
+      const key = mapKey(targetId);
+      if (!(key in mapRef.current) && !(key in pendingRef.current)) return;
+      delete mapRef.current[key];
+      pendingRef.current[key] = null;
+      sessionWritesRef.current[key] = null;
+      scheduleFlush();
+    },
+    [scheduleFlush]
+  );
 
-  return { read, write, clear };
+  return { ready, read, write, clear };
 }

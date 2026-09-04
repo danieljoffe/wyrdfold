@@ -462,7 +462,7 @@ async def test_enforce_llm_budget_jwt_user_invokes_check(monkeypatch):
     # — stub it so no Supabase round-trip happens. The resolution logic
     # itself is pinned in tests/test_entitlements_tiers.py.
     async def _resolve(supabase, *, user_id):
-        return budget_mod.ResolvedQuota(9.0, True, None)
+        return budget_mod.ResolvedQuota(9.0, True, None, "host")
 
     monkeypatch.setattr(budget_mod, "resolve_llm_quota_async", _resolve)
     await enforce_llm_budget(
@@ -499,7 +499,7 @@ async def test_enforce_llm_budget_passes_resolved_quota_through(monkeypatch):
     monkeypatch.setattr(budget_mod, "check_user_budget_async", _spy)
 
     async def _resolve(supabase, *, user_id):
-        return budget_mod.ResolvedQuota(25.0, True, ("fit.job", "poll_scoring"))
+        return budget_mod.ResolvedQuota(25.0, True, ("fit.job", "poll_scoring"), "host")
 
     monkeypatch.setattr(budget_mod, "resolve_llm_quota_async", _resolve)
     await enforce_llm_budget(
@@ -520,7 +520,7 @@ async def test_enforce_llm_budget_disabled_account_403s(monkeypatch):
     from app.services.llm import budget as budget_mod
 
     async def _resolve(supabase, *, user_id):
-        return budget_mod.ResolvedQuota(5.0, False, None)
+        return budget_mod.ResolvedQuota(5.0, False, None, "host")
 
     monkeypatch.setattr(budget_mod, "resolve_llm_quota_async", _resolve)
     check_spy = MagicMock()
@@ -542,7 +542,7 @@ async def test_enforce_llm_budget_propagates_429(monkeypatch):
     from app.services.llm import budget as budget_mod
 
     async def _resolve(supabase, *, user_id):
-        return budget_mod.ResolvedQuota(9.0, True, None)
+        return budget_mod.ResolvedQuota(9.0, True, None, "host")
 
     monkeypatch.setattr(budget_mod, "resolve_llm_quota_async", _resolve)
 

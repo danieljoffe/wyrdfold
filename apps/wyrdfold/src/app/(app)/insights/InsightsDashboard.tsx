@@ -248,6 +248,25 @@ export default function InsightsDashboard({
         </div>
       )}
 
+      {/* #844 §7: with no applications yet this view was a grid of zeros
+          and empty axes — the first thing behind the Trends tab for a new
+          user, reading as breakage. Name the state and what fills it. The
+          charts still render below so the shape of what's coming is
+          visible. */}
+      {!showKpiSkeleton &&
+        pipeline != null &&
+        (pipeline.total_applications ?? 0) === 0 &&
+        (pipeline.total_interviews ?? 0) === 0 && (
+          <div className='rounded-md border border-border bg-surface-tertiary p-3'>
+            <Text variant='caption' className='text-text-secondary'>
+              Nothing to chart yet — these trends fill in as you move jobs
+              through your pipeline on the Jobs page (Saved, Applied,
+              Interviewing…). Every status change is counted from the moment you
+              record it.
+            </Text>
+          </div>
+        )}
+
       {/* KPI cards */}
       <div
         className='grid gap-4 grid-cols-2 lg:grid-cols-4'

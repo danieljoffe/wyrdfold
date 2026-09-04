@@ -50,7 +50,10 @@ describe('rollOffIsInformative — the roll-off line gate (re-sweep R5)', () => 
 
 const originalFetch = global.fetch;
 
-function mockUsage(monthly: { spent_usd: number; limit_usd: number }) {
+function mockUsage(
+  monthly: { spent_usd: number; limit_usd: number },
+  extra: Record<string, unknown> = {}
+) {
   global.fetch = jest.fn().mockResolvedValue({
     ok: true,
     json: async () => ({
@@ -60,6 +63,7 @@ function mockUsage(monthly: { spent_usd: number; limit_usd: number }) {
       monthly_resets_at: null,
       analysis_daily_used: 0,
       analysis_daily_limit: 5,
+      ...extra,
     }),
   } as Response) as unknown as typeof fetch;
 }
@@ -89,5 +93,68 @@ describe('LlmUsageCard monthly allowance meter', () => {
       name: /30-day allowance used/i,
     });
     expect(bar).toHaveAttribute('aria-valuenow', '0');
+  });
+});
+
+describe('LlmUsageCard payer states (#858)', () => {
+  // NOTE: the pre-#858 tests above send NO key_source — that is the
+  // mixed-deploy old-API payload, and they prove it still renders the
+  // allowance (absent → "host").
+
+  it('free-with-no-key on a no-BYOK server: no phantom allowance, honest copy', async () => {
+    // The contradiction #858 documents: "$0.00 of $5.00" rendered for an
+    // account whose every AI call 402s before a quota is read.
+    mockUsage(
+      { spent_usd: 0, limit_usd: 5 },
+      { key_source: 'none', byok_available: false }
+    );
+    render(<LlmUsageCard />);
+    expect(
+      await screen.findByText(/require a paid plan on this server/i)
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/30-day allowance/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/\$0\.00 of \$5\.00/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
+  });
+
+  it('free-with-no-key where BYOK IS offered: points at the key fields', async () => {
+    mockUsage(
+      { spent_usd: 0, limit_usd: 5 },
+      { key_source: 'none', byok_available: true }
+    );
+    render(<LlmUsageCard />);
+    expect(
+      await screen.findByText(/add your own OpenRouter key above/i)
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
+  });
+
+  it('BYOK: shows own-key spend without a managed cap bar; analyses row stays', async () => {
+    mockUsage(
+      { spent_usd: 3.21, limit_usd: 0 },
+      { key_source: 'user', byok_available: true }
+    );
+    render(<LlmUsageCard />);
+    expect(
+      await screen.findByText(/your key's 30-day spend/i)
+    ).toBeInTheDocument();
+    expect(screen.getByText(/\$3\.21/)).toBeInTheDocument();
+    expect(screen.queryByText(/^30-day allowance$/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
+    // The deep-analysis daily cap is a global setting enforced for every
+    // payer, so its row must survive the branch.
+    expect(screen.getByText(/deep analyses today/i)).toBeInTheDocument();
+  });
+
+  it('host (managed plan): the allowance renders exactly as before', async () => {
+    mockUsage(
+      { spent_usd: 2, limit_usd: 10 },
+      { key_source: 'host', byok_available: false }
+    );
+    render(<LlmUsageCard />);
+    const bar = await screen.findByRole('progressbar', {
+      name: /30-day allowance used/i,
+    });
+    expect(bar).toHaveAttribute('aria-valuenow', '20');
   });
 });

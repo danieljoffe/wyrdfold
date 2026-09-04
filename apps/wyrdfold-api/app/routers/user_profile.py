@@ -20,6 +20,7 @@ from typing import Any, cast, get_args
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 from supabase import AsyncClient
 
 from app.config import settings
@@ -33,6 +34,8 @@ from app.dependencies import (
 from app.models.user_profile import (
     IdentityFields,
     IdentityFieldsUpdate,
+    JobsFilterPrefs,
+    JobsFilterPrefsPatch,
     LlmUsageResponse,
     LlmUsageWindow,
     NotificationPreferences,
@@ -500,6 +503,72 @@ async def reset_onboarding(
     return _read_onboarding(fresh)
 
 
+@router.get("/jobs-filters", response_model=JobsFilterPrefs)
+async def get_jobs_filter_prefs(
+    user_id: str = Depends(get_current_user_id),
+    user_email: str | None = Depends(get_current_user_email),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+) -> JobsFilterPrefs:
+    """The caller's saved /jobs filter snapshots (#866).
+
+    Server-side so filter memory is scoped to the ACCOUNT: the old
+    localStorage persistence used a global key, so a shared browser leaked
+    one user's filters into the next account's first render ("No jobs
+    found" on an account with matches). Rides the caller's own RLS row —
+    the read cannot see anyone else's snapshots by construction.
+    """
+    row = await _get_or_create_profile(
+        supabase, user_id, "jobs_filter_prefs", seed_email=user_email
+    )
+    return JobsFilterPrefs(filters=row.get("jobs_filter_prefs") or {})
+
+
+@router.patch("/jobs-filters", response_model=JobsFilterPrefs)
+async def patch_jobs_filter_prefs(
+    body: JobsFilterPrefsPatch,
+    user_id: str = Depends(get_current_user_id),
+    user_email: str | None = Depends(get_current_user_email),
+    supabase: AsyncClient = Depends(get_async_user_supabase),
+) -> JobsFilterPrefs:
+    """Merge a per-key patch into the caller's /jobs filter snapshots (#866).
+
+    PATCH-merge (value = replace, None = delete), NOT a whole-map PUT: with
+    replace semantics the client had to hydrate the server map before any
+    write was safe to send, which put the entire write path behind a GET
+    round-trip — and the e2e re-entry spec proved a fast navigation outran
+    it, silently persisting nothing. A patch of only the changed keys is
+    safe from the first render.
+
+    Merged server-side against the caller's own row; the merged map is
+    re-capped (64 keys) so patches can't accrete past the whole-map bound.
+    """
+    row = await _get_or_create_profile(
+        supabase, user_id, "jobs_filter_prefs", seed_email=user_email
+    )
+    merged: dict[str, Any] = dict(row.get("jobs_filter_prefs") or {})
+    for key, snapshot in body.filters.items():
+        if snapshot is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = snapshot
+    # The MERGED map must satisfy the canonical whole-map invariant (64 keys
+    # AND 16KB serialized) BEFORE anything persists — validated through the
+    # same model the GET serves, so the two bounds can't drift. The first
+    # cut re-capped only the key count: individually-valid patches could
+    # accrete past 16KB, and the response model's own validator would then
+    # reject the map AFTER the write — a 500 on state already persisted
+    # (the #994 review's blocker).
+    try:
+        validated = JobsFilterPrefs(filters=merged)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"filter snapshots invalid after merge: {exc.errors()[0]['msg']}",
+        ) from exc
+    await _update_profile(supabase, user_id, {"jobs_filter_prefs": validated.filters})
+    return validated
+
+
 @router.get("/llm-usage", response_model=LlmUsageResponse)
 async def get_llm_usage(
     # The user-visible spend reads run on the caller's ASYNC RLS user client
@@ -521,6 +590,7 @@ async def get_llm_usage(
     """
     from datetime import timedelta
 
+    from app.services import keys as keys_service
     from app.services.analysis.analyze import DEFAULT_PURPOSE
     from app.services.llm import budget, cost_log
 
@@ -605,6 +675,10 @@ async def get_llm_usage(
         monthly_resets_at=resets_at,
         analysis_daily_used=analysis_used,
         analysis_daily_limit=settings.analysis_daily_limit,
+        # #858: the same resolution the gates enforce names who pays, so the
+        # FE can stop rendering an allowance a free account can never spend.
+        key_source=quota.key_source,
+        byok_available=keys_service.is_configured(),
     )
 
 
