@@ -16,7 +16,8 @@
 ALTER TABLE public.sources ADD COLUMN IF NOT EXISTS domain text;
 
 COMMENT ON COLUMN public.sources.domain IS
-    '#470: verified company web domain (e.g. "datadoghq.com") — enrichment '
-    'guesses candidates from company_name/board_token and stores only one '
-    'that answers HTTP. Consumed by clients to BUILD logo links; no image '
-    'is ever stored.';
+    '#470: company web domain (e.g. "datadoghq.com") — enrichment guesses '
+    'candidates from company_name/board_token and stores one that answers '
+    'HTTP. That check is WEAK: a wrong-but-live domain can be stored, and '
+    'clients BUILD logo links from this value, so a bad row renders another '
+    'company''s logo. Correct by setting it NULL. No image is ever stored.';

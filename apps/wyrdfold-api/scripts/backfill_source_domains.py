@@ -3,8 +3,9 @@
 Walks ``sources WHERE domain IS NULL`` in batches, guesses candidate
 domains from company_name/board_token, probes each over the SSRF-safe
 transport, and stores the first that answers HTTP (see
-``app/services/company_domain.py`` for the semantics — links only, parked
-domains degrade to the initials monogram client-side).
+``app/services/company_domain.py`` for the semantics — links only, and note
+the weak-verification caveat there: a wrong-but-live domain can render
+ANOTHER company's logo, not the initials fallback. Run deliberately.)
 
 Idempotent and resumable: enriched rows leave the NULL set, so re-running
 continues where the last run stopped — and picks up sources created since,

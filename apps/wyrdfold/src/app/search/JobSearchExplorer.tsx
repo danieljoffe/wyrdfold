@@ -94,8 +94,13 @@ function hueFor(name: string): number {
 /** Ordered logo-link tiers for a company domain (#470) — links only, per
  *  the owner's constraint; nothing is stored. Brandfetch leads WHEN a client
  *  id is configured (NEXT_PUBLIC_BRANDFETCH_CLIENT_ID — inlined at build
- *  time), the token-free favicon endpoints follow, and the caller falls back
- *  to the initials monogram when every tier errors. */
+ *  time), DuckDuckGo's token-free favicon follows, and the caller falls back
+ *  to the initials monogram when every tier errors.
+ *
+ *  Every host here is a third party that receives the visitor's IP and the
+ *  company domain being viewed, so the list is deliberately short and bound
+ *  to the privacy policy by the `legalPages` spec — see `logoImageOrigins`
+ *  for why Google's favicon endpoint is not among them. */
 export function logoUrlTiers(domain: string): string[] {
   const tiers: string[] = [];
   const clientId = process.env.NEXT_PUBLIC_BRANDFETCH_CLIENT_ID;
@@ -106,9 +111,6 @@ export function logoUrlTiers(domain: string): string[] {
   }
   tiers.push(
     `https://icons.duckduckgo.com/ip3/${encodeURIComponent(domain)}.ico`
-  );
-  tiers.push(
-    `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=64`
   );
   return tiers;
 }
@@ -124,28 +126,50 @@ export function CompanyAvatar({
   /** `md` on the card grid, `lg` in the detail modal header (#467 §11.2). */
   size?: 'md' | 'lg';
 }) {
-  // Logo cascade state: index into logoUrlTiers; past the end → initials.
-  // Keyed resets via the img key below, so a new domain restarts the cascade.
+  // Stateless dispatcher. The cascade's tier lives in the child, KEYED BY
+  // DOMAIN, so a new company remounts it at tier 0.
+  //
+  // A key on the <img> alone does NOT do this: it remounts the image while
+  // leaving this component's state intact, so the next company would resume
+  // at the previous one's failed tier — or, once a cascade had been
+  // exhausted, render initials without ever requesting its logo. That
+  // matters wherever one instance sees successive companies: the detail
+  // modal feeds changing job props into the same subtree.
+  if (!domain) return <CompanyInitialsAvatar name={name} size={size} />;
+  return <CompanyLogo key={domain} name={name} domain={domain} size={size} />;
+}
+
+/** The cascade itself: walk `logoUrlTiers` on each image error, then fall
+ *  back to the initials monogram. Mounted per domain (see above), so its
+ *  tier state is scoped to one company by construction. */
+function CompanyLogo({
+  name,
+  domain,
+  size,
+}: {
+  name: string;
+  domain: string;
+  size: 'md' | 'lg';
+}) {
   const [tier, setTier] = useState(0);
-  const tiers = domain ? logoUrlTiers(domain) : [];
-  if (domain && tier < tiers.length) {
-    const px = size === 'lg' ? 48 : 40;
-    return (
-      <img
-        key={`${domain}:${tier}`}
-        src={tiers[tier]}
-        alt=''
-        aria-hidden
-        width={px}
-        height={px}
-        loading='lazy'
-        referrerPolicy='no-referrer'
-        className='shrink-0 rounded-md object-contain bg-white'
-        onError={() => setTier(t => t + 1)}
-      />
-    );
+  const tiers = logoUrlTiers(domain);
+  if (tier >= tiers.length) {
+    return <CompanyInitialsAvatar name={name} size={size} />;
   }
-  return <CompanyInitialsAvatar name={name} size={size} />;
+  const px = size === 'lg' ? 48 : 40;
+  return (
+    <img
+      src={tiers[tier]}
+      alt=''
+      aria-hidden
+      width={px}
+      height={px}
+      loading='lazy'
+      referrerPolicy='no-referrer'
+      className='shrink-0 rounded-md object-contain bg-white'
+      onError={() => setTier(t => t + 1)}
+    />
+  );
 }
 
 function CompanyInitialsAvatar({

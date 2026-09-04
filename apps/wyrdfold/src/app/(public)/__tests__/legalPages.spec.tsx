@@ -2,6 +2,7 @@ import '@testing-library/jest-dom';
 import { render, screen } from '@testing-library/react';
 import TermsPage from '../terms/page';
 import PrivacyPage from '../privacy/page';
+import { logoImageOrigins } from '@/utils/constants';
 
 /**
  * Guards on the two published legal pages.
@@ -104,6 +105,26 @@ describe('claims that must not drift back to an absolute', () => {
     const { container } = render(<PrivacyPage />);
     const text = container.textContent ?? '';
     expect(text).toMatch(/not currently offered on the hosted\s+service/i);
+  });
+
+  it('names every third-party host the browser loads logos from (#470)', () => {
+    // The policy is bound to the CODE here, not to a hand-kept list: these
+    // are the exact hosts `proxy.ts` allows in img-src, and each one sees
+    // the visitor's IP plus the company domain being viewed. Adding a logo
+    // provider without disclosing it fails HERE — the "published policy
+    // drifted from the system" class this suite exists for.
+    const { container } = render(<PrivacyPage />);
+    const text = container.textContent ?? '';
+
+    expect(logoImageOrigins.length).toBeGreaterThan(0); // guard can't pass vacuously
+    for (const origin of logoImageOrigins) {
+      const labels = new URL(origin).hostname.split('.');
+      const brand = labels[labels.length - 2]; // "cdn.brandfetch.io" -> brandfetch
+      expect(text.toLowerCase()).toContain(brand.toLowerCase());
+    }
+    // ...and the flow itself is described, not just the vendor names.
+    expect(text).toMatch(/loaded directly by\s+your browser/i);
+    expect(text).toMatch(/IP address/i);
   });
 
   it('says the embedding provider receives experience text', () => {

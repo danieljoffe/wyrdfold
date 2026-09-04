@@ -16,12 +16,20 @@ Design constraints (docs/research-wyrdfold-company-logos.md):
 
 - **Links only, ever** — nothing here fetches or stores an image; the
   client builds provider URLs from the stored domain.
-- **Verification is "answers HTTP", deliberately no smarter.** A parked
-  domain that 200s is a false positive we accept: the client's logo
-  cascade ends in the initials monogram on image error, so a wrong
-  domain degrades to exactly today's rendering. The failure mode of a
-  cleverer content check (dropping real domains whose landing pages look
-  odd) is silent and permanent by comparison.
+- **Verification is "answers HTTP", and that is WEAK.** Any non-5xx
+  response counts — 403, 404, a parking page, or an unrelated live site
+  that happens to own the guessed stem. When the guess is wrong, the
+  consequence is NOT "falls back to initials": if that wrong domain
+  serves a valid favicon, the UI renders ANOTHER COMPANY'S LOGO, and
+  only a domain whose logo requests all fail lands on the monogram.
+  Measured example: ``Linear`` resolves to ``linear.io``; the real
+  company is ``linear.app``.
+
+  This is why the enrichment does not run itself. There is no scheduled
+  tick and no source-creation hook — a human runs the backfill script
+  after accepting that error rate (or after strengthening resolution
+  with a name->domain lookup; see the research doc). A stored wrong
+  domain is corrected by nulling the row and re-running.
 - **SSRF posture**: candidate hostnames derive from board-published
   names/slugs — external input — so probes ride the IP-pinning transport
   (#192), same as url-health.
