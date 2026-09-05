@@ -125,6 +125,12 @@ class _SourcesQuery:
         self._rows = [r for r in self._rows if r[col] > val]
         return self
 
+    def neq(self, col: str, val: Any) -> _SourcesQuery:
+        # Filters FOR REAL: dropping the provider guard from the query must
+        # visibly change which rows come back (#470 dry-run finding).
+        self._rows = [r for r in self._rows if r.get(col) != val]
+        return self
+
     def order(self, col: str) -> _SourcesQuery:
         self._rows.sort(key=lambda r: r[col])
         return self
@@ -354,3 +360,85 @@ async def test_branded_name_declines_rather_than_falling_back_to_the_squatter() 
     got = await resolve_company_domain("Proton.ai", "proton", client=http)  # type: ignore[arg-type]
     assert got is None
     assert http.seen == ["proton.ai"]  # the stem was never even probed
+
+
+# ---- dry-run findings (#470, before the production backfill) ----------------
+
+
+@pytest.mark.parametrize("name", ["Manually Added", "Manual Entry", "manual", "MANUAL ENTRY"])
+def test_the_pooled_manual_source_gets_no_candidates_under_any_of_its_names(name: str) -> None:
+    """The display name is environment-specific — the local seed says
+    "Manually Added", prod says "Manual Entry" — and the prod dry run caught
+    the name-only guard about to stamp "manualentry.com" onto a row pooling
+    4 distinct employers. Every known spelling is excluded; the enrichment
+    query ALSO filters on provider so a new spelling cannot reopen this."""
+    assert candidate_domains(name, "manual") == []
+
+
+async def test_enrichment_never_examines_the_manual_pseudo_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Belt to the name-list's braces, asserted BEHAVIOURALLY: a manual row
+    whose display name has drifted to something the name list does not know
+    must still be skipped, because the query filters on provider."""
+    sb = _FakeSupabase(
+        [
+            {
+                "id": "s0",
+                "company_name": "Some Brand-New Manual Name",  # not in the name list
+                "board_token": "manual",
+                "provider": "manual",
+                "domain": None,
+            },
+            {
+                "id": "s1",
+                "company_name": "Datadog",
+                "board_token": "datadog81",
+                "provider": "greenhouse",
+                "domain": None,
+            },
+        ]
+    )
+
+    async def _fake_resolve(name: str, slug: str, *, client: Any = None) -> str | None:
+        return "datadog.com" if name == "Datadog" else "WRONG-should-never-run.com"
+
+    monkeypatch.setattr(cd, "resolve_company_domain", _fake_resolve)
+
+    examined, enriched, _ = await enrich_missing_source_domains(sb, limit=10)  # type: ignore[arg-type]
+
+    assert (examined, enriched) == (1, 1)  # the manual row was never even read
+    assert [u[0] for u in sb.updates] == ["s1"]
+
+
+@pytest.mark.parametrize(
+    ("token", "expected_stem_source"),
+    [
+        # Workday compound tokens — 1,274 of the catalog's sources. The whole
+        # token squashed to 50-char nonsense; the tenant segment is the slug.
+        (
+            "https://cbrlgroup.wd503.myworkdayjobs.com|cbrlgroup|crackerbarrelexternal",
+            "cbrlgroup",
+        ),
+        ("https://semtech.wd1.myworkdayjobs.com|semtech|semtechcareers", "semtech"),
+        # Plain tokens are untouched.
+        ("datadog81", "datadog"),
+        ("dbtlabs", "dbtlabs"),
+    ],
+)
+def test_compound_board_tokens_reduce_to_the_tenant_slug(
+    token: str, expected_stem_source: str
+) -> None:
+    cands = candidate_domains("Zzz Placeholder Co", token)
+    assert f"{expected_stem_source}.com" in cands
+    # ...and the squashed-URL nonsense is gone.
+    assert not any("myworkdayjobs" in c for c in cands)
+    assert not any(len(c) > 40 for c in cands)
+
+
+def test_a_trailing_hyphen_never_reaches_a_candidate() -> None:
+    """ "Appcues 2" + slug "appcues-2" produced the invalid "appcues-.com"
+    after the digit strip."""
+    assert all(
+        not c.startswith("-") and "-." not in c for c in candidate_domains("Appcues 2", "appcues-2")
+    )
