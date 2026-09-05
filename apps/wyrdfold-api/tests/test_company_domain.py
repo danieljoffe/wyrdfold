@@ -238,14 +238,13 @@ async def test_enrich_empty_null_set_is_a_noop() -> None:
         ("Covariance.ai", "covariance", "covariance.ai"),
     ],
 )
-def test_a_name_carrying_its_own_tld_is_the_first_candidate(
+def test_a_name_carrying_its_own_tld_is_the_only_candidate(
     name: str, slug: str, expected_first: str
 ) -> None:
-    cands = candidate_domains(name, slug)
-    assert cands[0] == expected_first
-    # ...and the squatter-shaped guess is still available as a fallback, just
-    # never ahead of the real thing.
-    assert expected_first.replace(".", "") + ".com" in cands
+    # Sole, not merely first (#1008 review): ordering alone would let a
+    # transient failure on the real domain hand the win to the squatter that
+    # owns the dot-stripped stem.
+    assert candidate_domains(name, slug) == [expected_first]
 
 
 def test_a_trailing_dot_or_unknown_suffix_is_not_treated_as_a_domain() -> None:
@@ -308,3 +307,29 @@ async def test_resolver_skips_a_parked_domain_and_takes_the_next_candidate() -> 
     got = await resolve_company_domain("Acme", "acme", client=http)  # type: ignore[arg-type]
     assert got == "acme.io"
     assert http.seen == ["acme.com", "acme.io"]
+
+
+async def test_branded_name_declines_rather_than_falling_back_to_the_squatter() -> None:
+    """#1008 review, the blocking case: the real domain is down/blocked and
+    the dot-stripped stem answers perfectly normally. Storing it would be the
+    exact misattribution the branded rule exists to prevent, so the resolver
+    must return None — a company with no logo beats a company wearing a
+    squatter's."""
+
+    class _Http:
+        def __init__(self) -> None:
+            self.seen: list[str] = []
+
+        async def get(self, url: str, follow_redirects: bool = True) -> Any:
+            d = url.removeprefix("https://")
+            self.seen.append(d)
+            if d == "proton.ai":
+                raise ConnectionError("transient")
+            # Innocuous, healthy-looking page — nothing about the RESPONSE
+            # betrays that this is the wrong company.
+            return MagicMock(status_code=200, text="<title>Proton AI</title>")
+
+    http = _Http()
+    got = await resolve_company_domain("Proton.ai", "proton", client=http)  # type: ignore[arg-type]
+    assert got is None
+    assert http.seen == ["proton.ai"]  # the stem was never even probed

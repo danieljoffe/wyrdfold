@@ -22,8 +22,25 @@ Design constraints (docs/research-wyrdfold-company-logos.md):
   monogram. Measured example that survives even the checks below:
   ``Linear`` resolves to ``linear.io``; the real company is ``linear.app``.
   A 250-source prod sample put the error rate at ~7-8% of stored domains
-  before :func:`homepage_is_usable` and the name-is-domain rule; the
-  residual is quieter mistakes rather than parking pages.
+  before :func:`homepage_is_usable` and the name-is-domain rule; a 500-source
+  re-measurement put the residual at ~2.4%.
+
+  What that residual IS, so nobody re-litigates it from first principles
+  (#1008 review). None of these are detectable from the HTTP response, and
+  all were measured as cheaper to accept than to chase:
+
+  * **An unrelated live company owns the stem.** ``laurel.com`` is an animal
+    charity; ``linear.io`` is not Linear. Indistinguishable from a correct
+    hit without an external authority (Wikidata P856 / Brandfetch Brand
+    Search) — that is the next lever if this rate ever matters.
+  * **Empty titles are accepted** (~9% of stored). Plenty of real sites ship
+    none; demanding one cost 128 of 421 stored domains in measurement, most
+    of them correct.
+  * **Most 4xx is accepted.** ``mastercard.com`` / ``littelfuse.com`` /
+    ``onemedical.com`` answer "Access Denied" on the CORRECT domain, so
+    treating a bot wall as absence would discard right answers.
+  * **Soft-404 detection is title-shaped, so partial.** A site that serves a
+    200 with a styled "nothing here" page and no telltale title passes.
 
   This is why the enrichment does not run itself. There is no scheduled
   tick and no source-creation hook — a human runs the backfill script
@@ -145,12 +162,17 @@ def candidate_domains(company_name: str, board_token: str) -> list[str]:
     """
     if company_name.strip().lower() in _PSEUDO_SOURCE_NAMES:
         return []
-    out: list[str] = []
-    # The name already carries its TLD → it IS the domain, and guessing past
-    # it lands on a squatter (measured 3/3). Always first.
+    # The name already carries its TLD → it IS the domain. That is KNOWLEDGE,
+    # not a guess, so it is the SOLE candidate: if it cannot be verified we
+    # decline rather than fall back to an invented stem, because the invented
+    # stem is exactly where the squatter lives (measured 3/3 — "Proton.ai"
+    # →  protonai.com is a for-sale page). Merely ordering it first would let
+    # a transient failure on proton.ai hand the squatter the win, which is
+    # the misattribution this rule exists to prevent.
     branded = _NAME_IS_DOMAIN_RE.match(company_name.strip().lower())
     if branded:
-        out.append(branded.group(0))
+        return [branded.group(0)]
+    out: list[str] = []
     stems: list[str] = []
     for stem in (_stem_from_name(company_name), _stem_from_slug(board_token)):
         if stem and stem not in stems:
