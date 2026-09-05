@@ -16,14 +16,31 @@ Design constraints (docs/research-wyrdfold-company-logos.md):
 
 - **Links only, ever** — nothing here fetches or stores an image; the
   client builds provider URLs from the stored domain.
-- **Verification is "answers HTTP", and that is WEAK.** Any non-5xx
-  response counts — 403, 404, a parking page, or an unrelated live site
-  that happens to own the guessed stem. When the guess is wrong, the
-  consequence is NOT "falls back to initials": if that wrong domain
-  serves a valid favicon, the UI renders ANOTHER COMPANY'S LOGO, and
-  only a domain whose logo requests all fail lands on the monogram.
-  Measured example: ``Linear`` resolves to ``linear.io``; the real
-  company is ``linear.app``.
+- **Verification is best-effort, and a wrong guess is NOT harmless.** If a
+  wrong-but-live domain serves a valid favicon the UI renders ANOTHER
+  COMPANY'S LOGO — only a domain whose logo requests all fail lands on the
+  monogram. Measured example that survives even the checks below:
+  ``Linear`` resolves to ``linear.io``; the real company is ``linear.app``.
+  A 250-source prod sample put the error rate at ~7-8% of stored domains
+  before :func:`homepage_is_usable` and the name-is-domain rule; a 500-source
+  re-measurement put the residual at ~2.4%.
+
+  What that residual IS, so nobody re-litigates it from first principles
+  (#1008 review). None of these are detectable from the HTTP response, and
+  all were measured as cheaper to accept than to chase:
+
+  * **An unrelated live company owns the stem.** ``laurel.com`` is an animal
+    charity; ``linear.io`` is not Linear. Indistinguishable from a correct
+    hit without an external authority (Wikidata P856 / Brandfetch Brand
+    Search) — that is the next lever if this rate ever matters.
+  * **Empty titles are accepted** (~9% of stored). Plenty of real sites ship
+    none; demanding one cost 128 of 421 stored domains in measurement, most
+    of them correct.
+  * **Most 4xx is accepted.** ``mastercard.com`` / ``littelfuse.com`` /
+    ``onemedical.com`` answer "Access Denied" on the CORRECT domain, so
+    treating a bot wall as absence would discard right answers.
+  * **Soft-404 detection is title-shaped, so partial.** A site that serves a
+    200 with a styled "nothing here" page and no telltale title passes.
 
   This is why the enrichment does not run itself. There is no scheduled
   tick and no source-creation hook — a human runs the backfill script
@@ -70,6 +87,80 @@ _PSEUDO_SOURCE_NAMES = frozenset({"manually added"})
 # ``x`` collide with squatters far more often than they hit the company).
 _STEM_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
 
+# TLDs a company name may carry as part of its BRAND ("Proton.ai",
+# "primer.io"). Measured on 250 prod sources: every such name was mapped to a
+# domain SQUATTER, because stripping the dot yields a stem
+# ("protonai") that squatters register precisely BECAUSE the real company
+# exists. The name is the domain; try it before inventing anything.
+_BRAND_TLDS = ("ai", "io", "com", "co", "app", "dev", "so", "sh", "xyz", "tech")
+_NAME_IS_DOMAIN_RE = re.compile(r"^([a-z0-9][a-z0-9-]{1,62})\.(" + "|".join(_BRAND_TLDS) + r")$")
+
+# A homepage that answers but is not the company's. Registrar parking pages
+# are the costly class: they resolve, they 200, and they serve a REGISTRAR's
+# favicon — so the UI renders a for-sale page's branding as an employer's
+# logo. Measured: 5 of 216 stored domains on the 250-source sample.
+_PARKED_TITLE_RE = re.compile(
+    r"for sale|hugedomains|buy this domain|domain (?:is )?(?:for sale|broker)|"
+    r"parked (?:free )?(?:at|by)|spaceship\.com|afternic|sedo|dan\.com|"
+    # Broker listing that never says "for sale" (found by doubling the sample
+    # to 1,000: button.com and datastealth.com both serve
+    # "BUTTON.COM | Strategic-Grade domain names for …").
+    #
+    # Kept to the OBSERVED signature. Generic alternatives ("premium
+    # domains", "domain names for") were tried and removed: they caught
+    # nothing the narrow pattern missed across 1,000 sources, and the
+    # catalog contains real domain-industry companies — GoDaddy, Tucows,
+    # Squarespace, Hostinger, Paralleldomain — whose own homepages could
+    # legitimately carry that wording. Rejecting a correct domain to catch
+    # nothing is the same bad trade this module already refused when it
+    # declined to require a company-naming title.
+    r"strategic-grade domain",
+    re.I,
+)
+# Answered, but it is not a homepage at all.
+_NOT_A_HOMEPAGE_RE = re.compile(r"^\s*(?:index of\s*/|page not found|404\b|not found)", re.I)
+# Registered but never launched — a placeholder, not a company site. Matched
+# only when the placeholder IS the whole title (optionally after a short brand
+# prefix, e.g. "Human - Coming Soon"), so a real page whose copy happens to
+# mention a launch is untouched.
+_PLACEHOLDER_TITLE_RE = re.compile(
+    r"^\s*(?:.{0,30}?[-–—|:]\s*)?(?:coming soon|under construction|launching soon)\s*[.!]?\s*$",
+    re.I,
+)
+_TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+
+
+def page_title(html: str) -> str:
+    """The document <title>, collapsed; "" when absent. Bounded read — a
+    homepage's title is in the first few KB and some sites are enormous."""
+    m = _TITLE_TAG_RE.search(html[:200_000])
+    return re.sub(r"\s+", " ", m.group(1)).strip()[:200] if m else ""
+
+
+def homepage_is_usable(status: int, title: str) -> bool:
+    """Is this response the company's own homepage? (pure, so the resolver
+    and the accuracy measurement cannot drift apart)
+
+    Deliberately asymmetric, from the 250-source measurement:
+
+    - **4xx-that-means-blocked is ACCEPTED.** ``mastercard.com``,
+      ``littelfuse.com`` and ``onemedical.com`` all answered "Access Denied"
+      or 403 — correct domains behind bot protection. Rejecting those would
+      throw away right answers to punish a defence.
+    - **404/410 is REJECTED.** A homepage that does not exist is not a
+      company site (``ttmtech.com`` → "Page not found").
+    - **Registrar / for-sale titles are REJECTED** — the parked-domain class.
+    - **An empty or echoing title is ACCEPTED.** Plenty of real sites ship no
+      title, and demanding one would cost more right answers than it saves.
+    """
+    if status >= 500 or status in (404, 410):
+        return False
+    return not (
+        _PARKED_TITLE_RE.search(title)
+        or _NOT_A_HOMEPAGE_RE.search(title)
+        or _PLACEHOLDER_TITLE_RE.search(title)
+    )
+
 
 def _stem_from_name(company_name: str) -> str | None:
     """``"dbt Labs"`` -> ``dbtlabs``; None when nothing plausible remains."""
@@ -96,25 +187,40 @@ def candidate_domains(company_name: str, board_token: str) -> list[str]:
     """
     if company_name.strip().lower() in _PSEUDO_SOURCE_NAMES:
         return []
+    # The name already carries its TLD → it IS the domain. That is KNOWLEDGE,
+    # not a guess, so it is the SOLE candidate: if it cannot be verified we
+    # decline rather than fall back to an invented stem, because the invented
+    # stem is exactly where the squatter lives (measured 3/3 — "Proton.ai"
+    # →  protonai.com is a for-sale page). Merely ordering it first would let
+    # a transient failure on proton.ai hand the squatter the win, which is
+    # the misattribution this rule exists to prevent.
+    branded = _NAME_IS_DOMAIN_RE.match(company_name.strip().lower())
+    if branded:
+        return [branded.group(0)]
+    out: list[str] = []
     stems: list[str] = []
     for stem in (_stem_from_name(company_name), _stem_from_slug(board_token)):
         if stem and stem not in stems:
             stems.append(stem)
-    return [f"{stem}{tld}" for stem in stems for tld in _CANDIDATE_TLDS]
+    for stem in stems:
+        for tld in _CANDIDATE_TLDS:
+            cand = f"{stem}{tld}"
+            if cand not in out:
+                out.append(cand)
+    return out
 
 
 async def _answers_http(client: httpx.AsyncClient, domain: str) -> bool:
-    """True when ``https://{domain}`` answers with any non-5xx status.
-
-    4xx counts as answering — a site that 403s bots still exists and its
-    logo endpoints usually work. Connection/TLS/DNS failures and 5xx do
-    not. Never raises.
-    """
+    """True when ``https://{domain}`` serves something that looks like the
+    company's own homepage — see :func:`homepage_is_usable` for the rules and
+    the measurements behind them. Never raises."""
     try:
         resp = await client.get(f"https://{domain}", follow_redirects=True)
+        # Body decode is inside the try on purpose: a homepage that serves
+        # undecodable bytes must fail this candidate, not the whole sweep.
+        return homepage_is_usable(resp.status_code, page_title(resp.text))
     except Exception:
         return False
-    return resp.status_code < 500
 
 
 async def resolve_company_domain(
