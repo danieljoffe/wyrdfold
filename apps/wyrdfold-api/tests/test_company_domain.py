@@ -261,6 +261,16 @@ def test_a_trailing_dot_or_unknown_suffix_is_not_treated_as_a_domain() -> None:
         (200, "Covariance.io is for sale | HugeDomains", False),
         # Answered, but not a homepage.
         (200, "Index of /", False),
+        # Broker listings that never say "for sale" — found only by doubling
+        # the measurement sample to 1,000 sources.
+        (200, "BUTTON.COM | Strategic-Grade domain names for ambitious brands", False),
+        (200, "DATASTEALTH.COM | Strategic-Grade domain names", False),
+        # Registered but never launched.
+        (200, "Coming Soon", False),
+        (200, "Human – Coming Soon", False),
+        (200, "Under Construction", False),
+        # ...but a real page whose copy mentions a launch is NOT a placeholder.
+        (200, "Acme Robotics — our Series B product is coming soon to the EU", True),
         (404, "Page not found", False),
         (410, "", False),
         (503, "", False),

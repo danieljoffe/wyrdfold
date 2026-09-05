@@ -101,11 +101,23 @@ _NAME_IS_DOMAIN_RE = re.compile(r"^([a-z0-9][a-z0-9-]{1,62})\.(" + "|".join(_BRA
 # logo. Measured: 5 of 216 stored domains on the 250-source sample.
 _PARKED_TITLE_RE = re.compile(
     r"for sale|hugedomains|buy this domain|domain (?:is )?(?:for sale|broker)|"
-    r"parked (?:free )?(?:at|by)|spaceship\.com|afternic|sedo|dan\.com",
+    r"parked (?:free )?(?:at|by)|spaceship\.com|afternic|sedo|dan\.com|"
+    # Broker listings that never say "for sale" (found by doubling the sample
+    # to 1,000: button.com and datastealth.com both serve
+    # "BUTTON.COM | Strategic-Grade domain names for …").
+    r"strategic-grade domain|premium domain(?: name)?s?\b|domain names? for",
     re.I,
 )
 # Answered, but it is not a homepage at all.
 _NOT_A_HOMEPAGE_RE = re.compile(r"^\s*(?:index of\s*/|page not found|404\b|not found)", re.I)
+# Registered but never launched — a placeholder, not a company site. Matched
+# only when the placeholder IS the whole title (optionally after a short brand
+# prefix, e.g. "Human - Coming Soon"), so a real page whose copy happens to
+# mention a launch is untouched.
+_PLACEHOLDER_TITLE_RE = re.compile(
+    r"^\s*(?:.{0,30}?[-–—|:]\s*)?(?:coming soon|under construction|launching soon)\s*[.!]?\s*$",
+    re.I,
+)
 _TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 
 
@@ -134,7 +146,11 @@ def homepage_is_usable(status: int, title: str) -> bool:
     """
     if status >= 500 or status in (404, 410):
         return False
-    return not (_PARKED_TITLE_RE.search(title) or _NOT_A_HOMEPAGE_RE.search(title))
+    return not (
+        _PARKED_TITLE_RE.search(title)
+        or _NOT_A_HOMEPAGE_RE.search(title)
+        or _PLACEHOLDER_TITLE_RE.search(title)
+    )
 
 
 def _stem_from_name(company_name: str) -> str | None:
