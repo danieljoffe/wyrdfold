@@ -58,6 +58,40 @@ describe('CompanyAvatar cascade', () => {
   });
 });
 
+describe('logo sizing', () => {
+  beforeEach(() => {
+    delete process.env.NEXT_PUBLIC_BRANDFETCH_CLIENT_ID;
+  });
+
+  it('renders the logo at 80% inside a tile matching the initials footprint', () => {
+    // The tile must keep the initials avatar's box (md 40px = h-10 w-10) so
+    // swapping between logo and monogram never shifts the grid; only the
+    // logo inside it is inset.
+    const { container } = render(
+      <CompanyAvatar name='Datadog' domain='datadoghq.com' />
+    );
+    const img = container.querySelector('img')!;
+    const tile = img.parentElement!;
+
+    expect(tile.className).toContain('h-10');
+    expect(tile.className).toContain('w-10');
+    expect(img.className).toContain('h-4/5');
+    expect(img.className).toContain('w-4/5');
+    // Intrinsic size matches the rendered 80%, so no reflow on load.
+    expect(img).toHaveAttribute('width', '32');
+    expect(img).toHaveAttribute('height', '32');
+  });
+
+  it('scales the tile and the inset together at lg', () => {
+    const { container } = render(
+      <CompanyAvatar name='Datadog' domain='datadoghq.com' size='lg' />
+    );
+    const img = container.querySelector('img')!;
+    expect(img.parentElement!.className).toContain('h-12');
+    expect(img).toHaveAttribute('width', '38'); // round(48 * 0.8)
+  });
+});
+
 describe('cascade resets when the company changes (#470 review)', () => {
   beforeEach(() => {
     delete process.env.NEXT_PUBLIC_BRANDFETCH_CLIENT_ID;

@@ -157,19 +157,33 @@ function CompanyLogo({
   if (tier >= tiers.length) {
     return <CompanyInitialsAvatar name={name} size={size} />;
   }
+  // The TILE keeps the initials avatar's footprint (md 40px / lg 48px) so
+  // swapping between logo and monogram never shifts the layout; the logo
+  // itself sits at 80% inside it. Favicons are square-cropped to their own
+  // edges, so filling the tile made them look oversized and cramped against
+  // the rounded corners next to the initials tiles they sit beside.
   const px = size === 'lg' ? 48 : 40;
+  const inner = Math.round(px * 0.8);
   return (
-    <img
-      src={tiers[tier]}
-      alt=''
-      aria-hidden
-      width={px}
-      height={px}
-      loading='lazy'
-      referrerPolicy='no-referrer'
-      className='shrink-0 rounded-md object-contain bg-white'
-      onError={() => setTier(t => t + 1)}
-    />
+    <span
+      className={`flex shrink-0 items-center justify-center rounded-md bg-white ${
+        size === 'lg' ? 'h-12 w-12' : 'h-10 w-10'
+      }`}
+    >
+      <img
+        src={tiers[tier]}
+        alt=''
+        aria-hidden
+        // Intrinsic size matches the rendered 80% so the browser reserves the
+        // right box before load (no reflow); the classes are what size it.
+        width={inner}
+        height={inner}
+        loading='lazy'
+        referrerPolicy='no-referrer'
+        className='h-4/5 w-4/5 object-contain'
+        onError={() => setTier(t => t + 1)}
+      />
+    </span>
   );
 }
 
