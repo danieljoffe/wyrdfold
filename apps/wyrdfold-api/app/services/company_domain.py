@@ -81,7 +81,24 @@ _CANDIDATE_TLDS = (".com", ".io")
 # Sources that aren't a single company. The shared manual pseudo-source
 # pools many employers under one row — any domain stored there would be
 # wrong for most of its jobs.
-_PSEUDO_SOURCE_NAMES = frozenset({"manually added"})
+#
+# Matched on the PROVIDER (see ``_MANUAL_PROVIDER``) because the display
+# name is environment-specific: the local seed calls it "Manually Added"
+# while prod calls it "Manual Entry", and a dry run caught the name-only
+# guard about to stamp "manualentry.com" onto a row pooling 4 distinct
+# employers. These names stay as defence-in-depth for any row that is
+# manual-shaped without the provider set.
+# Only OBSERVED pseudo-source labels belong here. The bare word "manual" was
+# tried and removed in review: ``candidate_domains`` has no provider context,
+# so reserving it would suppress a legitimate employer called Manual (a real
+# company — manual.co) on an ordinary Greenhouse source. The structural
+# provider filter already covers display-name drift, so this list only has to
+# catch a manual-shaped row whose provider is somehow not set.
+_PSEUDO_SOURCE_NAMES = frozenset({"manually added", "manual entry"})
+
+# The provider value the manual/pooled pseudo-source carries. Structural,
+# so it cannot drift with copy changes.
+_MANUAL_PROVIDER = "manual"
 
 # A plausible bare label: letters/digits, len >= 3 (1-2 char stems like
 # ``x`` collide with squatters far more often than they hit the company).
@@ -168,13 +185,35 @@ def _stem_from_name(company_name: str) -> str | None:
     return stem if len(stem) >= 3 and _STEM_RE.match(stem) else None
 
 
+def _slug_part(board_token: str) -> str:
+    """The company-identifying part of a board token.
+
+    Workday tokens are COMPOUND — ``https://cbrlgroup.wd503.myworkdayjobs
+    .com|cbrlgroup|crackerbarrelexternal`` — and 1,274 of the catalog's
+    sources carry that shape. Squashing the whole thing produced 50-char
+    nonsense candidates (``httpscbrlgroupwd503myworkdayjobscom...``): two
+    guaranteed-dead probes per Workday source, a quarter of the catalog.
+    The tenant segment after the URL is the useful one.
+    """
+    if "|" not in board_token:
+        return board_token
+    parts = [p.strip() for p in board_token.split("|") if p.strip()]
+    # Drop the URL segment; the first remaining part is the Workday tenant.
+    usable = [p for p in parts if not p.lower().startswith(("http://", "https://"))]
+    return usable[0] if usable else ""
+
+
 def _stem_from_slug(board_token: str) -> str | None:
     """``datadog81`` -> ``datadog`` (trailing digits are ATS-slug noise —
     ``datadog81.com`` is a squatter, ``datadog.com`` is the company);
-    ``dbtlabs`` -> ``dbtlabs``. None when nothing plausible remains."""
-    slug = board_token.strip().lower()
+    ``dbtlabs`` -> ``dbtlabs``. Compound Workday tokens are reduced to their
+    tenant segment first. None when nothing plausible remains."""
+    slug = _slug_part(board_token).strip().lower()
     slug = re.sub(r"[^a-z0-9-]", "", slug)
     slug = re.sub(r"\d+$", "", slug)
+    # AFTER the digit strip, which is what exposes the hyphen: "appcues-2"
+    # becomes "appcues-", yielding the invalid candidate "appcues-.com".
+    slug = slug.strip("-")
     return slug if len(slug) >= 3 and _STEM_RE.match(slug) else None
 
 
@@ -275,7 +314,13 @@ async def enrich_missing_source_domains(
     enriched rows leave the NULL set; new sources are picked up by the
     next full run.
     """
-    query = supabase.table("sources").select("id, company_name, board_token").is_("domain", "null")
+    query = (
+        supabase.table("sources")
+        .select("id, company_name, board_token")
+        .is_("domain", "null")
+        # The pooled manual pseudo-source is not one company (#470 dry run).
+        .neq("provider", _MANUAL_PROVIDER)
+    )
     if after_id is not None:
         query = query.gt("id", after_id)
     resp = await query.order("id").limit(limit).execute()
