@@ -271,6 +271,17 @@ def test_a_trailing_dot_or_unknown_suffix_is_not_treated_as_a_domain() -> None:
         (200, "Under Construction", False),
         # ...but a real page whose copy mentions a launch is NOT a placeholder.
         (200, "Acme Robotics — our Series B product is coming soon to the EU", True),
+        # NEGATIVE CONTROLS — the catalog contains real domain-industry
+        # companies (GoDaddy, Tucows, Squarespace, Hostinger, Paralleldomain).
+        # Their own homepages must stay usable; an earlier draft matched
+        # generic "domain names for" / "premium domains" wording, which would
+        # have discarded correct domains to catch nothing measurable.
+        (200, "Tucows | Making the Internet Better Since 1993", True),
+        (200, "Website Builder – Easily Create Your Own Website — Squarespace", True),
+        (200, "Hostinger - Bring Your Idea Online With a Website", True),
+        (200, "porkbun.com | An oddly satisfying experience.", True),
+        (200, "Premium domain names for your business | Namecheap", True),
+        (200, "Buy and sell domain names for the best price", True),
         (404, "Page not found", False),
         (410, "", False),
         (503, "", False),

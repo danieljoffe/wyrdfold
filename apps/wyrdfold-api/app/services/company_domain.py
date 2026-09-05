@@ -102,10 +102,19 @@ _NAME_IS_DOMAIN_RE = re.compile(r"^([a-z0-9][a-z0-9-]{1,62})\.(" + "|".join(_BRA
 _PARKED_TITLE_RE = re.compile(
     r"for sale|hugedomains|buy this domain|domain (?:is )?(?:for sale|broker)|"
     r"parked (?:free )?(?:at|by)|spaceship\.com|afternic|sedo|dan\.com|"
-    # Broker listings that never say "for sale" (found by doubling the sample
+    # Broker listing that never says "for sale" (found by doubling the sample
     # to 1,000: button.com and datastealth.com both serve
     # "BUTTON.COM | Strategic-Grade domain names for …").
-    r"strategic-grade domain|premium domain(?: name)?s?\b|domain names? for",
+    #
+    # Kept to the OBSERVED signature. Generic alternatives ("premium
+    # domains", "domain names for") were tried and removed: they caught
+    # nothing the narrow pattern missed across 1,000 sources, and the
+    # catalog contains real domain-industry companies — GoDaddy, Tucows,
+    # Squarespace, Hostinger, Paralleldomain — whose own homepages could
+    # legitimately carry that wording. Rejecting a correct domain to catch
+    # nothing is the same bad trade this module already refused when it
+    # declined to require a company-naming title.
+    r"strategic-grade domain",
     re.I,
 )
 # Answered, but it is not a homepage at all.
