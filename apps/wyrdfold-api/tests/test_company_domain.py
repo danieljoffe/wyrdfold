@@ -365,7 +365,7 @@ async def test_branded_name_declines_rather_than_falling_back_to_the_squatter() 
 # ---- dry-run findings (#470, before the production backfill) ----------------
 
 
-@pytest.mark.parametrize("name", ["Manually Added", "Manual Entry", "manual", "MANUAL ENTRY"])
+@pytest.mark.parametrize("name", ["Manually Added", "Manual Entry", "MANUAL ENTRY"])
 def test_the_pooled_manual_source_gets_no_candidates_under_any_of_its_names(name: str) -> None:
     """The display name is environment-specific — the local seed says
     "Manually Added", prod says "Manual Entry" — and the prod dry run caught
@@ -373,6 +373,20 @@ def test_the_pooled_manual_source_gets_no_candidates_under_any_of_its_names(name
     4 distinct employers. Every known spelling is excluded; the enrichment
     query ALSO filters on provider so a new spelling cannot reopen this."""
     assert candidate_domains(name, "manual") == []
+
+
+def test_a_real_company_called_manual_still_gets_candidates() -> None:
+    """Negative control (#1010 review): ``candidate_domains`` has no provider
+    context, so reserving the bare word "manual" would suppress a legitimate
+    employer of that name — Manual is a real company — on an ordinary
+    Greenhouse source. Only the observed pseudo-source LABELS are reserved;
+    the structural provider filter does the environment-drift work."""
+    assert candidate_domains("Manual", "manualhq") == [
+        "manual.com",
+        "manual.io",
+        "manualhq.com",
+        "manualhq.io",
+    ]
 
 
 async def test_enrichment_never_examines_the_manual_pseudo_source(

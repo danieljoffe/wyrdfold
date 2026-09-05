@@ -88,7 +88,13 @@ _CANDIDATE_TLDS = (".com", ".io")
 # guard about to stamp "manualentry.com" onto a row pooling 4 distinct
 # employers. These names stay as defence-in-depth for any row that is
 # manual-shaped without the provider set.
-_PSEUDO_SOURCE_NAMES = frozenset({"manually added", "manual entry", "manual"})
+# Only OBSERVED pseudo-source labels belong here. The bare word "manual" was
+# tried and removed in review: ``candidate_domains`` has no provider context,
+# so reserving it would suppress a legitimate employer called Manual (a real
+# company — manual.co) on an ordinary Greenhouse source. The structural
+# provider filter already covers display-name drift, so this list only has to
+# catch a manual-shaped row whose provider is somehow not set.
+_PSEUDO_SOURCE_NAMES = frozenset({"manually added", "manual entry"})
 
 # The provider value the manual/pooled pseudo-source carries. Structural,
 # so it cannot drift with copy changes.
