@@ -47,8 +47,16 @@
 --
 -- No backfill: see above, it is not derivable. Old rows stay NULL.
 -- Additive and nullable, so this is a metadata-only DDL — no table rewrite on
--- the ~482k-row table, and the deployed API tolerates the column's absence
--- (it only ever writes it), so the migration is safe to apply before merge.
+-- the ~482k-row table.
+--
+-- ROLLOUT ORDER — MIGRATION FIRST, and note which direction is the safe one:
+-- the OLD API tolerates this column being PRESENT (it never mentions it, and
+-- PostgREST ignores unknown columns on read). The NEW API does NOT tolerate it
+-- being ABSENT — _score_row_payload writes the key unconditionally, so every
+-- scoring write fails with PGRST204 against a pre-migration schema. Apply this
+-- before the API deploys. (An earlier version of this comment stated the
+-- tolerance backwards, which would have justified exactly the wrong ordering
+-- to someone reading only the SQL; caught in review of #1018.)
 
 ALTER TABLE public.scores
   ADD COLUMN IF NOT EXISTS exclusion_keywords text[];

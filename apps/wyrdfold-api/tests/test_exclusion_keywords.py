@@ -171,6 +171,13 @@ def test_known_writers_of_excluded_are_pinned():
     is another. The invariant cannot be proved, so this enforces the next best
     thing: a new writer cannot appear without someone deciding, here, whether
     it should also record a reason.
+
+    A TRIPWIRE, NOT PROOF. It finds writers lexically, by dict entries matching
+    ``"excluded":``. A helper that mutates the column through a differently
+    shaped payload would evade it, so this must not be cited as exhaustive
+    evidence in a later design discussion. The binding contract is the semantic
+    one in ``models/schemas.py`` and the column COMMENT; this only makes the
+    common case impossible to do by accident.
     """
     import re
     from pathlib import Path
@@ -217,3 +224,54 @@ def test_empty_jd_drop_does_not_claim_a_keyword_reason():
     empty_jd_block = src.split("if not jd_text.strip():", 1)[1].split("return None", 1)[0]
     assert '"excluded": True' in empty_jd_block, "anchor moved — retarget this test"
     assert "exclusion_keywords" not in empty_jd_block
+
+
+# ---- What exactly lands in the array ---------------------------------------
+
+
+def test_alias_match_persists_the_configured_keyword_not_the_title_wording():
+    """The predicate is ``_keyword_or_alias_in_text``, so a configured keyword
+    can fire on one of its aliases. What gets persisted is the CONFIGURED term,
+    not the surface form found in the title.
+
+    That is the behaviour we want — it records the user's rule rather than
+    scraped wording, which is stable across postings and is what a person would
+    recognise as "my negative keyword". Pinned here because #959 will turn this
+    array into a human explanation, and a UI author would otherwise reasonably
+    assume it contains verbatim matched title text. Raised in review of #1018.
+    """
+    # Configured canonical term, alias present in the title.
+    result = score_title_against_profile(
+        "Junior JS Developer", _profile(core={"React": 3}, negative_keywords=["javascript"])
+    )
+    assert result.excluded
+    assert result.exclusion_keywords == ["javascript"], "must record the rule, not the title"
+
+    # The reverse direction: configured alias, canonical present in the title.
+    reverse = score_title_against_profile(
+        "JavaScript Intern", _profile(core={"React": 3}, negative_keywords=["js"])
+    )
+    assert reverse.excluded
+    assert reverse.exclusion_keywords == ["js"]
+
+    # The SAME contract on the full-JD scorer, which is a separate code path.
+    # Covered explicitly because a sabotage check exposed the gap: the other
+    # full-JD tests use a keyword that coincides with the title's first word,
+    # so recording the title wording instead of the rule would have passed them.
+    full_jd = score_job_with_profile(
+        "Senior JS Engineer",
+        "<p>Build things.</p>",
+        _profile(core={"React": 3}, negative_keywords=["javascript"]),
+    )
+    assert full_jd.excluded
+    assert full_jd.exclusion_keywords == ["javascript"]
+
+
+def test_case_differences_persist_the_configured_casing():
+    """Same contract for casing: the match is case-insensitive, the record is
+    the configured spelling, so a UI can echo it back as the user typed it."""
+    result = score_title_against_profile(
+        "JUNIOR Engineer", _profile(core={"React": 3}, negative_keywords=["Junior"])
+    )
+    assert result.excluded
+    assert result.exclusion_keywords == ["Junior"]
