@@ -344,8 +344,10 @@ def _claim_run_or_202(
 
     The ``is_running`` check and the ``begin`` claim happen with no ``await``
     between them, so on the single event loop two concurrent kicks can't both
-    pass and both spawn (the panel's auto-fire, a StrictMode double-invoke, or
-    an impatient double-click would otherwise pay twice for one document).
+    pass and both spawn — an impatient double-click, two open tabs or a client
+    retry would otherwise pay twice for one document. Stated without naming a
+    caller-side mechanism on purpose: this is a server-side invariant, and the
+    comment it replaced named a panel auto-fire that #634 removed.
 
     Raises 429 past ``max_concurrent`` in-flight runs for this user.
     Backgrounding removed the natural serialization a 39s blocking request
