@@ -13,11 +13,21 @@ sample size of one account.
 
 THE HEADLINE THE MODEL EXISTS TO TEST
 Phase 1 is capped at ``phase1_daily_cap`` LLM calls per target per day
-(default 1000, unset in prod). That cap changes the shape of the answer:
-demand above it is not billed, it is *dropped*. So the failure mode of
-growth is not a large invoice — it is triage silently stopping partway
-through the day, which reaches a user as "I'm not getting matches" and
-reads like a relevance bug.
+(default 1000). That cap changes the shape of the answer: demand above it
+is not billed, it is *deferred* — re-offered next cycle, and lost only when
+saturation persists. So the failure mode of growth is not a large invoice;
+it is triage stopping partway through the day, which reaches a user as
+"I'm not getting matches" and reads like a relevance bug.
+
+WHAT IS MEASURED VS WHAT IS PROJECTED — read this before quoting a number.
+The cap landed in the code on 2026-08-31; the triage history this model
+reads ends 2026-08-25. The two do not overlap, so NOTHING here observes the
+cap binding: it has never run against live demand. Every "suppressed" /
+"days cap" figure is a COUNTERFACTUAL — today's cap applied to pre-cap
+demand — and the script proves the premise it rests on (that the demand
+series is uncensored) in its own output rather than asserting it.
+
+Only the PACKING section is a direct measurement of current behaviour.
 
 PUBLIC REPO: this file contains no prices, rates or spend figures. It
 reports CALLS and TOKENS. Pass --price-in/--price-out (USD per 1M tokens)
@@ -91,6 +101,26 @@ WHERE purpose = 'relevance.title_triage' AND metadata->>'batch_size' IS NOT NULL
 GROUP BY 1 HAVING count(*) > 200 ORDER BY 1 LIMIT 40;
 """
 
+# Is the demand series CENSORED by the very cap we are modelling? If the cap
+# was live while these calls were recorded, a capped day records only the
+# served calls and the model would be capping already-capped numbers — the
+# circularity a reviewer rightly flagged on #1016. The test is empirical: a
+# live cap of N truncates the series at N, so demand ABOVE the cap is proof it
+# was not enforced then.
+Q_CENSORING = """
+SET statement_timeout = '120s';
+WITH d AS (
+  SELECT created_at::date AS day, metadata->>'target_id' AS tgt, count(*) AS calls
+  FROM llm_costs
+  WHERE purpose = 'relevance.title_triage' AND metadata->>'target_id' IS NOT NULL
+  GROUP BY 1, 2)
+SELECT count(*) FILTER (WHERE calls > {cap})::int,
+       COALESCE(max(calls), 0)::int,
+       COALESCE(min(day)::text, ''),
+       COALESCE(max(day)::text, '')
+FROM d;
+"""
+
 # Back-test window: the busiest stretch, where the most targets ran at once.
 Q_BACKTEST = """
 SET statement_timeout = '120s';
@@ -139,10 +169,14 @@ class Measured:
     def p50(self) -> int:
         return int(statistics.median(self.demand))
 
-    @property
-    def capped_share(self) -> float:
+    def over_cap_share(self, cap: int) -> float:
+        """Share of observed target-days whose demand REACHES ``cap``.
+
+        Takes the cap rather than hardcoding 1000, so this headline can never
+        disagree with the scenario being modelled below it (it did: the figure
+        was pinned at 1000 while the forecast honoured --cap)."""
         d = self.demand
-        return sum(1 for c in d if c >= 1000) / len(d)
+        return sum(1 for c in d if c >= cap) / len(d)
 
     def sample_day(self, exclude: str | None = None) -> list[int]:
         """One day's per-target demand profile. Resampling at DAY level keeps
@@ -165,6 +199,49 @@ def measure() -> Measured:
     if not by_day:
         sys.exit("no triage history found — nothing to model")
     return Measured(by_day=by_day, tok_in=ti, tok_out=to, calls_sampled=n, tok_cache=tc)
+
+
+def censoring_report(m: Measured, cap: int) -> None:
+    """Answer, from the data itself, whether the demand series is censored by
+    the cap being modelled — before any conclusion leans on it.
+
+    Raised in review of #1016: if the cap was live while these calls were
+    recorded, a capped day records only SERVED calls, so applying the cap again
+    would be circular and the "suppressed" column would be inferring a tail it
+    had already destroyed. That objection is decisive when true, so the script
+    tests it instead of asserting an answer.
+
+    The test is that a live cap of N truncates the series at N. Demand observed
+    ABOVE the cap is therefore proof the cap was not enforced over that window.
+    """
+    raw = psql(Q_CENSORING.format(cap=cap))[0]
+    over, mx = int(raw[0]), int(raw[1])
+    first, last = raw[2], raw[3]
+    print("\nIS THIS DATA CENSORED BY THE CAP? (asked before anything relies on it)")
+    print(f"  window observed                   : {first} -> {last}")
+    print(f"  target-days ABOVE the cap         : {over:,}  (max {mx:,} vs cap {cap:,})")
+    if over:
+        print(
+            f"  VERDICT: NOT censored. A live {cap:,}-call cap truncates the series\n"
+            f"  at {cap:,}; {over:,} target-days sit above it, peaking at {mx:,}. So these\n"
+            "  are uncapped observations and applying the cap to them is a\n"
+            "  counterfactual projection, not a re-capping of capped numbers."
+        )
+        print(
+            "  CONSEQUENCE: the share above is what the cap WOULD truncate at this\n"
+            "  demand shape. It is NOT an observation that anything is being\n"
+            "  suppressed today — the cap postdates this window entirely."
+        )
+    else:
+        print(
+            f"  VERDICT: TREAT AS CENSORED — nothing exceeds {cap:,}. That is\n"
+            "  consistent with the cap having been live, but also with demand\n"
+            "  simply never reaching it; the two are indistinguishable from this\n"
+            "  table alone, so the test fails SAFE. The suppression columns below\n"
+            "  may be circular and must not be quoted without resolving which it\n"
+            "  is — check the cap's deploy date against the window above, or\n"
+            "  instrument demand at the decision point before the cap check."
+        )
 
 
 def packing_report(m: Measured) -> None:
@@ -260,8 +337,14 @@ def back_test(m: Measured) -> None:
             "  of ~3,000 calls/target against quiet days near 150), so no point\n"
             "  estimate can hit a given day — and the model does not pretend to.\n"
             "  Its INTERVAL is calibrated: an 80% band caught ~80% of real days.\n"
-            "  That is the property a capacity forecast needs. It still cannot\n"
-            "  validate the ASSUMED parameters below, where the real risk lives."
+            "\n  WHAT THIS DOES *NOT* VALIDATE (raised in review of #1016): it tests\n"
+            "  only that resampling observed demand reproduces observed demand. It\n"
+            "  says nothing about the SUPPRESSION column, which is arithmetic\n"
+            "  applied on top (demand minus cap), not something back-tested. Do not\n"
+            "  let 80% coverage lend confidence to the suppression figure. It also\n"
+            "  cannot validate the ASSUMED parameters below, where the real risk\n"
+            "  lives. The suppression estimate is only as good as its premise that\n"
+            "  demand is uncensored — which the section above tests directly."
         )
 
 
@@ -280,7 +363,7 @@ def forecast(
     )
     hdr = (
         f"  {'users':>8}{'t/user':>8}{'targets':>9}{'demand/day':>13}{'served':>12}"
-        f"{'suppressed':>12}{'days cap':>10}{'p90 served':>13}{'ceiling':>13}"
+        f"{'suppressed':>12}{'days cap':>10}{'p90 served':>13}{'call ceil':>13}"
     )
     if price_in is not None:
         hdr += f"{'rel. cost':>11}"
@@ -315,16 +398,28 @@ def forecast(
             s50 = statistics.mean(s[1] for s in sims)
             c50 = sum(1 for s in sims if s[2] > 0.10) / len(sims)
             s90 = sorted(s[1] for s in sims)[int(len(sims) * 0.9)]
-            # Deterministic, needs no simulation: the cap is a hard ceiling, so
-            # this is the most the system can EVER bill in a day at this size.
-            ceiling = targets * cap * (m.tok_in + m.tok_out)
+            # Deterministic, needs no simulation — but ONLY over CALLS. The cap
+            # bounds calls per target per day; it does not bound tokens, because
+            # tokens per call depend on packing. Reported as calls for that
+            # reason: expressing it in tokens would multiply by today's 11.1
+            # titles/call, and the packing fix this same script argues for would
+            # raise tokens/call toward the configured 250 and invalidate the
+            # number. (Flagged in review of #1016 — the old column multiplied by
+            # today's mean call size and called the result a spend ceiling.)
+            call_ceiling = targets * cap
             row = (
                 f"  {n:>8,}{t:>8}{targets:>9,}{d50:>13,.0f}{s50:>12,.0f}"
                 f"{d50 - s50:>12,.0f}{c50:>9.0%}{s90:>13,.0f}"
-                f"{ceiling / 1e9:>12,.1f}B"
+                f"{call_ceiling / 1e6:>12,.1f}M"
             )
             if price_in is not None and price_out is not None:
-                cost = s50 * (m.tok_in * price_in + m.tok_out * price_out) / 1_000_000
+                # Cache reads are billed (at a discount) and are 56.5% of input
+                # on this path, so a cost column that ignores them understates.
+                # Priced at the input rate here = deliberately CONSERVATIVE
+                # (an upper bound); pass the discounted rate if you want exact.
+                cost = (
+                    s50 * ((m.tok_in + m.tok_cache) * price_in + m.tok_out * price_out) / 1_000_000
+                )
                 row += f"{cost:>11,.0f}"
             print(row)
 
@@ -345,7 +440,10 @@ def main() -> None:
     print("MEASURED FROM PRODUCTION")
     print(f"  observed days / target-days       : {len(m.by_day):,} / {len(m.demand):,}")
     print(f"  calls/target/day  p50 / max       : {m.p50:,} / {max(m.demand):,}")
-    print(f"  target-days already at/over cap   : {m.capped_share:.1%}   <-- read this first")
+    print(
+        f"  target-days whose demand >= cap   : {m.over_cap_share(a.cap):.1%}"
+        f"   (cap={a.cap:,}) <-- a PROJECTION, see below"
+    )
     print(
         f"  tokens per call   in / out        : {m.tok_in:,} / {m.tok_out:,}"
         f"  (n={m.calls_sampled:,})"
@@ -354,6 +452,7 @@ def main() -> None:
     print("\nASSUMED (swept, never point-estimated)")
     print("  users, targets/user — the account sample is n=1, so these are guesses.")
 
+    censoring_report(m, a.cap)
     packing_report(m)
     back_test(m)
     forecast(
@@ -369,10 +468,13 @@ def main() -> None:
         "\nREADING THIS: columns are MEANS over simulated days; 'days cap' is the\n"
         "share of days on which >10% of targets hit the cap. Mean, not median,\n"
         "because daily volume is bimodal and spend accumulates across days.\n"
-        "'served' is what gets billed; 'suppressed' is demand the cap\n"
-        "DROPS — triage that never happens, surfacing to users as missing matches\n"
-        "rather than as spend. Cost is bounded by cap x targets BY CONSTRUCTION;\n"
-        "relevance is what degrades. See #1015."
+        "'served' is what would be billed; 'suppressed' is demand the cap would\n"
+        "DEFER — re-offered next cycle, and lost only when saturation persists,\n"
+        "which reaches a user as missing matches rather than as spend.\n"
+        "\nThese are PROJECTIONS, not observations: the cap postdates this demand\n"
+        "window entirely (see the censoring section above), so it has never yet\n"
+        "run against live demand. Cost is bounded by cap x targets BY\n"
+        "CONSTRUCTION; throughput is what degrades. See #1015."
     )
 
 
