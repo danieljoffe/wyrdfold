@@ -19,6 +19,52 @@ class ScoreResult(BaseModel):
     breakdown: ScoreBreakdown
     matched_keywords: list[str]
     excluded: bool
+    # The negative keywords that fired on the TITLE during THIS scoring pass.
+    #
+    # NARROW BY DESIGN. This records one specific cause; it is NOT a summary of
+    # why a row is excluded, because ``excluded`` has three writers today:
+    # this scoring path, the Phase-2 empty-JD drop in
+    # ``services/fit/score_persistence.py``, and the Phase-1 backfill in
+    # ``services/relevance/phase1_backfill.py`` (which ORs in ``not
+    # promising``). Only the first records keywords; the other two leave the
+    # field untouched, so a recorded finding survives them intact. So
+    # an empty list means "no title keyword fired here" and nothing more — it is
+    # not evidence of any particular alternative cause. A reader explaining a
+    # skip must combine this with ``excluded`` / ``promising`` /
+    # ``logistics_filters``. (Semantics tightened in review of #1018, which
+    # caught the earlier comment overclaiming this as the sole writer.)
+    #
+    # "This pass" is enforceable, not just asserted: the row also carries
+    # ``exclusion_keywords_version``, stamped with the same
+    # ``scored_profile_version`` the pass writes. Other writers advance that
+    # version without touching the array, so the row could otherwise read as
+    # current while carrying a keyword the newer profile no longer treats as a
+    # negative (review of #1018).
+    #
+    # READER RULE — the keywords describe the CURRENT profile iff::
+    #
+    #     exclusion_keywords IS NOT NULL
+    #     AND exclusion_keywords_version IS NOT NULL
+    #     AND exclusion_keywords_version == scored_profile_version
+    #
+    # RECORDEDNESS IS PART OF CURRENTNESS. Do not shorten this to a
+    # NULL-tolerant equality (SQL's ``IS NOT DISTINCT FROM``): that treats
+    # NULL/NULL as equal, so an UNRECORDED row — both NULL precisely because
+    # nothing was recorded — would read as "current". Version equality alone
+    # cannot tell "the fact is current" from "we have no fact".
+    #
+    # Unrecorded is not only a legacy state. The Phase-1 backfill upserts scores
+    # rows carrying only (promising, phase1_confidence, excluded), so on insert
+    # it CREATES a NULL-keyword row long after this column shipped. A reader must
+    # never infer from NULL whether a keyword fired (review of #1018).
+    #
+    # Kept because the reason is not reconstructible after the fact: a target's
+    # negative list moves with its profile version, so a row scored under an
+    # older profile can no longer be explained by replaying today's keywords.
+    # ``_title_matches_any_target`` already admits these postings specifically
+    # "so the scoring pipeline records the rejection for audit" — this is the
+    # half of that intent that was never stored.
+    exclusion_keywords: list[str] = Field(default_factory=list)
 
 
 Provider = Literal[

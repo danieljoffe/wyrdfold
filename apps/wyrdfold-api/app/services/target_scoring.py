@@ -81,6 +81,7 @@ def _score_row_payload(
     breakdown: ScoreBreakdown,
     matched_keywords: list[str],
     excluded: bool,
+    exclusion_keywords: list[str],
     scoring_status: ScoringStatus,
     scored_profile_version: int = 1,
     promising: bool | None = None,
@@ -97,6 +98,19 @@ def _score_row_payload(
         # matched_keywords is no longer persisted (write-only column dropped
         # in R2 — the breakdown JSONB already embeds match components).
         "excluded": excluded,
+        # Written UNCONDITIONALLY, never as an optional key: a bulk upsert
+        # writes the union of the batch's keys to every row (#928), so a
+        # sometimes-present key would leak one row's reason onto rows that
+        # were excluded for a different reason — or not excluded at all.
+        # Always present, empty list when nothing fired.
+        "exclusion_keywords": exclusion_keywords,
+        # Provenance for the line above. Other writers advance
+        # ``scored_profile_version`` without touching the array (the Phase-2
+        # paths in fit/score_persistence.py), so a row could otherwise read as
+        # current while carrying a keyword fact from an older profile — under
+        # which the keyword may no longer be a negative at all. Stamped with the
+        # SAME version this pass writes, so a reader compares the two.
+        "exclusion_keywords_version": scored_profile_version,
         "scoring_status": scoring_status,
         "scored_profile_version": scored_profile_version,
         # Initialise recency_score to the raw fit score (fresh-posting,
@@ -138,6 +152,7 @@ async def _upsert_score(
     breakdown: ScoreBreakdown,
     matched_keywords: list[str],
     excluded: bool,
+    exclusion_keywords: list[str],
     scoring_status: ScoringStatus,
     scored_profile_version: int = 1,
     promising: bool | None = None,
@@ -175,6 +190,7 @@ async def _upsert_score(
         breakdown=breakdown,
         matched_keywords=matched_keywords,
         excluded=excluded,
+        exclusion_keywords=exclusion_keywords,
         scoring_status=scoring_status,
         scored_profile_version=scored_profile_version,
         promising=promising,
@@ -250,6 +266,7 @@ async def score_title_and_upsert(
         breakdown=result.breakdown,
         matched_keywords=result.matched_keywords,
         excluded=result.excluded,
+        exclusion_keywords=result.exclusion_keywords,
         scoring_status="stage1",
         scored_profile_version=target.profile_version,
     )
@@ -335,6 +352,7 @@ async def score_and_upsert(
         breakdown=result.breakdown,
         matched_keywords=result.matched_keywords,
         excluded=result.excluded,
+        exclusion_keywords=result.exclusion_keywords,
         scoring_status="stage2",
         scored_profile_version=target.profile_version,
         promising=promising,
@@ -380,6 +398,7 @@ async def score_and_upsert_async(
         breakdown=result.breakdown,
         matched_keywords=result.matched_keywords,
         excluded=result.excluded,
+        exclusion_keywords=result.exclusion_keywords,
         scoring_status="stage2",
         scored_profile_version=target.profile_version,
         promising=promising,
@@ -580,6 +599,7 @@ def _title_score_page_rows(rows: list[dict[str, Any]], target: JobTarget) -> lis
                 breakdown=result.breakdown,
                 matched_keywords=result.matched_keywords,
                 excluded=result.excluded,
+                exclusion_keywords=result.exclusion_keywords,
                 scoring_status="stage1",
                 scored_profile_version=target.profile_version,
             )
