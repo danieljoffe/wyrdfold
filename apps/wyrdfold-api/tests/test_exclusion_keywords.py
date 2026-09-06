@@ -156,3 +156,64 @@ def test_payload_key_is_present_on_every_row_of_a_mixed_batch():
         [],
         ["intern", "contract"],
     ]
+
+
+# ---- The exclusion state machine has more than one writer -------------------
+
+
+def test_known_writers_of_excluded_are_pinned():
+    """``exclusion_keywords`` describes ONE cause. That is only safe while we
+    know what the other causes are, so this pins the set of places that write
+    the ``excluded`` key into a scores payload.
+
+    Review of #1018 caught the original comments claiming title keywords were
+    the sole writer of ``excluded``; they are not — the Phase-2 empty-JD drop
+    is another. The invariant cannot be proved, so this enforces the next best
+    thing: a new writer cannot appear without someone deciding, here, whether
+    it should also record a reason.
+    """
+    import re
+    from pathlib import Path
+
+    app = Path(__file__).resolve().parents[1] / "app"
+    pattern = re.compile(r"""["']excluded["']\s*:""")
+    found = {str(f.relative_to(app)) for f in app.rglob("*.py") if pattern.search(f.read_text())}
+    known = {
+        # The scoring write path — carries exclusion_keywords alongside.
+        "services/target_scoring.py",
+        # Phase 2's empty-JD terminal drop. An UPDATE that deliberately does
+        # NOT touch exclusion_keywords: the scoring pass's finding ("no title
+        # keyword fired") stays true, and this exclusion has its own cause.
+        "services/fit/score_persistence.py",
+        # The Phase-1 backfill, which ORs its verdict in:
+        #   "excluded": bool(was_excluded or not promising)
+        # It preserves an existing keyword exclusion and never writes
+        # exclusion_keywords, so a recorded finding survives — but it CAN set
+        # excluded purely from `not promising`, which is a third way for a row
+        # to read excluded=True with an empty keyword list. This guard found
+        # this writer; neither the review nor I had named it.
+        "services/relevance/phase1_backfill.py",
+    }
+    assert found == known, (
+        f"the set of writers of `excluded` changed: {found ^ known}. "
+        "If you added one, decide whether it should record a reason, and "
+        "update the semantics comments in models/schemas.py and the "
+        "scores.exclusion_keywords column comment to match."
+    )
+
+
+def test_empty_jd_drop_does_not_claim_a_keyword_reason():
+    """The Phase-2 empty-JD payload must not write ``exclusion_keywords``.
+
+    If it ever did — or defaulted it to [] — an empty-JD exclusion would assert
+    'no title keyword fired' about a pass that never looked at keywords, which
+    is the overclaim this field's semantics were narrowed to avoid.
+    """
+    import inspect
+
+    from app.services.fit import score_persistence
+
+    src = inspect.getsource(score_persistence)
+    empty_jd_block = src.split("if not jd_text.strip():", 1)[1].split("return None", 1)[0]
+    assert '"excluded": True' in empty_jd_block, "anchor moved — retarget this test"
+    assert "exclusion_keywords" not in empty_jd_block

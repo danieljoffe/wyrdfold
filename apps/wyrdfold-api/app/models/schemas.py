@@ -19,13 +19,27 @@ class ScoreResult(BaseModel):
     breakdown: ScoreBreakdown
     matched_keywords: list[str]
     excluded: bool
-    # The negative keywords that fired on the TITLE — the sole thing that sets
-    # ``excluded``. Kept because the reason is not reconstructible after the
-    # fact: a target's negative list moves with its profile version, so a row
-    # scored under an older profile can no longer be explained by replaying
-    # today's keywords. ``_title_matches_any_target`` already admits these
-    # postings specifically "so the scoring pipeline records the rejection for
-    # audit" — this is the half of that intent that was never stored.
+    # The negative keywords that fired on the TITLE during THIS scoring pass.
+    #
+    # NARROW BY DESIGN. This records one specific cause; it is NOT a summary of
+    # why a row is excluded, because ``excluded`` has three writers today:
+    # this scoring path, the Phase-2 empty-JD drop in
+    # ``services/fit/score_persistence.py``, and the Phase-1 backfill in
+    # ``services/relevance/phase1_backfill.py`` (which ORs in ``not
+    # promising``). Only the first records keywords; the other two leave the
+    # field untouched, so a recorded finding survives them intact. So
+    # an empty list means "no title keyword fired here" and nothing more — it is
+    # not evidence of any particular alternative cause. A reader explaining a
+    # skip must combine this with ``excluded`` / ``promising`` /
+    # ``logistics_filters``. (Semantics tightened in review of #1018, which
+    # caught the earlier comment overclaiming this as the sole writer.)
+    #
+    # Kept because the reason is not reconstructible after the fact: a target's
+    # negative list moves with its profile version, so a row scored under an
+    # older profile can no longer be explained by replaying today's keywords.
+    # ``_title_matches_any_target`` already admits these postings specifically
+    # "so the scoring pipeline records the rejection for audit" — this is the
+    # half of that intent that was never stored.
     exclusion_keywords: list[str] = Field(default_factory=list)
 
 

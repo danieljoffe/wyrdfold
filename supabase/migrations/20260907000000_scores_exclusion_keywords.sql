@@ -7,9 +7,20 @@
 -- that audit trail today but store only the verdict, never the reason.
 --
 -- Measured on prod before writing this (2026-09-05): of 204,078 rows flagged
--- ``excluded``, 105,213 (51.6%) carry no recoverable reason — no phase-1
--- ``promising = FALSE``, no ``logistics_filters``. Those are the
--- negative-keyword exclusions this column captures.
+-- ``excluded``, 98,406 carry a phase-1 ``promising = FALSE`` and 1,300 carry
+-- ``logistics_filters``; 105,213 carry neither and so cannot be explained from
+-- stored data at all. That gap is what this column closes.
+--
+-- Do NOT read that gap as "all negative-keyword exclusions" (an earlier version
+-- of this comment did, and review of #1018 was right to reject it): ``excluded``
+-- has two other writers: the Phase-2 empty-JD drop in
+-- ``services/fit/score_persistence.py``, and the Phase-1 backfill in
+-- ``services/relevance/phase1_backfill.py``, which ORs ``not promising`` into
+-- the flag. Re-measured against the empty-JD signature (``scoring_status =
+-- 'complete'`` + blank ``description_html``) it accounts for 2 rows, so the
+-- number barely moves — but the inference was unsound regardless of how small
+-- that population turned out to be. A test pins the writer set so a fourth
+-- cannot appear without someone deciding whether it records a reason.
 --
 -- Why now, rather than with the surface that reads it (#959): the reason is
 -- NOT reconstructible after the fact. A target's negative-keyword list moves
@@ -20,13 +31,19 @@
 -- breakdown JSONB, which is exactly why dropping it was safe.)
 --
 -- NULLABLE ON PURPOSE. Three states must stay distinguishable:
---   NULL  -> scored before this column existed; we do not know the reason,
---            and the UI must not invent one.
---   '{}'  -> recorded, and no negative keyword fired (excluded by the
---            phase-1 prefilter instead — see ``scores.promising``).
---   {...} -> recorded, and these keywords matched the TITLE.
+--   NULL  -> this scoring pass predates the column; whether a title keyword
+--            fired is UNKNOWN, and the UI must not invent an answer.
+--   '{}'  -> this scoring pass recorded that NO title negative keyword fired.
+--            That is all it says. It is NOT evidence of any other cause: the
+--            row may be excluded by the phase-1 prefilter, by the Phase-2
+--            empty-JD drop, or not be excluded at all.
+--   {...} -> these negative keywords matched the TITLE in this pass.
 -- A NOT NULL DEFAULT '{}' would collapse the first two and make every legacy
--- row read as "excluded, but nothing fired", which is a claim we cannot make.
+-- row assert "no keyword fired", which is a claim we cannot make.
+--
+-- The column describes ONE cause. Anything explaining a skip to a user must
+-- combine it with ``excluded`` / ``promising`` / ``logistics_filters`` rather
+-- than treating '{}' as proof of a particular alternative.
 --
 -- No backfill: see above, it is not derivable. Old rows stay NULL.
 -- Additive and nullable, so this is a metadata-only DDL — no table rewrite on
@@ -38,7 +55,11 @@ ALTER TABLE public.scores
 
 COMMENT ON COLUMN public.scores.exclusion_keywords IS
   'Negative keywords that matched the job TITLE and forced excluded=TRUE. '
-  'NULL = scored before the column existed (reason unknown, do not display); '
-  '{} = recorded, no keyword fired (excluded by the phase-1 prefilter, see '
-  'scores.promising); non-empty = the keywords that fired. Set in '
+  'Records ONE cause, not the whole exclusion state machine — excluded has '
+  'other writers (the Phase-2 empty-JD drop in fit/score_persistence.py and '
+  'the Phase-1 backfill in relevance/phase1_backfill.py; neither writes this '
+  'column, so a recorded finding survives them). '
+  'NULL = pass predates the column, unknown, do not display; {} = this pass '
+  'recorded that no title keyword fired, which implies nothing about other '
+  'causes; non-empty = these keywords matched the title. Set in '
   'app/services/scoring.py, persisted via _score_row_payload.';
