@@ -154,6 +154,34 @@ SELECT count(*)::int, COALESCE(max(calls), 0)::int, COALESCE(max(day)::text, '')
 FROM d;
 """
 
+# Backfill rows are distinguishable — ``metadata.trigger = 'activation_backfill'``
+# — so how much of its allowance a backfill ACTUALLY spends is measurable, once
+# any has run. Until then it is an assumption and must be swept and labelled as
+# one. Raised in review of #1016: the allowance is a CEILING
+# (``min(cap - used, floor(cap * fraction))``), not demand — a backfill stops
+# when its candidate window is exhausted, and rejection-store hits cost nothing.
+Q_BACKFILL_OBSERVED = """
+SET statement_timeout = '120s';
+WITH d AS (
+  SELECT created_at::date AS day, metadata->>'target_id' AS tgt, count(*) AS calls
+  FROM llm_costs
+  WHERE purpose = 'relevance.title_triage'
+    AND metadata->>'trigger' = 'activation_backfill'
+  GROUP BY 1, 2)
+SELECT count(*)::int, COALESCE(round(avg(calls)), 0)::int, COALESCE(max(calls), 0)::int
+FROM d;
+"""
+
+# Proves the demand series carries NO backfill calls, so it is ingestion-only
+# and the two claimants are genuinely additive rather than double-counted.
+Q_SAMPLE_PURITY = """
+SET statement_timeout = '120s';
+SELECT count(*) FILTER (WHERE metadata->>'trigger' = 'activation_backfill')::int,
+       count(*)::int
+FROM llm_costs
+WHERE purpose = 'relevance.title_triage' AND created_at < '{cap_deployed}'::date;
+"""
+
 Q_BACKTEST = """
 SET statement_timeout = '120s';
 WITH d AS (
@@ -293,6 +321,60 @@ def censoring_report(m: Measured, cap: int, cap_deployed: str) -> None:
         )
 
 
+def backfill_report(cap: int, fraction: float, utilisation: float, cap_deployed: str) -> int:
+    """Decide how many calls ONE activation actually spends, and say which of
+    measurement or assumption produced the number.
+
+    ``phase1_backfill_allowance`` returns ``min(cap - used, floor(cap *
+    fraction))`` — a CEILING. The real backfill stops when its candidate window
+    is exhausted, and rejection-store hits cost no LLM call, so a small or
+    already-triaged catalog finishes well below it. Treating the allowance as
+    consumption does two wrong things at once (review of #1016): it reduces
+    intake capacity by the full slice AND bills the whole slice, which biases
+    both sides of the headline in the same direction.
+
+    Backfill cost rows are tagged ``metadata.trigger='activation_backfill'``, so
+    this is measurable the moment any backfill runs. Until then the number is an
+    assumption, swept via --backfill-utilisation and labelled as a bound.
+    """
+    allowance = int(cap * fraction)
+    days, avg_calls, max_calls = (int(x) for x in psql(Q_BACKFILL_OBSERVED)[0])
+    pure = psql(Q_SAMPLE_PURITY.format(cap_deployed=cap_deployed))[0]
+    bf_in_sample, total_in_sample = int(pure[0]), int(pure[1])
+
+    print("\nBACKFILL — the cap's second spender")
+    print(
+        f"  allowance per activation          : {allowance:,} calls (floor({cap:,} x {fraction:g}))"
+    )
+    print(
+        f"  demand series is ingestion-only   : {bf_in_sample:,} backfill rows "
+        f"of {total_in_sample:,} — the two claimants are additive, not double-counted"
+    )
+    if days:
+        print(
+            f"  MEASURED over {days:,} activation-days : {avg_calls:,} calls avg "
+            f"(max {max_calls:,}) = {avg_calls / allowance:.0%} of allowance"
+        )
+        return min(avg_calls, allowance)
+
+    used = int(allowance * utilisation)
+    print("  observed activation-days          : 0 — the backfill has NEVER run")
+    print(
+        f"  so consumption is ASSUMED          : {utilisation:.0%} of allowance "
+        f"= {used:,} calls/activation"
+    )
+    if utilisation >= 1.0:
+        print(
+            "  ^^ 100% = a WORST-CASE BOUND, not a forecast. The backfill column\n"
+            "  below is what activations COULD cost, and intake is reduced by the\n"
+            "  full slice; both move together, so read the rows as a bound on\n"
+            "  contention rather than as expected spend. Lower it with\n"
+            "  --backfill-utilisation to model partial consumption. This upgrades\n"
+            "  itself to a measurement as soon as one backfill runs."
+        )
+    return used
+
+
 def packing_report(m: Measured) -> None:
     """The decision-relevant measurement: the cap counts CALLS, so poor batch
     packing spends the cap on prompt overhead instead of on judgements."""
@@ -412,7 +494,7 @@ def forecast(
     price_out: float | None,
     price_cache: float | None,
     activation_rates: list[float],
-    backfill_fraction: float,
+    backfill_calls: int,
 ) -> None:
     """Forecast served vs deferred Phase-1 work, with BOTH claimants on the cap.
 
@@ -439,8 +521,8 @@ def forecast(
         f"demand bootstrapped from {len(m.demand)} observed target-days"
     )
     print(
-        f"  backfill shares the cap: an activating target reserves "
-        f"floor({cap:,} x {backfill_fraction:g}) = {int(cap * backfill_fraction):,} calls"
+        f"  backfill shares the cap: an activating target spends {backfill_calls:,} "
+        f"calls (see BACKFILL above for measured-vs-assumed)"
     )
     hdr = (
         f"  {'users':>8}{'t/user':>8}{'act%':>6}{'targets':>9}{'demand/day':>13}"
@@ -449,7 +531,9 @@ def forecast(
     if price_in is not None:
         hdr += f"{'rel. cost':>11}"
     print(hdr)
-    backfill_reserve = int(cap * backfill_fraction)
+    # What an activation actually consumes — measured if any backfill has run,
+    # otherwise the swept assumption. NOT the raw allowance (review of #1016).
+    backfill_reserve = backfill_calls
     for n in users:
         for t in tpu:
             targets = n * t
@@ -569,6 +653,14 @@ def main() -> None:
         default=0.25,
         help="phase1_backfill_cap_fraction (prod default 0.25)",
     )
+    ap.add_argument(
+        "--backfill-utilisation",
+        type=float,
+        default=1.0,
+        help="share of the backfill ALLOWANCE actually consumed per activation. "
+        "1.0 (default) is a worst-case bound, not a forecast; ignored once real "
+        "backfill calls exist, which are measured instead",
+    )
     ap.add_argument("--seed", type=int, default=17)
     a = ap.parse_args()
     random.seed(a.seed)
@@ -590,6 +682,7 @@ def main() -> None:
     print("  users, targets/user — the account sample is n=1, so these are guesses.")
 
     censoring_report(m, a.cap, a.cap_deployed)
+    bf_calls = backfill_report(a.cap, a.backfill_fraction, a.backfill_utilisation, a.cap_deployed)
     packing_report(m)
     back_test(m, a.cap_deployed, a.backtest_trials)
     forecast(
@@ -602,15 +695,16 @@ def main() -> None:
         a.price_out,
         a.price_cache_read,
         [float(x) for x in a.activation_rates.split(",")],
-        a.backfill_fraction,
+        bf_calls,
     )
     print(
         "\nREADING THIS: columns are MEANS over simulated days; 'days cap' is the\n"
         "share of days on which >10% of targets hit the cap. Mean, not median,\n"
         "because daily volume is bimodal and spend accumulates across days.\n"
-        "'served' is what would be billed; 'suppressed' is demand the cap would\n"
-        "DEFER — re-offered next cycle, and lost only when saturation persists,\n"
-        "which reaches a user as missing matches rather than as spend.\n"
+        "'intake srv' + 'backfill' is what would be billed — BOTH draw on the\n"
+        "same per-target counter. 'deferred' is intake the cap would push to the\n"
+        "next cycle, lost only when saturation persists, which reaches a user as\n"
+        "missing matches rather than as spend.\n"
         "\nThese are PROJECTIONS, not observations: the cap postdates this demand\n"
         "window entirely (see the censoring section above), so it has never yet\n"
         "run against live demand. Cost is bounded by cap x targets BY\n"
