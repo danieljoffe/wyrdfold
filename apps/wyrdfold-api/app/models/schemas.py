@@ -37,11 +37,21 @@ class ScoreResult(BaseModel):
     # "This pass" is enforceable, not just asserted: the row also carries
     # ``exclusion_keywords_version``, stamped with the same
     # ``scored_profile_version`` the pass writes. Other writers advance that
-    # version without touching the array, so a reader compares the two — equal
-    # means the keywords describe the current profile, different means they are
-    # a historical fact from an older one. (Review of #1018 found the row could
-    # otherwise read as current while carrying a keyword that the newer profile
-    # may no longer treat as a negative.)
+    # version without touching the array, so the row could otherwise read as
+    # current while carrying a keyword the newer profile no longer treats as a
+    # negative (review of #1018).
+    #
+    # READER RULE — the keywords describe the CURRENT profile iff::
+    #
+    #     exclusion_keywords IS NOT NULL
+    #     AND exclusion_keywords_version IS NOT NULL
+    #     AND exclusion_keywords_version == scored_profile_version
+    #
+    # RECORDEDNESS IS PART OF CURRENTNESS. Do not shorten this to a
+    # NULL-tolerant equality (SQL's ``IS NOT DISTINCT FROM``): that treats
+    # NULL/NULL as equal, so a legacy row — both NULL precisely because nothing
+    # was recorded — would read as "current". Version equality alone cannot tell
+    # "the fact is current" from "we have no fact".
     #
     # Kept because the reason is not reconstructible after the fact: a target's
     # negative list moves with its profile version, so a row scored under an

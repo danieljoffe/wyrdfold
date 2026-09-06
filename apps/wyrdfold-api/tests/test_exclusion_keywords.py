@@ -280,6 +280,22 @@ def test_case_differences_persist_the_configured_casing():
 # ---- Provenance: whose profile version do the keywords belong to? ----------
 
 
+def _is_current(row: dict) -> bool:
+    """The documented reader rule, exactly as the migration and schemas state it.
+
+    RECORDEDNESS IS PART OF CURRENTNESS. Written out here rather than as a bare
+    equality because the first draft used SQL's ``IS NOT DISTINCT FROM``, which
+    treats NULL/NULL as equal and so classified legacy never-recorded rows as
+    current (review of #1018). Tests assert against this helper so the rule has
+    one definition and the legacy case below cannot silently drift back.
+    """
+    return (
+        row.get("exclusion_keywords") is not None
+        and row.get("exclusion_keywords_version") is not None
+        and row["exclusion_keywords_version"] == row["scored_profile_version"]
+    )
+
+
 def test_payload_stamps_the_profile_version_that_wrote_the_keywords():
     row = _payload(scored_profile_version=3)
     assert row["exclusion_keywords"] == ["junior"]
@@ -304,8 +320,7 @@ def test_a_later_writer_advancing_the_version_makes_the_keywords_detectably_stal
 
     assert row["exclusion_keywords"] == ["junior"], "the historical fact is preserved"
     assert row["exclusion_keywords_version"] == 3, "and still attributed to v3"
-    # The reader rule: equal => current, different => historical.
-    assert row["exclusion_keywords_version"] != row["scored_profile_version"]
+    assert not _is_current(row), "and is no longer the row's current reason"
 
 
 def test_a_rescore_at_the_new_version_realigns_the_pair():
@@ -314,6 +329,7 @@ def test_a_rescore_at_the_new_version_realigns_the_pair():
     row = _payload(scored_profile_version=4, exclusion_keywords=[])
     assert row["exclusion_keywords_version"] == row["scored_profile_version"] == 4
     assert row["exclusion_keywords"] == []
+    assert _is_current(row), "an empty array at a matching version IS a current finding"
 
 
 def test_provenance_key_is_present_on_every_row_of_a_mixed_batch():
@@ -325,3 +341,38 @@ def test_provenance_key_is_present_on_every_row_of_a_mixed_batch():
     ]
     assert len({frozenset(r) for r in batch}) == 1
     assert all("exclusion_keywords_version" in r for r in batch)
+
+
+def test_legacy_null_row_is_not_current_even_though_both_versions_are_null():
+    """The bug the reader rule had (review of #1018).
+
+    A pre-migration row has ``exclusion_keywords = NULL`` and
+    ``exclusion_keywords_version = NULL``. Under the original wording —
+    ``exclusion_keywords_version IS NOT DISTINCT FROM scored_profile_version``
+    — NULL/NULL compares EQUAL, so the row would have read as "current" and a
+    #959 reader could have presented "no keyword fired" about a pass that never
+    ran. Recordedness has to be part of the predicate.
+    """
+    legacy = {
+        "exclusion_keywords": None,
+        "exclusion_keywords_version": None,
+        "scored_profile_version": None,
+    }
+    assert not _is_current(legacy)
+
+    # The naive version-equality rule would have said "current" here — this is
+    # the assertion that would fail if someone reintroduces it.
+    null_tolerant_equal = legacy["exclusion_keywords_version"] == legacy["scored_profile_version"]
+    assert null_tolerant_equal, "precondition: the naive rule really does match"
+    assert not _is_current(legacy), "but the documented rule must reject it"
+
+
+def test_legacy_row_later_scored_at_v4_is_not_current():
+    """The other legacy shape: never recorded, but a later pass advanced the
+    row's own version. Keywords stay NULL, so there is still no fact to show."""
+    row = {
+        "exclusion_keywords": None,
+        "exclusion_keywords_version": None,
+        "scored_profile_version": 4,
+    }
+    assert not _is_current(row)

@@ -70,19 +70,34 @@ ALTER TABLE public.scores
   -- another writer touched the row (caught in review of #1018).
   --
   -- Set to the ``scored_profile_version`` of the pass that wrote the array.
-  -- READER RULE: the keywords describe the row's CURRENT profile iff
-  --   exclusion_keywords_version IS NOT DISTINCT FROM scored_profile_version
-  -- Otherwise they are a historical fact from an older profile: still worth
-  -- keeping (it is why the row was excluded, and it is not reconstructible),
-  -- but it must not be presented as the current reason.
+  --
+  -- READER RULE — the keywords describe the row's CURRENT profile iff:
+  --   exclusion_keywords            IS NOT NULL
+  --   AND exclusion_keywords_version IS NOT NULL
+  --   AND exclusion_keywords_version = scored_profile_version
+  --
+  -- RECORDEDNESS IS PART OF CURRENTNESS. An earlier draft wrote this as
+  -- ``exclusion_keywords_version IS NOT DISTINCT FROM scored_profile_version``,
+  -- which is wrong: that operator treats NULL/NULL as EQUAL, so every legacy
+  -- row — where both are NULL precisely because nothing was ever recorded —
+  -- would satisfy it and read as "current". Version equality alone cannot
+  -- distinguish "the fact is current" from "we have no fact". Caught in review
+  -- of #1018.
+  --
+  -- When the rule is false the keywords are a historical fact from an older
+  -- profile: still worth keeping (it is why the row was excluded, and it is not
+  -- reconstructible), but it must not be presented as the current reason.
   ADD COLUMN IF NOT EXISTS exclusion_keywords_version integer;
 
 COMMENT ON COLUMN public.scores.exclusion_keywords_version IS
   'The scored_profile_version of the pass that wrote exclusion_keywords. '
-  'Other writers advance scored_profile_version without touching the array, so '
-  'compare the two: equal = the keywords describe the current profile; '
-  'different = a historical fact from an older profile, do not present it as '
-  'the current reason. NULL alongside NULL keywords = never recorded.';
+  'Other writers advance scored_profile_version without touching the array. '
+  'CURRENT iff exclusion_keywords IS NOT NULL AND exclusion_keywords_version '
+  'IS NOT NULL AND exclusion_keywords_version = scored_profile_version. Do NOT '
+  'write this as IS NOT DISTINCT FROM: that treats NULL/NULL as equal, so a '
+  'legacy never-recorded row would read as current. Otherwise the keywords are '
+  'a historical fact from an older profile - keep them, but do not present '
+  'them as the current reason.';
 
 COMMENT ON COLUMN public.scores.exclusion_keywords IS
   'Negative keywords that matched the job TITLE and forced excluded=TRUE. '
