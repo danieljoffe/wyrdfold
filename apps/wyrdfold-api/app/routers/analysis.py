@@ -264,9 +264,12 @@ async def create_analysis(
 
     # Dedup: a run is already in flight for this exact cache key → don't spawn a
     # second (double LLM spend) and don't re-count; tell the client to keep
-    # polling. Covers concurrent explicit clicks (an impatient second press, two
-    # open tabs) and any StrictMode double-invoke. Panel open itself never POSTs
-    # — it is spend-free since #634 — so this is no longer an auto-fire guard.
+    # polling. It guards concurrent DUPLICATE REQUESTS of any origin — a
+    # double-click, two open tabs, a client retry. Deliberately stated without
+    # naming a specific caller-side mechanism: the previous comment pinned this
+    # to a panel auto-fire that #634 removed, and went stale the moment that
+    # changed. Panel open never POSTs now, but the guard is a server-side
+    # invariant and does not depend on which client behaviour is in fashion.
     if run_registry.is_running(key):
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
