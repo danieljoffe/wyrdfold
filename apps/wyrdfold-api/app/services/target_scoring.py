@@ -104,6 +104,13 @@ def _score_row_payload(
         # were excluded for a different reason — or not excluded at all.
         # Always present, empty list when nothing fired.
         "exclusion_keywords": exclusion_keywords,
+        # Provenance for the line above. Other writers advance
+        # ``scored_profile_version`` without touching the array (the Phase-2
+        # paths in fit/score_persistence.py), so a row could otherwise read as
+        # current while carrying a keyword fact from an older profile — under
+        # which the keyword may no longer be a negative at all. Stamped with the
+        # SAME version this pass writes, so a reader compares the two.
+        "exclusion_keywords_version": scored_profile_version,
         "scoring_status": scoring_status,
         "scored_profile_version": scored_profile_version,
         # Initialise recency_score to the raw fit score (fresh-posting,

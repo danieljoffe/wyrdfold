@@ -275,3 +275,53 @@ def test_case_differences_persist_the_configured_casing():
     )
     assert result.excluded
     assert result.exclusion_keywords == ["Junior"]
+
+
+# ---- Provenance: whose profile version do the keywords belong to? ----------
+
+
+def test_payload_stamps_the_profile_version_that_wrote_the_keywords():
+    row = _payload(scored_profile_version=3)
+    assert row["exclusion_keywords"] == ["junior"]
+    assert row["exclusion_keywords_version"] == 3
+    assert row["scored_profile_version"] == 3
+
+
+def test_a_later_writer_advancing_the_version_makes_the_keywords_detectably_stale():
+    """The hole this column closes (review of #1018).
+
+    Phase 2's writers set ``scored_profile_version = target.profile_version``
+    and deliberately leave ``exclusion_keywords`` alone. Without provenance the
+    row then reads as current at the new version while carrying a keyword fact
+    from the old one — under which the keyword may no longer be a negative at
+    all — and the comment claiming the array records "THIS scoring pass" would
+    be false.
+    """
+    row = _payload(scored_profile_version=3)
+    # A Phase-2 write at v4 — the empty-JD drop's payload shape, which touches
+    # scored_profile_version but not the keyword array.
+    row.update({"excluded": True, "scoring_status": "complete", "scored_profile_version": 4})
+
+    assert row["exclusion_keywords"] == ["junior"], "the historical fact is preserved"
+    assert row["exclusion_keywords_version"] == 3, "and still attributed to v3"
+    # The reader rule: equal => current, different => historical.
+    assert row["exclusion_keywords_version"] != row["scored_profile_version"]
+
+
+def test_a_rescore_at_the_new_version_realigns_the_pair():
+    """The other half: once the SCORING path runs again, the array and its
+    version advance together, so the reader rule reports 'current' again."""
+    row = _payload(scored_profile_version=4, exclusion_keywords=[])
+    assert row["exclusion_keywords_version"] == row["scored_profile_version"] == 4
+    assert row["exclusion_keywords"] == []
+
+
+def test_provenance_key_is_present_on_every_row_of_a_mixed_batch():
+    """Same #928 union hazard as the array itself — the two must travel
+    together, or a bulk page could carry the array without its provenance."""
+    batch = [
+        _payload(excluded=True, exclusion_keywords=["junior"], scored_profile_version=2),
+        _payload(excluded=False, exclusion_keywords=[], scored_profile_version=2),
+    ]
+    assert len({frozenset(r) for r in batch}) == 1
+    assert all("exclusion_keywords_version" in r for r in batch)

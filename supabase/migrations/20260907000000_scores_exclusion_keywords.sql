@@ -59,7 +59,30 @@
 -- to someone reading only the SQL; caught in review of #1018.)
 
 ALTER TABLE public.scores
-  ADD COLUMN IF NOT EXISTS exclusion_keywords text[];
+  ADD COLUMN IF NOT EXISTS exclusion_keywords text[],
+  -- PROVENANCE. Other writers advance ``scored_profile_version`` without
+  -- touching ``exclusion_keywords`` (the Phase-2 paths in
+  -- fit/score_persistence.py write ``scored_profile_version =
+  -- target.profile_version``), so a row can read as current at v4 while
+  -- carrying a keyword fact recorded at v3 — under which the keyword may not
+  -- even have been a negative any more. Without this column a reader cannot
+  -- tell, and "records what fired during THIS pass" would be false the moment
+  -- another writer touched the row (caught in review of #1018).
+  --
+  -- Set to the ``scored_profile_version`` of the pass that wrote the array.
+  -- READER RULE: the keywords describe the row's CURRENT profile iff
+  --   exclusion_keywords_version IS NOT DISTINCT FROM scored_profile_version
+  -- Otherwise they are a historical fact from an older profile: still worth
+  -- keeping (it is why the row was excluded, and it is not reconstructible),
+  -- but it must not be presented as the current reason.
+  ADD COLUMN IF NOT EXISTS exclusion_keywords_version integer;
+
+COMMENT ON COLUMN public.scores.exclusion_keywords_version IS
+  'The scored_profile_version of the pass that wrote exclusion_keywords. '
+  'Other writers advance scored_profile_version without touching the array, so '
+  'compare the two: equal = the keywords describe the current profile; '
+  'different = a historical fact from an older profile, do not present it as '
+  'the current reason. NULL alongside NULL keywords = never recorded.';
 
 COMMENT ON COLUMN public.scores.exclusion_keywords IS
   'Negative keywords that matched the job TITLE and forced excluded=TRUE. '

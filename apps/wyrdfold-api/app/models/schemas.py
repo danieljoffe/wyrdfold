@@ -34,6 +34,15 @@ class ScoreResult(BaseModel):
     # ``logistics_filters``. (Semantics tightened in review of #1018, which
     # caught the earlier comment overclaiming this as the sole writer.)
     #
+    # "This pass" is enforceable, not just asserted: the row also carries
+    # ``exclusion_keywords_version``, stamped with the same
+    # ``scored_profile_version`` the pass writes. Other writers advance that
+    # version without touching the array, so a reader compares the two — equal
+    # means the keywords describe the current profile, different means they are
+    # a historical fact from an older one. (Review of #1018 found the row could
+    # otherwise read as current while carrying a keyword that the newer profile
+    # may no longer treat as a negative.)
+    #
     # Kept because the reason is not reconstructible after the fact: a target's
     # negative list moves with its profile version, so a row scored under an
     # older profile can no longer be explained by replaying today's keywords.
