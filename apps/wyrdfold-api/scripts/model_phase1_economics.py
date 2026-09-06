@@ -49,6 +49,7 @@ import statistics
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import date
 
 # app.services.relevance.title_triage.PHASE1_BATCH_SIZE — inlined so the model
 # runs without importing the app package.
@@ -638,6 +639,34 @@ def forecast(
                 print(row)
 
 
+def _iso_date(raw: str) -> str:
+    """argparse type for ``--cap-deployed``: parse, then re-serialise canonically.
+
+    This value is the ONLY string input that reaches SQL — every demand query
+    interpolates it as ``created_at < '{cap_deployed}'::date`` — and ``--cap``,
+    the only other interpolated value, is already ``type=int``. Left as free
+    text it is an injection boundary: ``--cap-deployed "2026-01-01'::date OR
+    true--"`` builds
+
+        AND created_at < '2026-01-01'::date OR true--'::date
+
+    which silently defeats the pre-cap boundary the censoring guarantee rests
+    on, while still printing a normal-looking table. The script is read-only by
+    intent, but intent is not the control — the DATABASE_URL credential is, and
+    it points at production.
+
+    Parsing to a ``date`` and interpolating only ``date.isoformat()`` makes the
+    value safe by construction rather than by escaping, and rejects impossible
+    boundaries before any query runs. Raised in review of #1016.
+    """
+    try:
+        return date.fromisoformat(raw.strip()).isoformat()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"must be an ISO date (YYYY-MM-DD), got {raw!r}: {exc}"
+        ) from exc
+
+
 def _validate(a: argparse.Namespace) -> None:
     """Reject impossible scenarios instead of modelling them.
 
@@ -711,6 +740,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--cap-deployed",
+        type=_iso_date,
         default=CAP_DEPLOYED,
         help=f"date phase1_daily_cap went live; demand is sampled strictly before it "
         f"(default {CAP_DEPLOYED})",
