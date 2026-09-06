@@ -20,14 +20,16 @@ it is triage stopping partway through the day, which reaches a user as
 "I'm not getting matches" and reads like a relevance bug.
 
 WHAT IS MEASURED VS WHAT IS PROJECTED — read this before quoting a number.
-The cap landed in the code on 2026-08-31; the triage history this model
-reads ends 2026-08-25. The two do not overlap, so NOTHING here observes the
-cap binding: it has never run against live demand. Every "suppressed" /
-"days cap" figure is a COUNTERFACTUAL — today's cap applied to pre-cap
-demand — and the script proves the premise it rests on (that the demand
-series is uncensored) in its own output rather than asserting it.
+Every "suppressed" / "days cap" figure is a COUNTERFACTUAL: today's cap
+applied to demand recorded before the cap existed. Only the PACKING section
+measures current behaviour.
 
-Only the PACKING section is a direct measurement of current behaviour.
+The demand sample is bounded to ``created_at < CAP_DEPLOYED`` so that a
+capped observation cannot enter it — a cap that is live while calls are
+recorded censors them, and re-capping censored numbers is circular. The
+boundary is structural; the script reports what it excludes, so once Phase 1
+runs post-cap you see the baseline going stale instead of the two regimes
+quietly blending.
 
 PUBLIC REPO: this file contains no prices, rates or spend figures. It
 reports CALLS and TOKENS. Pass --price-in/--price-out (USD per 1M tokens)
@@ -52,6 +54,19 @@ from dataclasses import dataclass
 # runs without importing the app package.
 CONFIGURED_BATCH = 250
 
+# The commit that introduced ``phase1_daily_cap`` (744af754, 2026-08-31). The
+# demand sample is restricted to BEFORE this date, because a cap that is live
+# while calls are recorded CENSORS them: llm_costs would hold served work, not
+# demand, and re-capping it would be circular.
+#
+# This is a hard boundary, not a sanity check. Review of #1016 caught the
+# earlier design, which asked only "does ANY target-day exceed the cap?" — an
+# EXISTENTIAL test. It passed because pre-cap days peak at 3,718, and it would
+# have kept passing forever once post-cap days were added alongside them,
+# silently mixing censored and uncensored populations. Override with
+# --cap-deployed if the cap's effective date changes.
+CAP_DEPLOYED = "2026-08-31"
+
 # --- measured-parameter queries (one shot each, timeout-guarded) -------------
 
 # Per (day, target) demand. Grouped BY DAY downstream, because targets are
@@ -65,6 +80,7 @@ WITH d AS (
   SELECT created_at::date AS day, metadata->>'target_id' AS tgt, count(*) AS calls
   FROM llm_costs
   WHERE purpose = 'relevance.title_triage' AND metadata->>'target_id' IS NOT NULL
+    AND created_at < '{cap_deployed}'::date
   GROUP BY 1, 2)
 SELECT day::text, calls FROM d ORDER BY day;
 """
@@ -113,6 +129,7 @@ WITH d AS (
   SELECT created_at::date AS day, metadata->>'target_id' AS tgt, count(*) AS calls
   FROM llm_costs
   WHERE purpose = 'relevance.title_triage' AND metadata->>'target_id' IS NOT NULL
+    AND created_at < '{cap_deployed}'::date
   GROUP BY 1, 2)
 SELECT count(*) FILTER (WHERE calls > {cap})::int,
        COALESCE(max(calls), 0)::int,
@@ -122,12 +139,28 @@ FROM d;
 """
 
 # Back-test window: the busiest stretch, where the most targets ran at once.
+# What the boundary excludes. Silence here would hide the very regime change
+# the boundary exists for: once Phase 1 runs again post-cap, this is non-zero
+# and the forecast is extrapolating from an increasingly historical baseline.
+Q_POST_CAP = """
+SET statement_timeout = '120s';
+WITH d AS (
+  SELECT created_at::date AS day, metadata->>'target_id' AS tgt, count(*) AS calls
+  FROM llm_costs
+  WHERE purpose = 'relevance.title_triage' AND metadata->>'target_id' IS NOT NULL
+    AND created_at >= '{cap_deployed}'::date
+  GROUP BY 1, 2)
+SELECT count(*)::int, COALESCE(max(calls), 0)::int, COALESCE(max(day)::text, '')
+FROM d;
+"""
+
 Q_BACKTEST = """
 SET statement_timeout = '120s';
 WITH d AS (
   SELECT created_at::date AS day, metadata->>'target_id' AS tgt, count(*) AS calls
   FROM llm_costs
   WHERE purpose = 'relevance.title_triage' AND metadata->>'target_id' IS NOT NULL
+    AND created_at < '{cap_deployed}'::date
   GROUP BY 1, 2)
 SELECT day::text, count(*)::int AS targets, sum(calls)::int AS actual_calls
 FROM d GROUP BY 1 HAVING count(*) >= 5 ORDER BY 1;
@@ -191,9 +224,9 @@ class Measured:
         return [random.choice(prof) for _ in range(n)]
 
 
-def measure() -> Measured:
+def measure(cap_deployed: str) -> Measured:
     by_day: dict[str, list[int]] = {}
-    for day, calls in psql(Q_TARGET_DAY_DEMAND):
+    for day, calls in psql(Q_TARGET_DAY_DEMAND.format(cap_deployed=cap_deployed)):
         by_day.setdefault(day, []).append(int(calls))
     ti, to, n, tc = (int(x) for x in psql(Q_TOKENS_PER_CALL)[0])
     if not by_day:
@@ -201,46 +234,62 @@ def measure() -> Measured:
     return Measured(by_day=by_day, tok_in=ti, tok_out=to, calls_sampled=n, tok_cache=tc)
 
 
-def censoring_report(m: Measured, cap: int) -> None:
-    """Answer, from the data itself, whether the demand series is censored by
-    the cap being modelled — before any conclusion leans on it.
+def censoring_report(m: Measured, cap: int, cap_deployed: str) -> None:
+    """Establish that the demand sample is UNCENSORED, before anything uses it.
 
-    Raised in review of #1016: if the cap was live while these calls were
-    recorded, a capped day records only SERVED calls, so applying the cap again
-    would be circular and the "suppressed" column would be inferring a tail it
-    had already destroyed. That objection is decisive when true, so the script
-    tests it instead of asserting an answer.
+    If a cap is live while calls are recorded, ``llm_costs`` holds served work
+    rather than demand: a capped day records only what ran, so applying the cap
+    again is circular and the "suppressed" column infers a tail it had already
+    destroyed. That objection is decisive when true.
 
-    The test is that a live cap of N truncates the series at N. Demand observed
-    ABOVE the cap is therefore proof the cap was not enforced over that window.
+    The guarantee is STRUCTURAL, not observational. Every demand query is
+    bounded to ``created_at < cap_deployed``, so no capped observation can enter
+    the sample regardless of what production accumulates later.
+
+    An earlier version relied on an EXISTENTIAL check instead — "does any
+    target-day exceed the cap?" — which review of #1016 correctly rejected:
+    pre-cap days peak at 3,718, so that test would have kept reporting
+    "not censored" forever while post-cap capped days were quietly mixed in
+    beside them. It is kept below, demoted to corroboration of the boundary.
     """
-    raw = psql(Q_CENSORING.format(cap=cap))[0]
+    raw = psql(Q_CENSORING.format(cap=cap, cap_deployed=cap_deployed))[0]
     over, mx = int(raw[0]), int(raw[1])
     first, last = raw[2], raw[3]
-    print("\nIS THIS DATA CENSORED BY THE CAP? (asked before anything relies on it)")
-    print(f"  window observed                   : {first} -> {last}")
-    print(f"  target-days ABOVE the cap         : {over:,}  (max {mx:,} vs cap {cap:,})")
-    if over:
+    post = psql(Q_POST_CAP.format(cap_deployed=cap_deployed))[0]
+    post_days, post_max, post_last = int(post[0]), int(post[1]), post[2]
+
+    print("\nIS THE DEMAND SAMPLE UNCENSORED? (settled before anything uses it)")
+    provenance = "744af754" if cap_deployed == CAP_DEPLOYED else "overridden via --cap-deployed"
+    print(f"  cap deployed                      : {cap_deployed}  ({provenance})")
+    print(f"  sample window (pre-cap only)      : {first} -> {last}")
+    print(f"  GUARANTEE: every demand query is bounded to created_at < {cap_deployed},")
+    print("  so a capped observation cannot enter the sample by construction.")
+    print(f"  corroboration — target-days above {cap:,}: {over:,} (max {mx:,})")
+    if not over:
         print(
-            f"  VERDICT: NOT censored. A live {cap:,}-call cap truncates the series\n"
-            f"  at {cap:,}; {over:,} target-days sit above it, peaking at {mx:,}. So these\n"
-            "  are uncapped observations and applying the cap to them is a\n"
-            "  counterfactual projection, not a re-capping of capped numbers."
+            f"  NOTE: nothing in the sample exceeds {cap:,}. Not a problem — the\n"
+            "  boundary above is the guarantee — but it means this run cannot\n"
+            "  also corroborate it from the data, and a --cap set above observed\n"
+            "  demand makes every 'suppressed' figure identically zero."
         )
+
+    print(f"\n  EXCLUDED as post-cap                : {post_days:,} target-days", end="")
+    if post_days:
+        print(f" (through {post_last}, max {post_max:,})")
         print(
-            "  CONSEQUENCE: the share above is what the cap WOULD truncate at this\n"
-            "  demand shape. It is NOT an observation that anything is being\n"
-            "  suppressed today — the cap postdates this window entirely."
+            "  ^^ Phase 1 has run since the cap shipped, so those days ARE\n"
+            "  censored and are deliberately kept out of the demand sample. Two\n"
+            "  consequences: this forecast is now extrapolating from a\n"
+            "  historical baseline, and real suppression is finally measurable —\n"
+            "  instrument demand at the decision point BEFORE the cap check and\n"
+            "  model from that instead of from this script."
         )
     else:
+        print(" — none yet; the cap has never run.")
         print(
-            f"  VERDICT: TREAT AS CENSORED — nothing exceeds {cap:,}. That is\n"
-            "  consistent with the cap having been live, but also with demand\n"
-            "  simply never reaching it; the two are indistinguishable from this\n"
-            "  table alone, so the test fails SAFE. The suppression columns below\n"
-            "  may be circular and must not be quoted without resolving which it\n"
-            "  is — check the cap's deploy date against the window above, or\n"
-            "  instrument demand at the decision point before the cap check."
+            "  So every 'suppressed' / 'days cap' figure below is a COUNTERFACTUAL:\n"
+            "  today's cap applied to demand recorded before it existed. Nothing\n"
+            "  here observes the cap binding, because it never has."
         )
 
 
@@ -268,6 +317,8 @@ def packing_report(m: Measured) -> None:
         marginal, overhead = 0.0, 0.0
 
     print("\nBATCH PACKING — the cap counts CALLS, so this decides what it buys")
+    print("  (spans ALL history on purpose: how many titles ride a call is")
+    print("   unaffected by the cap, so it needs no pre-cap boundary)")
     print(f"  configured batch size             : {CONFIGURED_BATCH}")
     print(f"  actual titles per call  avg / p50 : {avg_b} / {p50_b}")
     print(f"  calls judging exactly ONE title   : {singles:,} of {calls:,} ({singles / calls:.0%})")
@@ -300,15 +351,17 @@ def packing_report(m: Measured) -> None:
         )
 
 
-def back_test(m: Measured) -> None:
+def back_test(m: Measured, cap_deployed: str, trials: int = 400) -> None:
     """Before forecasting: can the model reproduce days we have truth for?
 
     The model's only claim is `total = sum over targets of per-target demand`,
     so the test is whether sampling that empirical distribution reproduces the
     observed daily totals. If it cannot, the forecast is worthless.
     """
-    rows = psql(Q_BACKTEST)
-    print("\nBACK-TEST — predicted vs actual on days with >=5 targets running")
+    rows = psql(Q_BACKTEST.format(cap_deployed=cap_deployed))
+    print(
+        f"\nBACK-TEST — predicted vs actual on days with >=5 targets running ({trials:,} sims/day)"
+    )
     print(
         f"  {'day':<12}{'targets':>8}{'actual':>9}{'model p50':>11}"
         f"{'p10-p90':>16}{'err':>8}{'in band':>9}"
@@ -318,8 +371,9 @@ def back_test(m: Measured) -> None:
         targets, actual = int(targets_s), int(actual_s)
         # LEAVE-ONE-OUT: predict this day WITHOUT its own profile in the pool,
         # or the test is circular.
-        sims = sorted(sum(m.draw_targets(targets, exclude=day)) for _ in range(400))
-        p50, p10, p90 = sims[200], sims[40], sims[359]
+        sims = sorted(sum(m.draw_targets(targets, exclude=day)) for _ in range(trials))
+        p50 = sims[trials // 2]
+        p10, p90 = sims[int(trials * 0.10)], sims[int(trials * 0.90)]
         err = (p50 - actual) / actual if actual else 0.0
         hit = p10 <= actual <= p90
         inside += hit
@@ -380,7 +434,7 @@ def forecast(
             # rows no single day could ever produce (300 targets reading as less
             # capped than 100).
             sims = []
-            for _ in range(max(50, trials // 20)):
+            for _ in range(trials):
                 draws = m.draw_targets(cohort)
                 sims.append(
                     (
@@ -429,14 +483,27 @@ def main() -> None:
     ap.add_argument("--users", default="100,1000,10000,100000")
     ap.add_argument("--targets-per-user", default="1,3,5")
     ap.add_argument("--cap", type=int, default=1000, help="phase1_daily_cap (prod default 1000)")
-    ap.add_argument("--trials", type=int, default=2000)
+    # Used LITERALLY. It was previously scaled by //20 inside forecast() while
+    # the header printed the unscaled figure, so "--trials 2000" reported 2,000
+    # and ran 100 (caught in review of #1016). Default lowered to match the
+    # simulation count that was actually running, so runtime is unchanged.
+    ap.add_argument("--trials", type=int, default=200, help="forecast simulations per row")
+    ap.add_argument(
+        "--backtest-trials", type=int, default=400, help="simulations per back-tested day"
+    )
+    ap.add_argument(
+        "--cap-deployed",
+        default=CAP_DEPLOYED,
+        help=f"date phase1_daily_cap went live; demand is sampled strictly before it "
+        f"(default {CAP_DEPLOYED})",
+    )
     ap.add_argument("--price-in", type=float, default=None, help="USD per 1M input tokens")
     ap.add_argument("--price-out", type=float, default=None, help="USD per 1M output tokens")
     ap.add_argument("--seed", type=int, default=17)
     a = ap.parse_args()
     random.seed(a.seed)
 
-    m = measure()
+    m = measure(a.cap_deployed)
     print("MEASURED FROM PRODUCTION")
     print(f"  observed days / target-days       : {len(m.by_day):,} / {len(m.demand):,}")
     print(f"  calls/target/day  p50 / max       : {m.p50:,} / {max(m.demand):,}")
@@ -452,9 +519,9 @@ def main() -> None:
     print("\nASSUMED (swept, never point-estimated)")
     print("  users, targets/user — the account sample is n=1, so these are guesses.")
 
-    censoring_report(m, a.cap)
+    censoring_report(m, a.cap, a.cap_deployed)
     packing_report(m)
-    back_test(m)
+    back_test(m, a.cap_deployed, a.backtest_trials)
     forecast(
         m,
         [int(x) for x in a.users.split(",")],
