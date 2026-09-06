@@ -42,6 +42,7 @@ at run time if you want a cost column; it is never committed.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import random
 import shutil
@@ -714,12 +715,24 @@ def _validate(a: argparse.Namespace) -> None:
                 )
         except ValueError:
             errs.append(f"--activation-rates entries must be numbers (got {tok!r})")
+    # isfinite, not just >= 0. NaN fails EVERY comparison, so `val < 0` is False
+    # for it and a NaN price would sail through and turn the whole cost column
+    # into `nan` — nonsense that still prints. Infinity passes `< 0` too. The
+    # bounded parameters above reject both implicitly, because `0.0 <= x <= 1.0`
+    # is False for NaN and Inf; the open-ended prices are the only floats that
+    # needed this said explicitly. (Review of #1016 — non-blocking there, but the
+    # contract this script claims is that no nonsensical input produces output,
+    # and a partial fail-closed guard is the kind that gets trusted wrongly.)
     for label, val in (
         ("--price-in", a.price_in),
         ("--price-out", a.price_out),
         ("--price-cache-read", a.price_cache_read),
     ):
-        if val is not None and val < 0:
+        if val is None:
+            continue
+        if not math.isfinite(val):
+            errs.append(f"{label} must be a finite number (got {val})")
+        elif val < 0:
             errs.append(f"{label} must be >= 0 (got {val})")
     if errs:
         sys.exit("refusing to run — invalid scenario:\n  " + "\n  ".join(errs))
