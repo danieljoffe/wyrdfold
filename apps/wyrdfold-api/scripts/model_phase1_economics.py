@@ -410,18 +410,46 @@ def forecast(
     trials: int,
     price_in: float | None,
     price_out: float | None,
+    price_cache: float | None,
+    activation_rates: list[float],
+    backfill_fraction: float,
 ) -> None:
+    """Forecast served vs deferred Phase-1 work, with BOTH claimants on the cap.
+
+    ONE COUNTER, TWO SPENDERS — ``services/relevance/daily_cap.py`` says it
+    outright: the activation backfill and ordinary poll-cycle ingestion both
+    write ``purpose='relevance.title_triage'`` rows against the same
+    ``metadata.target_id``, so they draw down the SAME per-target daily count.
+    The backfill clamps itself to ``min(cap - used, floor(cap * fraction))``.
+
+    The demand series this model bootstraps predates that design, so it is
+    ORDINARY INGESTION DEMAND ONLY. Applying the whole cap to it would model a
+    world where intake is the sole claimant — which overstates served intake and
+    understates deferred work exactly when it matters most, since #1015 is about
+    opening signup and activation is precisely what a signup burst produces.
+    Raised in review of #1016.
+
+    So ``activation_rate`` is swept, never estimated: on an activating target's
+    day the backfill takes its share FIRST (the pessimistic ordering — running
+    it after intake would leave it nothing), and intake is served from what
+    remains.
+    """
     print(
         f"\nFORECAST — cap {cap:,} calls/target/day, {trials:,} trials, "
         f"demand bootstrapped from {len(m.demand)} observed target-days"
     )
+    print(
+        f"  backfill shares the cap: an activating target reserves "
+        f"floor({cap:,} x {backfill_fraction:g}) = {int(cap * backfill_fraction):,} calls"
+    )
     hdr = (
-        f"  {'users':>8}{'t/user':>8}{'targets':>9}{'demand/day':>13}{'served':>12}"
-        f"{'suppressed':>12}{'days cap':>10}{'p90 served':>13}{'call ceil':>13}"
+        f"  {'users':>8}{'t/user':>8}{'act%':>6}{'targets':>9}{'demand/day':>13}"
+        f"{'intake srv':>12}{'backfill':>11}{'deferred':>12}{'days cap':>10}{'call ceil':>12}"
     )
     if price_in is not None:
         hdr += f"{'rel. cost':>11}"
     print(hdr)
+    backfill_reserve = int(cap * backfill_fraction)
     for n in users:
         for t in tpu:
             targets = n * t
@@ -429,53 +457,77 @@ def forecast(
             # scale — the sum of draws scales linearly in expectation.
             cohort = min(targets, 5000)
             scale = targets / cohort
-            # Keep each trial's three quantities TOGETHER. Taking an independent
-            # median per column mixes burst trials with quiet ones and produces
-            # rows no single day could ever produce (300 targets reading as less
-            # capped than 100).
-            sims = []
-            for _ in range(trials):
-                draws = m.draw_targets(cohort)
-                sims.append(
-                    (
-                        sum(draws) * scale,
-                        sum(min(d, cap) for d in draws) * scale,
-                        sum(1 for d in draws if d >= cap) / cohort,
+            # Draw the day profiles ONCE and evaluate every activation rate
+            # against the SAME draws. Re-drawing per rate confounds the effect
+            # being measured with sampler noise: demand/day wandered by ~7%
+            # between rates that should share it exactly, which is larger than
+            # the activation effect itself.
+            all_draws = [m.draw_targets(cohort) for _ in range(trials)]
+            for act in activation_rates:
+                # Deterministic split of the cohort rather than a coin flip per
+                # target: with the rate swept, the question is "what does THIS
+                # activation level cost", not "how does that level vary" — and a
+                # per-target flip would add variance that is an artefact of the
+                # sampler, not of the system.
+                n_act = round(cohort * act)
+                sims = []
+                for draws in all_draws:
+                    intake_served = 0.0
+                    capped = 0
+                    for i, d in enumerate(draws):
+                        # Backfill takes its share FIRST — the pessimistic
+                        # ordering for intake. Running it after intake would
+                        # leave it `cap - used`, i.e. often nothing.
+                        room = cap - backfill_reserve if i < n_act else cap
+                        intake_served += min(d, room)
+                        if d >= room:
+                            capped += 1
+                    sims.append(
+                        (
+                            sum(draws) * scale,
+                            intake_served * scale,
+                            n_act * backfill_reserve * scale,
+                            capped / cohort,
+                        )
                     )
+                # Daily volume is bimodal: a sampled day either bursts (every
+                # target caps) or is quiet (none do), so a median row is one of
+                # those two worlds and hides the other. Spend and deferral
+                # ACCUMULATE over days, so the mean is the honest expectation;
+                # cap-binding is reported as the share of DAYS it happens on.
+                d50 = statistics.mean(s[0] for s in sims)
+                s50 = statistics.mean(s[1] for s in sims)
+                b50 = statistics.mean(s[2] for s in sims)
+                c50 = sum(1 for s in sims if s[3] > 0.10) / len(sims)
+                # Deterministic, needs no simulation — but ONLY over CALLS. The
+                # cap bounds calls per target per day; it does not bound tokens,
+                # because tokens per call depend on packing. Expressing it in
+                # tokens would multiply by today's 11.1 titles/call, and the
+                # packing fix this same script argues for would raise
+                # tokens/call toward 250 and invalidate it. (Flagged in review
+                # of #1016.)
+                call_ceiling = targets * cap
+                row = (
+                    f"  {n:>8,}{t:>8}{act:>6.0%}{targets:>9,}{d50:>13,.0f}"
+                    f"{s50:>12,.0f}{b50:>11,.0f}{d50 - s50:>12,.0f}{c50:>10.0%}"
+                    f"{call_ceiling / 1e6:>11,.1f}M"
                 )
-            # Daily volume is bimodal: a sampled day either bursts (every target
-            # caps) or is quiet (none do), so a median row is one of those two
-            # worlds and hides the other. Spend and suppression ACCUMULATE over
-            # days, so the mean is the honest expectation; p90 carries the tail,
-            # and cap-binding is reported as the share of DAYS it happens on.
-            d50 = statistics.mean(s[0] for s in sims)
-            s50 = statistics.mean(s[1] for s in sims)
-            c50 = sum(1 for s in sims if s[2] > 0.10) / len(sims)
-            s90 = sorted(s[1] for s in sims)[int(len(sims) * 0.9)]
-            # Deterministic, needs no simulation — but ONLY over CALLS. The cap
-            # bounds calls per target per day; it does not bound tokens, because
-            # tokens per call depend on packing. Reported as calls for that
-            # reason: expressing it in tokens would multiply by today's 11.1
-            # titles/call, and the packing fix this same script argues for would
-            # raise tokens/call toward the configured 250 and invalidate the
-            # number. (Flagged in review of #1016 — the old column multiplied by
-            # today's mean call size and called the result a spend ceiling.)
-            call_ceiling = targets * cap
-            row = (
-                f"  {n:>8,}{t:>8}{targets:>9,}{d50:>13,.0f}{s50:>12,.0f}"
-                f"{d50 - s50:>12,.0f}{c50:>9.0%}{s90:>13,.0f}"
-                f"{call_ceiling / 1e6:>12,.1f}M"
-            )
-            if price_in is not None and price_out is not None:
-                # Cache reads are billed (at a discount) and are 56.5% of input
-                # on this path, so a cost column that ignores them understates.
-                # Priced at the input rate here = deliberately CONSERVATIVE
-                # (an upper bound); pass the discounted rate if you want exact.
-                cost = (
-                    s50 * ((m.tok_in + m.tok_cache) * price_in + m.tok_out * price_out) / 1_000_000
-                )
-                row += f"{cost:>11,.0f}"
-            print(row)
+                if price_in is not None and price_out is not None:
+                    # Cache reads bill at their own (discounted) rate and are
+                    # 56.5% of input here, so ignoring them understates. They
+                    # get --price-cache-read; folding them into --price-in was
+                    # not "conservative but exact either way" — it priced fresh
+                    # input at the cache rate too (review of #1016). Defaults to
+                    # the input rate, i.e. an explicit upper bound.
+                    cache_rate = price_cache if price_cache is not None else price_in
+                    billed = s50 + b50  # the backfill's calls are billed too
+                    cost = (
+                        billed
+                        * (m.tok_in * price_in + m.tok_cache * cache_rate + m.tok_out * price_out)
+                        / 1_000_000
+                    )
+                    row += f"{cost:>11,.0f}"
+                print(row)
 
 
 def main() -> None:
@@ -499,6 +551,24 @@ def main() -> None:
     )
     ap.add_argument("--price-in", type=float, default=None, help="USD per 1M input tokens")
     ap.add_argument("--price-out", type=float, default=None, help="USD per 1M output tokens")
+    ap.add_argument(
+        "--price-cache-read",
+        type=float,
+        default=None,
+        help="USD per 1M prompt-cache-read tokens (defaults to --price-in, an upper bound)",
+    )
+    ap.add_argument(
+        "--activation-rates",
+        default="0,0.05,0.25",
+        help="share of targets activating on a given day; each reserves the "
+        "backfill's slice of the shared cap (swept, never estimated)",
+    )
+    ap.add_argument(
+        "--backfill-fraction",
+        type=float,
+        default=0.25,
+        help="phase1_backfill_cap_fraction (prod default 0.25)",
+    )
     ap.add_argument("--seed", type=int, default=17)
     a = ap.parse_args()
     random.seed(a.seed)
@@ -530,6 +600,9 @@ def main() -> None:
         a.trials,
         a.price_in,
         a.price_out,
+        a.price_cache_read,
+        [float(x) for x in a.activation_rates.split(",")],
+        a.backfill_fraction,
     )
     print(
         "\nREADING THIS: columns are MEANS over simulated days; 'days cap' is the\n"
