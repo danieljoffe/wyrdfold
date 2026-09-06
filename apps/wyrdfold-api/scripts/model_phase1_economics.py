@@ -322,29 +322,45 @@ def censoring_report(m: Measured, cap: int, cap_deployed: str) -> None:
 
 
 def backfill_report(cap: int, fraction: float, utilisation: float, cap_deployed: str) -> int:
-    """Decide how many calls ONE activation actually spends, and say which of
-    measurement or assumption produced the number.
+    """Decide how many calls ONE activation spends — and be honest that this
+    cannot currently be measured, only assumed.
 
     ``phase1_backfill_allowance`` returns ``min(cap - used, floor(cap *
     fraction))`` — a CEILING. The real backfill stops when its candidate window
-    is exhausted, and rejection-store hits cost no LLM call, so a small or
-    already-triaged catalog finishes well below it. Treating the allowance as
-    consumption does two wrong things at once (review of #1016): it reduces
-    intake capacity by the full slice AND bills the whole slice, which biases
-    both sides of the headline in the same direction.
+    is exhausted, and rejection-store hits cost no LLM call, so treating the
+    allowance as consumption overstates it (review of #1016).
 
-    Backfill cost rows are tagged ``metadata.trigger='activation_backfill'``, so
-    this is measurable the moment any backfill runs. Until then the number is an
-    assumption, swept via --backfill-utilisation and labelled as a bound.
+    WHY THIS DOES NOT SELF-PROMOTE TO A MEASUREMENT. Backfill cost rows are
+    tagged ``metadata.trigger='activation_backfill'``, which is tempting: group
+    by (day, target) and average. But that denominator only contains activation
+    days where the backfill made AT LEAST ONE call. A perfectly real activation
+    spends ZERO — empty candidate window, everything already graded, every
+    candidate served from the rejection store, or the pass stopping before the
+    first call (``no_llm_client``, ``allowance`` 0, budget block). Those write
+    no ``llm_costs`` row and vanish from the denominator entirely, so the
+    average is conditional on being non-zero and biases HIGH — precisely the
+    overstatement the allowance-vs-consumption fix was meant to remove.
+
+    An earlier version of this function did promote itself on exactly that
+    basis and labelled the result "MEASURED". It was caught in review of #1016.
+    A real measurement needs an activation/attempt denominator that includes
+    zero-call passes; nothing persists one today — ``backfill_phase1_for_target``
+    reports its counts to the application log and returns, writing no durable
+    attempt marker.
+
+    So: the observed rows are reported as CONTEXT, explicitly conditional, and
+    the returned figure always comes from the swept ``--backfill-utilisation``.
     """
     allowance = int(cap * fraction)
     days, avg_calls, max_calls = (int(x) for x in psql(Q_BACKFILL_OBSERVED)[0])
     pure = psql(Q_SAMPLE_PURITY.format(cap_deployed=cap_deployed))[0]
     bf_in_sample, total_in_sample = int(pure[0]), int(pure[1])
+    used = int(allowance * utilisation)
 
     print("\nBACKFILL — the cap's second spender")
     print(
-        f"  allowance per activation          : {allowance:,} calls (floor({cap:,} x {fraction:g}))"
+        f"  allowance per activation          : {allowance:,} calls "
+        f"(floor({cap:,} x {fraction:g})) — a CEILING, not demand"
     )
     print(
         f"  demand series is ingestion-only   : {bf_in_sample:,} backfill rows "
@@ -352,26 +368,34 @@ def backfill_report(cap: int, fraction: float, utilisation: float, cap_deployed:
     )
     if days:
         print(
-            f"  MEASURED over {days:,} activation-days : {avg_calls:,} calls avg "
-            f"(max {max_calls:,}) = {avg_calls / allowance:.0%} of allowance"
+            f"  context — NON-ZERO backfill days  : {days:,} day(s), {avg_calls:,} calls "
+            f"avg, max {max_calls:,}"
         )
-        return min(avg_calls, allowance)
+        print(
+            "  ^^ NOT a per-activation average. llm_costs only records days on\n"
+            "  which the backfill made a call, so activations that spent ZERO\n"
+            "  (empty window, all already graded, all rejection-store hits, or a\n"
+            "  pass that stopped before its first call) are missing from the\n"
+            "  denominator. This figure is conditional on being non-zero and so\n"
+            "  biases HIGH. It does not replace the assumption below."
+        )
+    else:
+        print("  observed backfill calls           : 0 — the backfill has never run")
 
-    used = int(allowance * utilisation)
-    print("  observed activation-days          : 0 — the backfill has NEVER run")
-    print(
-        f"  so consumption is ASSUMED          : {utilisation:.0%} of allowance "
-        f"= {used:,} calls/activation"
-    )
+    print(f"  ASSUMED consumption               : {utilisation:.0%} of allowance = {used:,} calls")
     if utilisation >= 1.0:
         print(
-            "  ^^ 100% = a WORST-CASE BOUND, not a forecast. The backfill column\n"
-            "  below is what activations COULD cost, and intake is reduced by the\n"
-            "  full slice; both move together, so read the rows as a bound on\n"
-            "  contention rather than as expected spend. Lower it with\n"
-            "  --backfill-utilisation to model partial consumption. This upgrades\n"
-            "  itself to a measurement as soon as one backfill runs."
+            "  ^^ 100% = a WORST-CASE BOUND, not a forecast. Intake is reduced by\n"
+            "  the full slice AND the full slice is billed; both move together, so\n"
+            "  read the rows as a bound on contention rather than expected spend.\n"
+            "  Lower it with --backfill-utilisation to model partial consumption."
         )
+    print(
+        "  TO MEASURE THIS FOR REAL: persist an activation/backfill ATTEMPT row\n"
+        "  (including zero-call passes) and average over that denominator.\n"
+        "  backfill_phase1_for_target already computes candidates / store_hits /\n"
+        "  llm_calls / stopped — it logs them and writes nothing durable."
+    )
     return used
 
 
@@ -522,7 +546,7 @@ def forecast(
     )
     print(
         f"  backfill shares the cap: an activating target spends {backfill_calls:,} "
-        f"calls (see BACKFILL above for measured-vs-assumed)"
+        f"calls (an ASSUMPTION — see BACKFILL above)"
     )
     hdr = (
         f"  {'users':>8}{'t/user':>8}{'act%':>6}{'targets':>9}{'demand/day':>13}"
