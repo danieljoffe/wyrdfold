@@ -143,9 +143,9 @@ def _dev_job_analysis(_latest_user: str, _messages: list[Message]) -> str:
     failing ``JobAnalysis`` validation (missing scorecard/recommendation),
     so every mock-env analysis surfaced "Analysis failed. Please retry." —
     local dev and CI could never drive the panel's flagship flow. A
-    deterministic moderate verdict keeps the full journey (auto-fire →
-    poll → verdict render → completion refetch) drivable with no provider
-    key. Grown per .claude/rules/llm-surfaces.md.
+    deterministic moderate verdict keeps the full journey (explicit
+    "Analyze match" click → poll → verdict render → completion refetch)
+    drivable with no provider key. Grown per .claude/rules/llm-surfaces.md.
     """
     return json.dumps(
         {

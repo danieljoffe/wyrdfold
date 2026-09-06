@@ -54,7 +54,7 @@ router = APIRouter(
 def _no_profile_response() -> JSONResponse:
     """The ``no_profile`` empty-state marker (#105).
 
-    A 200 (not a 4xx) so the panel's auto-fired call doesn't log a console
+    A 200 (not a 4xx) so a caller without a profile doesn't log a console
     error, and the body carries a structured code without leaking any internal
     endpoint path into the UI.
     """
