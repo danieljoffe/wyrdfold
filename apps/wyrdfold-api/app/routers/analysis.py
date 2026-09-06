@@ -268,8 +268,7 @@ async def create_analysis(
     # double-click, two open tabs, a client retry. Deliberately stated without
     # naming a specific caller-side mechanism: the previous comment pinned this
     # to a panel auto-fire that #634 removed, and went stale the moment that
-    # changed. Panel open never POSTs now, but the guard is a server-side
-    # invariant and does not depend on which client behaviour is in fashion.
+    # changed.
     if run_registry.is_running(key):
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
