@@ -31,8 +31,12 @@
 -- breakdown JSONB, which is exactly why dropping it was safe.)
 --
 -- NULLABLE ON PURPOSE. Three states must stay distinguishable:
---   NULL  -> this scoring pass predates the column; whether a title keyword
---            fired is UNKNOWN, and the UI must not invent an answer.
+--   NULL  -> NO keyword finding was recorded for this row. Do NOT infer
+--            whether a keyword fired. This is NOT only a legacy state: the
+--            Phase-1 backfill UPSERTS scores rows carrying only
+--            (promising, phase1_confidence, excluded), so on insert it CREATES
+--            a NULL-keyword row long after this migration. "Predates the
+--            column" was too narrow (review of #1018).
 --   '{}'  -> this scoring pass recorded that NO title negative keyword fired.
 --            That is all it says. It is NOT evidence of any other cause: the
 --            row may be excluded by the phase-1 prefilter, by the Phase-2
@@ -105,7 +109,9 @@ COMMENT ON COLUMN public.scores.exclusion_keywords IS
   'other writers (the Phase-2 empty-JD drop in fit/score_persistence.py and '
   'the Phase-1 backfill in relevance/phase1_backfill.py; neither writes this '
   'column, so a recorded finding survives them). '
-  'NULL = pass predates the column, unknown, do not display; {} = this pass '
+  'NULL = no keyword finding recorded for this row (legacy, OR a non-scoring '
+  'writer such as the Phase-1 backfill created it) - do not infer whether a '
+  'keyword fired; {} = this pass '
   'recorded that no title keyword fired, which implies nothing about other '
   'causes; non-empty = these keywords matched the title. Set in '
   'app/services/scoring.py, persisted via _score_row_payload.';

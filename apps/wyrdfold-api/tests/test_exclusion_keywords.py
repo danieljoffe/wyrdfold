@@ -376,3 +376,31 @@ def test_legacy_row_later_scored_at_v4_is_not_current():
         "scored_profile_version": 4,
     }
     assert not _is_current(row)
+
+
+def test_backfill_payload_creates_a_row_with_no_keyword_finding():
+    """NULL is not only a legacy state (review of #1018).
+
+    The Phase-1 backfill UPSERTS scores rows carrying only the verdict fields,
+    so on insert it creates a row whose ``exclusion_keywords`` is NULL long
+    after the column shipped. That is why the documented meaning of NULL is
+    "no keyword finding was recorded for this row" rather than "predates the
+    column", and why a reader must not infer from NULL that nothing fired.
+    """
+    from app.services.relevance.phase1_backfill import _verdict_row
+
+    row = _verdict_row(
+        job_posting_id="11111111-1111-1111-1111-111111111111",
+        target_id="22222222-2222-2222-2222-222222222222",
+        promising=False,
+        confidence=90,
+        was_excluded=False,
+    )
+    assert row["excluded"] is True, "a non-promising verdict excludes the row"
+    assert "exclusion_keywords" not in row, "and records no keyword finding"
+    assert "exclusion_keywords_version" not in row
+    # So a row this INSERTs reads as unrecorded, not as "nothing fired".
+    inserted = {**row, "scored_profile_version": 4}
+    assert not _is_current(
+        {"exclusion_keywords": None, "exclusion_keywords_version": None, **inserted}
+    )

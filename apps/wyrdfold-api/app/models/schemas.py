@@ -49,9 +49,14 @@ class ScoreResult(BaseModel):
     #
     # RECORDEDNESS IS PART OF CURRENTNESS. Do not shorten this to a
     # NULL-tolerant equality (SQL's ``IS NOT DISTINCT FROM``): that treats
-    # NULL/NULL as equal, so a legacy row — both NULL precisely because nothing
-    # was recorded — would read as "current". Version equality alone cannot tell
-    # "the fact is current" from "we have no fact".
+    # NULL/NULL as equal, so an UNRECORDED row — both NULL precisely because
+    # nothing was recorded — would read as "current". Version equality alone
+    # cannot tell "the fact is current" from "we have no fact".
+    #
+    # Unrecorded is not only a legacy state. The Phase-1 backfill upserts scores
+    # rows carrying only (promising, phase1_confidence, excluded), so on insert
+    # it CREATES a NULL-keyword row long after this column shipped. A reader must
+    # never infer from NULL whether a keyword fired (review of #1018).
     #
     # Kept because the reason is not reconstructible after the fact: a target's
     # negative list moves with its profile version, so a row scored under an
