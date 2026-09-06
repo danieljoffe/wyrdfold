@@ -19,6 +19,14 @@ class ScoreResult(BaseModel):
     breakdown: ScoreBreakdown
     matched_keywords: list[str]
     excluded: bool
+    # The negative keywords that fired on the TITLE — the sole thing that sets
+    # ``excluded``. Kept because the reason is not reconstructible after the
+    # fact: a target's negative list moves with its profile version, so a row
+    # scored under an older profile can no longer be explained by replaying
+    # today's keywords. ``_title_matches_any_target`` already admits these
+    # postings specifically "so the scoring pipeline records the rejection for
+    # audit" — this is the half of that intent that was never stored.
+    exclusion_keywords: list[str] = Field(default_factory=list)
 
 
 Provider = Literal[
