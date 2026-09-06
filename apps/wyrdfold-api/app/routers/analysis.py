@@ -238,10 +238,9 @@ async def create_analysis(
         user_id=user_id,
     )
     if optimized_doc is None:
-        # The panel auto-fires this on first open; a 404 would both leak an
-        # internal endpoint path into the UI and log a console error on every
-        # profile-less job open. Render the "set up your profile" CTA instead
-        # via a 200 marker (#105).
+        # A 404 would both leak an internal endpoint path into the UI and log a
+        # console error whenever a profile-less user asks for an analysis.
+        # Render the "set up your profile" CTA instead via a 200 marker (#105).
         return _no_profile_response()
 
     if cached is not None:
@@ -265,8 +264,9 @@ async def create_analysis(
 
     # Dedup: a run is already in flight for this exact cache key → don't spawn a
     # second (double LLM spend) and don't re-count; tell the client to keep
-    # polling. This also makes the panel's auto-fire + any StrictMode
-    # double-invoke safe.
+    # polling. Covers concurrent explicit clicks (an impatient second press, two
+    # open tabs) and any StrictMode double-invoke. Panel open itself never POSTs
+    # — it is spend-free since #634 — so this is no longer an auto-fire guard.
     if run_registry.is_running(key):
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
