@@ -638,6 +638,64 @@ def forecast(
                 print(row)
 
 
+def _validate(a: argparse.Namespace) -> None:
+    """Reject impossible scenarios instead of modelling them.
+
+    Every parameter here has a physical meaning, and out-of-range values do not
+    fail — they produce plausible-looking tables. Two examples this catches, both
+    reproduced before the check existed: ``--backfill-fraction 1.5`` makes the
+    reserve exceed the cap, so ``room`` goes negative and the model reports
+    NEGATIVE served intake (-50,000 on a 100-target run) with the deficit
+    silently added to "deferred"; ``--activation-rates 1.5`` activates more
+    targets than exist in the cohort and bills 150 activations against 100
+    targets. For a script whose numbers are quoted in a capacity decision,
+    printing that is worse than refusing to run (review of #1016).
+    """
+    errs: list[str] = []
+    if a.cap <= 0:
+        errs.append(f"--cap must be > 0 (got {a.cap}); a zero/negative cap is not 'unlimited'")
+    if a.trials <= 0:
+        errs.append(f"--trials must be > 0 (got {a.trials})")
+    if a.backtest_trials <= 0:
+        errs.append(f"--backtest-trials must be > 0 (got {a.backtest_trials})")
+    if not 0.0 <= a.backfill_fraction <= 1.0:
+        errs.append(
+            f"--backfill-fraction must be in [0,1] (got {a.backfill_fraction}); "
+            "above 1 the backfill reserve exceeds the cap and served intake goes negative"
+        )
+    if not 0.0 <= a.backfill_utilisation <= 1.0:
+        errs.append(
+            f"--backfill-utilisation must be in [0,1] (got {a.backfill_utilisation}); "
+            "it is a SHARE of the allowance, so above 1 spends more than the cap allows"
+        )
+    for label, raw in (("--users", a.users), ("--targets-per-user", a.targets_per_user)):
+        for tok in raw.split(","):
+            try:
+                if int(tok) <= 0:
+                    errs.append(f"{label} entries must be > 0 (got {tok})")
+            except ValueError:
+                errs.append(f"{label} entries must be integers (got {tok!r})")
+    for tok in a.activation_rates.split(","):
+        try:
+            if not 0.0 <= float(tok) <= 1.0:
+                errs.append(
+                    f"--activation-rates entries must be in [0,1] (got {tok}); "
+                    "above 1 activates more targets than the cohort holds, "
+                    "below 0 produces negative backfill volume"
+                )
+        except ValueError:
+            errs.append(f"--activation-rates entries must be numbers (got {tok!r})")
+    for label, val in (
+        ("--price-in", a.price_in),
+        ("--price-out", a.price_out),
+        ("--price-cache-read", a.price_cache_read),
+    ):
+        if val is not None and val < 0:
+            errs.append(f"{label} must be >= 0 (got {val})")
+    if errs:
+        sys.exit("refusing to run — invalid scenario:\n  " + "\n  ".join(errs))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="#1015 Phase-1 economics model (read-only).")
     ap.add_argument("--users", default="100,1000,10000,100000")
@@ -681,12 +739,14 @@ def main() -> None:
         "--backfill-utilisation",
         type=float,
         default=1.0,
-        help="share of the backfill ALLOWANCE actually consumed per activation. "
-        "1.0 (default) is a worst-case bound, not a forecast; ignored once real "
-        "backfill calls exist, which are measured instead",
+        help="share of the backfill ALLOWANCE consumed per activation, in [0,1]. "
+        "1.0 (default) is a worst-case bound, not a forecast. Always governs the "
+        "model: observed backfill rows are reported as context but never replace "
+        "it, because llm_costs cannot see zero-call activations",
     )
     ap.add_argument("--seed", type=int, default=17)
     a = ap.parse_args()
+    _validate(a)
     random.seed(a.seed)
 
     m = measure(a.cap_deployed)
