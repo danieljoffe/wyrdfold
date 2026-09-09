@@ -3319,3 +3319,126 @@ async def test_reaped_target_stops_scoring_and_phase2(monkeypatch, caplog):
     assert fake_phase2.await_count == 0
     warnings = [r.message for r in caplog.records if "reaped mid-cycle" in r.message]
     assert len(warnings) == 1
+
+
+# ---- #1015 packing: concurrent sources share one triage call ---------------
+
+
+async def _drive_two_sources(monkeypatch, *, coalescer, record_calls: list):
+    """Poll TWO sources concurrently for the SAME target, one new title each.
+
+    Concurrency is the point: coalescing only merges callers that overlap in
+    the debounce window, which is exactly the shape ``poll_all_sources``
+    produces (``POLL_CONCURRENCY`` semaphore over ``_worker``).
+    """
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from app.config import settings as live_settings
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "phase1_triage_enabled", True)
+    target = _target_with_keywords({"brand": 3}, ["brand new role"])
+
+    def _fetch(title: str):
+        async def fetch(_token: str) -> list[StandardJob]:
+            return [
+                StandardJob(
+                    external_id=f"new-{title}",
+                    title=title,
+                    location_name="Remote",
+                    content="",
+                    posted_at="2026-01-01",
+                    absolute_url="https://example.com/j/1",
+                )
+            ]
+
+        return fetch
+
+    async def _record(*_args, **kwargs):
+        record_calls.append(kwargs.get("metadata"))
+
+    monkeypatch.setattr(poller_mod, "_active_targets", AsyncMock(return_value=[target]))
+    monkeypatch.setattr(poller_mod, "get_llm_client_async", AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(poller_mod, "record_llm_cost_async", _record)
+    monkeypatch.setattr(poller_mod, "_async_service_client", lambda: MagicMock())
+
+    open_gate = MagicMock()
+    open_gate.target_blocked.return_value = False
+    open_gate.payer_for.return_value = "user-1"
+
+    async def one(company: str, title: str):
+        # Each source has its own fetcher and its own mock DB, exactly as the
+        # cycle gives each worker its own source row.
+        supabase, _j, _s = _make_poll_supabase([])
+        monkeypatch.setitem(poller_mod.FETCHERS, "greenhouse", _fetch(title))
+        source = dict(_GUARD_SOURCE, id=f"src-{company}", company_name=company)
+        return await poller_mod._poll_one_source(
+            source, supabase, budget_gate=open_gate, coalescer=coalescer
+        )
+
+    return await asyncio.gather(one("Acme", "Brand New Role A"), one("Beta", "Brand New Role B"))
+
+
+async def test_coalescer_packs_two_sources_into_one_triage_call(monkeypatch):
+    """The point of #1015: the cap counts CALLS, so two boards' titles for the
+    same target must ride one call instead of two."""
+    from unittest.mock import AsyncMock
+
+    from app.services.relevance.title_triage import TitleVerdict
+    from app.services.relevance.triage_coalescer import TitleTriageCoalescer
+
+    # Injected rather than patching ``poller_mod.triage_titles``: the coalescer
+    # holds its OWN module-level reference, so patching the poller's name would
+    # not intercept the coalesced path — and a test that silently missed it
+    # would look like it passed.
+    fake = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=True)}, MagicMock()))
+    co = TitleTriageCoalescer(debounce_seconds=0.05, triage=fake)
+    records: list = []
+
+    await _drive_two_sources(monkeypatch, coalescer=co, record_calls=records)
+
+    assert fake.await_count == 1, "two sources, one call"
+    assert sorted(fake.await_args.kwargs["titles"]) == [
+        "Brand New Role A",
+        "Brand New Role B",
+    ], "and the call carries BOTH boards' titles"
+
+
+async def test_coalesced_batch_writes_exactly_one_cost_row(monkeypatch):
+    """The per-target daily cap counts ``llm_costs`` rows. Two rows for one call
+    would over-count the cap and invent spend that never happened."""
+    from unittest.mock import AsyncMock
+
+    from app.services.relevance.title_triage import TitleVerdict
+    from app.services.relevance.triage_coalescer import TitleTriageCoalescer
+
+    fake = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=True)}, MagicMock()))
+    co = TitleTriageCoalescer(debounce_seconds=0.05, triage=fake)
+    records: list = []
+
+    await _drive_two_sources(monkeypatch, coalescer=co, record_calls=records)
+
+    assert len(records) == 1, f"one call must write one cost row, got {len(records)}"
+    assert records[0]["batch_size"] == 2, "and record the PACKED size, not one slice"
+    assert records[0]["source"] == "coalesced"
+
+
+async def test_without_the_coalescer_each_source_calls_and_bills_separately(monkeypatch):
+    """The control, and the OFF path the flag defaults to: behaviour is exactly
+    what it was before #1015 — one call and one cost row per source."""
+    from unittest.mock import AsyncMock
+
+    from app.services import poller as poller_mod
+    from app.services.relevance.title_triage import TitleVerdict
+
+    fake = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=True)}, MagicMock()))
+    monkeypatch.setattr(poller_mod, "triage_titles", fake)
+    records: list = []
+
+    await _drive_two_sources(monkeypatch, coalescer=None, record_calls=records)
+
+    assert fake.await_count == 2, "un-coalesced: one call per source"
+    assert len(records) == 2, "and one cost row each"
+    assert {r["batch_size"] for r in records} == {1}
+    assert {r["source"] for r in records} == {"Acme", "Beta"}

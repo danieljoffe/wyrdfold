@@ -362,6 +362,24 @@ class Settings(BaseSettings):
     # count, exactly as Phase 1 is today.
     phase1_backfill_cap_fraction: float = Field(default=0.25, ge=0.0, le=1.0)
 
+    # Pack concurrent same-target Phase-1 triage requests into one call (#1015).
+    # The cap counts CALLS, not titles, so packing decides what it buys:
+    # measured over 243,507 prod calls, batches averaged 11.1 titles against a
+    # configured 250, with 34% carrying exactly ONE title. Per (target,
+    # 10-minute window) that is 27.2 calls covering 301.8 titles from 26.9
+    # distinct sources — 1.89 calls fully packed, a ~14x reduction for
+    # byte-identical questions (``triage_titles`` takes no source argument).
+    #
+    # DEFAULT OFF. This changes how the poll cycle issues its LLM calls and how
+    # the resulting cost row is attributed, on the pipeline's most critical
+    # path, and it could not be exercised end-to-end before shipping: triage has
+    # been dormant since 2026-08-25 with no active targets, and waking it costs
+    # LLM spend. Flip it deliberately, with the poll logs in view.
+    phase1_coalesce_enabled: bool = False
+    # How long a triage request waits for others to join its batch. Bounds added
+    # latency per source; the cycle drains anything still buffered at the end.
+    phase1_coalesce_debounce_seconds: float = Field(default=0.25, ge=0.0, le=5.0)
+
     # ---- Catalog-health observability (#958) --------------------------------
     # Product-level eyes on the intake funnel: one catalog_health_cycles row
     # per recorded poll cycle (window intake, corpus quality, admitted-title

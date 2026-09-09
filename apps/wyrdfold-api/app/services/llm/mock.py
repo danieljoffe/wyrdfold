@@ -582,6 +582,14 @@ def phase1_triage_verdicts_json(titles: list[str], variant: str = "faithful") ->
     - ``truncated`` — the JSON cut off mid-verdict, the deepseek ~8K output
       ceiling overflowing a full batch. Must raise (the batch defers)
       rather than parse into a partial admit set.
+    - ``boundary_only`` — verdicts for ONLY the first and last id. Added for
+      the third consumer of this surface, ``relevance.triage_coalescer``,
+      which packs several callers' titles into one batch and must split the
+      verdicts back. Those two ids belong to DIFFERENT callers, so any
+      off-by-one in the split makes both land in one caller's slice while
+      the other silently gets nothing — a misattribution the faithful
+      variant cannot expose, because there every caller gets verdicts either
+      way.
     """
     if variant == "truncated":
         # A max_tokens stop cuts mid-token, so nothing in the payload closes:
@@ -592,6 +600,8 @@ def phase1_triage_verdicts_json(titles: list[str], variant: str = "faithful") ->
     verdicts: list[dict[str, Any]] = []
     for idx, title in enumerate(titles, start=1):
         if variant == "omits_ids" and idx > max(1, len(titles) // 2):
+            continue
+        if variant == "boundary_only" and idx not in (1, len(titles)):
             continue
         prefix = " ".join(title.split()[:2])
         if variant == "transposed_prefix":

@@ -64,6 +64,7 @@ from app.services.relevance.title_triage import (
     phase1_batch_size,
     triage_titles,
 )
+from app.services.relevance.triage_coalescer import TitleTriageCoalescer
 from app.services.sanitize import sanitize_html
 from app.services.scoring import score_title_against_profile
 from app.services.smartrecruiters import fetch_smartrecruiters_jobs
@@ -1689,6 +1690,7 @@ async def _poll_one_source(
     active_targets: list[JobTarget] | None = None,
     admission_targets: list[JobTarget] | None = None,
     stage3_users: tuple[dict[str, JobTarget], dict[str, OptimizedDoc]] | None = None,
+    coalescer: TitleTriageCoalescer | None = None,
 ) -> dict[str, Any]:
     """Poll a single job source. Returns a per-source summary dict.
 
@@ -2054,7 +2056,30 @@ async def _poll_one_source(
                         )
                         break
                     batch = titles[start : start + batch_cap]
-                    verdicts, result = await triage_titles(llm, target=active_target, titles=batch)
+                    # Coalesced path (#1015): pack this batch with the batches
+                    # other SOURCES are submitting for the SAME target right
+                    # now, so one call carries many boards' titles instead of
+                    # one board's handful. Same prompt, same verdicts —
+                    # ``triage_titles`` takes no source argument — and the same
+                    # payer, which is resolved per target above. Off by default.
+                    if coalescer is not None:
+                        packed = await coalescer.submit(llm, target=active_target, titles=batch)
+                        verdicts, result = packed.verdicts, packed.result
+                        # Exactly one caller per real call records the row, with
+                        # the PACKED size. The others rode the same call: they
+                        # must still see result is not None (their titles WERE
+                        # judged) but must not write a second row, or the
+                        # row-counting daily cap would over-count.
+                        record_cost = packed.owns_cost
+                        cost_batch_size = packed.batch_size
+                        cost_source: Any = "coalesced"
+                    else:
+                        verdicts, result = await triage_titles(
+                            llm, target=active_target, titles=batch
+                        )
+                        record_cost = result is not None
+                        cost_batch_size = len(batch)
+                        cost_source = company_name
                     if result is not None:
                         # A REAL LLM response → mark these titles attempted (a dropped
                         # verdict is a hiccup, so it still fail-opens). A FAILED call
@@ -2064,6 +2089,7 @@ async def _poll_one_source(
                         # must PAUSE the pipeline, never flood 100% admit.
                         for sp in range(start, min(start + len(batch), len(send_candidates))):
                             attempted_here.add(send_candidates[sp][0] + 1)
+                    if record_cost and result is not None:
                         try:
                             await record_llm_cost_async(
                                 _async_service_client(),
@@ -2072,8 +2098,8 @@ async def _poll_one_source(
                                 result=result,
                                 metadata={
                                     "target_id": active_target.id,
-                                    "source": company_name,
-                                    "batch_size": len(batch),
+                                    "source": cost_source,
+                                    "batch_size": cost_batch_size,
                                 },
                             )
                         except Exception:
@@ -3457,6 +3483,7 @@ async def _poll_one_source_budgeted(
     stage3_users: tuple[dict[str, JobTarget], dict[str, OptimizedDoc]] | None,
     admission_budget: AdmissionBudget | None = None,
     intake_budget: IntakeBudget | None = None,
+    coalescer: TitleTriageCoalescer | None = None,
 ) -> dict[str, Any]:
     """``_poll_one_source`` bounded by the per-source wall-time budget.
 
@@ -3483,6 +3510,7 @@ async def _poll_one_source_budgeted(
             stage3_users=stage3_users,
             admission_budget=admission_budget,
             intake_budget=intake_budget,
+            coalescer=coalescer,
         )
     try:
         return await asyncio.wait_for(
@@ -3495,6 +3523,7 @@ async def _poll_one_source_budgeted(
                 stage3_users=stage3_users,
                 admission_budget=admission_budget,
                 intake_budget=intake_budget,
+                coalescer=coalescer,
             ),
             timeout=budget,
         )
@@ -3568,6 +3597,15 @@ async def poll_all_sources(
     """
     admission_budget = new_admission_budget()
     intake_budget = await new_intake_budget(supabase)
+    # Cycle-scoped so sources polled concurrently can pack their same-target
+    # triage batches into one call (#1015). Scoped to the CYCLE, not the
+    # process: a stale coalescer outliving its cycle would hold titles whose
+    # candidate rows have moved on. Off by default — see phase1_coalesce_enabled.
+    coalescer = (
+        TitleTriageCoalescer(debounce_seconds=settings.phase1_coalesce_debounce_seconds)
+        if settings.phase1_coalesce_enabled
+        else None
+    )
     result = (
         progress
         if progress is not None
@@ -3598,12 +3636,23 @@ async def poll_all_sources(
                 stage3_users=stage3_users,
                 admission_budget=admission_budget,
                 intake_budget=intake_budget,
+                coalescer=coalescer,
             )
         # No await between the source completing and the fold, so a
         # cancellation can never drop a finished source's counts.
         _accumulate_poll_summary(result, summary)
 
     await asyncio.gather(*(_worker(s) for s in sources))
+    if coalescer is not None:
+        # Anything still inside the debounce window when the last source
+        # finished would otherwise be dropped silently, taking its titles'
+        # verdicts with it. Draining resolves every outstanding waiter — but the
+        # sources awaiting them have already returned, so this only flushes work
+        # whose callers are still in flight.
+        try:
+            await coalescer.drain()
+        except Exception:
+            logger.exception("phase1 coalescer drain failed (cycle unaffected)")
     logger.info("poll cycle finished: %s %s", admission_budget.report(), intake_budget.report())
     _log_redetect_cycle_summary()
     # Product-level catalog health (#958). Telemetry only: record_cycle_health
