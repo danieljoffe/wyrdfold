@@ -6,7 +6,7 @@
 
 [[IgnoredVulns]]
 id = "GHSA-5p2g-fcmc-qvqq"
-ignoreUntil = 2026-09-07
+ignoreUntil = 2026-12-09
 reason = """
 image-size DoS via infinite loop in the JXL/HEIF parsers.
 
@@ -21,23 +21,25 @@ bundle, and this repo ships no Less stylesheets at all. Exploitation requires
 feeding attacker-controlled JXL/HEIF images to the parser, which nothing in
 our build does.
 
-Re-check 2026-09-07: drop this the moment a patched release lands.
+Re-checked 2026-09-09: still unpatched — npm's latest is 2.0.2, the same
+version OSV flags as last_affected. Extended to 2026-12-09. Drop this the
+moment a patched release lands.
 """
 
 [[IgnoredVulns]]
 id = "GHSA-w3rx-r6r6-pgpr"
-ignoreUntil = 2026-09-07
+ignoreUntil = 2026-12-09
 reason = """
 Second advisory against the same unpatched image-size parsers; identical
 reasoning to GHSA-5p2g-fcmc-qvqq above — no fixed version at any version,
 dev-only transitive via less@4 (vite peer), no Less in this repo.
 
-Re-check 2026-09-07.
+Re-checked 2026-09-09: still unpatched (latest 2.0.2). Extended to 2026-12-09.
 """
 
 [[IgnoredVulns]]
 id = "GHSA-jmr9-qjv8-65gv"
-ignoreUntil = 2026-09-09
+ignoreUntil = 2026-12-09
 reason = """
 extract-zip unvalidated symlink path traversal (published 2026-08-12; started
 failing every PR's OSV audit that day, unrelated to the PRs themselves).
@@ -52,5 +54,54 @@ only job there is unpacking browser archives downloaded from the vendor's own
 CDN during CI browser install; nothing feeds it attacker-controlled zips, and
 it never enters a production bundle.
 
-Re-check 2026-09-09: drop this the moment a patched release lands.
+Re-checked 2026-09-09 (the day it expired): still unpatched — npm's latest is
+2.0.1, the same version OSV flags as last_affected. Extended to 2026-12-09.
+Drop this the moment a patched release lands.
+"""
+
+[[IgnoredVulns]]
+id = "GHSA-7pqw-9j4j-h8q3"
+ignoreUntil = 2026-12-09
+reason = """
+SECOND advisory against the same unpatched extract-zip; identical reasoning to
+GHSA-jmr9-qjv8-65gv above — no fixed version at any version (npm's latest is
+2.0.1, the version OSV flags as last_affected), dev-only transitive via
+@lhci/cli -> puppeteer-core -> @puppeteer/browsers, unpacking browser archives
+from the vendor's own CDN during CI.
+
+Listed separately because osv-scanner matches on advisory ID: the existing
+entry covers only GHSA-jmr9, so this one kept failing the gate on its own.
+
+Re-check 2026-12-09.
+"""
+
+[[IgnoredVulns]]
+id = "GHSA-82fw-gwwq-j7x9"
+ignoreUntil = 2026-12-09
+reason = """
+vitest / @vitest/mocker: the dev server serves files outside the project root.
+
+A FIXED VERSION EXISTS (4.1.11), and the rule at the top of this file says pin
+rather than suppress — so this entry needs the extra justification for why the
+pin is the wrong tool HERE.
+
+Pinning drops the package instead of upgrading it. @vitest/browser-playwright
+declares an EXACT peer (`vitest: 4.1.4`), and vitest itself is an undeclared
+transitive reached only through @nx/vitest@23.1.2 (a peer of the nx toolchain).
+Forcing vitest >= 4.1.11 makes that exact peer unsatisfiable, so pnpm resolves
+by REMOVING vitest and its 44-package subtree from the lockfile rather than
+failing loudly: the audit goes green because the package is gone, not because
+it is patched. Verified by reading the lockfile diff (-492 lines) — pinning the
+whole @vitest/* family together does not help, because @nx/vitest is what
+decides the version and it is not ours to pin. Upgrading nx is the real fix and
+is far outside a Phase-1 packing PR.
+
+Unreachable here regardless: this repo's frontend test runner is JEST
+(`nx test wyrdfold`). Nothing in this workspace declares or runs vitest, so its
+dev server is never started, and the advisory requires a running vitest dev
+server to reach a file outside the project root. devDependencies-only; never
+enters a production bundle.
+
+Re-check 2026-12-09, or sooner if the nx toolchain moves: drop this the moment
+@nx/vitest resolves a patched vitest on its own.
 """
