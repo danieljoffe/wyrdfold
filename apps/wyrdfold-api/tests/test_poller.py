@@ -3407,21 +3407,33 @@ async def test_coalescer_packs_two_sources_into_one_triage_call(monkeypatch):
 
 async def test_coalesced_batch_writes_exactly_one_cost_row(monkeypatch):
     """The per-target daily cap counts ``llm_costs`` rows. Two rows for one call
-    would over-count the cap and invent spend that never happened."""
+    would over-count the cap and invent spend that never happened.
+
+    Wired the way PRODUCTION wires it — with ``on_cost``, so the coalescer
+    persists from inside the task that made the call. Without it this test
+    exercised the legacy caller-records path and would have passed while the
+    shipped path behaved differently (review of #1025).
+    """
     from unittest.mock import AsyncMock
 
     from app.services.relevance.title_triage import TitleVerdict
     from app.services.relevance.triage_coalescer import TitleTriageCoalescer
 
-    fake = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=True)}, MagicMock()))
-    co = TitleTriageCoalescer(debounce_seconds=0.05, triage=fake)
     records: list = []
 
-    await _drive_two_sources(monkeypatch, coalescer=co, record_calls=records)
+    async def on_cost(target, _result, batch_size):
+        records.append({"target_id": target.id, "batch_size": batch_size, "source": "coalesced"})
+
+    fake = AsyncMock(return_value=({1: TitleVerdict(id=1, promising=True)}, MagicMock()))
+    co = TitleTriageCoalescer(debounce_seconds=0.05, triage=fake, on_cost=on_cost)
+    caller_records: list = []
+
+    await _drive_two_sources(monkeypatch, coalescer=co, record_calls=caller_records)
 
     assert len(records) == 1, f"one call must write one cost row, got {len(records)}"
     assert records[0]["batch_size"] == 2, "and record the PACKED size, not one slice"
     assert records[0]["source"] == "coalesced"
+    assert caller_records == [], "the CALLERS must write nothing on the coalesced path"
 
 
 async def test_without_the_coalescer_each_source_calls_and_bills_separately(monkeypatch):

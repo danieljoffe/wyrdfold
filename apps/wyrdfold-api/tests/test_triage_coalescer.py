@@ -326,3 +326,69 @@ async def test_a_lost_flush_defers_rather_than_hanging_forever():
     assert result.result is None, "degrades to defer"
     assert result.verdicts == {}
     assert not result.owns_cost, "a deferred waiter must not claim a cost row"
+
+
+# ---- Cost is owned by the CALL, not by a caller ---------------------------
+
+
+async def test_cancelling_the_owning_caller_still_records_the_cost():
+    """The blocker from review of #1025.
+
+    Every source is wrapped in ``asyncio.wait_for`` with its own wall-clock
+    budget, so the waiter that started a batch can be cancelled while the LLM
+    call it triggered keeps running. Under the old design ownership was pinned
+    to that waiter, so the provider billed a call we recorded ZERO rows for —
+    undercounting spend AND the row-counting daily cap. Reproduced before
+    fixing; this pins the fix.
+    """
+    rows: list[tuple[str, int]] = []
+
+    async def on_cost(target: JobTarget, _result: Any, batch_size: int) -> None:
+        rows.append((target.id, batch_size))
+
+    async def slow(_llm: Any, *, target: JobTarget, titles: list[str]) -> Any:
+        await asyncio.sleep(0.05)  # the call outlives its owner
+        return ({}, object())
+
+    co = TitleTriageCoalescer(debounce_seconds=0.01, triage=slow, on_cost=on_cost)
+    tgt = _target()
+    owner = asyncio.ensure_future(co.submit(None, target=tgt, titles=["A one"]))
+    survivor = asyncio.ensure_future(co.submit(None, target=tgt, titles=["B one"]))
+    await asyncio.sleep(0.02)
+    owner.cancel()
+
+    await co.drain()
+    result = await survivor
+
+    assert rows == [(tgt.id, 2)], "one row, packed size, despite the owner dying"
+    assert not result.owns_cost, "no caller records when the coalescer does"
+
+
+async def test_a_failed_call_records_no_cost():
+    """Symmetry: the row follows the CALL. No result means no spend to record."""
+    rows: list[Any] = []
+
+    async def on_cost(*args: Any) -> None:
+        rows.append(args)
+
+    async def boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("provider exploded")
+
+    co = TitleTriageCoalescer(debounce_seconds=0.01, triage=boom, on_cost=on_cost)
+    result = await co.submit(None, target=_target(), titles=["A one"])
+    assert rows == []
+    assert result.result is None
+
+
+async def test_a_cost_write_failure_does_not_cost_the_verdicts():
+    """A telemetry failure must not lose judged titles — they would re-triage
+    next cycle and be paid for twice. Mirrors the un-coalesced path, which
+    swallows the same failure."""
+
+    async def on_cost(*_a: Any) -> None:
+        raise RuntimeError("cost sink down")
+
+    co = TitleTriageCoalescer(debounce_seconds=0.01, on_cost=on_cost)
+    result = await co.submit(_client(["Alpha one"]), target=_target(), titles=["Alpha one"])
+    assert result.result is not None, "verdicts still delivered"
+    assert result.verdicts[1].title_prefix == "Alpha one"

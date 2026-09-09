@@ -7,7 +7,7 @@ import inspect
 import logging
 import time
 from collections import Counter
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
@@ -2065,12 +2065,14 @@ async def _poll_one_source(
                     if coalescer is not None:
                         packed = await coalescer.submit(llm, target=active_target, titles=batch)
                         verdicts, result = packed.verdicts, packed.result
-                        # Exactly one caller per real call records the row, with
-                        # the PACKED size. The others rode the same call: they
-                        # must still see result is not None (their titles WERE
-                        # judged) but must not write a second row, or the
-                        # row-counting daily cap would over-count.
-                        record_cost = packed.owns_cost
+                        # The coalescer already wrote the cost row, from inside
+                        # the task that made the call — one row per real call,
+                        # and not lost if THIS source is cancelled by its
+                        # wall-clock budget mid-batch (review of #1025). So this
+                        # caller records nothing. It still sees result is not
+                        # None: its titles WERE judged, which is what the
+                        # attempted/defer contract below reads.
+                        record_cost = packed.owns_cost  # False on this path
                         cost_batch_size = packed.batch_size
                         cost_source: Any = "coalesced"
                     else:
@@ -3585,6 +3587,58 @@ def _accumulate_poll_summary(result: PollResult, summary: dict[str, Any]) -> Non
         result.errors.append(summary["error"])
 
 
+@contextlib.asynccontextmanager
+async def _cycle_coalescer(
+    supabase: AsyncClient, payer_for: Callable[[str], str | None] | None
+) -> AsyncIterator[TitleTriageCoalescer | None]:
+    """Cycle-scoped Phase-1 triage coalescer (#1015), or ``None`` when off.
+
+    A CONTEXT MANAGER, and shared by BOTH poll entry points, deliberately.
+    Review of #1025 caught the first version wired only into
+    ``poll_all_sources``: ``poll_due_sources`` is the cron path the scheduler
+    actually registers, so enabling the flag would have changed nothing in
+    production while looking enabled. Two hand-rolled copies of
+    create-pass-drain is how that happens, so there is now one.
+
+    The drain is in ``finally``: titles still inside the debounce window when
+    the last source finishes would otherwise be dropped silently, taking their
+    verdicts with them.
+
+    Scoped to the CYCLE, not the process — a coalescer outliving its cycle would
+    hold titles whose candidate rows have moved on.
+    """
+    if not settings.phase1_coalesce_enabled:
+        yield None
+        return
+
+    async def _record(target: JobTarget, result: Any, batch_size: int) -> None:
+        # The coalescer persists the cost itself, from inside the task that made
+        # the call, so a cancelled caller cannot lose the row (review of #1025).
+        await record_llm_cost_async(
+            _async_service_client(),
+            user_id=payer_for(target.id) if payer_for else None,
+            purpose=PHASE1_PURPOSE,
+            result=result,
+            metadata={
+                "target_id": target.id,
+                "source": "coalesced",
+                "batch_size": batch_size,
+            },
+        )
+
+    coalescer = TitleTriageCoalescer(
+        debounce_seconds=settings.phase1_coalesce_debounce_seconds,
+        on_cost=_record,
+    )
+    try:
+        yield coalescer
+    finally:
+        try:
+            await coalescer.drain()
+        except Exception:
+            logger.exception("phase1 coalescer drain failed (cycle unaffected)")
+
+
 async def poll_all_sources(
     supabase: AsyncClient, *, progress: PollResult | None = None
 ) -> PollResult:
@@ -3597,15 +3651,6 @@ async def poll_all_sources(
     """
     admission_budget = new_admission_budget()
     intake_budget = await new_intake_budget(supabase)
-    # Cycle-scoped so sources polled concurrently can pack their same-target
-    # triage batches into one call (#1015). Scoped to the CYCLE, not the
-    # process: a stale coalescer outliving its cycle would hold titles whose
-    # candidate rows have moved on. Off by default — see phase1_coalesce_enabled.
-    coalescer = (
-        TitleTriageCoalescer(debounce_seconds=settings.phase1_coalesce_debounce_seconds)
-        if settings.phase1_coalesce_enabled
-        else None
-    )
     result = (
         progress
         if progress is not None
@@ -3625,7 +3670,7 @@ async def poll_all_sources(
     sources = _drop_paid_sources_if_unconsumed(all_sources, has_active_targets=has_active)
     semaphore = asyncio.Semaphore(POLL_CONCURRENCY)
 
-    async def _worker(raw_source: Any) -> None:
+    async def _worker(raw_source: Any, coalescer: TitleTriageCoalescer | None) -> None:
         async with semaphore:
             summary = await _poll_one_source_budgeted(
                 cast(dict[str, Any], raw_source),
@@ -3642,17 +3687,8 @@ async def poll_all_sources(
         # cancellation can never drop a finished source's counts.
         _accumulate_poll_summary(result, summary)
 
-    await asyncio.gather(*(_worker(s) for s in sources))
-    if coalescer is not None:
-        # Anything still inside the debounce window when the last source
-        # finished would otherwise be dropped silently, taking its titles'
-        # verdicts with it. Draining resolves every outstanding waiter — but the
-        # sources awaiting them have already returned, so this only flushes work
-        # whose callers are still in flight.
-        try:
-            await coalescer.drain()
-        except Exception:
-            logger.exception("phase1 coalescer drain failed (cycle unaffected)")
+    async with _cycle_coalescer(supabase, budget_gate.payer_for if budget_gate else None) as co:
+        await asyncio.gather(*(_worker(s, co) for s in sources))
     logger.info("poll cycle finished: %s %s", admission_budget.report(), intake_budget.report())
     _log_redetect_cycle_summary()
     # Product-level catalog health (#958). Telemetry only: record_cycle_health
@@ -3806,7 +3842,7 @@ async def poll_due_sources(
     # replaced silently reset to all-misses on every release.
     phase1_store_stats = {"hits": 0, "misses": 0}
 
-    async def _worker(source: dict[str, Any]) -> None:
+    async def _worker(source: dict[str, Any], coalescer: TitleTriageCoalescer | None) -> None:
         async with semaphore:
             summary = await _poll_one_source_budgeted(
                 source,
@@ -3817,6 +3853,7 @@ async def poll_due_sources(
                 stage3_users=stage3_users,
                 admission_budget=admission_budget,
                 intake_budget=intake_budget,
+                coalescer=coalescer,
             )
         # No await between the source completing and the fold, so a
         # cancellation can never drop a finished source's counts.
@@ -3824,7 +3861,11 @@ async def poll_due_sources(
         phase1_store_stats["hits"] += summary.get("phase1_store_hits", 0)
         phase1_store_stats["misses"] += summary.get("phase1_store_misses", 0)
 
-    await asyncio.gather(*(_worker(s) for s in due))
+    # THE CRON PATH. ``scheduler.py`` registers this entry point, not
+    # ``poll_all_sources``, so a coalescer wired only into the latter would have
+    # left the flag inert in production (review of #1025).
+    async with _cycle_coalescer(supabase, budget_gate.payer_for if budget_gate else None) as co:
+        await asyncio.gather(*(_worker(s, co) for s in due))
     logger.info("poll cycle finished: %s %s", admission_budget.report(), intake_budget.report())
     _log_redetect_cycle_summary()
     if phase1_store_stats["hits"] or phase1_store_stats["misses"]:

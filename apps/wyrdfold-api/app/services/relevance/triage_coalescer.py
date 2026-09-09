@@ -33,20 +33,35 @@ per target (``payer = gate.payer_for(active_target.id)`` in the poller), so
 every request merged into one call shares a payer and a BYOK key — cost
 attribution stays unambiguous, which is the property that makes this sound.
 
-COST ACCOUNTING
+COST ACCOUNTING — OWNED HERE, NOT BY A CALLER
 One real LLM call must produce exactly one ``llm_costs`` row, or the per-target
-daily cap (which counts rows) would over- or under-count. Exactly one waiter per
-call is handed ``owns_cost=True`` along with the PACKED ``batch_size`` to record;
-the others get ``owns_cost=False``. Every waiter in a successful call still
-receives a non-None ``result``, because the poller uses ``result is not None`` to
-mean "these titles were attempted" — the fail-open/defer contract (#285/#294) —
-and their titles genuinely were judged.
+daily cap (which counts rows) would over- or under-count.
+
+An earlier design handed ``owns_cost=True`` to one waiter and let it write the
+row. That loses rows under cancellation, which is ROUTINE here: every source is
+wrapped in ``asyncio.wait_for`` with its own wall-clock budget, so the owning
+waiter can be cancelled while the LLM call it started keeps running. Reproduced
+before fixing — the provider bills the call and we record ZERO rows, undercounting
+both spend and the cap. Picking the first *live* waiter only narrows the window:
+a waiter can still be cancelled after ownership is handed to it and before it
+writes. Raised in review of #1025.
+
+So the coalescer persists the cost itself, inside the same task that made the
+call, via the ``on_cost`` callback handed to the constructor. No waiter can drop
+it, because no waiter is responsible for it. ``owns_cost`` remains on the result
+purely so the un-coalesced caller path and tests can distinguish the two modes;
+when ``on_cost`` is set it is always False.
+
+Every waiter in a successful call still receives a non-None ``result``, because
+the poller uses ``result is not None`` to mean "these titles were attempted" —
+the fail-open/defer contract (#285/#294) — and their titles genuinely were judged.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from app.models.llm import LLMResult
@@ -113,7 +128,14 @@ class TitleTriageCoalescer:
         batch_size: int | None = None,
         max_wait_seconds: float = 120.0,
         triage: object = None,
+        on_cost: Callable[[JobTarget, object, int], Awaitable[None]] | None = None,
     ) -> None:
+        # Called once per REAL LLM call, from inside the flush task, with
+        # (target, result, packed_batch_size). Owning persistence here rather
+        # than handing it to a waiter is what makes cancellation safe — see the
+        # module docstring. None keeps the old caller-records behaviour, which
+        # the tests use to assert the distinction.
+        self._on_cost = on_cost
         self._debounce = debounce_seconds
         # A waiter must never block forever. Its future is resolved by a flush
         # it does not own, so any bug that loses the flush — a pending key that
@@ -214,9 +236,30 @@ class TitleTriageCoalescer:
             self._fail(group)
             return
 
+        # Persist the cost HERE, before resolving anyone. The call happened and
+        # is billed regardless of who is still waiting for it, so the row must
+        # not depend on a waiter surviving (review of #1025). Its own try/except:
+        # a cost-write failure must not cost the verdicts, exactly as the
+        # un-coalesced path swallows the same failure.
+        if result is not None and self._on_cost is not None:
+            try:
+                await self._on_cost(lead.target, result, len(titles))
+            except Exception:
+                logger.exception(
+                    "phase1 coalescer: failed to record cost for target %s "
+                    "(%d titles) — verdicts still delivered",
+                    lead.target.id,
+                    len(titles),
+                )
+
         # Split the 1-based global verdict map back into each caller's own
         # 1-based space. A dropped verdict stays dropped for that caller, which
         # is the same fail-open the un-coalesced path has.
+        #
+        # ``owns_cost`` is only handed out when nobody else is persisting: with
+        # ``on_cost`` set the coalescer already wrote the row, and a waiter that
+        # also wrote one would double-count the cap.
+        caller_records = self._on_cost is None
         offset = 0
         for i, w in enumerate(group):
             local = {
@@ -225,12 +268,13 @@ class TitleTriageCoalescer:
                 if offset < idx <= offset + len(w.titles)
             }
             if not w.future.done():
+                owns = caller_records and i == 0 and result is not None
                 w.future.set_result(
                     CoalescedVerdicts(
                         verdicts=local,
                         result=result,
-                        owns_cost=(i == 0 and result is not None),
-                        batch_size=len(titles) if i == 0 else 0,
+                        owns_cost=owns,
+                        batch_size=len(titles) if owns else 0,
                     )
                 )
             offset += len(w.titles)

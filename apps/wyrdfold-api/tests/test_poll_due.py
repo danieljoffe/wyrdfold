@@ -340,3 +340,72 @@ async def test_poll_due_sources_cap_zero_is_unbounded(
 
     assert poll_one.await_count == 3
     assert result.sources_polled == 3
+
+
+# ---- #1015: the CRON path must actually get a coalescer -------------------
+
+
+@pytest.mark.asyncio
+async def test_poll_due_sources_passes_a_coalescer_when_the_flag_is_on(monkeypatch) -> None:
+    """``scheduler.py`` registers THIS entry point, not ``poll_all_sources``.
+
+    The first version of #1015 wired the coalescer only into
+    ``poll_all_sources``, so enabling ``phase1_coalesce_enabled`` would have
+    left production polling unchanged while looking enabled — the flag would
+    have reported a win it never delivered. Caught in review of #1025.
+    """
+    from app.config import settings as live_settings
+    from app.services.relevance.triage_coalescer import TitleTriageCoalescer
+
+    monkeypatch.setattr(live_settings, "phase1_coalesce_enabled", True)
+    long_ago = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
+    supabase = _supabase_returning([_src(last_polled_at=long_ago, poll_interval_minutes=240)])
+
+    with (
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock) as get_opt,
+        patch("app.services.poller._active_targets", new_callable=AsyncMock, return_value=[]),
+        patch("app.services.poller._poll_one_source", new_callable=AsyncMock) as poll_one,
+    ):
+        get_opt.return_value = None
+        poll_one.return_value = {
+            "polled": True,
+            "new": 0,
+            "updated": 0,
+            "archived": 0,
+            "error": None,
+        }
+        await poll_due_sources(supabase)
+
+    assert poll_one.await_count == 1
+    passed = poll_one.await_args.kwargs.get("coalescer")
+    assert isinstance(passed, TitleTriageCoalescer), (
+        "the cron path must hand the coalescer down, or the flag is inert in prod"
+    )
+
+
+@pytest.mark.asyncio
+async def test_poll_due_sources_passes_none_when_the_flag_is_off(monkeypatch) -> None:
+    """Default-off must reach the source path as literally ``None`` — the
+    un-coalesced branch is selected by ``coalescer is not None``."""
+    from app.config import settings as live_settings
+
+    monkeypatch.setattr(live_settings, "phase1_coalesce_enabled", False)
+    long_ago = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
+    supabase = _supabase_returning([_src(last_polled_at=long_ago, poll_interval_minutes=240)])
+
+    with (
+        patch("app.services.poller._latest_optimized", new_callable=AsyncMock) as get_opt,
+        patch("app.services.poller._active_targets", new_callable=AsyncMock, return_value=[]),
+        patch("app.services.poller._poll_one_source", new_callable=AsyncMock) as poll_one,
+    ):
+        get_opt.return_value = None
+        poll_one.return_value = {
+            "polled": True,
+            "new": 0,
+            "updated": 0,
+            "archived": 0,
+            "error": None,
+        }
+        await poll_due_sources(supabase)
+
+    assert poll_one.await_args.kwargs.get("coalescer") is None
