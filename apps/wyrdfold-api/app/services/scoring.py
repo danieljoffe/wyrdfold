@@ -478,6 +478,7 @@ def score_job_with_profile(
     breakdown = ScoreBreakdown()
     all_matched: list[str] = []
     excluded = False
+    exclusion_keywords: list[str] = []
 
     # Title as a high-weight implicit section
     title_lower = title.lower()
@@ -575,6 +576,7 @@ def score_job_with_profile(
         if _keyword_or_alias_in_text(keyword, title_lower):
             breakdown.negative += profile.negative.weight
             excluded = True
+            exclusion_keywords.append(keyword)
             continue
 
         # Check requirements-type sections only (soft penalty, no exclude)
@@ -633,6 +635,7 @@ def score_job_with_profile(
         breakdown=breakdown,
         matched_keywords=list(set(all_matched)),
         excluded=excluded,
+        exclusion_keywords=exclusion_keywords,
     )
 
 
@@ -673,6 +676,7 @@ def score_title_against_profile(
     breakdown = ScoreBreakdown()
     all_matched: list[str] = []
     excluded = False
+    exclusion_keywords: list[str] = []
 
     # Category keywords
     for cat_name, cat_profile in profile.categories.items():
@@ -701,6 +705,7 @@ def score_title_against_profile(
         if _keyword_or_alias_in_text(keyword, title_lower):
             breakdown.negative += profile.negative.weight
             excluded = True
+            exclusion_keywords.append(keyword)
 
     # Seniority-tier penalty — see _seniority_tier_penalty docstring
     breakdown.negative += _seniority_tier_penalty(title_lower, profile.seniority.level)
@@ -731,4 +736,5 @@ def score_title_against_profile(
         breakdown=breakdown,
         matched_keywords=list(set(all_matched)),
         excluded=excluded,
+        exclusion_keywords=exclusion_keywords,
     )

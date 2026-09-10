@@ -54,7 +54,7 @@ router = APIRouter(
 def _no_profile_response() -> JSONResponse:
     """The ``no_profile`` empty-state marker (#105).
 
-    A 200 (not a 4xx) so the panel's auto-fired call doesn't log a console
+    A 200 (not a 4xx) so a caller without a profile doesn't log a console
     error, and the body carries a structured code without leaking any internal
     endpoint path into the UI.
     """
@@ -238,10 +238,9 @@ async def create_analysis(
         user_id=user_id,
     )
     if optimized_doc is None:
-        # The panel auto-fires this on first open; a 404 would both leak an
-        # internal endpoint path into the UI and log a console error on every
-        # profile-less job open. Render the "set up your profile" CTA instead
-        # via a 200 marker (#105).
+        # A 404 would both leak an internal endpoint path into the UI and log a
+        # console error whenever a profile-less user asks for an analysis.
+        # Render the "set up your profile" CTA instead via a 200 marker (#105).
         return _no_profile_response()
 
     if cached is not None:
@@ -265,8 +264,11 @@ async def create_analysis(
 
     # Dedup: a run is already in flight for this exact cache key → don't spawn a
     # second (double LLM spend) and don't re-count; tell the client to keep
-    # polling. This also makes the panel's auto-fire + any StrictMode
-    # double-invoke safe.
+    # polling. It guards concurrent DUPLICATE REQUESTS of any origin — a
+    # double-click, two open tabs, a client retry. Deliberately stated without
+    # naming a specific caller-side mechanism: the previous comment pinned this
+    # to a panel auto-fire that #634 removed, and went stale the moment that
+    # changed.
     if run_registry.is_running(key):
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
