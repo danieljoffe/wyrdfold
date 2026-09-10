@@ -14,28 +14,40 @@ updates:
         patterns:
           - 'nx'
           - '@nx/*'
+          - '@nx*'
           - '@nrwl/*'
+          - '@nrwl*'
         update-types:
           - major
           - minor
           - patch
       npm-minor-patch:
-        # `patterns` defaults to '*', so this group matches every dependency
-        # and can claim the `@nx/*` plugins before the `nx` group above ever
-        # sees them. That is not hypothetical: on 2026-09-06 it split the nx
-        # family across two PRs -- #1020 carried `nx` core 23.1.2 -> 23.2.0
-        # while #1022 carried every `@nx/*` plugin on the same bump. Either
-        # one merged alone leaves core and plugins on different versions, and
-        # the project graph dies with `hashDaemonClientEnv is not a function`
-        # (that helper is new in 23.2.0, so 23.2.0 plugins calling into a
-        # 23.1.2 core find nothing there).
+        # OBSERVED 2026-09-06: despite the `nx` group above listing
+        # `@nx/*`, Dependabot put `nx` core in the `nx` group (#1020) and all
+        # eight `@nx/*` plugins in THIS group (#1022), on the same 23.1.2 ->
+        # 23.2.0 bump. Split that way, whichever PR merges alone leaves core
+        # and plugins on different versions and the project graph dies with
+        # `hashDaemonClientEnv is not a function` -- that helper is new in
+        # 23.2.0, so 23.2.0 plugins calling into a 23.1.2 core find nothing.
         #
-        # Excluding them here forces the whole nx family into the `nx` group
-        # no matter how group precedence resolves.
+        # WHY it split is NOT established. GitHub's docs say a dependency
+        # "is included in the first group that it matches", and `nx` is
+        # declared first -- so on the documented behaviour this should not
+        # have happened at all. Treat the cause as unknown (likely a quirk in
+        # how scoped patterns match) rather than trusting the ordering.
+        #
+        # This exclusion is the part that IS documented: "If a dependency
+        # matches both a pattern and an exclude-pattern, then it is excluded
+        # from the group." So nx packages can no longer land here silently
+        # paired with a mismatched core, whatever the grouping quirk is.
+        # `@nx*` / `@nrwl*` are belt-and-braces in case the slash in the
+        # `@nx/*` form is what failed to match.
         exclude-patterns:
           - 'nx'
           - '@nx/*'
+          - '@nx*'
           - '@nrwl/*'
+          - '@nrwl*'
         update-types:
           - minor
           - patch
