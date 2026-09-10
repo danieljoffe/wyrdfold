@@ -54,8 +54,8 @@
 -- Applied to production 2026-09-10 against 503,761 rows; the figure here was
 -- written as "~482k" from a count taken days earlier, and a stale magnitude in
 -- a migration note is the kind of thing a later reader sizes a maintenance
--- window from. COMMENT-ONLY correction — the DDL above is unchanged and
--- already applied.
+-- window from. COMMENT-ONLY correction — the DDL is unchanged and already
+-- applied.
 --
 -- ROLLOUT ORDER — MIGRATION FIRST, and note which direction is the safe one:
 -- the OLD API tolerates this column being PRESENT (it never mentions it, and
