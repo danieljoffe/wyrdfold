@@ -218,3 +218,145 @@ def test_duplicate_migration_versions_are_fatal(tmp_path: Path):
     _write(tmp_path, "20260907000000_a.sql", "20260907000000_b.sql")
     with pytest.raises(SystemExit):
         preflight.repo_migrations(tmp_path)
+
+
+# ---- postgrest_probe control flow, through a fake client -------------------
+#
+# Review of #1028, round 2: the earlier tests only asserted membership in the
+# accepted/rejected constants, so a regression that swapped the branches,
+# ignored ``exc.code`` or swallowed a cleanup failure would have stayed green.
+# These drive the real function and assert the verdict it returns.
+
+
+class _FakeQuery:
+    def __init__(self, owner: _FakeClient, op: str) -> None:
+        self._owner, self._op = owner, op
+
+    def eq(self, *_a: object, **_k: object) -> _FakeQuery:
+        return self
+
+    def execute(self) -> object:
+        if self._op == "insert":
+            if self._owner.insert_error is not None:
+                raise self._owner.insert_error
+            self._owner.inserted = True
+            return object()
+        self._owner.delete_attempted = True
+        if self._owner.delete_error is not None:
+            raise self._owner.delete_error
+        self._owner.deleted = True
+        return object()
+
+
+class _FakeTable:
+    def __init__(self, owner: _FakeClient) -> None:
+        self._owner = owner
+
+    def insert(self, payload: dict) -> _FakeQuery:
+        self._owner.payloads.append(payload)
+        return _FakeQuery(self._owner, "insert")
+
+    def delete(self) -> _FakeQuery:
+        return _FakeQuery(self._owner, "delete")
+
+
+class _FakeClient:
+    """Minimal stand-in for the supabase client, scripted to fail how we choose."""
+
+    def __init__(
+        self, *, insert_error: Exception | None = None, delete_error: Exception | None = None
+    ) -> None:
+        self.insert_error = insert_error
+        self.delete_error = delete_error
+        self.payloads: list[dict] = []
+        self.inserted = False
+        self.deleted = False
+        self.delete_attempted = False
+
+    def table(self, _name: str) -> _FakeTable:
+        return _FakeTable(self)
+
+
+def _api_error(code: str) -> Exception:
+    from postgrest.exceptions import APIError
+
+    return APIError({"message": f"scripted {code}", "code": code, "hint": None, "details": None})
+
+
+def test_probe_reports_proof_when_the_insert_succeeds():
+    fake = _FakeClient()
+    ok, detail = preflight.postgrest_probe("scores", ["a", "b"], client=fake)
+    assert ok, detail
+    assert fake.inserted and fake.deleted, "the probe row must be cleaned up"
+
+
+def test_probe_sends_every_requested_column_in_one_payload():
+    """#1027 needs BOTH keys proven. Sending them separately, or dropping one,
+    would prove a weaker claim than the gate advertises."""
+    fake = _FakeClient()
+    preflight.postgrest_probe(
+        "scores", ["exclusion_keywords", "exclusion_keywords_version"], client=fake
+    )
+    assert len(fake.payloads) == 1, "one payload, not one per column"
+    sent = fake.payloads[0]
+    assert "exclusion_keywords" in sent
+    assert "exclusion_keywords_version" in sent
+
+
+@pytest.mark.parametrize("sqlstate", ["23502", "23503", "23505", "23514"])
+def test_probe_treats_constraint_violations_as_proof(sqlstate: str):
+    """The row was rejected, but only Postgres could have rejected it — which
+    means PostgREST already accepted the payload shape."""
+    fake = _FakeClient(insert_error=_api_error(sqlstate))
+    ok, detail = preflight.postgrest_probe("scores", ["a"], client=fake)
+    assert ok, detail
+    assert sqlstate in detail
+
+
+@pytest.mark.parametrize(
+    ("code", "why"),
+    [
+        ("PGRST204", "unknown column — the exact thing being tested for"),
+        ("PGRST205", "unknown table"),
+        ("PGRST301", "auth failure proves nothing about the schema"),
+        ("PGRST302", "auth required"),
+    ],
+)
+def test_probe_fails_closed_on_postgrest_rejections(code: str, why: str):
+    fake = _FakeClient(insert_error=_api_error(code))
+    ok, detail = preflight.postgrest_probe("scores", ["a"], client=fake)
+    assert not ok, f"{code} must not be proof ({why}); got: {detail}"
+
+
+def test_probe_fails_closed_on_an_unrecognised_api_code():
+    """The default must be 'not proof' — including for codes that do not exist
+    yet. This is the branch that made the original version fail open."""
+    fake = _FakeClient(insert_error=_api_error("PGRST999"))
+    ok, detail = preflight.postgrest_probe("scores", ["a"], client=fake)
+    assert not ok
+    assert "unrecognised" in detail.lower()
+
+
+def test_probe_fails_closed_on_a_network_error():
+    """A URL with nothing listening reported success in the first version."""
+    fake = _FakeClient(insert_error=ConnectionRefusedError("[Errno 61] Connection refused"))
+    ok, detail = preflight.postgrest_probe("scores", ["a"], client=fake)
+    assert not ok
+    assert "not proof" in detail
+
+
+def test_a_cleanup_failure_fails_the_probe_and_names_the_row():
+    """Reporting success while leaving a probe row behind would make this tool
+    a source of the drift it exists to detect."""
+    fake = _FakeClient(delete_error=RuntimeError("delete blew up"))
+    ok, detail = preflight.postgrest_probe("scores", ["a"], client=fake)
+    assert not ok, "an orphaned probe row must fail the run"
+    assert "INSERTED but could not be deleted" in detail
+    assert fake.delete_attempted
+
+
+def test_probe_rejects_a_hostile_column_name_before_any_call():
+    fake = _FakeClient()
+    with pytest.raises(SystemExit):
+        preflight.postgrest_probe("scores", ["a; DROP TABLE scores--"], client=fake)
+    assert fake.payloads == [], "nothing may be sent when validation fails"

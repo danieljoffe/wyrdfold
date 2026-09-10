@@ -182,18 +182,20 @@ def psql(sql: str, **params: str) -> list[str]:
 
 
 def column_facts(table: str, prefix: str) -> list[tuple[str, str, str, str]]:
-    """(name, type, is_nullable, default) for columns matching ``prefix``.
+    """(name, type, is_nullable, default) for public.<table> columns matching
+    ``prefix``. Scoped to ``table_schema = 'public'`` — filtering on table_name
+    alone would let a same-named table in another schema answer for this one
+    (review of #1028).
 
-    Reported so the operator can eyeball the shape the migration promised —
-    nullable, no default — rather than only that a column exists. A NOT NULL
-    DEFAULT would silently change what an absent value MEANS.
+    REPORTING ONLY. It does not decide the exit code; ``--expect-shape`` does.
     """
     table = _ident(table, "--show-columns table")
     prefix = _ident(prefix, "--show-columns prefix")
     rows = psql(
         "SELECT column_name || '|' || data_type || '|' || is_nullable || '|' "
         "|| COALESCE(column_default, '(none)') "
-        "FROM information_schema.columns WHERE table_name = :'tbl' "
+        "FROM information_schema.columns WHERE table_schema = 'public' "
+        "AND table_name = :'tbl' "
         "AND column_name LIKE :'pfx' || '%' ORDER BY column_name;",
         tbl=table,
         pfx=prefix,
@@ -204,6 +206,55 @@ def column_facts(table: str, prefix: str) -> list[tuple[str, str, str, str]]:
         if len(parts) == 4:
             out.append((parts[0], parts[1], parts[2], parts[3]))
     return out
+
+
+# ``scores.exclusion_keywords=ARRAY:nullable:nodefault``
+_SHAPE_RE = re.compile(
+    r"^(?P<table>[a-z_][a-z0-9_]*)\.(?P<column>[a-z_][a-z0-9_]*)"
+    r"=(?P<type>[a-zA-Z ]+)"
+    r"(?P<attrs>(:(nullable|notnull|nodefault))*)$"
+)
+
+
+def check_expected_shape(spec: str) -> tuple[bool, str]:
+    """Assert one column's declared shape, and RETURN whether it holds.
+
+    Exists because ``--show-columns`` only printed. The PR claimed a single exit
+    code replaced the manual checks, but a missing column, a wrong type, an
+    unexpected NOT NULL or a default all still exited 0 — the claim outran the
+    code (review of #1028). A shape assertion has to move the exit code or it is
+    just more output for an operator to skim.
+
+    ``nullable``/``notnull`` and ``nodefault`` are checked only when named, so a
+    spec asserts exactly what it says and nothing implicitly.
+    """
+    m = _SHAPE_RE.match(spec.strip())
+    if not m:
+        return False, (
+            f"malformed --expect-shape {spec!r}; want "
+            "table.column=TYPE[:nullable|:notnull][:nodefault]"
+        )
+    table, column = m.group("table"), m.group("column")
+    want_type = m.group("type").strip().lower()
+    attrs = set(m.group("attrs").split(":")) - {""}
+
+    facts = [f for f in column_facts(table, column) if f[0] == column]
+    if not facts:
+        return False, f"{table}.{column} DOES NOT EXIST in schema public"
+    _, data_type, is_nullable, default = facts[0]
+
+    problems = []
+    if data_type.strip().lower() != want_type:
+        problems.append(f"type is {data_type!r}, expected {want_type!r}")
+    if "nullable" in attrs and is_nullable != "YES":
+        problems.append("is NOT NULL, expected nullable")
+    if "notnull" in attrs and is_nullable != "NO":
+        problems.append("is nullable, expected NOT NULL")
+    if "nodefault" in attrs and default != "(none)":
+        problems.append(f"has default {default!r}, expected none")
+    if problems:
+        return False, f"{table}.{column}: " + "; ".join(problems)
+    return True, f"{table}.{column}: {data_type}, nullable={is_nullable}, default={default}"
 
 
 # SQLSTATEs that can only be reached AFTER PostgREST has parsed the payload and
@@ -227,7 +278,7 @@ _POSTGREST_REJECTED = {
 }
 
 
-def postgrest_probe(table: str, columns: list[str]) -> tuple[bool, str]:
+def postgrest_probe(table: str, columns: list[str], *, client: Any = None) -> tuple[bool, str]:
     """Write a throwaway row through PostgREST carrying EVERY column in
     ``columns``, then delete it. Returns ``(proved, detail)``.
 
@@ -258,14 +309,22 @@ def postgrest_probe(table: str, columns: list[str]) -> tuple[bool, str]:
     except ImportError:
         return False, "supabase/postgrest client not importable — run inside the api venv"
 
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    if not (url and key):
-        return False, "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set"
-
     table = _ident(table, "--probe-table")
-    cols = [_ident(c, "--probe-column") for c in columns]
-    sb = create_client(url, key)
+    cols = [_ident(c, "--probe-columns") for c in columns]
+
+    # ``client`` is injectable so the RESULT-INTERPRETING branches can be tested
+    # directly. Review of #1028: the first test round only asserted membership in
+    # the accepted/rejected constants, so a regression that swapped the branches,
+    # ignored ``exc.code`` or swallowed a cleanup failure would have stayed green.
+    # Live verification is evidence about one run; this is evidence about the code.
+    if client is None:
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        if not (url and key):
+            return False, "SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set"
+        sb = create_client(url, key)
+    else:
+        sb = client
     probe_id = str(uuid.uuid4())
     payload: dict[str, Any] = {"id": probe_id}
     for c in cols:
@@ -333,12 +392,35 @@ def main() -> int:
         "no real environment",
     )
     ap.add_argument(
+        "--expect-shape",
+        action="append",
+        default=[],
+        metavar="TABLE.COLUMN=TYPE[:nullable|:notnull][:nodefault]",
+        help="ASSERT a column's shape and fail the run if it differs. Repeatable. "
+        "Unlike --show-columns, this moves the exit code — e.g. "
+        "scores.exclusion_keywords=ARRAY:nullable:nodefault",
+    )
+    ap.add_argument(
         "--show-columns",
         metavar="TABLE:PREFIX",
         help="report type/nullability/default for columns matching a prefix, "
         "e.g. scores:exclusion_keywords",
     )
     a = ap.parse_args()
+
+    # Validate probe arguments BEFORE touching either target. A half-specified
+    # probe used to skip silently and still exit 0, and ``--probe-columns ','``
+    # parsed to an empty list and proved nothing while looking like a run
+    # (review of #1028). A gate must refuse an instruction it cannot honour.
+    probe_cols: list[str] = []
+    if bool(a.probe_table) != bool(a.probe_columns):
+        ap.error("--probe-table and --probe-columns must be given together")
+    if a.probe_columns:
+        probe_cols = [c.strip() for c in a.probe_columns.split(",") if c.strip()]
+        if not probe_cols:
+            ap.error("--probe-columns parsed to no columns — nothing would be proved")
+        if len(set(probe_cols)) != len(probe_cols):
+            ap.error(f"--probe-columns has duplicates: {a.probe_columns!r}")
 
     migrations_dir = Path(a.migrations_dir)
     if not migrations_dir.is_dir():
@@ -355,6 +437,15 @@ def main() -> int:
     print(f"  ledger  (DATABASE_URL) : {_redacted(db_url) if db_url else '(unset)'}  -> {db_id}")
     if rest_url:
         print(f"  schema  (SUPABASE_URL) : {_redacted(rest_url)}  -> {rest_id}")
+    unknown = [i for i in (db_id, rest_id) if i.startswith("unknown:")]
+    if unknown and not a.allow_target_mismatch:
+        print(
+            f"\n  ⛔ UNRECOGNISED TARGET: {', '.join(unknown)}. Two hosts this script\n"
+            "  cannot identify would compare EQUAL to each other, which is the\n"
+            "  opposite of what an identity check is for. Fail closed, or pass\n"
+            "  --allow-target-mismatch deliberately."
+        )
+        return 1
     mismatch = bool(rest_url and db_url and db_id != rest_id)
     if mismatch:
         print(
@@ -405,10 +496,24 @@ def main() -> int:
         for name, typ, nullable, default in facts:
             print(f"  {name}: {typ}, nullable={nullable}, default={default}")
 
+    shape_failed = False
+    if a.expect_shape:
+        print("\nEXPECTED COLUMN SHAPE (asserted — affects the exit code)")
+        for spec in a.expect_shape:
+            ok, detail = check_expected_shape(spec)
+            print(f"  {'✅' if ok else '⛔'} {detail}")
+            if not ok:
+                shape_failed = True
+        if shape_failed:
+            print(
+                "  A column that exists but has the wrong type, nullability or\n"
+                "  default is not the column the migration promised — and a\n"
+                "  NOT NULL DEFAULT would silently change what an absent value MEANS."
+            )
+
     probe_failed = False
-    if a.probe_table and a.probe_columns:
-        cols = [c.strip() for c in a.probe_columns.split(",") if c.strip()]
-        ok, detail = postgrest_probe(a.probe_table, cols)
+    if probe_cols:
+        ok, detail = postgrest_probe(a.probe_table, probe_cols)
         print("\nPOSTGREST SCHEMA-CACHE PROBE")
         print(f"  {'✅' if ok else '⛔'} {detail}")
         if not ok:
@@ -419,7 +524,7 @@ def main() -> int:
                 "  that matters — a passing information_schema query is not enough."
             )
 
-    return 1 if (pending or probe_failed) else 0
+    return 1 if (pending or shape_failed or probe_failed) else 0
 
 
 if __name__ == "__main__":
