@@ -14,9 +14,7 @@ updates:
         patterns:
           - 'nx'
           - '@nx/*'
-          - '@nx*'
           - '@nrwl/*'
-          - '@nrwl*'
         update-types:
           - major
           - minor
@@ -40,14 +38,18 @@ updates:
         # matches both a pattern and an exclude-pattern, then it is excluded
         # from the group." So nx packages can no longer land here silently
         # paired with a mismatched core, whatever the grouping quirk is.
-        # `@nx*` / `@nrwl*` are belt-and-braces in case the slash in the
-        # `@nx/*` form is what failed to match.
+        #
+        # Patterns stay on the exact scoped forms. Broader globs (`@nx*`)
+        # were considered and rejected: they would also match sibling scopes
+        # that merely start with `@nx`, and because the same glob sits in
+        # both this exclusion and the group above, an overmatch would pull an
+        # unrelated package out of `npm-minor-patch` and onto nx's cadence.
+        # If the next nx release still splits, that localises the cause to
+        # scoped-pattern matching -- fix it then, with evidence.
         exclude-patterns:
           - 'nx'
           - '@nx/*'
-          - '@nx*'
           - '@nrwl/*'
-          - '@nrwl*'
         update-types:
           - minor
           - patch
