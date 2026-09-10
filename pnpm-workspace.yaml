@@ -18,6 +18,7 @@ overrides:
   # (2.0.2) is flagged with no fix published. Suppressed in osv-scanner.toml
   # with justification instead. See GHSA-5p2g-fcmc-qvqq.
   nanoid: ^3.3.17 # GHSA-2v37-7h3g-55p8 (was 3.3.16)
+  smol-toml: ^1.7.1 # GHSA-7w5x-hrqm-74c2 (1.6.1 flagged; fix 1.7.1). The tree already resolved a patched 1.8.0 elsewhere — this lifts the stale 1.6.1 copy onto the same line. Live-DB OSV moving target.
   '@opentelemetry/core': 2.8.0
   '@opentelemetry/resources': 2.8.0
   '@opentelemetry/sdk-trace-base': 2.8.0
