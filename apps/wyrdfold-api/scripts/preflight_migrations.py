@@ -30,13 +30,22 @@ READ-ONLY by default. ``--probe-table`` performs ONE insert and deletes it in a
     export DATABASE_URL=...            # ledger check (read-only)
     uv run python scripts/preflight_migrations.py
 
-    # the full #1027 gate — ledger + column shapes + a real PostgREST write
-    # carrying BOTH columns in one payload:
+    # the full #1027 gate — ledger + ASSERTED column shapes + a real PostgREST
+    # write carrying BOTH columns in one payload:
     export SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=...
     uv run python scripts/preflight_migrations.py \
-        --show-columns scores:exclusion_keywords \
+        --expect-shape 'scores.exclusion_keywords=ARRAY:nullable:nodefault' \
+        --expect-shape 'scores.exclusion_keywords_version=integer:nullable:nodefault' \
         --probe-table scores \
         --probe-columns exclusion_keywords,exclusion_keywords_version
+
+    # NOT --show-columns here. It is reporting-only and does not move the exit
+    # code, so a canonical example built on it hands the operator a weaker check
+    # than the label "gate" promises — a column with the wrong type, an
+    # unexpected NOT NULL or a default would still exit 0. Caught in review of
+    # #1028: the same shape as the bugs this script exists to prevent, one level
+    # down, in the documentation. ``test_docstring_gate_example_asserts_shapes``
+    # pins it so it cannot drift back.
 
 DATABASE_URL and SUPABASE_URL are independent variables, so the script derives a
 project identity from each and refuses to report on a split target — a prod

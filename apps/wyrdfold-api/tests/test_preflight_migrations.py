@@ -360,3 +360,41 @@ def test_probe_rejects_a_hostile_column_name_before_any_call():
     with pytest.raises(SystemExit):
         preflight.postgrest_probe("scores", ["a; DROP TABLE scores--"], client=fake)
     assert fake.payloads == [], "nothing may be sent when validation fails"
+
+
+# ---- the documented gate command must actually be a gate -------------------
+
+
+def test_docstring_gate_example_asserts_shapes():
+    """The canonical example is what an operator copies, so it has to carry the
+    ASSERTING flags.
+
+    Review of #1028 caught the example built on ``--show-columns``, which is
+    reporting-only: copying it would exit 0 even with a wrong type, an
+    unexpected NOT NULL or a default — a weaker check than the label "gate"
+    promises. Same shape as the bugs this script exists to prevent, one level
+    down, in the documentation. Pinned because prose rots silently.
+    """
+    doc = preflight.__doc__ or ""
+    gate = doc.split("the full #1027 gate", 1)
+    assert len(gate) == 2, "the docstring must document a full-gate example"
+    example = gate[1].split("Exit 0 = safe", 1)[0]
+
+    assert "--expect-shape" in example, "the gate example must ASSERT shapes"
+    for column, typ in (
+        ("scores.exclusion_keywords", "ARRAY"),
+        ("scores.exclusion_keywords_version", "integer"),
+    ):
+        assert f"{column}={typ}:nullable:nodefault" in example, (
+            f"the gate example must assert {column}'s full shape — #1027 needs "
+            "both columns proven, not one asserted and one printed"
+        )
+    assert "--probe-columns exclusion_keywords,exclusion_keywords_version" in example, (
+        "both columns must go through PostgREST in one payload"
+    )
+
+
+def test_show_columns_is_documented_as_reporting_only():
+    """If --show-columns ever starts affecting the exit code, this should be
+    revisited deliberately rather than silently."""
+    assert "REPORTING ONLY" in (preflight.column_facts.__doc__ or "")
