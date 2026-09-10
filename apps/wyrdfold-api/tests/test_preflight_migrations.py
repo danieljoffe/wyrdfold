@@ -111,3 +111,110 @@ def test_rejects_anything_that_is_not_an_identifier(hostile: str):
     rather than escapes."""
     with pytest.raises(SystemExit):
         preflight._ident(hostile, "probe")
+
+
+# ---- fail-closed classification (review of #1028) --------------------------
+#
+# The first version returned True for every exception that was not PGRST204 —
+# so an invalid key, a dead URL and a missing table all printed a green tick.
+# Verified before fixing: an invalid service key and a refused connection both
+# exited 0. These pin the classification so that cannot come back.
+
+
+# The classification sets are asserted directly rather than through a fake
+# client: the live behaviour was verified against a real database (invalid key
+# -> PGRST301 exit 1; dead URL -> ConnectError exit 1; valid target -> both
+# columns accepted), and a fake that agrees with the implementation would prove
+# less than that did.
+
+
+@pytest.mark.parametrize(
+    "sqlstate",
+    ["23502", "23503", "23505", "23514"],
+)
+def test_constraint_violations_prove_the_payload_was_accepted(sqlstate: str):
+    """These can only be reached once PostgREST has parsed the payload and
+    handed the row to Postgres — so they ARE proof the schema cache knows the
+    columns, even though the write failed."""
+    assert sqlstate in preflight._PAYLOAD_ACCEPTED_SQLSTATES
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["PGRST204", "PGRST205", "PGRST301", "PGRST302"],
+)
+def test_postgrest_rejections_are_never_proof(code: str):
+    """Unknown column, unknown table, and both auth failures all mean the
+    request never reached the table."""
+    assert code in preflight._POSTGREST_REJECTED
+    assert code not in preflight._PAYLOAD_ACCEPTED_SQLSTATES
+
+
+def test_an_unrecognised_code_is_not_in_the_accepted_set():
+    """The default must be 'not proof'. A timeout, a 500, a code added by a
+    future PostgREST — none of them may pass silently."""
+    for code in ("PGRST100", "42501", "08006", "", "None"):
+        assert code not in preflight._PAYLOAD_ACCEPTED_SQLSTATES
+
+
+# ---- target identity (review of #1028) ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://abcdefghijklmnop.supabase.co", "abcdefghijklmnop"),
+        (
+            "postgresql://postgres.abcdefghijklmnop:pw@aws-1.pooler.supabase.com:5432/postgres",
+            "abcdefghijklmnop",
+        ),
+        (
+            "postgresql://postgres:pw@db.abcdefghijklmnop.supabase.co:5432/postgres",
+            "abcdefghijklmnop",
+        ),
+        ("http://127.0.0.1:54321", "local"),
+        ("postgresql://postgres:postgres@127.0.0.1:54322/postgres", "local"),
+        ("http://localhost:54321", "local"),
+    ],
+)
+def test_project_identity_recognises_both_url_shapes(url: str, expected: str):
+    assert preflight._project_identity(url) == expected
+
+
+def test_a_prod_ledger_and_a_local_probe_do_not_match():
+    """The exact composite-green scenario: a production ledger paired with a
+    local PostgREST would otherwise bless an environment that does not exist."""
+    prod = preflight._project_identity(
+        "postgresql://postgres.abcdefghijklmnop:pw@aws-1.pooler.supabase.com:5432/postgres"
+    )
+    local = preflight._project_identity("http://127.0.0.1:54321")
+    assert prod != local
+
+
+def test_an_unrecognised_host_never_reads_as_a_match():
+    """Unknown must not collapse into some shared bucket that compares equal."""
+    a = preflight._project_identity("https://something-else.example.com")
+    b = preflight._project_identity("https://another.example.org")
+    assert a != b
+    assert a != "local"
+    assert a.startswith("unknown:")
+
+
+def test_redacted_url_never_leaks_credentials():
+    out = preflight._redacted(
+        "postgresql://postgres.abcdefghijklmnop:sup3rs3cr3t@aws-1.pooler.supabase.com:5432/postgres"
+    )
+    assert "sup3rs3cr3t" not in out
+    assert "postgres.abcdefghijklmnop" not in out, "userinfo must not be printed"
+    assert "aws-1.pooler.supabase.com:5432" in out
+
+
+# ---- duplicate versions (review of #1028) ---------------------------------
+
+
+def test_duplicate_migration_versions_are_fatal(tmp_path: Path):
+    """Last-one-wins would hide a file from the ledger comparison, so a real
+    unapplied migration could sit behind a green report."""
+    _write(tmp_path, "20260907000000_a.sql", "20260907000000_b.sql")
+    with pytest.raises(SystemExit):
+        preflight.repo_migrations(tmp_path)
