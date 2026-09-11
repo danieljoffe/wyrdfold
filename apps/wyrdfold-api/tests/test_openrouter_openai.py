@@ -7,7 +7,6 @@ then engages) rather than leak a silently-wrong dict into scoring.
 """
 
 import json
-import logging
 
 import httpx
 import pytest
@@ -449,10 +448,11 @@ async def test_grammar_400_error_body_surfaces_clearly(monkeypatch) -> None:
         await _call(client)
 
 
-# ---- prose-instead-of-tool-call retry (prod 2026-08-05) ---------------------
-# DeepSeek intermittently ignores ``tool_choice`` and answers in prose with
-# finish_reason='stop'. The flake is stochastic, so complete_tool_use retries
-# exactly this shape ONCE; every other parse failure still fails immediately.
+# ---- single-attempt contract: no retry on any parse failure (#935) ----------
+# DeepSeek answering in prose with finish_reason='stop' used to trigger one
+# paid retry — "a coin flip on a deterministic failure", because the cause was
+# which endpoint served the call. That class is unroutable now, so EVERY
+# parse failure fails on the first attempt and the caller's fallback engages.
 
 
 class _FakeHttpSeq:
@@ -481,32 +481,22 @@ _GOOD = {
 
 
 @pytest.mark.asyncio
-async def test_missing_tool_call_retries_once_and_succeeds(monkeypatch) -> None:
+async def test_missing_tool_call_fails_loud_without_retry(monkeypatch) -> None:
+    # A prose answer fails on the FIRST attempt and never consumes a second
+    # call — the queued good response must go unread (retry spend is gone).
     client = OpenRouterLLMClient(api_key="sk-test")
     fake = _FakeHttpSeq([_http_resp(_PROSE), _http_resp(_GOOD)])
     monkeypatch.setattr(client, "_openai_client", lambda: fake)
 
-    out, _ = await _call(client)
-
-    assert out == {"ok": True}
-    assert len(fake.posted) == 2  # first attempt prose, one retry, done
-
-
-@pytest.mark.asyncio
-async def test_missing_tool_call_twice_fails_loud_after_one_retry(monkeypatch) -> None:
-    client = OpenRouterLLMClient(api_key="sk-test")
-    fake = _FakeHttpSeq([_http_resp(_PROSE), _http_resp(_PROSE)])
-    monkeypatch.setattr(client, "_openai_client", lambda: fake)
-
     with pytest.raises(MissingToolCallError, match="Expected a forced tool_call"):
         await _call(client)
-    assert len(fake.posted) == 2  # exactly one retry, never a loop
+    assert len(fake.posted) == 1  # exactly one attempt, never a retry
 
 
 @pytest.mark.asyncio
 async def test_other_parse_failures_do_not_retry(monkeypatch) -> None:
-    # Malformed tool arguments are a DIFFERENT contract break (not the prose
-    # flake) — they must fail on the first attempt, no retry spend.
+    # Malformed tool arguments fail on the first attempt too — the same
+    # single-attempt contract as the prose case above.
     bad_args = _resp(_tool_calls("{not valid json"))
     client = OpenRouterLLMClient(api_key="sk-test")
     fake = _FakeHttpSeq([_http_resp(bad_args), _http_resp(_GOOD)])
@@ -517,15 +507,14 @@ async def test_other_parse_failures_do_not_retry(monkeypatch) -> None:
     assert len(fake.posted) == 1
 
 
-# ---- Salvaging a tool call the model wrote as XML prose (#821) --------------
+# ---- prose-shaped answers fail CLOSED (#821 / #850 corpus, #935 closure) ----
 #
-# DeepSeek answers a forced tool call by writing Anthropic's XML invocation
-# syntax into ``content`` instead of emitting ``tool_calls``. Prod logged 88 of
-# these in one 16h window — EVERY one with ``finish_reason='stop'``, i.e. a
-# complete answer we were throwing away, retrying at full cost, and losing
-# anyway when the retry reproduced it (21 of 25 distinct titles recurred).
-#
-# The payloads below are the real logged ones.
+# The payloads below are the real logged ones the salvage parsers used to
+# recover. Salvage and the paid retry were removed when #935 closed: the
+# provider-capability cause (endpoints that cannot honor a forced named
+# function) is unroutable now — the routing ignore list plus OpenRouter's own
+# feature filter — so a prose answer is a genuine model refusal. The corpus
+# stays to prove this path fails CLOSED: the typed error, never a parsed dict.
 
 _REAL_TRIAGE_CONTENT = (
     '<invoke name="return_TitleTriageResponse">\n'
@@ -540,99 +529,49 @@ _REAL_TAGS_CONTENT = (
     '<parameter name="role_family" string="true">engineering</parameter>\n'
     "</invoke>"
 )
+_REAL_BARE_JSON_CONTENT = (
+    'This is a clear case of different role function. The target is "Senior '
+    'Frontend Engineer" which is an engineering role focused on frontend '
+    'development. The candidate title "Intern, AI Prototyping" is an '
+    "internship position (different seniority level).\n\n"
+    '{\n  "verdicts": [\n'
+    '    {"id": 1, "promising": false, "confidence": 95, "title_prefix": "Intern, AI"}\n'
+    "  ]\n}"
+)
 
 
-def test_prose_tool_call_is_salvaged_not_discarded() -> None:
-    data = _resp([], finish="stop", content=_REAL_TRIAGE_CONTENT)
-    out = _parse_openai_tool_response(data, tool_name="return_TitleTriageResponse", max_tokens=1000)
-    assert out == {
-        "verdicts": [
-            {
-                "id": 1,
-                "promising": False,
-                "confidence": 85,
-                "title_prefix": "Data Scientist – Cyber",
-            }
-        ]
-    }
-
-
-def test_prose_salvage_names_the_responding_provider(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """#935: the deterministic prose-tool-call failures track which endpoint
-    served the call. Every salvage names the provider so the hit rate is
-    correlatable per provider — that correlation is what the routing
-    ignore-list was derived from, and drift in the endpoint pool shows up in
-    these lines first."""
-    data = _resp([], finish="stop", content=_REAL_TRIAGE_CONTENT, provider="GMICloud")
-    with caplog.at_level(logging.WARNING, logger="app.services.llm.openrouter_client"):
-        _parse_openai_tool_response(data, tool_name="return_TitleTriageResponse", max_tokens=1000)
-    assert any("provider='GMICloud'" in r.message for r in caplog.records)
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(_REAL_TRIAGE_CONTENT, id="xml-invoke-block-821"),
+        pytest.param(_REAL_TAGS_CONTENT, id="xml-multi-parameter-821"),
+        pytest.param(_REAL_BARE_JSON_CONTENT, id="bare-json-after-reasoning-850"),
+        pytest.param("I can't help with that", id="plain-refusal"),
+    ],
+)
+def test_prose_answers_raise_instead_of_salvaging(content: str) -> None:
+    """A COMPLETE answer buried in prose must raise like any other prose —
+    accepting it would reopen the silently-wrong-dict channel the salvage
+    guards existed to police, this time without the guards."""
+    data = _resp([], finish="stop", content=content)
+    with pytest.raises(MissingToolCallError, match="Expected a forced tool_call"):
+        _parse_openai_tool_response(
+            data, tool_name="return_TitleTriageResponse", max_tokens=1000
+        )
 
 
 def test_missing_tool_call_failure_names_the_responding_provider() -> None:
-    """The unsalvageable case carries the provider too — the paid retry was
-    'a coin flip on a deterministic failure', and provider-labelled failures
-    are how that determinism becomes visible in prod logs."""
+    """The failure carries the provider label — how a prose hit stays
+    correlatable per endpoint in prod logs, and the signal for re-deriving
+    the routing ignore list if the endpoint pool drifts (#935)."""
     data = _resp([], finish="stop", content="I refuse.", provider="SambaNova")
     with pytest.raises(MissingToolCallError, match="provider='SambaNova'"):
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
 
 
-def test_prose_salvage_decodes_json_and_string_parameters() -> None:
-    """``string="true"`` marks a raw string; anything else is JSON — so
-    ``true``/``100`` must not come back as the strings "true"/"100"."""
-    data = _resp([], finish="stop", content=_REAL_TAGS_CONTENT)
-    out = _parse_openai_tool_response(data, tool_name="return_QualificationTags", max_tokens=1000)
-    assert out == {"is_us": True, "us_confidence": 100, "role_family": "engineering"}
-
-
-def test_prose_salvage_refuses_a_truncated_block() -> None:
-    """No closing ``</invoke>`` ⇒ the response was cut off. Refuse.
-
-    QualificationTags has a default for EVERY field plus a tolerate-malformed
-    pass, so a partial dict would validate silently and write a confidently
-    wrong tag. Better to raise and let the retry/fallback run.
-    """
-    truncated = _REAL_TAGS_CONTENT[: _REAL_TAGS_CONTENT.index('<parameter name="role_family"')]
-    data = _resp([], finish="stop", content=truncated)
-    with pytest.raises(ValueError, match="Expected a forced tool_call"):
-        _parse_openai_tool_response(data, tool_name="return_QualificationTags", max_tokens=1000)
-
-
-def test_prose_salvage_refuses_when_a_parameter_failed_to_parse() -> None:
-    """A ``<parameter`` that opened but never closed must not be silently
-    dropped from an otherwise-complete block."""
-    content = (
-        '<invoke name="return_QualificationTags">\n'
-        '<parameter name="is_us" string="false">true</parameter>\n'
-        '<parameter name="role_family" string="true">engineering\n'
-        "</invoke>"
-    )
-    data = _resp([], finish="stop", content=content)
-    with pytest.raises(ValueError, match="Expected a forced tool_call"):
-        _parse_openai_tool_response(data, tool_name="return_QualificationTags", max_tokens=1000)
-
-
-def test_prose_salvage_refuses_a_different_tools_payload() -> None:
-    """The block names another tool — accepting it would answer the wrong
-    question with a well-formed dict."""
-    data = _resp([], finish="stop", content=_REAL_TRIAGE_CONTENT)
-    with pytest.raises(ValueError, match="Expected a forced tool_call"):
-        _parse_openai_tool_response(data, tool_name="return_QualificationTags", max_tokens=1000)
-
-
-def test_plain_prose_refusal_still_raises() -> None:
-    """No XML at all — the original behaviour is untouched."""
-    data = _resp([], finish="stop", content="I can't help with that")
-    with pytest.raises(ValueError, match="Expected a forced tool_call"):
-        _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
-
-
 def test_structured_tool_calls_still_win_over_content() -> None:
-    """Salvage is a fallback, never a preference: a real tool_call must be used
-    even when the model also echoed XML into content."""
+    """A real tool_call is used even when the model also echoed XML into
+    content — prose alongside a structured answer is noise, not a failure."""
     data = _resp(
         _tool_calls('{"verdicts": [{"id": 9}]}'),
         finish="tool_calls",
@@ -640,105 +579,6 @@ def test_structured_tool_calls_still_win_over_content() -> None:
     )
     out = _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
     assert out == {"verdicts": [{"id": 9}]}
-
-
-# ---- #850: the OTHER prose shape — bare JSON, no XML wrapper -----------------
-
-_TRIAGE_SCHEMA = {
-    "type": "object",
-    "properties": {"verdicts": {"type": "array"}},
-    "required": ["verdicts"],
-}
-
-
-def _prose_json(content: str) -> dict:
-    return _resp([], finish="stop", content=content)
-
-
-def test_salvages_a_bare_json_object_written_into_content() -> None:
-    """The exact prod failure (#850): reasoning prose, then the answer as plain
-    JSON, no tool_calls and no XML. Captured verbatim from the Railway logs."""
-    content = (
-        'This is a clear case of different role function. The target is "Senior '
-        'Frontend Engineer" which is an engineering role focused on frontend '
-        'development. The candidate title "Intern, AI Prototyping" is an '
-        "internship position (different seniority level).\n\n"
-        '{\n  "verdicts": [\n'
-        '    {"id": 1, "promising": false, "confidence": 95, "title_prefix": "Intern, AI"}\n'
-        "  ]\n}"
-    )
-    out = _parse_openai_tool_response(
-        _prose_json(content),
-        tool_name="return_TitleTriageResponse",
-        max_tokens=1000,
-        tool_input_schema=_TRIAGE_SCHEMA,
-    )
-    assert out["verdicts"][0]["id"] == 1
-    assert out["verdicts"][0]["promising"] is False
-
-
-def test_refuses_an_object_missing_a_required_key() -> None:
-    """All-or-nothing. A bare object names no tool, and our models default every
-    field — so a fragment would validate silently into a confident wrong answer.
-    The schema's required keys are the only thing standing in the way."""
-    with pytest.raises(MissingToolCallError):
-        _parse_openai_tool_response(
-            _prose_json('Thinking...\n{"confidence": 95}'),
-            tool_name="return_TitleTriageResponse",
-            max_tokens=1000,
-            tool_input_schema=_TRIAGE_SCHEMA,
-        )
-
-
-def test_prefers_the_last_object_so_a_worked_example_cannot_win() -> None:
-    """Models reason first and answer last. An example echoed from the prompt
-    appears earlier, so taking the first match would return the wrong payload."""
-    content = (
-        'For example the shape is {"verdicts": [{"id": 99, "promising": true}]}.\n'
-        'My actual answer:\n{"verdicts": [{"id": 1, "promising": false}]}'
-    )
-    out = _parse_openai_tool_response(
-        _prose_json(content),
-        tool_name="return_TitleTriageResponse",
-        max_tokens=1000,
-        tool_input_schema=_TRIAGE_SCHEMA,
-    )
-    assert out["verdicts"][0]["id"] == 1
-
-
-def test_a_truncated_object_is_not_salvaged() -> None:
-    """A response cut at the token cap has no closing brace, so no span is
-    emitted and it raises — a half-read batch must never look complete."""
-    with pytest.raises(MissingToolCallError):
-        _parse_openai_tool_response(
-            _prose_json('Reasoning...\n{"verdicts": [{"id": 1, "promis'),
-            tool_name="return_TitleTriageResponse",
-            max_tokens=1000,
-            tool_input_schema=_TRIAGE_SCHEMA,
-        )
-
-
-def test_braces_inside_strings_do_not_unbalance_the_scan() -> None:
-    """A JD quoting "{tech}" must not break the brace matching."""
-    content = 'Note the title says "{Remote}" here.\n{"verdicts": [{"id": 7, "promising": true}]}'
-    out = _parse_openai_tool_response(
-        _prose_json(content),
-        tool_name="return_TitleTriageResponse",
-        max_tokens=1000,
-        tool_input_schema=_TRIAGE_SCHEMA,
-    )
-    assert out["verdicts"][0]["id"] == 7
-
-
-def test_no_schema_means_no_json_salvage() -> None:
-    """Callers that don't pass a schema keep the old behaviour exactly — the
-    guard is the schema, so without one we refuse rather than guess."""
-    with pytest.raises(MissingToolCallError):
-        _parse_openai_tool_response(
-            _prose_json('{"verdicts": []}'),
-            tool_name="return_TitleTriageResponse",
-            max_tokens=1000,
-        )
 
 
 # ---- reported cost on the OpenAI-shaped path (#933) -------------------------

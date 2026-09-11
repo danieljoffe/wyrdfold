@@ -28,10 +28,6 @@ from app.models.llm import (
     ModelId,
 )
 from app.services.llm.errors import MissingToolCallError
-from app.services.llm.openrouter_client import (
-    _parse_prose_json_tool_call,
-    _parse_prose_tool_call,
-)
 from app.services.llm.pricing import calculate_cost
 
 
@@ -592,9 +588,9 @@ def phase1_triage_verdicts_json(titles: list[str], variant: str = "faithful") ->
       way.
     """
     if variant == "truncated":
-        # A max_tokens stop cuts mid-token, so nothing in the payload closes:
-        # no balanced JSON span exists for the prose-JSON salvage to recover
-        # (#850's all-or-nothing rule), and the batch defers.
+        # A max_tokens stop cuts mid-token, so nothing in the payload closes —
+        # not valid JSON, so the mock raises the typed error and the batch
+        # defers (the same fail-closed contract the real client applies).
         return '{"verdicts": [{"id": 1, "promising": true, "confid'
 
     verdicts: list[dict[str, Any]] = []
@@ -633,9 +629,11 @@ def prose_xml_tool_call(tool_name: str, **params: Any) -> str:
     Anthropic XML inside ``content`` instead of a structured ``tool_calls``.
 
     Values are rendered as JSON unless they are already plain strings, matching
-    the ``string="true"`` flag the model sets. Scripted onto any purpose, this
-    lets a surface prove it RECOVERS the answer rather than deferring — the
-    real client salvages these, and 88 of them landed in one prod window.
+    the ``string="true"`` flag the model set. 88 of these landed in one prod
+    window when routing could still reach non-forced-function endpoints; the
+    client salvaged them until the #935 closure made that class unroutable and
+    removed salvage. Scripted onto any purpose, this now lets a surface prove
+    it fails CLOSED — the typed ``MissingToolCallError``, never a parsed dict.
     """
     lines = [f'<invoke name="{tool_name}">']
     for name, value in params.items():
@@ -656,13 +654,11 @@ def prose_json_tool_call(prose: str, **params: Any) -> str:
     Distinct from :func:`prose_xml_tool_call` (#821), which is the same refusal
     dressed as Anthropic XML. Measured in prod as 4 discarded triage batches in
     12h, every one carrying a complete answer; the retry failed just as often,
-    so it is deterministic per batch rather than a flake. Scripted onto any
-    purpose, this lets a surface prove it RECOVERS the answer instead of
-    deferring the whole batch.
-
-    The real client only salvages an object carrying every ``required`` key from
-    the tool schema, so a surface scripted with a PARTIAL object here still gets
-    the typed failure — that asymmetry is the point.
+    so it was deterministic per batch rather than a flake — the signature of
+    the provider-capability cause the #935 closure made unroutable. The client
+    salvaged this shape until then; with salvage removed, scripting it onto a
+    surface proves the surface fails CLOSED (typed ``MissingToolCallError``)
+    rather than validating a prose answer into a confident dict.
     """
     return f"{prose}\n\n{json.dumps(params, indent=2)}"
 
@@ -838,33 +834,26 @@ class MockLLMClient:
         )
         response_text = self._render_response(purpose, latest_user, messages)
         # A non-JSON script models the model answering in PROSE instead of
-        # emitting the forced tool call (the deepseek 2026-08-05 flake) —
-        # raise the same typed error the real parser does so downstream
-        # surfaces inherit the exact failure shape from the bug corpus.
+        # emitting the forced tool call — raise the same typed error the real
+        # client does so downstream surfaces inherit the exact failure shape
+        # from the bug corpus.
         #
-        # …unless the prose IS the tool call in Anthropic's XML syntax, which
-        # deepseek emits constantly (#821: 88 occurrences in one 16h prod
-        # window). The real client salvages those, so the mock must too — and
-        # it calls the SAME parser rather than reimplementing it, or the bug
-        # corpus would drift from the behaviour it is meant to pin.
-        # …or the OTHER prose shape (#850): reasoning followed by the answer as
-        # a bare JSON object with no XML wrapper. Measured in prod as 4 discarded
-        # triage batches in 12h, each carrying a complete answer. Same rule as
-        # above — call the SAME parsers rather than reimplementing them.
+        # That includes prose carrying the answer as Anthropic XML (#821) or
+        # as a bare JSON object after reasoning text (#850). The client used
+        # to SALVAGE those — the mock called its parsers so the corpus could
+        # not drift — but the #935 closure removed salvage entirely: the
+        # provider-capability cause is unroutable (routing ignore list +
+        # OpenRouter's own feature filter), so prose now fails loud and the
+        # caller's fallback engages (triage defers, grading skips). The
+        # corpus builders (``prose_xml_tool_call`` / ``prose_json_tool_call``)
+        # stay: scripted onto a surface they now prove it fails CLOSED.
         try:
             tool_input = json.loads(response_text)
         except json.JSONDecodeError as exc:
-            salvaged = _parse_prose_tool_call(response_text, tool_name=tool_name)
-            if salvaged is None:
-                salvaged = _parse_prose_json_tool_call(
-                    response_text, tool_input_schema=tool_input_schema
-                )
-            if salvaged is None:
-                raise MissingToolCallError(
-                    f"Expected a forced tool_call for {tool_name!r}, got prose "
-                    f"content={response_text[:200]!r}"
-                ) from exc
-            tool_input = salvaged
+            raise MissingToolCallError(
+                f"Expected a forced tool_call for {tool_name!r}, got prose "
+                f"content={response_text[:200]!r}"
+            ) from exc
         if not isinstance(tool_input, dict):
             raise ValueError(
                 f"Scripted response for {purpose!r} must decode to a JSON object, "
