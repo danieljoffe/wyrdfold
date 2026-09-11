@@ -7,6 +7,7 @@ then engages) rather than leak a silently-wrong dict into scoring.
 """
 
 import json
+import logging
 
 import httpx
 import pytest
@@ -567,6 +568,23 @@ def test_missing_tool_call_failure_names_the_responding_provider() -> None:
     data = _resp([], finish="stop", content="I refuse.", provider="SambaNova")
     with pytest.raises(MissingToolCallError, match="provider='SambaNova'"):
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+
+
+def test_missing_tool_call_emits_a_provider_labelled_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Production telemetry must retain the provider WITHOUT relying on any
+    caller logging the exception text: the raise site itself emits one
+    warning. A future handler that quietly catches this ValueError subclass
+    cannot erase the endpoint-drift signal."""
+    data = _resp([], finish="stop", content="I refuse.", provider="SambaNova")
+    with caplog.at_level(logging.WARNING, logger="app.services.llm.openrouter_client"):
+        with pytest.raises(MissingToolCallError):
+            _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert any(
+        "provider='SambaNova'" in r.getMessage() and "failing closed" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_structured_tool_calls_still_win_over_content() -> None:

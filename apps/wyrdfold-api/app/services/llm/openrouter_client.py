@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncIterator
 from typing import Any, cast
@@ -98,6 +99,7 @@ _NO_FORCED_FUNCTION_PROVIDERS: tuple[str, ...] = (
 # HTTP statuses worth a retry (transient); others translate + raise immediately.
 _TRANSIENT_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 529})
 
+logger = logging.getLogger(__name__)
 _BACKOFF_BASE_SECONDS = 0.5
 
 
@@ -168,6 +170,19 @@ def _parse_openai_tool_response(
     message = choice.get("message") or {}
     tool_calls = message.get("tool_calls") or []
     if not tool_calls:
+        # One warning at the RAISE site so the provider-labelled signal is
+        # production telemetry by construction, independent of how any caller
+        # catches this ValueError subclass. (Today's callers keep the text
+        # anyway — triage's and grading's broad handlers both
+        # ``logger.exception`` the traceback — but a future quiet catch must
+        # not be able to erase the drift signal.)
+        logger.warning(
+            "forced tool_call missing for %r — model answered in prose "
+            "(finish_reason=%r, provider=%r); failing closed, no retry (#935)",
+            tool_name,
+            finish,
+            provider,
+        )
         # 600, not 200: a shorter cap cut these mid-payload, which made a
         # complete-but-misplaced answer look like a truncated one in the logs.
         raise MissingToolCallError(
