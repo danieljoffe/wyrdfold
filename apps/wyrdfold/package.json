@@ -17,7 +17,7 @@
     "@tiptap/pm": "^3.31.3",
     "@tiptap/react": "^3.31.3",
     "@tiptap/starter-kit": "^3.31.3",
-    "isomorphic-dompurify": "3.23.0",
+    "isomorphic-dompurify": "4.1.0",
     "lucide-react": "1.42.0",
     "next": "16.3.4",
     "react": "^19.2.8",
