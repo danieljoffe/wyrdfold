@@ -20,6 +20,36 @@ updates:
           - minor
           - patch
       npm-minor-patch:
+        # OBSERVED 2026-09-06: despite the `nx` group above listing
+        # `@nx/*`, Dependabot put `nx` core in the `nx` group (#1020) and all
+        # eight `@nx/*` plugins in THIS group (#1022), on the same 23.1.2 ->
+        # 23.2.0 bump. Split that way, whichever PR merges alone leaves core
+        # and plugins on different versions and the project graph dies with
+        # `hashDaemonClientEnv is not a function` -- that helper is new in
+        # 23.2.0, so 23.2.0 plugins calling into a 23.1.2 core find nothing.
+        #
+        # WHY it split is NOT established. GitHub's docs say a dependency
+        # "is included in the first group that it matches", and `nx` is
+        # declared first -- so on the documented behaviour this should not
+        # have happened at all. Treat the cause as unknown (likely a quirk in
+        # how scoped patterns match) rather than trusting the ordering.
+        #
+        # This exclusion is the part that IS documented: "If a dependency
+        # matches both a pattern and an exclude-pattern, then it is excluded
+        # from the group." So nx packages can no longer land here silently
+        # paired with a mismatched core, whatever the grouping quirk is.
+        #
+        # Patterns stay on the exact scoped forms. Broader globs (`@nx*`)
+        # were considered and rejected: they would also match sibling scopes
+        # that merely start with `@nx`, and because the same glob sits in
+        # both this exclusion and the group above, an overmatch would pull an
+        # unrelated package out of `npm-minor-patch` and onto nx's cadence.
+        # If the next nx release still splits, that localises the cause to
+        # scoped-pattern matching -- fix it then, with evidence.
+        exclude-patterns:
+          - 'nx'
+          - '@nx/*'
+          - '@nrwl/*'
         update-types:
           - minor
           - patch
@@ -41,7 +71,7 @@ updates:
     schedule:
       interval: weekly
 
-  # Keeps the pinned python:3.11-slim base-image digest in apps/wyrdfold-api/
+  # Keeps the pinned python:3.14-slim base-image digest in apps/wyrdfold-api/
   # Dockerfile fresh, so the pin (added for reproducible Trivy scans, #192)
   # auto-bumps for CVE patches instead of going stale.
   - package-ecosystem: docker
