@@ -749,16 +749,21 @@ def test_normalize_posting_title_prompt_forbids_inferring_seniority_from_prose()
 
 
 # ---------------------------------------------------------------------------
-# #821: the model writes the forced tool call as Anthropic XML inside
-# ``content`` instead of emitting ``tool_calls``. Prod logged 88 of these in a
-# single 16h window, every one complete (``finish_reason='stop'``) — a correct
-# answer we discarded, retried at full cost, and lost anyway when the retry
-# reproduced it. The mock now carries the behaviour so every LLM surface
-# inherits it.
+# #821 / #850: prose-shaped tool calls — Anthropic XML in ``content``, or a
+# bare JSON object after reasoning text. Prod logged 88 XML cases in one 16h
+# window when routing could still reach endpoints that cannot honor a forced
+# named function. The client SALVAGED both shapes until the #935 closure made
+# that failure class unroutable (routing ignore list + OpenRouter's own
+# feature filter) and removed salvage + the paid retry. The corpus inputs
+# stay: scripted onto a surface they now prove the fail-CLOSED contract —
+# the typed ``MissingToolCallError``, never a parsed dict.
 # ---------------------------------------------------------------------------
 
 
-async def test_mock_salvages_a_prose_xml_tool_call() -> None:
+async def test_mock_prose_xml_tool_call_fails_loud() -> None:
+    """#821's exact shape — a complete, well-formed XML answer — must raise,
+    not parse: salvage is gone, and a prose answer engages the caller's
+    fallback (triage defers, grading skips) instead of a recovered dict."""
     client = MockLLMClient()
     client.register(
         "triage",
@@ -767,38 +772,16 @@ async def test_mock_salvages_a_prose_xml_tool_call() -> None:
             verdicts=[{"id": 1, "promising": False, "confidence": 85}],
         ),
     )
-    tool_input, _ = await client.complete_tool_use(
-        model="claude-haiku-4-5",
-        system="s",
-        messages=[Message(role="user", content="triage these")],
-        tool_name="return_TitleTriageResponse",
-        tool_description="d",
-        tool_input_schema={},
-        purpose="triage",
-    )
-    assert tool_input == {"verdicts": [{"id": 1, "promising": False, "confidence": 85}]}
-
-
-async def test_mock_prose_xml_preserves_value_types() -> None:
-    """``string="true"`` is a raw string; everything else is JSON. A bool must
-    not arrive as the string "true" — that is how a wrong tag gets written."""
-    client = MockLLMClient()
-    client.register(
-        "tag",
-        prose_xml_tool_call(
-            "return_QualificationTags", is_us=True, us_confidence=100, role_family="engineering"
-        ),
-    )
-    tool_input, _ = await client.complete_tool_use(
-        model="claude-haiku-4-5",
-        system="s",
-        messages=[Message(role="user", content="tag this")],
-        tool_name="return_QualificationTags",
-        tool_description="d",
-        tool_input_schema={},
-        purpose="tag",
-    )
-    assert tool_input == {"is_us": True, "us_confidence": 100, "role_family": "engineering"}
+    with pytest.raises(MissingToolCallError):
+        await client.complete_tool_use(
+            model="claude-haiku-4-5",
+            system="s",
+            messages=[Message(role="user", content="triage these")],
+            tool_name="return_TitleTriageResponse",
+            tool_description="d",
+            tool_input_schema={},
+            purpose="triage",
+        )
 
 
 async def test_mock_still_raises_on_prose_that_is_not_a_tool_call() -> None:
@@ -821,11 +804,11 @@ async def test_mock_still_raises_on_prose_that_is_not_a_tool_call() -> None:
 _TRIAGE_SCHEMA = {"type": "object", "required": ["verdicts"]}
 
 
-async def test_mock_salvages_a_prose_json_tool_call() -> None:
-    """#850: the model reasons in prose, then writes the answer as a bare JSON
-    object — no tool_calls, no XML. Distinct from #821's XML shape, and it was
-    still being discarded: 4 triage batches lost in a 12h prod window, each
-    carrying a complete answer."""
+async def test_mock_prose_json_tool_call_fails_loud() -> None:
+    """#850's exact shape — reasoning prose, then the answer as a bare JSON
+    object with no tool_calls and no XML. A COMPLETE answer buried in prose
+    must still raise: with salvage removed there is no partial/complete
+    distinction left, prose is prose."""
     client = MockLLMClient()
     client.register(
         "triage",
@@ -834,24 +817,6 @@ async def test_mock_salvages_a_prose_json_tool_call() -> None:
             verdicts=[{"id": 1, "promising": False, "confidence": 95}],
         ),
     )
-    tool_input, _ = await client.complete_tool_use(
-        model="claude-haiku-4-5",
-        system="s",
-        messages=[Message(role="user", content="triage these")],
-        tool_name="return_TitleTriageResponse",
-        tool_description="d",
-        tool_input_schema=_TRIAGE_SCHEMA,
-        purpose="triage",
-    )
-    assert tool_input == {"verdicts": [{"id": 1, "promising": False, "confidence": 95}]}
-
-
-async def test_mock_refuses_a_partial_prose_json_object() -> None:
-    """All-or-nothing survives the mock too. A bare object names no tool and our
-    models default every field, so a fragment must raise rather than validate
-    into a confident wrong answer — the schema's required keys are the guard."""
-    client = MockLLMClient()
-    client.register("triage", prose_json_tool_call("Thinking out loud.", confidence=95))
     with pytest.raises(MissingToolCallError):
         await client.complete_tool_use(
             model="claude-haiku-4-5",

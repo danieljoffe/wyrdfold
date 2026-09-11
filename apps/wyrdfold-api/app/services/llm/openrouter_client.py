@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
 from collections.abc import AsyncIterator
 from typing import Any, cast
@@ -62,12 +61,22 @@ _OPENAI_SHAPED_MODELS: frozenset[str] = frozenset({"deepseek-v3-2"})
 # Provider slugs whose endpoints declare they CANNOT honor a forced NAMED
 # function (``supports_tool_choice.function=false`` in OpenRouter's endpoint
 # metadata — verified live against /models/deepseek/deepseek-v3.2/endpoints,
-# 2026-09-02). The OpenAI-shaped path below forces a named function on every
-# call, so routing to one of these is a request the endpoint has declared it
-# cannot serve — the credible mechanical cause of the deterministic
-# prose-tool-call failures the salvage parsers exist for (#935: whether a call
-# succeeded depended on which endpoint it landed on, invisible because nothing
-# pinned the provider).
+# 2026-09-02, re-verified 2026-09-11). The OpenAI-shaped path below forces a
+# named function on every call, so routing to one of these is a request the
+# endpoint has declared it cannot serve — the mechanical cause of the
+# deterministic prose-tool-call failures this module used to carry salvage
+# parsers for (#821/#850): whether a call succeeded depended on which endpoint
+# it landed on, invisible because nothing pinned the provider.
+#
+# CLOSED by the #935 probe (2026-09-11): OpenRouter's routing now ALSO
+# feature-filters forced-named-function requests off ``function=false``
+# endpoints (pinning one with fallbacks disabled 404s "No endpoints found"),
+# and 150/150 probe calls through this exact provider block returned
+# structured tool_calls from non-ignored providers only. The failure class is
+# unroutable by two independent layers, which is why the salvage parsers and
+# the paid retry were removed — a prose answer now fails loud immediately
+# (``MissingToolCallError`` below, provider-labelled) and the caller's
+# fallback engages (triage defers, grading skips).
 #
 # ``require_parameters`` alone does NOT exclude five of these six (GMICloud,
 # StreamLake, AtlasCloud, Novita, Alibaba): they list ``tool_choice`` as a
@@ -77,7 +86,7 @@ _OPENAI_SHAPED_MODELS: frozenset[str] = frozenset({"deepseek-v3-2"})
 # so ``require_parameters`` already filters it; it stays here defensively in
 # case its declared parameters change ahead of its function-mode support
 # (the #980 review's correction). Re-derive the list from the endpoints API
-# when the salvage-parser hit rate moves.
+# if provider-labelled ``MissingToolCallError`` lines reappear in prod logs.
 _NO_FORCED_FUNCTION_PROVIDERS: tuple[str, ...] = (
     "gmicloud",
     "streamlake",
@@ -129,151 +138,11 @@ def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
     return cast("dict[str, Any]", resolve(body, frozenset()))
 
 
-# DeepSeek answers a forced tool call by writing Anthropic's XML invocation
-# syntax into ``content`` instead of emitting a structured ``tool_calls`` entry:
-#
-#   <invoke name="return_TitleTriageResponse">
-#   <parameter name="verdicts" string="false">[{"id": 1, "promising": false}]</parameter>
-#   </invoke>
-#
-# The answer is right there and well-formed — prod logs show 88 of these in one
-# 16h window, every one with ``finish_reason='stop'`` (nothing truncated). We
-# were discarding all of them, retrying once at full cost, and losing the
-# verdict anyway when the retry reproduced the same output — which it does,
-# because the failure is deterministic per input, not a stochastic flake
-# (21 of 25 distinct titles recurred).
-_PROSE_INVOKE_RE = re.compile(
-    r"<invoke\s+name=\"(?P<tool>[^\"]+)\"\s*>(?P<body>.*?)</invoke>", re.DOTALL
-)
-_PROSE_PARAM_RE = re.compile(
-    r"<parameter\s+name=\"(?P<name>[^\"]+)\"(?:\s+string=\"(?P<is_str>true|false)\")?\s*>"
-    r"(?P<value>.*?)</parameter>",
-    re.DOTALL,
-)
-
-
-def _balanced_json_objects(text: str) -> list[str]:
-    """Every top-level ``{...}`` span in ``text``, in order of appearance.
-
-    String-aware, so a brace inside a JD quote ("we use {tech}") can't
-    unbalance the scan. A span is emitted only when its closing brace is
-    found, so a response truncated mid-object yields nothing for that span —
-    which is what keeps a cut-off answer from being salvaged as a whole one.
-    """
-    spans: list[str] = []
-    depth = 0
-    start = -1
-    in_str = False
-    escaped = False
-    for i, ch in enumerate(text):
-        if in_str:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}" and depth:
-            depth -= 1
-            if depth == 0 and start >= 0:
-                spans.append(text[start : i + 1])
-    return spans
-
-
-def _parse_prose_json_tool_call(
-    content: object, *, tool_input_schema: dict[str, Any]
-) -> dict[str, Any] | None:
-    """Recover a tool input the model wrote as a bare JSON object in prose.
-
-    The sibling of :func:`_parse_prose_tool_call`, for the OTHER shape models
-    fall back to: reasoning prose followed by the answer as plain JSON, with no
-    XML wrapper and no ``tool_calls`` (#850 — measured in prod as 4 failures in
-    12h on ``return_TitleTriageResponse``, every one carrying a complete,
-    well-formed answer that was thrown away).
-
-    SAME ALL-OR-NOTHING RULE, and it needs teeth here that the XML path gets
-    for free. XML names its tool, so a mismatch is detectable; a bare object
-    names nothing, and the models we call define a default for every field —
-    so handing Pydantic a partial or unrelated dict would validate silently
-    into a confidently-wrong answer. Two guards instead:
-
-    - the object must be **balanced** (truncation yields no span at all), and
-    - it must carry **every ``required`` key** from the tool's own schema, so a
-      fragment, an example echoed from the prompt, or some unrelated JSON the
-      model mused about cannot pass as the answer.
-
-    The LAST qualifying span wins: models reason first and answer last, so a
-    worked example earlier in the prose must not outrank the real payload.
-    """
-    if not isinstance(content, str) or "{" not in content:
-        return None
-    required = [k for k in (tool_input_schema.get("required") or []) if isinstance(k, str)]
-    for span in reversed(_balanced_json_objects(content)):
-        try:
-            obj = json.loads(span)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(obj, dict) or not obj:
-            continue
-        if required and not all(key in obj for key in required):
-            continue  # partial — refuse rather than half-answer
-        return obj
-    return None
-
-
-def _parse_prose_tool_call(content: object, *, tool_name: str) -> dict[str, Any] | None:
-    """Recover a tool input the model wrote as XML prose, or ``None``.
-
-    ALL-OR-NOTHING on purpose. ``QualificationTags`` has a default for every
-    field and a ``_tolerate_malformed`` pass on top, so a PARTIAL dict would
-    validate silently and write a confidently-wrong tag — exactly the
-    "silently-wrong dict flowing downstream" this module refuses elsewhere. So
-    this only returns something when the block is provably complete:
-
-    - the closing ``</invoke>`` is present (a response cut off at the token cap
-      can't match, and falls back to the existing raise), and
-    - every ``<parameter`` opened in the body also parsed, so a malformed one
-      in the middle can't be silently dropped.
-
-    A parameter's value is JSON unless the model tagged it ``string="true"``.
-    When it claims JSON but isn't, the raw text is passed through and the
-    caller's Pydantic validation decides — that is the loud failure, and it is
-    the same gate the structured path goes through.
-    """
-    if not isinstance(content, str) or "<invoke" not in content:
-        return None
-    invoke = _PROSE_INVOKE_RE.search(content)
-    if invoke is None or invoke.group("tool") != tool_name:
-        return None
-    body = invoke.group("body")
-    tool_input: dict[str, Any] = {}
-    for param in _PROSE_PARAM_RE.finditer(body):
-        raw = param.group("value")
-        if param.group("is_str") == "true":
-            tool_input[param.group("name")] = raw
-            continue
-        try:
-            tool_input[param.group("name")] = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            tool_input[param.group("name")] = raw
-    if not tool_input or len(tool_input) != body.count("<parameter"):
-        return None
-    return tool_input
-
-
 def _parse_openai_tool_response(
     data: dict[str, Any],
     *,
     tool_name: str,
     max_tokens: int,
-    tool_input_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Extract the forced tool call's arguments from an OpenAI-compatible
     chat/completions response. Fails loud on every way the structured
@@ -286,42 +155,36 @@ def _parse_openai_tool_response(
     choice = choices[0]
     finish = choice.get("finish_reason")
     # OpenRouter names the endpoint that actually served the call on every
-    # response. Logged with each salvage and with the hard failure so the
-    # "prose instead of tool_calls" hit rate is correlatable per provider
-    # (#935) — the routing preference in ``_openai_tool_use`` is derived from
-    # exactly this correlation, and drift shows up here first.
+    # response. The hard failure carries it so a prose-instead-of-tool_calls
+    # hit stays correlatable per provider in prod logs — that correlation is
+    # what the routing ignore list in ``_openai_tool_use`` was derived from
+    # (#935), and drift in the endpoint pool would show up here first.
+    #
+    # No salvage, no retry (#935 closure): the provider-capability cause of
+    # prose answers is unroutable now (the ignore list + OpenRouter's own
+    # feature filter), so a prose answer here is a genuine model refusal —
+    # fail loud once and let the caller's fallback engage (triage defers,
+    # grading skips). The removed parsers' inputs live on as mock bug-corpus
+    # entries proving this path fails CLOSED.
     provider = data.get("provider")
     message = choice.get("message") or {}
     tool_calls = message.get("tool_calls") or []
     if not tool_calls:
-        content = message.get("content")
-        salvaged = _parse_prose_tool_call(content, tool_name=tool_name)
-        if salvaged is not None:
-            logger.warning(
-                "salvaged %r from a prose tool call — model wrote XML into content "
-                "instead of emitting tool_calls (finish_reason=%r, provider=%r)",
-                tool_name,
-                finish,
-                provider,
-            )
-            return salvaged
-        # The other prose shape (#850): reasoning followed by the answer as a
-        # bare JSON object, no XML wrapper. Gated on the tool's own required
-        # keys, so a fragment or an echoed example can't pass as the answer.
-        if tool_input_schema is not None:
-            salvaged = _parse_prose_json_tool_call(content, tool_input_schema=tool_input_schema)
-            if salvaged is not None:
-                logger.warning(
-                    "salvaged %r from a prose JSON tool call — model wrote a bare "
-                    "JSON object into content instead of emitting tool_calls "
-                    "(finish_reason=%r, provider=%r)",
-                    tool_name,
-                    finish,
-                    provider,
-                )
-                return salvaged
-        # 600, not 200: the old cap cut every one of these mid-payload, which
-        # made a complete-but-misplaced answer look like a truncated one.
+        # One warning at the RAISE site so the provider-labelled signal is
+        # production telemetry by construction, independent of how any caller
+        # catches this ValueError subclass. (Today's callers keep the text
+        # anyway — triage's and grading's broad handlers both
+        # ``logger.exception`` the traceback — but a future quiet catch must
+        # not be able to erase the drift signal.)
+        logger.warning(
+            "forced tool_call missing for %r — model answered in prose "
+            "(finish_reason=%r, provider=%r); failing closed, no retry (#935)",
+            tool_name,
+            finish,
+            provider,
+        )
+        # 600, not 200: a shorter cap cut these mid-payload, which made a
+        # complete-but-misplaced answer look like a truncated one in the logs.
         raise MissingToolCallError(
             f"Expected a forced tool_call for {tool_name!r}, got finish_reason="
             f"{finish!r}, provider={provider!r}, "
@@ -428,35 +291,21 @@ class OpenRouterLLMClient(AnthropicLLMClient):
         temperature: float | None = None,
     ) -> tuple[dict[str, Any], LLMResult]:
         if model in _OPENAI_SHAPED_MODELS:
-            try:
-                return await self._openai_tool_use(
-                    model=model,
-                    system=system,
-                    messages=messages,
-                    tool_name=tool_name,
-                    tool_description=tool_description,
-                    tool_input_schema=tool_input_schema,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
-            except MissingToolCallError:
-                # Stochastic prose-instead-of-tool-call flake: one fresh
-                # attempt, then fail loud as before (the caller's fallback —
-                # triage defers, grading skips — engages on the second miss).
-                logger.warning(
-                    "forced tool_call missing for %s (model answered in prose) — retrying once",
-                    tool_name,
-                )
-                return await self._openai_tool_use(
-                    model=model,
-                    system=system,
-                    messages=messages,
-                    tool_name=tool_name,
-                    tool_description=tool_description,
-                    tool_input_schema=tool_input_schema,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
+            # No retry on MissingToolCallError (#935 closure): the paid retry
+            # existed for the provider-capability failure — "a coin flip on a
+            # deterministic failure" — and that class is unroutable now. A
+            # prose answer fails loud on the first attempt and the caller's
+            # fallback engages (triage defers, grading skips).
+            return await self._openai_tool_use(
+                model=model,
+                system=system,
+                messages=messages,
+                tool_name=tool_name,
+                tool_description=tool_description,
+                tool_input_schema=tool_input_schema,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
         return await super().complete_tool_use(
             model=model,
             system=system,
@@ -619,7 +468,6 @@ class OpenRouterLLMClient(AnthropicLLMClient):
             data,
             tool_name=tool_name,
             max_tokens=max_tokens,
-            tool_input_schema=tool_input_schema,
         )
         usage = _openai_usage(data)
         # OpenRouter puts what it actually billed in ``usage.cost`` on every
