@@ -119,8 +119,9 @@ Reprint them any time with `supabase status`. `supabase stop` shuts it down;
 
 The seed (`supabase/seed.sql`) inserts a small catalog of **fictional** jobs, so
 `/search` returns results immediately without running the poller or spending
-anything on AI. It does not create an account — sign up through the app and the
-magic-link email arrives in Mailpit at <http://localhost:54324>.
+anything on AI. It creates no account, but it does pre-authorise
+`dev@example.com` to sign up — signup is invite-only even locally, and step 4
+explains why that matters.
 
 **Hosted (Supabase cloud).** For a deployed instance, or if you'd rather not run
 Docker. Create a project (dashboard → New project), then:
@@ -148,14 +149,15 @@ cp apps/wyrdfold-api/.env.example apps/wyrdfold-api/.env
 
 Each template documents required vs. optional variables. The short version:
 
-| Variable                                     | Where        | Notes                                                    |
-| -------------------------------------------- | ------------ | -------------------------------------------------------- |
-| `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` | API          | Supabase dashboard → Settings → API                      |
-| `SUPABASE_ANON_KEY`                          | API          | Same page. **Required** — the API won't start without it |
-| `NEXT_PUBLIC_SUPABASE_URL` + `..._ANON_ID`   | web          | Same page, anon/publishable key                          |
-| `WYRDFOLD_API_KEY`                           | both (match) | `openssl rand -hex 32`                                   |
-| `WYRDFOLD_API_URL`                           | web          | `http://localhost:8001` for local dev                    |
-| `LLM_PROVIDER` + the matching key            | API          | `anthropic` or `openrouter`; defaults to `mock`          |
+| Variable                                     | Where        | Notes                                                                               |
+| -------------------------------------------- | ------------ | ----------------------------------------------------------------------------------- |
+| `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` | API          | Supabase dashboard → Settings → API                                                 |
+| `SUPABASE_ANON_KEY`                          | API          | Same page. **Required** — the API won't start without it                            |
+| `NEXT_PUBLIC_SUPABASE_URL` + `..._ANON_ID`   | web          | Same page, anon/publishable key                                                     |
+| `WYRDFOLD_API_KEY`                           | API          | Operator routes (poll/admin). `openssl rand -hex 32`                                |
+| `WYRDFOLD_CRON_KEY`                          | both (match) | Only if you use the web app's cron proxy; the web app sends THIS, not the key above |
+| `WYRDFOLD_API_URL`                           | web          | `http://localhost:8001` for local dev                                               |
+| `LLM_PROVIDER` + the matching key            | API          | `anthropic` or `openrouter`; defaults to `mock`                                     |
 
 Everything else — Brave Search (source discovery), Firecrawl (JS-rendered
 extraction), Voyage (embeddings), Twilio (SMS), Sentry, Resend alerts — is
@@ -174,7 +176,7 @@ NEXT_PUBLIC_SUPABASE_ANON_ID=<ANON_KEY from supabase status>
 SUPABASE_URL=http://127.0.0.1:54321
 SUPABASE_SERVICE_ROLE_KEY=<SERVICE_ROLE_KEY from supabase status>
 SUPABASE_ANON_KEY=<ANON_KEY from supabase status>
-WYRDFOLD_API_KEY=local-dev-key   # any string; must match the web app's value
+WYRDFOLD_API_KEY=local-dev-key   # operator routes on THIS api; any string
 LLM_PROVIDER=mock                # no AI key needed; fixtures replace real calls
 ```
 
@@ -206,10 +208,28 @@ Or run the API in Docker instead (see [`docker-compose.yml`](./docker-compose.ym
 docker compose up --build api
 ```
 
-Open <http://localhost:3100>, sign in with a magic link (Supabase's built-in
-email works out of the box for low volume), and the onboarding wizard takes
-it from there: describe your target role, add your experience, and activate
-the target.
+Open <http://localhost:3100>. Browsing and `/search` work straight away against
+the seeded catalog, signed out.
+
+**To sign in, use `dev@example.com`** — then open Mailpit at
+<http://localhost:54324> and click the magic link it caught. From there the
+onboarding wizard takes over: describe your target role, add your experience,
+and activate the target.
+
+> **Signup is closed by default, and the error does not say so.** The
+> `before_user_created` auth hook rejects any address missing from
+> `wyrdfold_beta_invites`, returning GoTrue's verbatim `User not found` —
+> indistinguishable from a bug. `supabase/seed.sql` pre-authorises
+> `dev@example.com` for exactly this reason. To use your own address instead:
+>
+> ```bash
+> psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" \
+>   -c "insert into wyrdfold_beta_invites (email, invited_at)
+>       values ('you@example.com', now()) on conflict do nothing;"
+> ```
+>
+> On a **hosted** instance this hook is what keeps signup closed — invite real
+> addresses deliberately, one row at a time.
 
 ### 5. Background polling
 
@@ -288,7 +308,9 @@ The reference deployment (any equivalent host works):
 
 - **Web** → Vercel (`apps/wyrdfold/vercel.json`). Needs
   `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_ID`,
-  `WYRDFOLD_API_URL`, `WYRDFOLD_API_KEY`, and `CRON_SECRET`.
+  `WYRDFOLD_API_URL`, `CRON_SECRET`, and — only if you use the cron proxy
+  route — `WYRDFOLD_CRON_KEY` matching the API's. The web app does **not**
+  read `WYRDFOLD_API_KEY`; that one is the API's own operator credential.
 - **API** → Railway (`apps/wyrdfold-api/Dockerfile` + `railway.toml`), or any
   Docker host via `docker-compose.yml`. Set `ALLOWED_HOSTS` to your public
   domain(s) and `SENTRY_ENVIRONMENT=production` if using Sentry.

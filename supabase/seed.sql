@@ -16,7 +16,13 @@
 -- magic-link flow rather than from SQL — seeding `auth.users` by hand desyncs
 -- identities and refresh tokens and breaks sign-in in confusing ways. Sign up
 -- through the app (locally, the magic-link email lands in Mailpit on :54324)
--- and the onboarding wizard builds the rest. README -> "Local development".
+-- and the onboarding wizard builds the rest. README -> step 4.
+--
+-- It DOES pre-authorise one address to sign up, because signup is closed by
+-- default and that is not obvious: the `before_user_created` auth hook
+-- (enabled in config.toml, so it runs LOCALLY too) rejects any email absent
+-- from `wyrdfold_beta_invites` with GoTrue's verbatim "User not found" —
+-- which reads as a broken app rather than a closed door. See below.
 --
 -- EVERY COMPANY AND POSTING BELOW IS FICTIONAL. This file is committed to a
 -- public repository: it must never carry scraped listings, real candidate or
@@ -83,5 +89,22 @@ values
   ('seed-015', '5eed0000-0000-4000-a000-000000000004', 'Technical Program Manager',          'Harborline Freight', 'Chicago, IL',      'Chicago',       'IL', 'US', false, false, true, 'full_time', 145000, 180000, 'USD', 'yearly', 'https://example.com/jobs/seed-015', '<p>Hold three engineering teams to one roadmap without becoming a bottleneck.</p>', now() - interval '21 days'),
   ('seed-016', '5eed0000-0000-4000-a000-000000000001', 'Software Engineer, Internal Tools',  'Northwind Systems',  'Remote, US',       null,            null, 'US', true, true,  true, 'part_time', 70000,  90000,  'USD', 'yearly', 'https://example.com/jobs/seed-016', '<p>Part-time role building the tooling the rest of engineering leans on daily.</p>', now() - interval '25 days')
 on conflict (source_id, external_id) do nothing;
+
+-- One pre-authorised address so the documented sign-up actually works. The
+-- `before_user_created` hook refuses anything not listed here, and it is
+-- enabled locally as well as in production — without this row a new
+-- developer's first sign-in attempt fails with "User not found".
+--
+-- SAFE TO APPLY ANYWHERE, including a hosted project (the README describes
+-- doing that deliberately), because this does NOT open signup:
+--   * exactly one address is authorised, not a pattern or a wildcard;
+--   * `example.com` is RFC 2606 reserved and accepts no mail anywhere, so on a
+--     real deployment nobody can receive the magic link and complete signup;
+--   * locally it works because Mailpit (:54324) catches every message
+--     regardless of domain — that asymmetry is the whole point.
+-- Closed signup in production is therefore preserved, not weakened.
+insert into public.wyrdfold_beta_invites (email, invited_at)
+values ('dev@example.com', now())
+on conflict (email) do nothing;
 
 commit;
