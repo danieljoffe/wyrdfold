@@ -1891,6 +1891,10 @@ async def _poll_one_source(
         # means an empty ``phase1_verdicts`` is the ramped fallback, not the
         # ordinary "triage off / no targets" admit — see ``_any_target_admits``.
         persistent_skips = 0
+        # Same abstentions, counted BY REASON, so the one-per-source
+        # ``poll_funnel`` line can carry what the per-target lines used to say
+        # (see the logging note where these are recorded).
+        persistent_skip_reasons: Counter[str] = Counter()
         triage_candidates = [
             (idx, job)
             for idx, job in enumerate(jobs)
@@ -1952,6 +1956,7 @@ async def _poll_one_source(
                     )
                     if admits:
                         persistent_skips += 1
+                        persistent_skip_reasons[str(reason)] += 1
                     if not admits:
                         phase1_verdicts[active_target.id] = {}
                         phase1_attempted[active_target.id] = set()  # → all defer
@@ -1969,7 +1974,35 @@ async def _poll_one_source(
                         )
                     else:
                         outcome = "deferring, will re-triage next cycle"
-                    logger.info(
+                    # LEVEL SPLIT BY WHETHER WORK IS WITHHELD, not by novelty.
+                    #
+                    # ``admits`` is the benign branch: the target abstains but
+                    # ingestion proceeds on the deterministic free gates, so
+                    # nothing is lost and there is nothing to act on. It is
+                    # also the branch that FLOODS — this runs once per
+                    # (source x target), and the condition is PERSISTENT by
+                    # construction, so it restates an unchanging fact on every
+                    # source of every cycle. Prod 2026-09-11: 147 identical
+                    # lines in one cycle (5 catalog targets x ~30 sources),
+                    # 102 of them inside a single minute, 44% of all
+                    # application log lines — and it scales with sources
+                    # polled, against 5,223 enabled sources.
+                    #
+                    # That shape has already cost this system real visibility:
+                    # the 2026-08-12 credit exhaustion flooded a per-target
+                    # per-cycle line past Railway's 500 logs/sec replica cap
+                    # and DROPPED 101 messages, exactly when they were most
+                    # needed (see the ``LLMServiceError`` note in
+                    # ``title_triage``, which fixed the same class there).
+                    #
+                    # So the benign branch goes to DEBUG and is carried at INFO
+                    # in aggregate on the one-per-source ``poll_funnel`` line
+                    # instead — "why did grading stop?" stays greppable, which
+                    # is the requirement ``payers.BlockReason`` documents. The
+                    # two DEFERRING branches stay at INFO: there work really is
+                    # withheld, and they are rare.
+                    log = logger.debug if admits else logger.info
+                    log(
                         "Phase 1 deferred for target %s (payer %s blocked: %s; %s)",
                         active_target.id,
                         gate.payer_for(active_target.id),
@@ -2728,7 +2761,7 @@ async def _poll_one_source(
             "dropped_title_prematch=%d dropped_non_us=%d candidates=%d "
             "upserted_new=%d upserted_updated=%d archived=%d "
             "board_us_marked=%d board_us_archived=%d location_us_marked=%d "
-            "phase1_no_by_target=%s",
+            "phase1_no_by_target=%s phase1_persistent_skips=%s",
             company_name,
             len(jobs),
             dropped_phase1,
@@ -2743,6 +2776,10 @@ async def _poll_one_source(
             board_us_archived,
             location_us_marked,
             per_target_phase1_no or "{}",
+            # Carries the per-target DEBUG lines' content in aggregate: which
+            # persistent block reasons abstained on this source, and how many
+            # targets each. "{}" when none, so the field is always present.
+            dict(persistent_skip_reasons) or "{}",
         )
 
     except BoardFetchError as exc:
