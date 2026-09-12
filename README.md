@@ -91,18 +91,52 @@ What you need before starting:
 ```bash
 git clone https://github.com/danieljoffe/wyrdfold.git
 cd wyrdfold
-pnpm install     # installs JS deps; postinstall runs `uv sync` for Python
+pnpm install     # JS deps; postinstall also creates the Python venv
 ```
+
+The API's own Python packages are installed on first run, not here — `nx dev
+wyrdfold-api` shells out to `uv run --package wyrdfold-api`, which resolves them
+then. So the first API start is slower than later ones, and an `import fastapi`
+straight after `pnpm install` will fail. That is expected.
 
 ### 2. Create the database
 
-Create a Supabase project (dashboard → New project), then apply the schema:
+Two options. **Local is the one to start with** — it needs no account, costs
+nothing, and is what the end-to-end test suite runs against.
+
+**Local (Docker).** Requires Docker running. One command brings up Postgres,
+auth, storage and a mail catcher, applies every migration, and loads the
+development seed:
+
+```bash
+supabase start   # Postgres :54322 · API :54321 · Studio :54323 · Mailpit :54324
+```
+
+It prints an `ANON_KEY` and `SERVICE_ROLE_KEY` — you need both in step 3.
+Reprint them any time with `supabase status`. `supabase stop` shuts it down;
+`pnpm db:reset` wipes and rebuilds from the migration chain plus the seed.
+
+The seed (`supabase/seed.sql`) inserts a small catalog of **fictional** jobs, so
+`/search` returns results immediately without running the poller or spending
+anything on AI. It does not create an account — sign up through the app and the
+magic-link email arrives in Mailpit at <http://localhost:54324>.
+
+**Hosted (Supabase cloud).** For a deployed instance, or if you'd rather not run
+Docker. Create a project (dashboard → New project), then:
 
 ```bash
 supabase login
 supabase link --project-ref <your-project-ref>
 pnpm db:push     # applies supabase/migrations to your project
 ```
+
+> `db:push` writes to whichever project is currently linked, and `supabase
+link` persists that choice. Run `supabase projects list` if you are unsure
+> which one you are pointed at — the marked entry is the target.
+
+A hosted project starts **empty**: `db:push` applies schema only, never the
+seed. To get the same starter catalog there, run
+`psql "$DATABASE_URL" -f supabase/seed.sql` against it deliberately.
 
 ### 3. Configure environment
 
@@ -125,6 +159,30 @@ Everything else — Brave Search (source discovery), Firecrawl (JS-rendered
 extraction), Voyage (embeddings), Twilio (SMS), Sentry, Resend alerts — is
 **optional and degrades gracefully**: leave it unset and the feature is
 skipped or mocked.
+
+Running locally, point both apps at the local stack and use the keys
+`supabase start` printed:
+
+```bash
+# apps/wyrdfold/.env.local
+NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321
+NEXT_PUBLIC_SUPABASE_ANON_ID=<ANON_KEY from supabase status>
+
+# apps/wyrdfold-api/.env
+SUPABASE_URL=http://127.0.0.1:54321
+SUPABASE_SERVICE_ROLE_KEY=<SERVICE_ROLE_KEY from supabase status>
+LLM_PROVIDER=mock          # no AI key needed; fixtures replace real calls
+```
+
+Open the app at `http://localhost:3100` and keep that host throughout. Sign-in
+redirects must match Supabase's allowlist exactly, and an unmatched value is
+silently rewritten to the Site URL rather than rejected — which looks like the
+magic link mysteriously not working. `supabase start` allowlists `localhost`
+ports by default; `127.0.0.1` is a different entry.
+
+For a fuller walkthrough — every variable, the Supabase redirect-URL
+allowlist, and the deployment notes — see
+[`apps/wyrdfold/SETUP.md`](./apps/wyrdfold/SETUP.md).
 
 ### 4. Run
 
