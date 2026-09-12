@@ -79,9 +79,10 @@ What you need before starting:
 
 - **Node.js 24.x** and **pnpm** (`packageManager` is pinned)
 - **[uv](https://docs.astral.sh/uv/)** for the Python API
-- **[Supabase CLI](https://supabase.com/docs/guides/cli)** and a free
-  [Supabase](https://supabase.com) project (this is the database + auth —
-  the only hard external dependency)
+- **[Supabase CLI](https://supabase.com/docs/guides/cli)** — this is the
+  database + auth, and the only hard external dependency. Either **Docker**
+  (the CLI runs the whole stack locally, no account needed) or a free
+  [Supabase](https://supabase.com) project. Step 2 covers both.
 - An LLM API key — [Anthropic](https://console.anthropic.com) or
   [OpenRouter](https://openrouter.ai) — for real job grading. The API boots
   without one (`LLM_PROVIDER=mock`), but matching quality is the product.
@@ -130,9 +131,9 @@ supabase link --project-ref <your-project-ref>
 pnpm db:push     # applies supabase/migrations to your project
 ```
 
-> `db:push` writes to whichever project is currently linked, and `supabase
-link` persists that choice. Run `supabase projects list` if you are unsure
-> which one you are pointed at — the marked entry is the target.
+> **`db:push` writes to whichever project is currently linked**, and
+> `supabase link` persists that choice across sessions. Run
+> `supabase projects list` if you are unsure which one you are pointed at.
 
 A hosted project starts **empty**: `db:push` applies schema only, never the
 seed. To get the same starter catalog there, run
