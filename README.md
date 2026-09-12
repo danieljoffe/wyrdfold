@@ -129,12 +129,16 @@ Docker. Create a project (dashboard → New project), then:
 ```bash
 supabase login
 supabase link --project-ref <your-project-ref>
-pnpm db:push     # applies supabase/migrations to your project
+pnpm db:push --target production   # applies supabase/migrations to that target
 ```
 
-> **`db:push` writes to whichever project is currently linked**, and
-> `supabase link` persists that choice across sessions. Run
-> `supabase projects list` if you are unsure which one you are pointed at.
+> **`db:push` refuses to run without `--target`.** The target names a
+> `[remotes.<name>]` block in `supabase/config.toml`; the command verifies the
+> CLI is linked to that exact project and refuses if it is not. Without the
+> guard, `db:push` would write to whatever you linked last — possibly weeks ago,
+> in another session, recorded only in a gitignored file. `pnpm db:target
+--target <name>` performs the same check and runs nothing, if you just want to
+> know where you are pointed.
 
 A hosted project starts **empty**: `db:push` applies schema only, never the
 seed. To get the same starter catalog there, run
