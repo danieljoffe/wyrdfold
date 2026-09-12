@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -2368,6 +2369,69 @@ async def test_persistent_block_still_ingests_new_listings(monkeypatch, reason: 
 
     assert summary["error"] is None
     jobs_table.upsert.assert_called()  # the listing reached the catalog
+
+
+@pytest.mark.asyncio
+async def test_benign_persistent_skip_does_not_log_per_target_at_info(
+    monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """LOG VOLUME. The ``admits`` branch withholds nothing — ingestion proceeds
+    on the free gates — but it runs once per (source x target) for a condition
+    that is PERSISTENT by construction, so at INFO it restates an unchanging
+    fact on every source of every cycle.
+
+    Prod 2026-09-11: 147 identical lines in one cycle (5 catalog targets x ~30
+    sources), 102 inside a single minute, 44% of all application log lines,
+    scaling with 5,223 enabled sources. The same shape passed Railway's 500
+    logs/sec replica cap on 2026-08-12 and DROPPED 101 messages.
+
+    So the benign branch belongs at DEBUG. Restoring INFO fails this test.
+    """
+    with caplog.at_level(logging.DEBUG, logger="app.services.poller"):
+        await _run_poll_with_blocked_gate(monkeypatch, reason="catalog_ungraded")
+
+    per_target = [r for r in caplog.records if "Phase 1 deferred for target" in r.getMessage()]
+    assert per_target, "the per-target line must still exist — at DEBUG, not deleted"
+    assert all(r.levelno == logging.DEBUG for r in per_target), (
+        "a benign persistent skip must not log at INFO once per (source x target)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_withheld_persistent_skip_still_logs_at_info(
+    monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The counter-case that keeps the demotion honest. With the staged rollout
+    OFF the same reason genuinely WITHHOLDS the listing, so it stays at INFO —
+    the split is by whether work is lost, not by which reason it is."""
+    with caplog.at_level(logging.DEBUG, logger="app.services.poller"):
+        await _run_poll_with_blocked_gate(
+            monkeypatch, reason="catalog_ungraded", admits=False
+        )
+
+    per_target = [r for r in caplog.records if "Phase 1 deferred for target" in r.getMessage()]
+    assert per_target
+    assert all(r.levelno == logging.INFO for r in per_target), (
+        "a skip that DROPS the listing must stay visible at INFO"
+    )
+
+
+@pytest.mark.asyncio
+async def test_poll_funnel_carries_the_persistent_skip_reasons(
+    monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Nothing is lost by the demotion: the one-per-source funnel line carries
+    which reasons abstained and how many targets each, so "why did grading
+    stop?" stays answerable by grepping Railway — the requirement
+    ``payers.BlockReason`` documents."""
+    with caplog.at_level(logging.INFO, logger="app.services.poller"):
+        await _run_poll_with_blocked_gate(monkeypatch, reason="catalog_ungraded")
+
+    funnel = [r.getMessage() for r in caplog.records if "poll_funnel" in r.getMessage()]
+    assert funnel, "poll_funnel must still be emitted"
+    assert any("phase1_persistent_skips={'catalog_ungraded': 1}" in m for m in funnel), (
+        f"the reason/count must survive in the aggregate line; got: {funnel}"
+    )
 
 
 @pytest.mark.asyncio

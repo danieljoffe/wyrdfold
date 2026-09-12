@@ -61,15 +61,26 @@ class TrialExpiredError(Exception):
 class MissingToolCallError(ValueError):
     """The model answered in PROSE instead of emitting the forced tool call.
 
-    DeepSeek intermittently ignores ``tool_choice`` and returns its reasoning
-    as plain content with ``finish_reason='stop'`` (prod 2026-08-05: several
-    triage batches/night deferred this way, each a full re-spend next cycle).
-    Distinct from the other structured-output parse failures so
-    ``complete_tool_use`` can retry exactly this shape once — the flake is
-    stochastic, so a second attempt usually lands. Subclasses ``ValueError``
-    so existing broad handlers (triage's defer-not-admit, ``complete_json``
-    fallbacks) are unchanged. The mock client raises it for prose scripts,
-    mirroring the real parser (llm-surfaces bug corpus).
+    Single-attempt, fail-closed (#935): no retry and no salvage — the
+    prose failures traced to endpoints that cannot honor a forced named
+    function (``supports_tool_choice.function=false``), a class the routing
+    ignore list plus OpenRouter's own feature filter now keep unroutable, so
+    a prose answer is treated as a genuine model refusal. The caller's
+    fallback engages on the first miss: triage defers, grading skips.
+
+    Diagnostic contract: the raise site logs one provider-labelled warning
+    and the exception message carries ``provider=…`` too, so a hit stays
+    correlatable per endpoint in prod logs — the signal for re-deriving the
+    routing ignore list if the endpoint pool drifts.
+
+    (History: 2026-08-05 through #935's closure this was retried once and
+    two salvage parsers recovered complete prose answers; all three were
+    removed when the probe proved the provider-capability cause unroutable.)
+
+    Subclasses ``ValueError`` so existing broad handlers (triage's
+    defer-not-admit, ``complete_json`` fallbacks) are unchanged. The mock
+    client raises it for prose scripts, mirroring the real client
+    (llm-surfaces bug corpus).
     """
 
 
