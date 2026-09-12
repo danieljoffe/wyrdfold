@@ -26,7 +26,8 @@
     "dev": "nx run-many --target=dev --all",
     "postinstall": "command -v uv >/dev/null && uv sync || echo 'uv not found — skipping Python deps (install: https://docs.astral.sh/uv/)'",
     "prepare": "husky",
-    "db:push": "supabase db push",
+    "db:push": "uv run --project apps/wyrdfold-api python apps/wyrdfold-api/scripts/db_target_guard.py --run 'db push'",
+    "db:target": "uv run --project apps/wyrdfold-api python apps/wyrdfold-api/scripts/db_target_guard.py",
     "db:reset": "supabase db reset",
     "db:gen-types": "supabase gen types typescript --linked > apps/wyrdfold/src/lib/supabase/types.ts"
   },

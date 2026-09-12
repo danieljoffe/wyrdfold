@@ -124,17 +124,37 @@ anything on AI. It creates no account, but it does pre-authorise
 explains why that matters.
 
 **Hosted (Supabase cloud).** For a deployed instance, or if you'd rather not run
-Docker. Create a project (dashboard → New project), then:
+Docker. Create a project (dashboard → New project), then link to it:
 
 ```bash
 supabase login
 supabase link --project-ref <your-project-ref>
-pnpm db:push     # applies supabase/migrations to your project
 ```
 
-> **`db:push` writes to whichever project is currently linked**, and
-> `supabase link` persists that choice across sessions. Run
-> `supabase projects list` if you are unsure which one you are pointed at.
+Declare it as a target in `supabase/config.toml` — `db:push` only accepts
+targets named there:
+
+```toml
+[remotes.mine]                       # any name; "mine" is just an example
+project_id = "<your-project-ref>"
+```
+
+Then apply the schema:
+
+```bash
+pnpm db:push --target mine
+```
+
+> **`db:push` refuses without `--target`**, and refuses again if the CLI is
+> linked to a different project than the one that target names. Without it, the
+> command writes to whatever you linked last — possibly weeks ago, in another
+> session, recorded only in a gitignored file. `pnpm db:target --target <name>`
+> runs the same check and nothing else, when you only want to know where you
+> are pointed.
+>
+> The committed `[remotes.production]` block is **WyrdFold's own deployment**,
+> not yours. `--target production` will refuse against your project — that is
+> the guard working, not a misconfiguration.
 
 A hosted project starts **empty**: `db:push` applies schema only, never the
 seed. To get the same starter catalog there, run
