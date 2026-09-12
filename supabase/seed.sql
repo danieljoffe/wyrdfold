@@ -36,12 +36,23 @@
 
 begin;
 
+-- enabled = FALSE, deliberately. These board tokens are fictional, so a
+-- scheduler that picked them up would issue doomed requests to Greenhouse,
+-- Lever and Ashby, rack up consecutive_failures, and — because a poll that
+-- finds none of a source's existing jobs archives them — quietly delete the
+-- starter catalog it is meant to provide. The poller selects on
+-- `enabled = true` (poller.py), so leaving them disabled keeps them
+-- unreachable by discovery on ANY instance, including a hosted one where
+-- someone later turns the scheduler on.
+--
+-- Search is unaffected: it joins `sources(domain)` by foreign key for the
+-- company domain and never filters on `enabled` (job_search.py).
 insert into public.sources (id, board_token, company_name, provider, domain, enabled)
 values
-  ('5eed0000-0000-4000-a000-000000000001', 'seed-northwind',  'Northwind Systems',  'greenhouse', 'example.com', true),
-  ('5eed0000-0000-4000-a000-000000000002', 'seed-lumenworks', 'Lumenworks',         'greenhouse', 'example.com', true),
-  ('5eed0000-0000-4000-a000-000000000003', 'seed-atlasgrove', 'Atlas Grove Health', 'lever',      'example.com', true),
-  ('5eed0000-0000-4000-a000-000000000004', 'seed-harborline', 'Harborline Freight', 'ashby',      'example.com', true)
+  ('5eed0000-0000-4000-a000-000000000001', 'seed-northwind',  'Northwind Systems',  'greenhouse', 'example.com', false),
+  ('5eed0000-0000-4000-a000-000000000002', 'seed-lumenworks', 'Lumenworks',         'greenhouse', 'example.com', false),
+  ('5eed0000-0000-4000-a000-000000000003', 'seed-atlasgrove', 'Atlas Grove Health', 'lever',      'example.com', false),
+  ('5eed0000-0000-4000-a000-000000000004', 'seed-harborline', 'Harborline Freight', 'ashby',      'example.com', false)
 on conflict (board_token) do nothing;
 
 -- A spread rather than sixteen near-identical rows: remote and on-site, with

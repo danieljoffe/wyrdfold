@@ -148,13 +148,14 @@ cp apps/wyrdfold-api/.env.example apps/wyrdfold-api/.env
 
 Each template documents required vs. optional variables. The short version:
 
-| Variable                                     | Where        | Notes                                           |
-| -------------------------------------------- | ------------ | ----------------------------------------------- |
-| `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` | API          | Supabase dashboard → Settings → API             |
-| `NEXT_PUBLIC_SUPABASE_URL` + `..._ANON_ID`   | web          | Same page, anon/publishable key                 |
-| `WYRDFOLD_API_KEY`                           | both (match) | `openssl rand -hex 32`                          |
-| `WYRDFOLD_API_URL`                           | web          | `http://localhost:8001` for local dev           |
-| `LLM_PROVIDER` + the matching key            | API          | `anthropic` or `openrouter`; defaults to `mock` |
+| Variable                                     | Where        | Notes                                                    |
+| -------------------------------------------- | ------------ | -------------------------------------------------------- |
+| `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` | API          | Supabase dashboard → Settings → API                      |
+| `SUPABASE_ANON_KEY`                          | API          | Same page. **Required** — the API won't start without it |
+| `NEXT_PUBLIC_SUPABASE_URL` + `..._ANON_ID`   | web          | Same page, anon/publishable key                          |
+| `WYRDFOLD_API_KEY`                           | both (match) | `openssl rand -hex 32`                                   |
+| `WYRDFOLD_API_URL`                           | web          | `http://localhost:8001` for local dev                    |
+| `LLM_PROVIDER` + the matching key            | API          | `anthropic` or `openrouter`; defaults to `mock`          |
 
 Everything else — Brave Search (source discovery), Firecrawl (JS-rendered
 extraction), Voyage (embeddings), Twilio (SMS), Sentry, Resend alerts — is
@@ -172,8 +173,15 @@ NEXT_PUBLIC_SUPABASE_ANON_ID=<ANON_KEY from supabase status>
 # apps/wyrdfold-api/.env
 SUPABASE_URL=http://127.0.0.1:54321
 SUPABASE_SERVICE_ROLE_KEY=<SERVICE_ROLE_KEY from supabase status>
-LLM_PROVIDER=mock          # no AI key needed; fixtures replace real calls
+SUPABASE_ANON_KEY=<ANON_KEY from supabase status>
+WYRDFOLD_API_KEY=local-dev-key   # any string; must match the web app's value
+LLM_PROVIDER=mock                # no AI key needed; fixtures replace real calls
 ```
+
+Both Supabase keys are required. The API refuses to start without
+`SUPABASE_ANON_KEY` — the per-user routes build a JWT-bound client from it, and
+booting without it would leave the healthcheck green while every authenticated
+request failed.
 
 Open the app at `http://localhost:3100` and keep that host throughout. Sign-in
 redirects must match Supabase's allowlist exactly, and an unmatched value is
