@@ -64,7 +64,7 @@ import os
 import re
 import subprocess
 import sys
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 # Production's project ref. Committed already (supabase/config.toml), not a
@@ -115,7 +115,19 @@ def project_identity(raw: str) -> str:
 
 
 def assert_safe_direction(read_url: str, write_url: str, confirmed: str) -> tuple[str, str]:
-    """Refuse unless the write target is provably not production."""
+    """Refuse unless this is provably production -> not-production.
+
+    Both halves are checked. Proving only that the destination is not
+    production would leave the *source* unconstrained, so the script would
+    happily copy an empty local database over staging and report success —
+    the contract in the name ("the real catalog") would be silently unmet.
+
+    Order matters, because the first refusal is the message the operator reads.
+    Writing to production is the worst outcome, so it is checked first; a
+    wrong-source complaint would bury it. "Same project both ends" comes next
+    because it names the confusion precisely. Only then the source check, which
+    is the catch-all for everything else pointed at PROD_DB_URL.
+    """
     src = project_identity(read_url)
     dst = project_identity(write_url)
 
@@ -133,6 +145,13 @@ def assert_safe_direction(read_url: str, write_url: str, confirmed: str) -> tupl
         raise SyncError(
             f"REFUSING: read and write resolve to the SAME project ({src}). "
             "Nothing to copy, and it suggests one of the two is misconfigured."
+        )
+
+    if src != PRODUCTION_REF:
+        raise SyncError(
+            f"REFUSING: the read source resolves to {src!r}, not production "
+            f"({PRODUCTION_REF}). This script imports the REAL catalog; point "
+            "PROD_DB_URL at production, or use a different tool."
         )
     if confirmed != dst:
         raise SyncError(
@@ -164,20 +183,55 @@ def checked_limit(value: int) -> int:
     return value
 
 
+# The state every copied source is forced into, as data so the regression test
+# can assert the COMPLETE outgoing payload rather than the one field someone
+# remembered. Adding a behavioural column to `sources` means adding it here.
+#
+# `disabled_at` is the subtle one and is why this is a dict. Setting
+# `enabled=False` is not sufficient to keep a source inert, because
+# `recover_stale_sources()` re-enables exactly the rows where
+#
+#     enabled = false AND disabled_at IS NOT NULL AND disabled_at < now() - 24h
+#
+# and the column comment in 20260623150000_ingestion_resilience.sql defines
+# NULL as "never auto-disabled (or an operator disabled it manually)". So a
+# production source that the failure backoff disabled more than
+# SOURCE_RECOVERY_AFTER_HOURS ago arrives here carrying its own re-enable
+# order: staging's next poll cycle turns it back on, polls a real ATS board,
+# and — because a poll that finds none of a source's jobs ARCHIVES them —
+# deletes the catalog this script just imported. Copying `disabled_at`
+# unchanged is the one field that can undo every other field here.
+#
+# Measured against production the day this was written: 19 of 5,255 sources
+# carried a `disabled_at`, none yet older than the 24h cooldown. That is a
+# latent bug, not a dormant one — those 19 age into eligibility, so a sync that
+# is safe today is not safe next week. Hence forced, not defaulted.
+_INERT_SOURCE_STATE: dict[str, Any] = {
+    "enabled": False,
+    # Auto-recovery marker. NULL means "manual", which is never overridden.
+    "disabled_at": None,
+    # Polling lifecycle. Reset so staging does not inherit production's
+    # history and immediately look unhealthy, or misreport its own cadence.
+    "last_polled_at": None,
+    "last_candidate_at": None,
+    "consecutive_failures": 0,
+    # Denormalised counter the poller maintains. Production's value describes
+    # production's catalog, not the subset copied here, so it would be wrong
+    # either way; 0 is at least CONSISTENT with last_polled_at being NULL —
+    # "this database has never polled this source". It is surfaced by
+    # routers/sources.py and diagnostics, so a stale value is visible, not inert.
+    "job_count": 0,
+}
+
+
 def disabled_source(row: dict[str, Any]) -> dict[str, Any]:
     """A source row rendered safe to insert into a non-production database.
 
     Forced, never defaulted. An enabled copy lets staging poll a real ATS board,
     and a poll that finds none of that source's jobs ARCHIVES them — staging
-    would delete the catalog this script just imported. The polling bookkeeping
-    is reset too, so staging does not inherit production's failure counters and
-    immediately look unhealthy.
+    would delete the catalog this script just imported.
     """
-    out = dict(row)
-    out["enabled"] = False
-    out["last_polled_at"] = None
-    out["consecutive_failures"] = 0
-    return out
+    return {**row, **_INERT_SOURCE_STATE}
 
 
 def uuid_in_list(values: list[str]) -> str:
@@ -190,7 +244,9 @@ def uuid_in_list(values: list[str]) -> str:
     """
     bad = [v for v in values if not _UUID.match(str(v))]
     if bad:
-        raise SyncError(f"refusing to interpolate {len(bad)} non-UUID source id(s), e.g. {bad[0]!r}")
+        raise SyncError(
+            f"refusing to interpolate {len(bad)} non-UUID source id(s), e.g. {bad[0]!r}"
+        )
     return ",".join(f"'{v}'" for v in values)
 
 
@@ -222,7 +278,7 @@ def psql_json(url: str, sql: str) -> list[dict[str, Any]]:
     )
     if proc.returncode != 0:
         raise SyncError(f"read query failed: {proc.stderr.strip()[:300]}")
-    return json.loads(proc.stdout.strip() or "[]")
+    return cast("list[dict[str, Any]]", json.loads(proc.stdout.strip() or "[]"))
 
 
 def post_rows(base_url: str, key: str, table: str, rows: list[dict[str, Any]]) -> int:
@@ -278,20 +334,31 @@ def delete_all(base_url: str, key: str, dst_ref: str) -> None:
         try:
             urllib.request.urlopen(req, timeout=300)  # noqa: S310 — scheme enforced by require_web_url
         except urllib.error.HTTPError as exc:
-            raise SyncError(f"clearing {table} failed: HTTP {exc.code} {exc.read().decode()[:200]}") from exc
+            raise SyncError(
+                f"clearing {table} failed: HTTP {exc.code} {exc.read().decode()[:200]}"
+            ) from exc
         print(f"    cleared {table}")
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Copy real jobs+sources into a non-production database.")
+    ap = argparse.ArgumentParser(
+        description="Copy real jobs+sources into a non-production database."
+    )
     ap.add_argument("--confirm-write-to", required=True, help="project ref of the write target")
-    ap.add_argument("--limit", type=int, default=5000, help=f"most-recent jobs to copy (1..{MAX_LIMIT}, default 5000)")
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=5000,
+        help=f"most-recent jobs to copy (1..{MAX_LIMIT}, default 5000)",
+    )
     ap.add_argument(
         "--replace",
         action="store_true",
         help="clear staging's jobs+sources first, making this a snapshot rather than an additive import",
     )
-    ap.add_argument("--dry-run", action="store_true", help="report what would be copied, write nothing")
+    ap.add_argument(
+        "--dry-run", action="store_true", help="report what would be copied, write nothing"
+    )
     args = ap.parse_args(argv)
 
     read_url = os.environ.get("PROD_DB_URL", "")
@@ -321,7 +388,9 @@ def main(argv: list[str] | None = None) -> int:
     except SyncError as exc:
         print(f"sync: {exc}", file=sys.stderr)
         return 2
-    print(f"sync: reading {src} -> writing {dst}  (limit {limit}, mode={'replace' if args.replace else 'additive'})")
+    print(
+        f"sync: reading {src} -> writing {dst}  (limit {limit}, mode={'replace' if args.replace else 'additive'})"
+    )
 
     jobs = psql_json(
         read_url,

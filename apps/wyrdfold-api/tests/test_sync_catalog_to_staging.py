@@ -24,6 +24,8 @@ STAGING_REF = "dyczsvaoqhvnafwwxuvf"
 PROD_POOLER = f"postgresql://postgres.{PRODUCTION_REF}:pw@aws-1.pooler.supabase.com:5432/postgres"
 STAGING_REST = f"https://{STAGING_REF}.supabase.co"
 PROD_REST = f"https://{PRODUCTION_REF}.supabase.co"
+# A local stack: identifiable, and emphatically not production.
+LOCAL_URL = "postgresql://postgres:postgres@127.0.0.1:54322/postgres"
 
 
 # ---- identity ---------------------------------------------------------------
@@ -40,7 +42,10 @@ def test_identity_from_pooler_url_reads_the_username() -> None:
 
 
 def test_identity_from_direct_db_host() -> None:
-    assert project_identity(f"postgresql://postgres:pw@db.{STAGING_REF}.supabase.co:5432/postgres") == STAGING_REF
+    assert (
+        project_identity(f"postgresql://postgres:pw@db.{STAGING_REF}.supabase.co:5432/postgres")
+        == STAGING_REF
+    )
 
 
 def test_localhost_is_local() -> None:
@@ -149,7 +154,12 @@ def test_disabled_source_resets_polling_bookkeeping() -> None:
     """Staging must not inherit production's failure counters and immediately
     look unhealthy, nor a last_polled_at that makes it seem recently active."""
     out = disabled_source(
-        {"id": "x", "enabled": True, "last_polled_at": "2026-09-01T00:00:00Z", "consecutive_failures": 7}
+        {
+            "id": "x",
+            "enabled": True,
+            "last_polled_at": "2026-09-01T00:00:00Z",
+            "consecutive_failures": 7,
+        }
     )
     assert out["last_polled_at"] is None
     assert out["consecutive_failures"] == 0
@@ -164,9 +174,19 @@ def test_disabled_source_does_not_mutate_the_input() -> None:
 
 
 def test_disabled_source_preserves_everything_else() -> None:
-    row = {"id": "x", "board_token": "acme", "company_name": "Acme", "provider": "greenhouse", "enabled": True}
+    row = {
+        "id": "x",
+        "board_token": "acme",
+        "company_name": "Acme",
+        "provider": "greenhouse",
+        "enabled": True,
+    }
     out = disabled_source(row)
-    assert out["board_token"] == "acme" and out["company_name"] == "Acme" and out["provider"] == "greenhouse"
+    assert (
+        out["board_token"] == "acme"
+        and out["company_name"] == "Acme"
+        and out["provider"] == "greenhouse"
+    )
 
 
 def test_every_source_written_by_main_is_disabled(monkeypatch) -> None:
@@ -180,16 +200,32 @@ def test_every_source_written_by_main_is_disabled(monkeypatch) -> None:
     monkeypatch.setenv("STAGING_SERVICE_KEY", "sb_secret_test")
 
     jobs = [{"id": f"j{i}", "source_id": "11111111-2222-4333-8444-555555555555"} for i in range(3)]
-    reads = [jobs, [{"id": "11111111-2222-4333-8444-555555555555", "enabled": True, "consecutive_failures": 9}]]
+    reads = [
+        jobs,
+        [
+            {
+                "id": "11111111-2222-4333-8444-555555555555",
+                "enabled": True,
+                "consecutive_failures": 9,
+            }
+        ],
+    ]
     monkeypatch.setattr(mod, "psql_json", lambda *a, **k: reads.pop(0))
 
     written: dict[str, list] = {}
-    monkeypatch.setattr(mod, "post_rows", lambda _u, _k, table, rows: written.setdefault(table, rows) and 0)
+    monkeypatch.setattr(
+        mod, "post_rows", lambda _u, _k, table, rows: written.setdefault(table, rows) and 0
+    )
 
     assert mod.main(["--confirm-write-to", STAGING_REF, "--limit", "3"]) == 0
     assert written["sources"], "sources were never written"
-    assert all(s["enabled"] is False for s in written["sources"]), "an ENABLED source reached the write"
-    assert all(s["consecutive_failures"] == 0 for s in written["sources"])
+    # The COMPLETE forced payload, not just the field that comes to mind.
+    # Asserting only `enabled` is what let `disabled_at` through review once.
+    for row in written["sources"]:
+        for field, expected in mod._INERT_SOURCE_STATE.items():
+            assert row[field] == expected, (
+                f"source reached the write with {field}={row[field]!r}, expected {expected!r}"
+            )
 
 
 def test_main_refuses_before_writing_anything(monkeypatch) -> None:
@@ -205,3 +241,99 @@ def test_main_refuses_before_writing_anything(monkeypatch) -> None:
 
     assert mod.main(["--confirm-write-to", PRODUCTION_REF]) == 2
     assert calls == [], "a refused run touched the database"
+
+
+# ---------------------------------------------------------------------------
+# Auto-recovery: `enabled=False` alone does not keep a source off.
+# ---------------------------------------------------------------------------
+
+
+def test_disabled_at_is_cleared_so_auto_recovery_cannot_re_enable() -> None:
+    """`recover_stale_sources()` re-enables rows matching
+
+        enabled = false AND disabled_at IS NOT NULL AND disabled_at < now()-24h
+
+    so a production source auto-disabled long enough ago arrives carrying its
+    own re-enable order. NULL is the documented "manual, never override" value.
+    """
+    from scripts.sync_catalog_to_staging import disabled_source
+
+    out = disabled_source(
+        {
+            "id": "s1",
+            "enabled": False,
+            "disabled_at": "2020-01-01T00:00:00+00:00",  # ancient: eligible
+            "consecutive_failures": 7,
+        }
+    )
+    assert out["disabled_at"] is None
+    assert out["enabled"] is False
+
+
+def test_the_recovery_predicate_does_not_select_a_synced_source() -> None:
+    """Encode the poller's actual WHERE clause and run it against the output,
+    so this test fails if `recover_stale_sources()` is ever widened."""
+    from datetime import UTC, datetime, timedelta
+
+    from scripts.sync_catalog_to_staging import disabled_source
+
+    cutoff = datetime.now(UTC) - timedelta(hours=24)
+
+    def would_recover(row: dict) -> bool:
+        stamp = row.get("disabled_at")
+        return (
+            row.get("enabled") is False
+            and stamp is not None
+            and datetime.fromisoformat(stamp) < cutoff
+        )
+
+    ancient = {"id": "s", "enabled": True, "disabled_at": "2020-01-01T00:00:00+00:00"}
+    assert would_recover({**ancient, "enabled": False}), "predicate is vacuous"
+    assert not would_recover(disabled_source(ancient))
+
+
+def test_every_behavioural_source_column_is_forced() -> None:
+    """A production row with every field set to its most dangerous value must
+    come out fully inert -- catches a new column added to the table but not to
+    _INERT_SOURCE_STATE, which is how `disabled_at` was missed."""
+    from scripts.sync_catalog_to_staging import _INERT_SOURCE_STATE, disabled_source
+
+    hostile = {
+        "id": "s1",
+        "board_token": "acme",
+        "company_name": "Acme",
+        "enabled": True,
+        "disabled_at": "2020-01-01T00:00:00+00:00",
+        "last_polled_at": "2020-01-01T00:00:00+00:00",
+        "last_candidate_at": "2020-01-01T00:00:00+00:00",
+        "consecutive_failures": 42,
+        "job_count": 9999,
+    }
+    out = disabled_source(hostile)
+    assert out == {**hostile, **_INERT_SOURCE_STATE}
+    # Descriptive columns must survive -- this is a copy, not a wipe.
+    assert out["board_token"] == "acme"
+    assert out["company_name"] == "Acme"
+
+
+# ---------------------------------------------------------------------------
+# Direction: production -> not-production. BOTH halves.
+# ---------------------------------------------------------------------------
+
+
+def test_a_non_production_source_is_refused() -> None:
+    """Proving only that the destination is not production leaves the source
+    unconstrained: an empty local database would be copied over staging and
+    the run would report success."""
+    from scripts.sync_catalog_to_staging import SyncError, assert_safe_direction
+
+    with pytest.raises(SyncError, match="not production"):
+        assert_safe_direction(LOCAL_URL, STAGING_REST, STAGING_REF)
+
+
+def test_production_to_staging_is_allowed() -> None:
+    """The refusal above must not be satisfiable by refusing everything."""
+    from scripts.sync_catalog_to_staging import assert_safe_direction
+
+    src, dst = assert_safe_direction(PROD_POOLER, STAGING_REST, STAGING_REF)
+    assert (src, dst) == (PRODUCTION_REF, STAGING_REF)
