@@ -54,6 +54,39 @@ USAGE
     uv run python scripts/sync_catalog_to_staging.py \
         --confirm-write-to <staging-ref> --limit 5000 --dry-run
     # then drop --dry-run
+
+THIS IS AN ADDITIVE IMPORT, NOT A MIRROR
+The read excludes rows production has archived or purged, and merge-upsert
+never removes their existing staging copies, so repeated runs accumulate and
+staging drifts toward showing jobs production no longer serves. The word
+"sync" invites the opposite assumption, hence this paragraph.
+
+RESETTING STAGING
+There is deliberately no --replace flag. An earlier revision had one, and it
+was wrong: "clear jobs+sources" reads like two tables, but both carry inbound
+ON DELETE CASCADE, so the real blast radius enumerated against the live schema
+is eleven relationships —
+
+    jobs     <- analyses, job_feedback, notifications_sent, scores,
+                status_log, user_jobs, job_embeddings,
+                user_target_job_removals          (all CASCADE)
+             <- documents.job_posting_id          (SET NULL)
+    sources  <- jobs (and therefore all of the above again),
+                source_registrations              (both CASCADE)
+
+`user_jobs` is the user's saved and applied jobs — application-tracking state,
+not catalog. A flag advertised as a catalog refresh would silently destroy the
+seeded personas and any manual test state on staging, which is the opposite of
+what a disposable environment is FOR.
+
+If you genuinely need a clean catalog, do it deliberately and visibly:
+
+    supabase db reset --linked          # via `pnpm db:push`-style targeting
+    # then re-run this importer
+
+or write the TRUNCATE by hand, having read the list above. Neither is wrapped
+in a flag here on purpose: a destructive reset should cost more keystrokes
+than an additive import, and should not be one typo away from it.
 """
 
 from __future__ import annotations
@@ -184,8 +217,16 @@ def checked_limit(value: int) -> int:
 
 
 # The state every copied source is forced into, as data so the regression test
-# can assert the COMPLETE outgoing payload rather than the one field someone
-# remembered. Adding a behavioural column to `sources` means adding it here.
+# can assert the whole outgoing payload rather than the one field someone
+# remembered.
+#
+# Keeping this honest is the hard part, and prose has now failed twice: the
+# first revision missed `disabled_at`, the second still carried `last_error`
+# while its own comment claimed to be complete. So every column of `sources`
+# must appear either here or in _COPIED_AS_IS below, and an integration test
+# (tests/integration/test_sync_source_columns.py) reads the LIVE table and
+# fails on any column classified in neither. A new column cannot be added to
+# the table without someone deciding, in this file, what the sync does with it.
 #
 # `disabled_at` is the subtle one and is why this is a dict. Setting
 # `enabled=False` is not sufficient to keep a source inert, because
@@ -215,6 +256,12 @@ _INERT_SOURCE_STATE: dict[str, Any] = {
     "last_polled_at": None,
     "last_candidate_at": None,
     "consecutive_failures": 0,
+    # Failure diagnostics. Harmless to polling — nothing reads them to decide
+    # whether to poll — but staging would report PRODUCTION's last failure as
+    # its own, which is the kind of inherited noise that sends someone
+    # debugging an outage that happened in another database.
+    "last_error": None,
+    "last_error_at": None,
     # Denormalised counter the poller maintains. Production's value describes
     # production's catalog, not the subset copied here, so it would be wrong
     # either way; 0 is at least CONSISTENT with last_polled_at being NULL —
@@ -222,6 +269,27 @@ _INERT_SOURCE_STATE: dict[str, Any] = {
     # routers/sources.py and diagnostics, so a stale value is visible, not inert.
     "job_count": 0,
 }
+
+
+# Columns copied through unchanged, declared rather than assumed. Identity and
+# descriptive fields: they are the POINT of the import (a source with a blanked
+# board_token is not a real source), and none of them influences whether or how
+# the poller runs.
+#
+# Listed explicitly so the integration test can tell "deliberately copied" from
+# "nobody has looked at this yet". A new column defaults to neither, which is
+# what makes the test fail loudly instead of passing vacuously.
+_COPIED_AS_IS: frozenset[str] = frozenset(
+    {
+        "id",
+        "board_token",
+        "company_name",
+        "provider",
+        "domain",
+        "created_at",
+        "poll_interval_minutes",
+    }
+)
 
 
 def disabled_source(row: dict[str, Any]) -> dict[str, Any]:
@@ -312,34 +380,6 @@ def post_rows(base_url: str, key: str, table: str, rows: list[dict[str, Any]]) -
     return written
 
 
-def delete_all(base_url: str, key: str, dst_ref: str) -> None:
-    """Clear jobs then sources from a NON-PRODUCTION database.
-
-    Only reachable after ``assert_safe_direction`` has refused production, but
-    the destination is re-checked here anyway: this is the one code path that
-    destroys rows, and a future refactor that reorders the callers should not
-    be able to quietly point it at the live catalog.
-    """
-    if dst_ref == PRODUCTION_REF:
-        raise SyncError("REFUSING: delete_all was reached with production as the destination.")
-    import urllib.error
-    import urllib.request
-
-    for table in ("jobs", "sources"):  # jobs first — they reference sources
-        req = urllib.request.Request(  # noqa: S310 — scheme enforced by require_web_url
-            f"{base_url.rstrip('/')}/rest/v1/{table}?id=not.is.null",
-            method="DELETE",
-            headers={"apikey": key, "Authorization": f"Bearer {key}", "Prefer": "return=minimal"},
-        )
-        try:
-            urllib.request.urlopen(req, timeout=300)  # noqa: S310 — scheme enforced by require_web_url
-        except urllib.error.HTTPError as exc:
-            raise SyncError(
-                f"clearing {table} failed: HTTP {exc.code} {exc.read().decode()[:200]}"
-            ) from exc
-        print(f"    cleared {table}")
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Copy real jobs+sources into a non-production database."
@@ -350,11 +390,6 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=5000,
         help=f"most-recent jobs to copy (1..{MAX_LIMIT}, default 5000)",
-    )
-    ap.add_argument(
-        "--replace",
-        action="store_true",
-        help="clear staging's jobs+sources first, making this a snapshot rather than an additive import",
     )
     ap.add_argument(
         "--dry-run", action="store_true", help="report what would be copied, write nothing"
@@ -389,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"sync: {exc}", file=sys.stderr)
         return 2
     print(
-        f"sync: reading {src} -> writing {dst}  (limit {limit}, mode={'replace' if args.replace else 'additive'})"
+        f"sync: reading {src} -> writing {dst}  (limit {limit}, mode=additive)"
     )
 
     jobs = psql_json(
@@ -415,13 +450,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    would copy: {j.get('title')} | {j.get('company_name')}")
         return 0
 
-    # WITHOUT --replace this is an ADDITIVE import, not a mirror. The read
-    # excludes rows production has archived or purged, but merge-upsert never
-    # removes their existing staging copies — so repeated runs accumulate, and
-    # staging drifts into showing jobs production no longer serves. Named here
-    # because "sync" invites the opposite assumption.
-    if args.replace:
-        delete_all(write_url, write_key, dst)
+    # This is an ADDITIVE import, not a mirror — see RESETTING STAGING in the
+    # module docstring for why there is deliberately no --replace flag here.
     post_rows(write_url, write_key, "sources", sources)
     post_rows(write_url, write_key, "jobs", jobs)
     print(f"sync: done — {len(sources)} sources, {len(jobs)} jobs into {dst}.")
