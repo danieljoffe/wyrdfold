@@ -337,3 +337,18 @@ content_path = "./supabase/templates/confirm-signup.html"
 # break sign-in by rewriting every unmatched redirect to it.
 [remotes.staging]
 project_id = "dyczsvaoqhvnafwwxuvf"
+
+# Seeding is opt-in PER REMOTE and off by default — `db push --include-seed`
+# against a remote refuses unless the target says otherwise. Staging opts in:
+# it is a disposable environment whose whole job is to be reproducible, and the
+# seed is fictional data on an RFC 2606 domain with every source disabled, so
+# re-seeding it costs nothing and can poll nothing.
+#
+# There is deliberately NO equivalent block for [remotes.production]. Supabase's
+# default already refuses there, and that default is load-bearing: `db push
+# --include-seed` aimed at production would insert fictional companies into the
+# live catalog. Leaving the default in place means production refuses even if
+# someone types the flag by mistake — the same fail-closed posture as the
+# target guard itself.
+[remotes.staging.db.seed]
+enabled = true
