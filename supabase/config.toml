@@ -317,3 +317,23 @@ content_path = "./supabase/templates/magic-link.html"
 [remotes.production.auth.email.template.confirmation]
 subject = "Confirm your email to start using WyrdFold"
 content_path = "./supabase/templates/confirm-signup.html"
+
+# ----------------------------------------------------------------------------
+# STAGING (#1014). A second hosted project so verification of consequence stops
+# happening against production — in particular the Stripe live-mode subscribe
+# flow (#861), which cannot be rehearsed anywhere else.
+#
+# Declared here rather than anywhere new because `pnpm db:push` reads exactly
+# these blocks: the target is named on the command line, matched against the
+# CLI's sticky link, and refused on disagreement (apps/wyrdfold-api/scripts/
+# db_target_guard.py). Adding this block is what makes `--target staging` a
+# real target instead of a refusal — and, symmetrically, what makes pushing to
+# production while linked to staging impossible.
+#
+# NO [remotes.staging.auth] block yet: site_url and the redirect allowlist need
+# the staging frontend's URL, and the Vercel project does not exist. Adding one
+# with placeholder URLs would be worse than omitting it — `supabase config push`
+# applies immediately and does not prompt, so a wrong site_url would silently
+# break sign-in by rewriting every unmatched redirect to it.
+[remotes.staging]
+project_id = "dyczsvaoqhvnafwwxuvf"
