@@ -357,3 +357,110 @@ def test_a_redirect_flag_is_still_refused_when_the_target_is_wrong(monkeypatch, 
     mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=PROD)
     assert mod.main(["--target", "staging", "--run", "db push", "--local"]) == 2
     assert calls == []
+
+
+# --------------------------------------------------------------------------
+# The --run bypass.
+#
+# The first version of this guard validated only the tokens argparse left
+# over, and split --run straight into the command. So the allowlist was
+# bypassable through the interface the module docstring itself documents:
+# every check passed, "target 'staging' verified" printed, and the write went
+# to production. These tests exist because the guard was defeated once.
+# --------------------------------------------------------------------------
+
+PROD_URL = f"postgresql://postgres.{PROD}:pw@aws-1.pooler.supabase.com:5432/postgres"
+
+
+@pytest.mark.parametrize(
+    ("label", "argv"),
+    [
+        # Inside the --run string: the placement that actually got through.
+        ("inside --run", ["--target", "staging", "--run", f"db push --db-url {PROD_URL}"]),
+        # Appended after --target: the placement the first version did catch.
+        ("after --target", ["--target", "staging", "--run", "db push", "--db-url", PROD_URL]),
+        # The equals form of the same thing.
+        ("equals form", ["--target", "staging", "--run", f"db push --db-url={PROD_URL}"]),
+    ],
+)
+def test_the_production_url_attack_runs_nothing(monkeypatch, tmp_path, label, argv) -> None:
+    """Name staging, verify staging, hand the CLI production's URL."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    assert mod.main(argv) == 2, label
+    assert calls == [], f"{label}: a command ran despite the redirect flag"
+
+
+@pytest.mark.parametrize("flag", ["--db-url x", "--local", "--workdir /tmp/x", "--profile other"])
+def test_redirect_flags_inside_run_are_refused(monkeypatch, tmp_path, flag) -> None:
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    assert mod.main(["--target", "staging", "--run", f"db push {flag}"]) == 2
+    assert calls == []
+
+
+@pytest.mark.parametrize("command", ["db reset", "projects delete", "secrets list", "link"])
+def test_only_allowlisted_commands_run(monkeypatch, tmp_path, command) -> None:
+    """The command is allowlisted for the same reason the flags are. `db reset`
+    is the sharp one: it would drop and recreate the target database."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    assert mod.main(["--target", "staging", "--run", command]) == 2
+    assert calls == []
+
+
+@pytest.mark.parametrize("command", ["db push", "config push", "db pull", "migration list"])
+def test_allowlisted_commands_still_run(monkeypatch, tmp_path, command) -> None:
+    """Guards the refusals above against being satisfiable by refusing all."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    assert mod.main(["--target", "staging", "--run", command]) == 0
+    assert calls == [[SUPABASE, *command.split()]]
+
+
+def test_a_value_flag_with_no_value_is_refused(monkeypatch, tmp_path) -> None:
+    """Forwarding malformed argv may prompt interactively or be reinterpreted
+    by a future CLI version. Neither is something a guard should allow through
+    unexamined."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    assert mod.main(["--target", "staging", "--run", "db push --password"]) == 2
+    assert calls == []
+
+
+def test_a_quoted_value_survives_as_one_argument(monkeypatch, tmp_path) -> None:
+    """shlex, not str.split: splitting on whitespace would turn
+    `--password 'a b'` into three tokens and shift every later flag out of
+    alignment, so the wrong token would be validated as a flag."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    assert mod.main(["--target", "staging", "--run", "db push --password 'a b c'"]) == 0
+    assert calls == [[SUPABASE, "db", "push", "--password", "a b c"]]
+
+
+def test_unbalanced_quotes_refuse_instead_of_raising(monkeypatch, tmp_path) -> None:
+    """shlex raises ValueError on an unterminated quote; that must surface as a
+    refusal with exit 2, not a traceback."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    assert mod.main(["--target", "staging", "--run", "db push --password 'unterminated"]) == 2
+    assert calls == []
+
+
+def test_flags_from_both_placements_are_validated_together(monkeypatch, tmp_path) -> None:
+    """One allowed flag in each position, plus a redirect in one of them: the
+    single validation pass has to see all of them."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    assert (
+        mod.main(
+            [
+                "--target",
+                "staging",
+                "--run",
+                "db push --include-seed --db-url x",
+                "--dry-run",
+            ]
+        )
+        == 2
+    )
+    assert calls == []
+
+
+def test_both_placements_combine_when_all_are_allowed(monkeypatch, tmp_path) -> None:
+    """And the legitimate version of the same shape still works, in order."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    assert mod.main(["--target", "staging", "--run", "db push --include-seed", "--dry-run"]) == 0
+    assert calls == [[SUPABASE, "db", "push", "--include-seed", "--dry-run"]]

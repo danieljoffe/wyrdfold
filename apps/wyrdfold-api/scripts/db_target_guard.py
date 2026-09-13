@@ -52,12 +52,26 @@ USAGE
     uv run --project apps/wyrdfold-api python \
         apps/wyrdfold-api/scripts/db_target_guard.py \
         --target production --run 'db push'
+
+WHAT --run ACCEPTS
+An allowlisted command (``db push``, ``config push``, …) optionally followed
+by allowlisted flags. Both halves are checked, and so is anything appended
+after ``--target``: one validation pass over the complete argv.
+
+That is not how it started. The first version checked only the tokens argparse
+left over and split ``--run`` straight into the command, so
+
+    --target staging --run 'db push --db-url <production-url>'
+
+passed every check, printed "target 'staging' verified", and then wrote to
+production. A guard that certifies the wrong answer is worse than no guard.
 """
 
 from __future__ import annotations
 
 import argparse
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -101,6 +115,34 @@ _PROJECT_ID = re.compile(r"""^\s*project_id\s*=\s*["']([A-Za-z0-9]+)["']\s*(?:#.
 #
 # The asymmetry is deliberate. Over-refusing is a nuisance that prints the flag
 # name and two ways forward; over-permitting writes to the wrong database.
+# The COMMAND part of --run, as a fixed set of word sequences rather than an
+# opaque string.
+#
+# The first version validated only the tokens argparse left over, and split
+# --run straight into the command. That left the whole allowlist bypassable
+# through the documented interface:
+#
+#   --target staging --run 'db push --db-url <production-url>'
+#
+# `extra` is empty, so nothing was checked; `--db-url` went into the command;
+# and the guard printed "target 'staging' verified" before writing to
+# production. A control that certifies the wrong answer is worse than no
+# control -- it converts "we did not check" into "we checked and it is fine",
+# which is the #1028 lesson restated.
+#
+# So the command is an allowlist too. A new supabase subcommand needs a line
+# here, and that is the point: every argv this script executes is either a
+# word sequence someone approved or a flag someone approved.
+_ALLOWED_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
+    {
+        ("db", "push"),
+        ("db", "pull"),
+        ("config", "push"),
+        ("migration", "list"),
+        ("migration", "repair"),
+    }
+)
+
 _PASSTHROUGH_FLAGS: frozenset[str] = frozenset(
     {
         "--include-all",
@@ -116,9 +158,7 @@ _PASSTHROUGH_FLAGS: frozenset[str] = frozenset(
 # Allowed flags that consume the following token as their value. Tracked so a
 # value that happens to start with "-" (a password, say) is not itself mistaken
 # for an unrecognised flag and refused.
-_PASSTHROUGH_FLAGS_WITH_VALUE: frozenset[str] = frozenset(
-    {"--password", "-p", "--log-level"}
-)
+_PASSTHROUGH_FLAGS_WITH_VALUE: frozenset[str] = frozenset({"--password", "-p", "--log-level"})
 
 
 class GuardError(Exception):
@@ -219,7 +259,16 @@ def checked_passthrough(extra: list[str]) -> list[str]:
         # ``--flag=value`` is the same flag as ``--flag value``.
         name, sep, _value = token.partition("=")
         if name in _PASSTHROUGH_FLAGS_WITH_VALUE:
-            index += 1 if sep else 2  # skip the value token when separate
+            if sep:
+                index += 1
+                continue
+            # `--password` as the final token has no value. Forwarding it would
+            # hand the CLI malformed argv, which may prompt interactively or be
+            # reinterpreted by a future version -- neither is a thing a guard
+            # should let through unexamined.
+            if index + 1 >= len(extra):
+                raise GuardError(f"REFUSING: {name} expects a value and none followed it.")
+            index += 2
             continue
         if name in _PASSTHROUGH_FLAGS:
             index += 1
@@ -236,6 +285,43 @@ def checked_passthrough(extra: list[str]) -> list[str]:
             "  own the choice."
         )
     return extra
+
+
+def split_run(raw: str) -> tuple[list[str], list[str]]:
+    """Split ``--run`` into (command words, flags).
+
+    ``shlex`` rather than ``str.split`` so a quoted value survives as one
+    token; splitting on whitespace would turn ``--password 'a b'`` into three
+    tokens and shift every flag after it out of alignment.
+
+    The first bare word starts the command and the first token beginning with
+    ``-`` starts the flags. Anything after that is a flag or a flag's value,
+    and every one of them is validated -- including the ones that arrived
+    inside this string, which is precisely what the earlier version missed.
+    """
+    try:
+        tokens = shlex.split(raw)
+    except ValueError as exc:
+        raise GuardError(f"could not parse --run {raw!r}: {exc}") from exc
+    words: list[str] = []
+    for position, token in enumerate(tokens):
+        if token.startswith("-"):
+            return words, tokens[position:]
+        words.append(token)
+    return words, []
+
+
+def checked_command(words: list[str]) -> list[str]:
+    """The command to run, or a refusal naming what is allowed."""
+    if tuple(words) not in _ALLOWED_COMMANDS:
+        allowed = ", ".join(" ".join(c) for c in sorted(_ALLOWED_COMMANDS))
+        raise GuardError(
+            f"REFUSING: {' '.join(words)!r} is not an allowed command.\n"
+            f"  Allowed: {allowed}\n"
+            "  The command is allowlisted for the same reason the flags are:\n"
+            "  every argv this script runs has to be something a person approved."
+        )
+    return words
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -267,7 +353,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"db-target: {exc}", file=sys.stderr)
         return 2
 
-
     try:
         config_text = CONFIG_TOML.read_text(encoding="utf-8")
     except OSError as exc:
@@ -280,7 +365,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"db-target: {exc}", file=sys.stderr)
         return 2
 
-    base = args.run.split()
+    try:
+        base, run_flags = split_run(args.run)
+        # ONE validation pass over every flag that will be executed, whichever
+        # side of the command line it arrived on. Validating only `extra` is
+        # what let `--run 'db push --db-url <prod>'` through.
+        passthrough = checked_passthrough([*run_flags, *passthrough])
+        if base:
+            base = checked_command(base)
+    except GuardError as exc:
+        print(f"db-target: {exc}", file=sys.stderr)
+        return 2
+
     if not base:
         if passthrough:
             # Without --run there is no command for these to attach to, and
@@ -309,7 +405,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    print(f"db-target: target {args.target!r} verified (project {ref}) — running: supabase {' '.join(command)}")
+    print(
+        # shlex.join, not " ".join: a quoted value renders as one token, so the
+        # line the operator reads matches the argv that actually runs.
+        f"db-target: target {args.target!r} verified (project {ref}) — "
+        f"running: supabase {shlex.join(command)}"
+    )
     return subprocess.call([binary, *command], cwd=REPO_ROOT)  # noqa: S603 — fixed argv, resolved binary
 
 
