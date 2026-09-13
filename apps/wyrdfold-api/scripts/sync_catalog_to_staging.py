@@ -80,6 +80,12 @@ BATCH = 500
 
 SAFE_TABLES = ("sources", "jobs")
 
+# Upper bound on a single run. Production holds ~88k live jobs; the point of
+# this script is a WORKING SLICE, not a clone, and staging runs on the smallest
+# compute tier. A cap makes "I typed an extra zero" a refusal instead of a long
+# transfer nobody meant to start.
+MAX_LIMIT = 25_000
+
 
 class SyncError(Exception):
     """A refusal, written for the operator."""
@@ -137,6 +143,41 @@ def assert_safe_direction(read_url: str, write_url: str, confirmed: str) -> tupl
 
 
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def checked_limit(value: int) -> int:
+    """Refuse a limit that is not a deliberate, bounded row count.
+
+    Postgres rejects a negative LIMIT outright ("LIMIT must not be negative"),
+    so a negative value fails anyway — but it fails deep inside a psql call
+    with a message about SQL, which tells the operator nothing about the flag
+    they mistyped. Zero is accepted by Postgres and silently copies nothing,
+    which looks like success. Both refuse here, at the boundary, by name.
+    """
+    if value < 1:
+        raise SyncError(f"--limit must be at least 1, got {value}")
+    if value > MAX_LIMIT:
+        raise SyncError(
+            f"--limit {value} exceeds the {MAX_LIMIT} cap. This copies a working slice, "
+            "not the whole catalog; raise MAX_LIMIT deliberately if you really mean it."
+        )
+    return value
+
+
+def disabled_source(row: dict[str, Any]) -> dict[str, Any]:
+    """A source row rendered safe to insert into a non-production database.
+
+    Forced, never defaulted. An enabled copy lets staging poll a real ATS board,
+    and a poll that finds none of that source's jobs ARCHIVES them — staging
+    would delete the catalog this script just imported. The polling bookkeeping
+    is reset too, so staging does not inherit production's failure counters and
+    immediately look unhealthy.
+    """
+    out = dict(row)
+    out["enabled"] = False
+    out["last_polled_at"] = None
+    out["consecutive_failures"] = 0
+    return out
 
 
 def uuid_in_list(values: list[str]) -> str:
@@ -215,10 +256,41 @@ def post_rows(base_url: str, key: str, table: str, rows: list[dict[str, Any]]) -
     return written
 
 
+def delete_all(base_url: str, key: str, dst_ref: str) -> None:
+    """Clear jobs then sources from a NON-PRODUCTION database.
+
+    Only reachable after ``assert_safe_direction`` has refused production, but
+    the destination is re-checked here anyway: this is the one code path that
+    destroys rows, and a future refactor that reorders the callers should not
+    be able to quietly point it at the live catalog.
+    """
+    if dst_ref == PRODUCTION_REF:
+        raise SyncError("REFUSING: delete_all was reached with production as the destination.")
+    import urllib.error
+    import urllib.request
+
+    for table in ("jobs", "sources"):  # jobs first — they reference sources
+        req = urllib.request.Request(  # noqa: S310 — scheme enforced by require_web_url
+            f"{base_url.rstrip('/')}/rest/v1/{table}?id=not.is.null",
+            method="DELETE",
+            headers={"apikey": key, "Authorization": f"Bearer {key}", "Prefer": "return=minimal"},
+        )
+        try:
+            urllib.request.urlopen(req, timeout=300)  # noqa: S310 — scheme enforced by require_web_url
+        except urllib.error.HTTPError as exc:
+            raise SyncError(f"clearing {table} failed: HTTP {exc.code} {exc.read().decode()[:200]}") from exc
+        print(f"    cleared {table}")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Copy real jobs+sources into a non-production database.")
     ap.add_argument("--confirm-write-to", required=True, help="project ref of the write target")
-    ap.add_argument("--limit", type=int, default=5000, help="most-recent jobs to copy (default 5000)")
+    ap.add_argument("--limit", type=int, default=5000, help=f"most-recent jobs to copy (1..{MAX_LIMIT}, default 5000)")
+    ap.add_argument(
+        "--replace",
+        action="store_true",
+        help="clear staging's jobs+sources first, making this a snapshot rather than an additive import",
+    )
     ap.add_argument("--dry-run", action="store_true", help="report what would be copied, write nothing")
     args = ap.parse_args(argv)
 
@@ -239,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
+        limit = checked_limit(args.limit)
         src, dst = assert_safe_direction(read_url, write_url, args.confirm_write_to)
     except SyncError as exc:
         print(f"sync: {exc}", file=sys.stderr)
@@ -248,12 +321,12 @@ def main(argv: list[str] | None = None) -> int:
     except SyncError as exc:
         print(f"sync: {exc}", file=sys.stderr)
         return 2
-    print(f"sync: reading {src} -> writing {dst}  (limit {args.limit})")
+    print(f"sync: reading {src} -> writing {dst}  (limit {limit}, mode={'replace' if args.replace else 'additive'})")
 
     jobs = psql_json(
         read_url,
         "SELECT * FROM public.jobs WHERE archived_at IS NULL AND purged_at IS NULL "  # noqa: S608 — only interpolation is an int() cast
-        f"ORDER BY cataloged_at DESC NULLS LAST LIMIT {int(args.limit)}",
+        f"ORDER BY cataloged_at DESC NULLS LAST LIMIT {limit}",
     )
     if not jobs:
         print("sync: no jobs matched; nothing to do.")
@@ -264,13 +337,7 @@ def main(argv: list[str] | None = None) -> int:
         f"SELECT * FROM public.sources WHERE id IN ({uuid_in_list(source_ids)})",  # noqa: S608 — ids UUID-validated by uuid_in_list
     )
 
-    # Forced, not defaulted. A copied-enabled source would let staging poll a
-    # real board, and a poll that finds none of its jobs archives them — the
-    # catalog this script just imported would delete itself.
-    for s in sources:
-        s["enabled"] = False
-        s["last_polled_at"] = None
-        s["consecutive_failures"] = 0
+    sources = [disabled_source(r) for r in sources]
 
     print(f"sync: {len(jobs)} jobs across {len(sources)} sources (all forced enabled=false)")
     if args.dry_run:
@@ -279,6 +346,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    would copy: {j.get('title')} | {j.get('company_name')}")
         return 0
 
+    # WITHOUT --replace this is an ADDITIVE import, not a mirror. The read
+    # excludes rows production has archived or purged, but merge-upsert never
+    # removes their existing staging copies — so repeated runs accumulate, and
+    # staging drifts into showing jobs production no longer serves. Named here
+    # because "sync" invites the opposite assumption.
+    if args.replace:
+        delete_all(write_url, write_key, dst)
     post_rows(write_url, write_key, "sources", sources)
     post_rows(write_url, write_key, "jobs", jobs)
     print(f"sync: done — {len(sources)} sources, {len(jobs)} jobs into {dst}.")
