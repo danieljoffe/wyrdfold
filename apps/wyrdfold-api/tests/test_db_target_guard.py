@@ -19,6 +19,9 @@ from scripts.db_target_guard import (
 
 PROD = "swxiuutaikxbirauivjg"
 STAGING = "stagingrefaaaaaaaa"
+# Where _wire pins the CLI, so assertions name the argv the guard builds
+# rather than wherever this machine keeps the binary.
+SUPABASE = "/usr/local/bin/supabase"
 
 CONFIG = f"""
 project_id = "wyrdfold"
@@ -162,11 +165,15 @@ def _wire(monkeypatch, tmp_path, *, config: str, linked: str | None):
     monkeypatch.setattr(mod, "CONFIG_TOML", cfg)
     monkeypatch.setattr(mod, "LINK_FILE", link)
     calls: list[list[str]] = []
-    monkeypatch.setattr(mod, "subprocess", type("S", (), {"call": staticmethod(lambda c, **k: calls.append(c) or 0)}))
+    monkeypatch.setattr(
+        mod,
+        "subprocess",
+        type("S", (), {"call": staticmethod(lambda c, **k: calls.append(c) or 0)}),
+    )
     # The guard resolves `supabase` via shutil.which so a missing CLI refuses
     # instead of raising. Pin it here: the test asserts the argv it builds, not
     # where this machine happens to keep the binary.
-    monkeypatch.setattr(mod.shutil, "which", lambda _name: "/usr/local/bin/supabase")
+    monkeypatch.setattr(mod.shutil, "which", lambda _name: SUPABASE)
     return mod, calls
 
 
@@ -174,7 +181,7 @@ def test_verified_target_runs_exactly_the_named_command(monkeypatch, tmp_path) -
     mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=PROD)
     rc = mod.main(["--target", "production", "--run", "db push"])
     assert rc == 0
-    assert calls == [["/usr/local/bin/supabase", "db", "push"]]
+    assert calls == [[SUPABASE, "db", "push"]]
 
 
 def test_refusal_runs_nothing(monkeypatch, tmp_path) -> None:
@@ -207,4 +214,146 @@ def test_missing_supabase_cli_refuses_instead_of_raising(monkeypatch, tmp_path) 
     mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=PROD)
     monkeypatch.setattr(mod.shutil, "which", lambda _name: None)
     assert mod.main(["--target", "production", "--run", "db push"]) == 2
+    assert calls == []
+
+
+# --------------------------------------------------------------------------
+# Pass-through flags.
+#
+# `pnpm db:push --target staging --include-seed` must reach the CLI, but the
+# mechanism that allows it must not become a way around the guard: several
+# supabase flags choose a DIFFERENT database than the one just verified.
+# --------------------------------------------------------------------------
+
+
+def test_allowed_flag_reaches_the_cli(monkeypatch, tmp_path) -> None:
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    rc = mod.main(["--target", "staging", "--run", "db push", "--include-seed"])
+    assert rc == 0
+    assert calls == [[SUPABASE, "db", "push", "--include-seed"]]
+
+
+def test_several_allowed_flags_keep_their_order(monkeypatch, tmp_path) -> None:
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    rc = mod.main(["--target", "staging", "--run", "db push", "--include-seed", "--dry-run"])
+    assert rc == 0
+    assert calls == [[SUPABASE, "db", "push", "--include-seed", "--dry-run"]]
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--db-url",  # writes to an arbitrary connection string
+        "--local",  # writes to the local db, making the named target a lie
+        "--workdir",  # different config.toml AND different .temp/project-ref
+        "--profile",  # resolves the project against other credentials
+    ],
+)
+def test_target_redirecting_flags_are_refused(monkeypatch, tmp_path, flag) -> None:
+    """These would defeat the guard, not merely bypass it: every check passes,
+    and then the write lands somewhere else entirely."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    rc = mod.main(["--target", "staging", "--run", "db push", flag, "value"])
+    assert rc == 2
+    assert calls == [], f"{flag} must not reach the CLI"
+
+
+def test_the_actual_attack_writes_nothing(monkeypatch, tmp_path) -> None:
+    """Name staging, verify staging, then hand the CLI production's URL."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    rc = mod.main(
+        [
+            "--target",
+            "staging",
+            "--run",
+            "db push",
+            "--db-url",
+            f"postgresql://postgres.{PROD}:pw@aws-1.pooler.supabase.com:5432/postgres",
+        ]
+    )
+    assert rc == 2
+    assert calls == []
+
+
+def test_equals_form_of_a_redirect_flag_is_refused(monkeypatch, tmp_path) -> None:
+    """`--db-url=x` must be refused like `--db-url x`.
+
+    Note this passes on the allowlist alone -- an unrecognised whole token is
+    refused whether or not "=" is understood. It is here as a boundary case,
+    not as cover for the parsing; `--log-level=debug` below is what actually
+    exercises that.
+    """
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    rc = mod.main(["--target", "staging", "--run", "db push", "--db-url=postgres://x"])
+    assert rc == 2
+    assert calls == []
+
+
+def test_equals_form_of_an_allowed_value_flag_is_forwarded(monkeypatch, tmp_path) -> None:
+    """This is what splitting on "=" buys. Treating the token whole would leave
+    `--log-level=debug` unrecognised and refuse a legitimate command."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    rc = mod.main(["--target", "staging", "--run", "db push", "--log-level=debug"])
+    assert rc == 0
+    assert calls == [[SUPABASE, "db", "push", "--log-level=debug"]]
+
+
+def test_separate_value_form_does_not_swallow_the_next_flag(monkeypatch, tmp_path) -> None:
+    """`--log-level debug --db-url x`: the value is skipped, but scanning must
+    resume in time to still catch the redirect that follows it."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    rc = mod.main(
+        [
+            "--target",
+            "staging",
+            "--run",
+            "db push",
+            "--log-level",
+            "debug",
+            "--db-url",
+            "postgres://x",
+        ]
+    )
+    assert rc == 2
+    assert calls == []
+
+
+def test_unknown_flag_refuses_rather_than_forwarding(monkeypatch, tmp_path) -> None:
+    """The default for anything unrecognised is refusal -- a future supabase
+    release adding a redirecting flag must not pass straight through."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    rc = mod.main(["--target", "staging", "--run", "db push", "--brand-new-flag"])
+    assert rc == 2
+    assert calls == []
+
+
+def test_password_value_starting_with_dash_is_not_mistaken_for_a_flag(
+    monkeypatch, tmp_path
+) -> None:
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    rc = mod.main(["--target", "staging", "--run", "db push", "--password", "-secret"])
+    assert rc == 0
+    assert calls == [[SUPABASE, "db", "push", "--password", "-secret"]]
+
+
+def test_flags_without_a_run_command_refuse(monkeypatch, tmp_path) -> None:
+    """Forwarding them alone would invoke bare `supabase --include-seed`."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    assert mod.main(["--target", "staging", "--include-seed"]) == 2
+    assert calls == []
+
+
+def test_a_bare_word_is_refused(monkeypatch, tmp_path) -> None:
+    """The command belongs in --run; a stray positional would be forwarded as
+    an argument to it."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    assert mod.main(["--target", "staging", "--run", "db push", "reset"]) == 2
+    assert calls == []
+
+
+def test_a_redirect_flag_is_still_refused_when_the_target_is_wrong(monkeypatch, tmp_path) -> None:
+    """Order matters: the target check must not be what saves us here, or the
+    allowlist would be untested whenever the link happens to disagree."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=PROD)
+    assert mod.main(["--target", "staging", "--run", "db push", "--local"]) == 2
     assert calls == []
