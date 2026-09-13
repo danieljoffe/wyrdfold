@@ -280,3 +280,111 @@ def test_production_refusal_reaches_no_write(monkeypatch) -> None:
     monkeypatch.setenv("STAGING_SERVICE_KEY", "sb_secret_test")
     assert mod.main(["--confirm-write-to", PRODUCTION_REF]) == 2
     assert calls == []
+
+
+# --- the invite write is the lock, so it must fail closed -----------------
+
+
+def _fake_transport(monkeypatch, *, invite_status: int = 201):
+    """Record every request; let the caller break the invite write."""
+    import scripts.seed_staging_users as mod
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_request(url, key, method, path, body=None):
+        calls.append((method, path))
+        if "wyrdfold_beta_invites" in path:
+            return invite_status, ([] if invite_status < 300 else {"message": "nope"})
+        if path.startswith("/auth/v1/admin/generate_link"):
+            return 200, {"action_link": "https://example.invalid/verify?token=x"}
+        if path.startswith("/auth/v1/admin/users") and method == "POST":
+            return 201, {"id": "00000000-0000-4000-8000-000000000001"}
+        return 201, []
+
+    monkeypatch.setattr(mod, "_request", fake_request)
+    monkeypatch.setenv("STAGING_SUPABASE_URL", STAGING_URL)
+    monkeypatch.setenv("STAGING_SERVICE_KEY", "sb_secret_test")
+    return mod, calls
+
+
+def test_a_failed_invite_creates_no_account(monkeypatch) -> None:
+    """The ordering comment claims a partial failure leaves a recoverable
+    state. That is only true if a failed invite STOPS us — otherwise we create
+    an account the auth hook will refuse, which is the exact state the ordering
+    was supposed to prevent, reported as success."""
+    mod, calls = _fake_transport(monkeypatch, invite_status=500)
+    with pytest.raises(SeedError, match="invite write failed"):
+        mod.main(["--confirm-write-to", STAGING_REF])
+    assert not any("admin/users" in p for _m, p in calls), (
+        "an auth user was created after the invite failed"
+    )
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 409, 500, 503])
+def test_every_failing_invite_status_stops_the_run(monkeypatch, status) -> None:
+    """409 included: with merge-duplicates an existing invite returns 200, so a
+    409 means the header is gone and this is a real conflict, not a re-run."""
+    mod, calls = _fake_transport(monkeypatch, invite_status=status)
+    with pytest.raises(SeedError):
+        mod.main(["--confirm-write-to", STAGING_REF])
+    assert not any("admin/users" in p for _m, p in calls)
+
+
+@pytest.mark.parametrize("status", [200, 201])
+def test_both_success_statuses_are_accepted(monkeypatch, status) -> None:
+    """Measured against the real API: merge-duplicates returns 200 for an
+    existing email and 201 for a new one. Accepting only 201 would make every
+    re-run fail; accepting anything would make the check useless."""
+    mod, calls = _fake_transport(monkeypatch, invite_status=status)
+    assert mod.main(["--confirm-write-to", STAGING_REF]) == 0
+    assert any("admin/users" in p for _m, p in calls)
+
+
+def test_invite_write_still_carries_the_merge_header() -> None:
+    """Without `resolution=merge-duplicates` an existing invite returns 409 —
+    verified against staging. The header is what makes 200 possible, so the
+    status check above and this header have to travel together."""
+    import inspect
+
+    import scripts.seed_staging_users as mod
+
+    assert "resolution=merge-duplicates" in inspect.getsource(mod._request)
+
+
+# --- getting in ------------------------------------------------------------
+
+
+def test_login_links_are_not_printed_by_default(monkeypatch, capsys) -> None:
+    """They are live credentials for a staging account. Opt-in, not ambient."""
+    mod, calls = _fake_transport(monkeypatch)
+    assert mod.main(["--confirm-write-to", STAGING_REF]) == 0
+    assert not any("generate_link" in p for _m, p in calls)
+    out = capsys.readouterr().out
+    assert "--login-links" in out, "the run should say how to actually sign in"
+
+
+def test_login_links_uses_the_admin_endpoint_that_sends_no_mail(monkeypatch) -> None:
+    """`admin/generate_link` RETURNS the link. Using the ordinary OTP endpoint
+    would mail an unroutable address and hand back nothing."""
+    mod, calls = _fake_transport(monkeypatch)
+    assert mod.main(["--confirm-write-to", STAGING_REF, "--login-links"]) == 0
+    generated = [p for _m, p in calls if "generate_link" in p]
+    assert len(generated) == len(PERSONAS), "not every persona got a link"
+    assert not any(p == "/auth/v1/otp" for _m, p in calls), "this would send mail"
+
+
+def test_a_failed_link_is_a_refusal_not_a_blank(monkeypatch) -> None:
+    """Printing an empty line where a credential should be is worse than
+    failing: it reads as 'no link needed'."""
+    import scripts.seed_staging_users as mod
+
+    monkeypatch.setattr(mod, "_request", lambda *a, **k: (500, {"msg": "down"}))
+    with pytest.raises(SeedError, match="could not generate a login link"):
+        mod.generate_login_link(STAGING_URL, "k", "priya.raghavan@example.com")
+
+
+def test_dry_run_generates_no_links(monkeypatch) -> None:
+    """--dry-run must not mint credentials as a side effect."""
+    mod, calls = _fake_transport(monkeypatch)
+    assert mod.main(["--confirm-write-to", STAGING_REF, "--dry-run", "--login-links"]) == 0
+    assert calls == []

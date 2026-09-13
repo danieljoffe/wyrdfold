@@ -32,6 +32,15 @@ Writes users. Refuses if the destination resolves to production, reusing
 one copy of the identity logic means it cannot drift into disagreeing with
 itself about which database is production.
 
+GETTING IN
+Confirming an address marks it verified; it does not hand anyone a way in.
+The product is magic-link only and example.com is unroutable by design, so a
+seeded persona is unreachable through the normal path unless you ask for a
+link. ``--login-links`` prints one-time sign-in links via the admin API, which
+RETURNS them instead of mailing them — the closed-signup hook is untouched and
+staging keeps refusing everyone not on the allowlist. Those links are live
+credentials, which is why they are opt-in rather than printed every run.
+
 USAGE
     cd apps/wyrdfold-api
     export STAGING_SUPABASE_URL=https://<ref>.supabase.co
@@ -40,6 +49,10 @@ USAGE
     uv run python scripts/seed_staging_users.py \
         --confirm-write-to <staging-ref> --dry-run
     # then drop --dry-run
+
+    # and to actually sign in as one of them:
+    uv run python scripts/seed_staging_users.py \
+        --confirm-write-to <staging-ref> --login-links
 """
 
 from __future__ import annotations
@@ -191,6 +204,36 @@ def profile_row(persona: dict[str, Any], user_id: str, now: datetime) -> dict[st
     }
 
 
+def generate_login_link(url: str, key: str, email: str) -> str:
+    """A one-time sign-in link for a persona, WITHOUT sending mail.
+
+    Confirming an address only marks it verified; it does not hand anyone a way
+    in. The product is magic-link only and example.com is deliberately
+    unroutable, so a seeded persona is unreachable through the normal path --
+    the accounts exist, carry profiles, and nobody can sign in as them.
+
+    `admin/generate_link` closes that without touching the closed-signup hook:
+    it RETURNS the action link instead of emailing it, so the allowlist keeps
+    refusing everyone else exactly as before. The alternative -- giving
+    personas passwords, or routing staging mail somewhere catchable -- would
+    each widen the perimeter to solve an operator-convenience problem.
+
+    The returned link is a CREDENTIAL. It is single-use and short-lived, but it
+    is a live session for that account, which is why printing them is opt-in
+    rather than part of every run.
+    """
+    status, payload = _request(
+        url,
+        key,
+        "POST",
+        "/auth/v1/admin/generate_link",
+        {"type": "magiclink", "email": email},
+    )
+    if status != 200 or not isinstance(payload, dict) or not payload.get("action_link"):
+        raise SeedError(f"could not generate a login link for {email}: {status} {payload!r}")
+    return str(payload["action_link"])
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="seed_staging_users",
@@ -205,6 +248,14 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run",
         action="store_true",
         help="report what would be created, write nothing",
+    )
+    ap.add_argument(
+        "--login-links",
+        action="store_true",
+        help=(
+            "after seeding, print a one-time sign-in link per persona. These "
+            "are live credentials for staging accounts - opt-in on purpose."
+        ),
     )
     args = ap.parse_args(argv)
 
@@ -237,7 +288,25 @@ def main(argv: list[str] | None = None) -> int:
         # The allowlist FIRST. If the run dies midway, the state it leaves is
         # "invited but no account" -- recoverable by signing in. The reverse
         # order would leave an account that the auth hook refuses to admit.
-        _request(write_url, key, "POST", "/rest/v1/wyrdfold_beta_invites", [{"email": email}])
+        # CHECKED, not fire-and-forget. This write IS the lock, and the
+        # comment above claims the ordering makes a partial failure safe --
+        # which is only true if a failed invite STOPS us. Discarding the status
+        # and creating the account anyway produces exactly the state the
+        # ordering was supposed to prevent, while printing progress as if it
+        # had worked.
+        #
+        # 200 and 201 are both success here, measured rather than assumed:
+        # with `resolution=merge-duplicates` an existing email returns 200 and
+        # a new one 201. Without that header the same write returns 409, which
+        # is the evidence that the header is load-bearing.
+        status, payload = _request(
+            write_url, key, "POST", "/rest/v1/wyrdfold_beta_invites", [{"email": email}]
+        )
+        if status not in (200, 201):
+            raise SeedError(
+                f"invite write failed for {email}: {status} {payload!r}. "
+                "Refusing to create an account the auth hook would then reject."
+            )
         user_id = ensure_auth_user(write_url, key, email)
 
         status, payload = _request(
@@ -276,6 +345,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {email:<32} plan={persona['plan']:<8} id={user_id[:8]}…")
 
     print(f"seed: done — {len(PERSONAS)} personas in {dst}.")
+
+    if args.login_links:
+        print(
+            "\nseed: one-time sign-in links (single-use, short-lived, and a "
+            "live session for that account — do not paste them anywhere shared):"
+        )
+        for persona in PERSONAS:
+            link = generate_login_link(write_url, key, persona["email"])
+            print(f"  {persona['email']}\n    {link}")
+    else:
+        print(
+            "seed: personas cannot receive mail (example.com is unroutable). "
+            "Re-run with --login-links for one-time sign-in links."
+        )
     return 0
 
 
