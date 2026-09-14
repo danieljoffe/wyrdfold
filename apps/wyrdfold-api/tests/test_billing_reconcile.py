@@ -76,8 +76,17 @@ def sub(customer: str, price: str, status: str = "active", sid: str = "sub_1") -
 class FakeStripe:
     """Paginates like Stripe: `.data` + `.has_more`, cursor via starting_after."""
 
-    def __init__(self, pages: list[list[dict[str, Any]]], *, explode: bool = False):
+    def __init__(
+        self,
+        pages: list[list[Any]],
+        *,
+        explode: bool = False,
+        recheck_pages: list[list[Any]] | None = None,
+    ):
         self.pages = pages
+        # What the per-customer re-check sees, when it differs from the bulk
+        # snapshot. Models the real hazard: Stripe's answer changing mid-sweep.
+        self.recheck_pages = recheck_pages
         self.explode = explode
         self.calls: list[dict[str, Any]] = []
         self.subscriptions = self
@@ -86,6 +95,23 @@ class FakeStripe:
         if self.explode:
             raise RuntimeError("stripe is down")
         self.calls.append(dict(params))
+
+        # Stripe filters server-side when `customer` is passed. The fake must
+        # too, or the per-customer re-check would read the whole snapshot back
+        # and the freshness fix would be testing nothing.
+        if params.get("customer"):
+            wanted = params["customer"]
+            source = self.recheck_pages if self.recheck_pages is not None else self.pages
+            rows = [x for page in source for x in page if x.customer == wanted]
+
+            class Filtered:
+                pass
+
+            f = Filtered()
+            f.data = rows
+            f.has_more = False
+            return f
+
         after = params.get("starting_after")
         index = 0
         if after:
@@ -115,7 +141,11 @@ class FakeDB:
         self.read_fails = read_fails
         self.write_fails = write_fails
         self.writes: list[tuple[str, dict[str, Any]]] = []
+        # Every eq() filter attached to each write, so a test can assert the
+        # compare-and-set is present rather than trusting it is.
+        self.write_filters: list[dict[str, Any]] = []
         self._update: dict[str, Any] | None = None
+        self._filters: dict[str, Any] = {}
 
     def table(self, _name: str):
         return self
@@ -134,17 +164,22 @@ class FakeDB:
         self._update = payload
         return self
 
-    def eq(self, _col: str, value: str):
-        self._eq = value
+    def eq(self, col: str, value: Any):
+        # Chained eq() calls ACCUMULATE, as in postgrest — they do not replace
+        # one another. The first version overwrote, which hid the CAS filter.
+        self._filters[col] = value
         return self
 
     async def execute(self):
         if self._update is not None:
             if self.write_fails:
                 self._update = None
+                self._filters = {}
                 raise RuntimeError("write failed")
-            self.writes.append((self._eq, dict(self._update)))
+            self.writes.append((self._filters.get("user_id"), dict(self._update)))
+            self.write_filters.append(dict(self._filters))
             self._update = None
+            self._filters = {}
 
             class R:
                 pass
@@ -152,6 +187,7 @@ class FakeDB:
             r = R()
             r.data = []
             return r
+        self._filters = {}
         if self.read_fails:
             raise RuntimeError("read failed")
 
@@ -516,3 +552,100 @@ def test_the_module_writes_only_the_plan_column() -> None:
         ):
             keys = {k.value for k in node.args[0].keys if isinstance(k, ast.Constant)}
             assert keys == {"plan"}, f"writes columns beyond 'plan': {sorted(keys)}"
+
+
+# --- the stale-snapshot race ---------------------------------------------
+#
+# The bulk snapshot is taken before the profile read and long before the
+# write. A cancellation landing in between made the sweep write the stale paid
+# plan back — and because it never downgrades, nothing would ever take it away
+# again. Permanent paid access after cancellation.
+# -------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_cancellation_between_snapshot_and_write_is_not_healed() -> None:
+    """The exact interleaving:
+
+        1. sweep snapshots Stripe  -> customer is on an ACTIVE starter
+        2. customer cancels; the webhook sets plan=free
+        3. sweep reads profiles    -> free
+        4. sweep would upgrade from the STALE snapshot
+
+    Step 4 must not happen. `recheck_pages` is what Stripe reports when asked
+    again about that one customer — here, a cancelled subscription.
+    """
+    db = FakeDB([profile("u1", "free", "cus_1")])
+    stripe = FakeStripe(
+        [[sub("cus_1", STARTER, "active")]],  # the stale snapshot
+        recheck_pages=[[sub("cus_1", STARTER, "canceled")]],  # the truth now
+    )
+    report = await reconcile_billing(db, client=stripe)
+    assert db.writes == [], "restored paid access to a cancelled customer"
+    assert report["healed"] == 0
+    assert report["stale_skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_downgrade_between_snapshot_and_write_is_not_healed() -> None:
+    """Same race, softer form: pro in the snapshot, starter by the time we write."""
+    db = FakeDB([profile("u1", "free", "cus_1")])
+    stripe = FakeStripe(
+        [[sub("cus_1", PRO, "active")]],
+        recheck_pages=[[sub("cus_1", STARTER, "active")]],
+    )
+    report = await reconcile_billing(db, client=stripe)
+    assert db.writes == [], "wrote a plan Stripe no longer entitles"
+    assert report["stale_skipped"] == 1
+
+
+@pytest.mark.asyncio
+async def test_the_recheck_is_scoped_to_one_customer() -> None:
+    """Re-reading the whole catalogue per heal would make the sweep O(users)
+    in Stripe calls. It must ask about the single customer being healed."""
+    db = FakeDB([profile("u1", "free", "cus_1")])
+    stripe = FakeStripe([[sub("cus_1", STARTER)]])
+    await reconcile_billing(db, client=stripe)
+    rechecks = [c for c in stripe.calls if c.get("customer")]
+    assert len(rechecks) == 1
+    assert rechecks[0]["customer"] == "cus_1"
+
+
+@pytest.mark.asyncio
+async def test_no_recheck_happens_when_nothing_needs_healing() -> None:
+    """The common case must stay a single bulk call — the re-check is the rare
+    path, which is what makes it affordable."""
+    db = FakeDB([profile("u1", "starter", "cus_1")])
+    stripe = FakeStripe([[sub("cus_1", STARTER)]])
+    await reconcile_billing(db, client=stripe)
+    assert [c for c in stripe.calls if c.get("customer")] == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_recheck_does_not_heal() -> None:
+    """If Stripe cannot be re-asked, the honest answer is to wait for the next
+    pass — not to fall back on the snapshot we already distrust."""
+
+    class FlakyRecheck(FakeStripe):
+        def list(self, params: dict[str, Any]):
+            if params.get("customer"):
+                raise RuntimeError("stripe timed out")
+            return super().list(params)
+
+    db = FakeDB([profile("u1", "free", "cus_1")])
+    report = await reconcile_billing(db, client=FlakyRecheck([[sub("cus_1", STARTER)]]))
+    assert db.writes == []
+    assert report["healed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_write_is_a_compare_and_set() -> None:
+    """Closes the second window: a webhook writing between our profile read and
+    our update must not be clobbered. Not sufficient alone — a cancellation
+    BEFORE the profile read leaves the row already `free`, so the CAS matches —
+    which is why the fresh re-check above carries the real weight."""
+    db = FakeDB([profile("u1", "free", "cus_1")])
+    await reconcile_billing(db, client=FakeStripe([[sub("cus_1", STARTER)]]))
+    assert db.write_filters == [{"user_id": "u1", "plan": "free"}], (
+        "the heal did not constrain on the plan it read"
+    )

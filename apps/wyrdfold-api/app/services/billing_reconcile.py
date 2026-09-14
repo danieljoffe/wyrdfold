@@ -174,6 +174,30 @@ def _list_all_subscriptions(client: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _entitled_plan_now(client: Any, customer_id: str) -> str | None:
+    """Re-ask Stripe about ONE customer. Blocking — call via ``to_thread``.
+
+    The bulk snapshot is unavoidably stale by the time a heal is written, and
+    stale in the one direction that matters: it can say "paid" about a
+    subscription cancelled since. Because the sweep never downgrades, writing
+    from a stale snapshot does not merely produce a transient error — it
+    restores paid access permanently, until a human notices.
+
+    A compare-and-set on the profile row does NOT close this. If the
+    cancellation lands BEFORE the profile read, the row already reads `free`,
+    so the CAS sees no conflict and the stale grant goes through anyway.
+    Freshness has to come from the authoritative side.
+
+    Cheap because it only runs for accounts about to be healed, which is the
+    rare path — the common case is `in_sync` and makes no extra call.
+    """
+    page = client.subscriptions.list(
+        params={"customer": customer_id, "status": "all", "limit": _PAGE_SIZE}
+    )
+    rows = [_as_dict(sub) for sub in (page.data or [])]
+    return _expected_plans(rows).get(customer_id)
+
+
 async def reconcile_billing(
     supabase: AsyncClient, *, client: Any | None = None
 ) -> dict[str, int]:
@@ -189,6 +213,7 @@ async def reconcile_billing(
         "healed": 0,
         "underpaid_reported": 0,
         "unknown_customer": 0,
+        "stale_skipped": 0,
     }
 
     # Billing is saas-only. A self-hosted instance has no Stripe relationship,
@@ -257,11 +282,40 @@ async def reconcile_billing(
         # `rank` alone is not enough: an unknown stored plan ranks 0, so a
         # rank comparison would happily "upgrade" it to anything.
         if target in ("starter", "pro") and rank(target) > rank(current):
+            # RE-ASK STRIPE before writing. `target` came from a snapshot taken
+            # before the profile read, and a cancellation in between would make
+            # this write restore paid access PERMANENTLY — the sweep never
+            # downgrades, so nothing would ever take it back.
+            try:
+                fresh = await asyncio.to_thread(
+                    _entitled_plan_now, client, customer
+                )
+            except Exception:
+                logger.exception(
+                    "billing reconcile: could not re-verify customer=%s — not healing",
+                    customer,
+                )
+                continue
+            if fresh != target:
+                report["stale_skipped"] += 1
+                logger.warning(
+                    "billing reconcile: customer=%s changed between the snapshot "
+                    "(%s) and now (%s) — NOT healed; the next pass will act on "
+                    "fresh data",
+                    customer,
+                    target,
+                    fresh,
+                )
+                continue
             try:
                 await (
                     supabase.table("user_profiles")
                     .update({"plan": target})
                     .eq("user_id", row.get("user_id"))
+                    # Compare-and-set: do not clobber a webhook that wrote
+                    # between our read and here. Not sufficient on its own
+                    # (see _entitled_plan_now), but it closes the second window.
+                    .eq("plan", current)
                     .execute()
                 )
             except Exception:
