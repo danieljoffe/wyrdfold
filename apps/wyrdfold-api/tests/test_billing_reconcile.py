@@ -135,9 +135,19 @@ class FakeDB:
     """Enough of the supabase chain to record what the sweep would write."""
 
     def __init__(
-        self, rows: list[dict[str, Any]], *, read_fails: bool = False, write_fails: bool = False
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        read_fails: bool = False,
+        write_fails: bool = False,
+        concurrent_write: bool = False,
     ):
         self.rows = rows
+        # When True, another writer (the cancellation webhook) touches the row
+        # just before our update lands, bumping its token. Models the exact
+        # interleaving a value-based CAS cannot see, because the webhook writes
+        # the SAME value we already read.
+        self.concurrent_write = concurrent_write
         self.read_fails = read_fails
         self.write_fails = write_fails
         self.writes: list[tuple[str, dict[str, Any]]] = []
@@ -176,10 +186,36 @@ class FakeDB:
                 self._update = None
                 self._filters = {}
                 raise RuntimeError("write failed")
-            self.writes.append((self._filters.get("user_id"), dict(self._update)))
+            if self.concurrent_write:
+                # The webhook writes first; the trigger moves updated_at even
+                # though the plan value is unchanged.
+                for r in self.rows:
+                    if r["user_id"] == self._filters.get("user_id"):
+                        r["updated_at"] = "T1"
+            # Honour the token: a conditional update whose token no longer
+            # matches affects ZERO rows, exactly as Postgres would.
+            target_row = next(
+                (r for r in self.rows if r["user_id"] == self._filters.get("user_id")),
+                None,
+            )
+            token = self._filters.get("updated_at")
+            matched = target_row is not None and (
+                token is None or target_row.get("updated_at") == token
+            )
             self.write_filters.append(dict(self._filters))
+            if matched:
+                self.writes.append((self._filters.get("user_id"), dict(self._update)))
+                target_row["plan"] = self._update["plan"]
+                target_row["updated_at"] = "T2"
             self._update = None
             self._filters = {}
+
+            class W:
+                pass
+
+            w = W()
+            w.data = [dict(target_row)] if matched and target_row else []
+            return w
 
             class R:
                 pass
@@ -199,8 +235,17 @@ class FakeDB:
         return r
 
 
-def profile(user: str, plan: str, customer: str | None) -> dict[str, Any]:
-    return {"user_id": user, "plan": plan, "stripe_customer_id": customer}
+def profile(user: str, plan: str, customer: str | None, updated_at: str = "T0") -> dict[str, Any]:
+    # `updated_at` is the concurrency token. trg_user_profiles_updated_at sets
+    # it on EVERY update, including a same-value one — verified against the
+    # real database, which is what makes the same-value interleaving
+    # detectable.
+    return {
+        "user_id": user,
+        "plan": plan,
+        "stripe_customer_id": customer,
+        "updated_at": updated_at,
+    }
 
 
 # --- the bug this exists for --------------------------------------------
@@ -639,13 +684,76 @@ async def test_a_failed_recheck_does_not_heal() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_write_is_a_compare_and_set() -> None:
-    """Closes the second window: a webhook writing between our profile read and
-    our update must not be clobbered. Not sufficient alone — a cancellation
-    BEFORE the profile read leaves the row already `free`, so the CAS matches —
-    which is why the fresh re-check above carries the real weight."""
-    db = FakeDB([profile("u1", "free", "cus_1")])
+async def test_the_write_locks_on_the_concurrency_token() -> None:
+    """The CAS must key on `updated_at`, not on the plan value.
+
+    A value-based CAS (`.eq("plan", current)`) cannot see the dangerous
+    interleaving, because the cancellation webhook writes `free` — the SAME
+    value already read — so the filter still matches. `updated_at` is bumped
+    by trg_user_profiles_updated_at on EVERY update, so any intervening write
+    moves it. Verified against the real database.
+    """
+    db = FakeDB([profile("u1", "free", "cus_1", updated_at="T0")])
     await reconcile_billing(db, client=FakeStripe([[sub("cus_1", STARTER)]]))
-    assert db.write_filters == [{"user_id": "u1", "plan": "free"}], (
-        "the heal did not constrain on the plan it read"
+    assert db.write_filters == [{"user_id": "u1", "updated_at": "T0"}], (
+        "the heal did not lock on the concurrency token"
     )
+
+
+# --- the same-value interleaving -----------------------------------------
+#
+# The hole a value-based CAS leaves open, and the reason the lock is a token:
+#
+#   1. profile read            -> plan = free
+#   2. fresh Stripe re-check   -> starter   (still active at this instant)
+#   3. cancellation lands; its webhook writes plan = free  (SAME value)
+#   4. CAS .eq("plan", "free") STILL MATCHES -> writes starter
+#
+# Step 4 restores paid access after cancellation, permanently, because later
+# sweeps never downgrade. Locking on `updated_at` makes step 3 visible.
+# -------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_same_value_webhook_write_blocks_the_heal() -> None:
+    """The exact interleaving from review. `concurrent_write` bumps the token
+    without changing the plan, exactly as the cancellation webhook would."""
+    db = FakeDB([profile("u1", "free", "cus_1", updated_at="T0")], concurrent_write=True)
+    report = await reconcile_billing(db, client=FakeStripe([[sub("cus_1", STARTER)]]))
+    assert db.writes == [], "restored paid access despite a concurrent cancellation"
+    assert report["healed"] == 0
+    assert report["stale_skipped"] == 1
+    assert db.rows[0]["plan"] == "free", "the account must be left on free"
+
+
+@pytest.mark.asyncio
+async def test_a_zero_row_conditional_update_is_not_counted_as_healed() -> None:
+    """A CAS that matched nothing is not a heal. Counting it would report
+    success for precisely the interleaving the lock exists to catch — the
+    failure would look like a fix, which is worse than no report at all."""
+    db = FakeDB([profile("u1", "free", "cus_1", updated_at="T0")], concurrent_write=True)
+    report = await reconcile_billing(db, client=FakeStripe([[sub("cus_1", STARTER)]]))
+    assert report["healed"] == 0, "counted a zero-row update as a successful heal"
+
+
+@pytest.mark.asyncio
+async def test_a_profile_with_no_token_is_not_healed() -> None:
+    """Without `updated_at` the CAS would be unguarded, so the safe answer is
+    to skip rather than write unlocked."""
+    row = profile("u1", "free", "cus_1")
+    del row["updated_at"]
+    db = FakeDB([row])
+    report = await reconcile_billing(db, client=FakeStripe([[sub("cus_1", STARTER)]]))
+    assert db.writes == []
+    assert report["healed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_happy_path_still_heals_with_the_token() -> None:
+    """Guards the three refusals above against being satisfiable by refusing
+    everything — the lock must still let a legitimate heal through."""
+    db = FakeDB([profile("u1", "free", "cus_1", updated_at="T0")])
+    report = await reconcile_billing(db, client=FakeStripe([[sub("cus_1", STARTER)]]))
+    assert db.writes == [("u1", {"plan": "starter"})]
+    assert report["healed"] == 1
+    assert db.rows[0]["plan"] == "starter"

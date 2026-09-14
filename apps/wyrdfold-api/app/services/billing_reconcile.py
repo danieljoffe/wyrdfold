@@ -239,7 +239,7 @@ async def reconcile_billing(
     try:
         resp = await (
             supabase.table("user_profiles")
-            .select("user_id, plan, stripe_customer_id")
+            .select("user_id, plan, stripe_customer_id, updated_at")
             .not_.is_("stripe_customer_id", "null")
             .execute()
         )
@@ -307,15 +307,29 @@ async def reconcile_billing(
                     fresh,
                 )
                 continue
+            # CONCURRENCY TOKEN, not a value comparison.
+            #
+            # `.eq("plan", current)` is not enough, and the hole is exact: the
+            # cancellation webhook writes `free` — the SAME value we already
+            # read — so a value-based CAS still matches and the stale grant
+            # goes in. `updated_at` is bumped by trg_user_profiles_updated_at
+            # (BEFORE UPDATE, `NEW.updated_at = NOW()`, unconditional), so ANY
+            # intervening write moves it, including a same-value one. That is
+            # what makes this interleaving detectable rather than invisible.
+            token = row.get("updated_at")
+            if not token:
+                logger.error(
+                    "billing reconcile: user=%s has no updated_at to lock on — "
+                    "not healing (the CAS would be unguarded)",
+                    row.get("user_id"),
+                )
+                continue
             try:
-                await (
+                resp = await (
                     supabase.table("user_profiles")
                     .update({"plan": target})
                     .eq("user_id", row.get("user_id"))
-                    # Compare-and-set: do not clobber a webhook that wrote
-                    # between our read and here. Not sufficient on its own
-                    # (see _entitled_plan_now), but it closes the second window.
-                    .eq("plan", current)
+                    .eq("updated_at", token)
                     .execute()
                 )
             except Exception:
@@ -323,6 +337,18 @@ async def reconcile_billing(
                     "billing reconcile: failed to heal user=%s to plan=%s",
                     row.get("user_id"),
                     target,
+                )
+                continue
+            # A conditional update that matched NOTHING is not a heal. Counting
+            # it as one would report success for the exact interleaving this
+            # lock exists to catch — the failure would look like a fix.
+            if not (getattr(resp, "data", None) or []):
+                report["stale_skipped"] += 1
+                logger.warning(
+                    "billing reconcile: user=%s changed underneath the sweep "
+                    "(another writer touched the row) — NOT healed; the next "
+                    "pass will act on fresh data",
+                    row.get("user_id"),
                 )
                 continue
             report["healed"] += 1
