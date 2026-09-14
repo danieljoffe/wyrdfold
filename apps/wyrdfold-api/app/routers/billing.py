@@ -35,6 +35,7 @@ from supabase import AsyncClient
 from app.config import settings
 from app.dependencies import get_async_service_supabase, get_current_user_id
 from app.rate_limit import limiter
+from app.services import billing_plans
 
 logger = logging.getLogger(__name__)
 
@@ -80,12 +81,12 @@ def _price_for_plan(plan: str) -> str:
     return price
 
 
-def _plan_for_price(price_id: str) -> str | None:
-    if price_id and price_id == settings.stripe_starter_price_id:
-        return "starter"
-    if price_id and price_id == settings.stripe_pro_price_id:
-        return "pro"
-    return None
+# Re-exported under the original private names so every call site below is
+# unchanged. The DEFINITIONS moved to services/billing_plans.py because the
+# reconciliation sweep needs the same mapping, and two copies would eventually
+# disagree — at which point the sweep and the webhook would overwrite each
+# other's writes forever.
+_plan_for_price = billing_plans.plan_for_price
 
 
 async def _get_stripe_customer_id(supabase: AsyncClient, user_id: str) -> str | None:
@@ -369,11 +370,7 @@ async def _set_plan(supabase: AsyncClient, user_id: str, plan: str) -> None:
     logger.info("billing: plan=%s user=%s", plan, user_id)
 
 
-# Statuses whose subscription actually entitles the managed tier. Anything
-# else (past_due, unpaid, canceled, incomplete, incomplete_expired, paused)
-# falls back to 'free' — which still works via BYOK, so a failed card
-# never bricks the account.
-_ENTITLED_STATUSES = ("active", "trialing")
+_ENTITLED_STATUSES = billing_plans.ENTITLED_STATUSES
 
 
 async def _handle_event(supabase: AsyncClient, event: dict[str, Any]) -> None:
