@@ -433,3 +433,86 @@ async def test_end_to_end_with_sdk_style_objects() -> None:
     report = await reconcile_billing(db, client=FakeStripe([[sub("cus_1", PRO)]]))
     assert db.writes == [("u1", {"plan": "pro"})]
     assert report["healed"] == 1
+
+
+# --- the guard, enforced structurally -------------------------------------
+
+
+def test_every_plan_write_sits_under_the_upgrade_guard() -> None:
+    """ "Never downgrades" must survive edits, not just hold in this revision.
+
+    Behavioural tests above prove the CURRENT code does not downgrade. They
+    cannot stop someone adding a second write path later — a retry branch, a
+    "fix up the trial" special case — that skips the check. This asserts the
+    property against the parse tree: every `.update()` in the module is
+    enclosed by the paid-target + rank test.
+
+    Same reasoning as the repo's existing AST guard on `.single()`: when the
+    cost of a mistake is high and the mistake is easy to make in a hurry, pin
+    the shape rather than the behaviour.
+    """
+    import ast
+    import pathlib
+
+    import app.services.billing_reconcile as module
+
+    tree = ast.parse(pathlib.Path(module.__file__).read_text())
+
+    class Walk(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.stack: list[str] = []
+            self.writes: list[tuple[int, list[str]]] = []
+
+        def visit_If(self, node: ast.If) -> None:
+            self.stack.append(ast.unparse(node.test))
+            for child in node.body:
+                self.visit(child)
+            self.stack.pop()
+            for child in node.orelse:
+                self.visit(child)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Attribute) and node.func.attr in (
+                "update",
+                "insert",
+                "upsert",
+                "delete",
+            ):
+                self.writes.append((node.lineno, list(self.stack)))
+            self.generic_visit(node)
+
+    walk = Walk()
+    walk.visit(tree)
+
+    # Precondition: if this found nothing the assertion below is vacuous.
+    assert walk.writes, "found no DB writes at all — the AST walk is broken"
+
+    for line, guards in walk.writes:
+        guarded = any("starter" in g and "pro" in g and "rank(" in g for g in guards)
+        assert guarded, (
+            f"{module.__file__}:{line} writes to the database without the "
+            "upgrade guard above it. Every write here must be enclosed by "
+            "`target in ('starter', 'pro') and rank(target) > rank(current)` — "
+            "that check is what makes an automatic downgrade impossible."
+        )
+
+
+def test_the_module_writes_only_the_plan_column() -> None:
+    """A sweep that can set arbitrary columns is a different, larger risk than
+    one that can only move a plan forward."""
+    import ast
+    import pathlib
+
+    import app.services.billing_reconcile as module
+
+    tree = ast.parse(pathlib.Path(module.__file__).read_text())
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "update"
+            and node.args
+            and isinstance(node.args[0], ast.Dict)
+        ):
+            keys = {k.value for k in node.args[0].keys if isinstance(k, ast.Constant)}
+            assert keys == {"plan"}, f"writes columns beyond 'plan': {sorted(keys)}"
