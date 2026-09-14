@@ -252,6 +252,25 @@ class Settings(BaseSettings):
     # self-hosted deployment should not get unrequested background writes. The
     # one-shot heal in 20260811020000 fixes rows already stranded; this flag is
     # the ONGOING guard, so prod wants ACTIVATION_SWEEP_ENABLED=true.
+    # Billing reconciliation (#861). OFF by default like every other sweep: it
+    # makes outbound Stripe calls on a timer, which a self-hosted instance must
+    # never do unasked. Production wants BILLING_RECONCILE_ENABLED=true — a
+    # missed webhook means someone paid and got nothing, and nothing else in
+    # the system notices.
+    billing_reconcile_enabled: bool = False
+    # MINUTES, not hours, unlike the other sweeps. The window this closes is
+    # "customer paid and is staring at a 402", so the useful unit is how long
+    # they wait, not how cheap the sweep is. It costs a handful of Stripe list
+    # calls.
+    #
+    # A short tick also sidesteps #244: IntervalTrigger counts from PROCESS
+    # START, and this app deploys near-daily, so a tick longer than the deploy
+    # cadence can go indefinitely without firing (discovery ran ONCE in its
+    # first six enabled days). The ledger-anchor catch-up the hourly sweeps
+    # carry is unnecessary here because 30 minutes is far shorter than any
+    # plausible deploy interval — worst case a redeploy costs one tick.
+    billing_reconcile_tick_minutes: int = Field(default=30, ge=5, le=1440)
+
     activation_sweep_enabled: bool = False
     activation_sweep_tick_hours: int = Field(default=6, ge=1, le=168)
     # Deliberately generous: the cutoff keys on `updated_at`, which a running
