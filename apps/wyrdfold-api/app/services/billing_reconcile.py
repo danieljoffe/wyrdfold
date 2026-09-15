@@ -261,7 +261,19 @@ async def reconcile_billing(
         if target is None:
             # Stripe has no entitled subscription for them. Could be a lapse,
             # could be a comp, could be an abandoned checkout. Never act.
-            if rank(current) > 0:
+            #
+            # Only a PAID tier is worth reporting here. `trial` is granted by
+            # us and bounded by `trial_expired()`, not by Stripe — having no
+            # subscription is its NORMAL state, not a discrepancy. Reporting it
+            # was a false positive that scaled badly: `trial` is the default
+            # plan for new users (the entitlements trigger sets it on INSERT),
+            # so every trial user who opened a checkout and did not finish
+            # would emit an ERROR every tick, forever. Alert noise is how a
+            # real signal later gets ignored.
+            #
+            # `rank(current) > 0` was the original condition and is wrong for
+            # exactly one value; naming the paid plans says what is meant.
+            if current in ("starter", "pro"):
                 report["underpaid_reported"] += 1
                 logger.error(
                     "billing reconcile: user=%s is on plan=%s but Stripe has no "

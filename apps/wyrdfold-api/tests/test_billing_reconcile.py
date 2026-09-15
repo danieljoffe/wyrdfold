@@ -757,3 +757,57 @@ async def test_the_happy_path_still_heals_with_the_token() -> None:
     assert db.writes == [("u1", {"plan": "starter"})]
     assert report["healed"] == 1
     assert db.rows[0]["plan"] == "starter"
+
+
+# --- trial is not a discrepancy ------------------------------------------
+#
+# Found by running the real live-mode cutover, not by tests or review: a
+# `trial` account with a stripe_customer_id and no subscription was reported
+# as underpaid every tick. A trial has no Stripe subscription BY DESIGN — it
+# is granted by us and bounded by trial_expired(), not by Stripe.
+#
+# It scaled badly, too: `trial` is the default plan for new users (the
+# entitlements trigger sets it on INSERT), so every trial user who opened a
+# checkout and did not finish would emit an ERROR forever.
+# -------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_trial_with_no_subscription_is_not_reported() -> None:
+    """The false positive. A trial holding a customer id (they started a
+    checkout once) must be silent, not an ERROR every 30 minutes."""
+    db = FakeDB([profile("u1", "trial", "cus_1")])
+    report = await reconcile_billing(db, client=FakeStripe([[]]))
+    assert report["underpaid_reported"] == 0, "trial reported as underpaid"
+    assert report["in_sync"] == 1
+    assert db.writes == []
+
+
+@pytest.mark.asyncio
+async def test_free_with_no_subscription_is_still_silent() -> None:
+    db = FakeDB([profile("u1", "free", "cus_1")])
+    report = await reconcile_billing(db, client=FakeStripe([[]]))
+    assert report["underpaid_reported"] == 0
+    assert report["in_sync"] == 1
+
+
+@pytest.mark.parametrize("plan", ["starter", "pro"])
+@pytest.mark.asyncio
+async def test_a_paid_plan_with_no_subscription_is_still_reported(plan) -> None:
+    """Guards the fix against over-correcting. A PAID tier with no
+    subscription is the case worth a human — that is what found the stale
+    `pro` account on production."""
+    db = FakeDB([profile("u1", plan, "cus_1")])
+    report = await reconcile_billing(db, client=FakeStripe([[]]))
+    assert report["underpaid_reported"] == 1, f"{plan} should still be reported"
+    assert db.writes == [], "still must not downgrade"
+
+
+@pytest.mark.asyncio
+async def test_a_trial_is_still_upgraded_when_stripe_says_paid() -> None:
+    """Silencing the report must not silence the HEAL. A trial user who
+    actually subscribed still gets their plan."""
+    db = FakeDB([profile("u1", "trial", "cus_1", updated_at="T0")])
+    report = await reconcile_billing(db, client=FakeStripe([[sub("cus_1", PRO)]]))
+    assert db.writes == [("u1", {"plan": "pro"})]
+    assert report["healed"] == 1
