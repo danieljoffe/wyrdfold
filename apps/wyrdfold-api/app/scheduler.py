@@ -35,6 +35,7 @@ from supabase import Client
 from app.cache import job_list_cache
 from app.config import settings
 from app.models.schemas import PollResult
+from app.services.billing_reconcile import reconcile_billing
 from app.services.ingestion_health import _newest_discovery_at, check_ingestion_health
 from app.services.poll_lock import poll_advisory_lock
 from app.services.poller import (
@@ -313,6 +314,31 @@ async def _run_scheduled_retention_purge() -> None:
         logger.exception("scheduled retention purge raised")
 
 
+async def _run_scheduled_billing_reconcile() -> None:
+    """Tick body — heal accounts Stripe says are paid that we still treat as free.
+
+    Same defensive shape as the other ticks: pull the singleton client, skip if
+    uninitialized, never raise. That last part matters more here than usual —
+    this sweep exists because a silent failure cost someone a subscription, and
+    a sweep that dies silently would be the same bug wearing a different hat.
+    """
+    try:
+        client = get_async_supabase()
+        if client is None:
+            logger.warning(
+                "scheduled billing reconcile skipped — async supabase client not initialized"
+            )
+            return
+        await _record_scheduler_run("billing_reconcile")
+        report = await reconcile_billing(client)
+        # Anything other than a clean pass is worth an INFO line; drift itself
+        # is already logged at ERROR inside the sweep so it reaches Sentry.
+        if report["healed"] or report["underpaid_reported"] or report["unknown_customer"]:
+            logger.info("scheduled billing reconcile: %s", report)
+    except Exception:
+        logger.exception("scheduled billing reconcile raised")
+
+
 async def _run_scheduled_activation_sweep() -> None:
     """Tick body — reclaim targets stranded in an in-flight activation state.
 
@@ -543,6 +569,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
       - ``discovery_run`` — gated on ``DISCOVERY_SCHEDULER_ENABLED``
       - ``recency_refresh`` — gated on ``RECENCY_REFRESH_ENABLED``
       - ``activation_sweep`` — gated on ``ACTIVATION_SWEEP_ENABLED``
+      - ``billing_reconcile`` — gated on ``BILLING_RECONCILE_ENABLED``
 
     If all flags are off, no scheduler is started. If only some are on,
     only those jobs are registered. Sharing one scheduler avoids multiple
@@ -555,12 +582,14 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         or settings.discovery_scheduler_enabled
         or settings.recency_refresh_enabled
         or settings.activation_sweep_enabled
+        or settings.billing_reconcile_enabled
     ):
         logger.info(
             "schedulers disabled (set POLL_SCHEDULER_ENABLED=true, "
             "URL_HEALTH_CHECK_ENABLED=true, RETENTION_PURGE_ENABLED=true, "
             "DISCOVERY_SCHEDULER_ENABLED=true, RECENCY_REFRESH_ENABLED=true, "
-            "or ACTIVATION_SWEEP_ENABLED=true "
+            "ACTIVATION_SWEEP_ENABLED=true, "
+            "or BILLING_RECONCILE_ENABLED=true "
             "to enable)"
         )
         return None
@@ -677,6 +706,26 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         logger.info(
             "retention purge scheduler registered (tick every %d h)",
             settings.retention_purge_tick_hours,
+        )
+
+    if settings.billing_reconcile_enabled:
+        scheduler.add_job(
+            _run_scheduled_billing_reconcile,
+            IntervalTrigger(minutes=settings.billing_reconcile_tick_minutes),
+            id="billing_reconcile",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+            misfire_grace_time=_SWEEP_MISFIRE_GRACE_S,
+        )
+        # No ledger-anchor catch-up here, unlike the hourly sweeps. Those need
+        # one because IntervalTrigger counts from PROCESS START and a tick
+        # longer than the deploy cadence can never fire (#244). A 30-minute
+        # tick is far shorter than any plausible deploy interval, so a redeploy
+        # costs at most one tick.
+        logger.info(
+            "billing reconcile scheduler registered (tick every %d min)",
+            settings.billing_reconcile_tick_minutes,
         )
 
     if settings.activation_sweep_enabled:

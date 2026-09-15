@@ -317,3 +317,58 @@ content_path = "./supabase/templates/magic-link.html"
 [remotes.production.auth.email.template.confirmation]
 subject = "Confirm your email to start using WyrdFold"
 content_path = "./supabase/templates/confirm-signup.html"
+
+# ----------------------------------------------------------------------------
+# STAGING (#1014). A second hosted project so verification of consequence stops
+# happening against production — in particular the Stripe live-mode subscribe
+# flow (#861), which cannot be rehearsed anywhere else.
+#
+# Declared here rather than anywhere new because `pnpm db:push` reads exactly
+# these blocks: the target is named on the command line, matched against the
+# CLI's sticky link, and refused on disagreement (apps/wyrdfold-api/scripts/
+# db_target_guard.py). Adding this block is what makes `--target staging` a
+# real target instead of a refusal — and, symmetrically, what makes pushing to
+# production while linked to staging impossible.
+#
+[remotes.staging]
+project_id = "dyczsvaoqhvnafwwxuvf"
+
+# The auth override is REQUIRED once a remote exists, not optional. Without a
+# [remotes.<name>.auth] block the CLI applies the BASE [auth] section, whose
+# site_url is the LOCAL-ONLY localhost value — so a plain `supabase config push`
+# against staging would set its site_url to localhost and rewrite every
+# unmatched redirect there, breaking sign-in in exactly the silent way
+# apps/wyrdfold/SETUP.md warns about. Omitting this block does not defer the
+# risk; it arms it.
+#
+# (An earlier revision of this file said the block was omitted because the
+# staging frontend did not exist yet. That was true when written and stale by
+# the time it was committed — staging.wyrdfold.com now serves with its own
+# certificate. Caught in review of #1042.)
+#
+# localhost entries are kept alongside the staging origin on purpose: a
+# developer pointing a local frontend at the staging database is a normal
+# rehearsal, and an unlisted redirect fails silently rather than loudly.
+[remotes.staging.auth]
+site_url = "https://staging.wyrdfold.com"
+additional_redirect_urls = [
+  "https://staging.wyrdfold.com",
+  "https://staging.wyrdfold.com/auth/callback",
+  "http://localhost:3100",
+  "http://localhost:3100/auth/callback",
+]
+
+# Seeding is opt-in PER REMOTE and off by default — `db push --include-seed`
+# against a remote refuses unless the target says otherwise. Staging opts in:
+# it is a disposable environment whose whole job is to be reproducible, and the
+# seed is fictional data on an RFC 2606 domain with every source disabled, so
+# re-seeding it costs nothing and can poll nothing.
+#
+# There is deliberately NO equivalent block for [remotes.production]. Supabase's
+# default already refuses there, and that default is load-bearing: `db push
+# --include-seed` aimed at production would insert fictional companies into the
+# live catalog. Leaving the default in place means production refuses even if
+# someone types the flag by mistake — the same fail-closed posture as the
+# target guard itself.
+[remotes.staging.db.seed]
+enabled = true
