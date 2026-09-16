@@ -199,6 +199,71 @@ def declared_targets(config_text: str) -> dict[str, str]:
     return targets
 
 
+_SEED_HEADER = re.compile(r"^\s*\[remotes\.([A-Za-z0-9_-]+)\.db\.seed\]\s*$")
+_SEED_ENABLED = re.compile(r"""^\s*enabled\s*=\s*true\s*(?:#.*)?$""")
+
+
+def seed_enabled_targets(config_text: str) -> set[str]:
+    """Targets that explicitly opt in to seeding, via
+    ``[remotes.<name>.db.seed] enabled = true``.
+
+    Matched narrowly on purpose: the BASE ``[db.seed]`` section configures the
+    LOCAL stack and must not be mistaken for a remote opt-in. A loose parse here
+    would hand every remote a seed permit it never asked for.
+    """
+    out: set[str] = set()
+    current: str | None = None
+    for line in config_text.splitlines():
+        header = _SEED_HEADER.match(line)
+        if header:
+            current = header.group(1)
+            continue
+        if _ANY_HEADER.match(line):
+            current = None
+            continue
+        if current and _SEED_ENABLED.match(line):
+            out.add(current)
+            current = None
+    return out
+
+
+def checked_seed_flag(target: str, flags: list[str], opted_in: set[str]) -> None:
+    """Refuse ``--include-seed`` for a target that has not opted in.
+
+    WHY THIS EXISTS SEPARATELY FROM THE FLAG ALLOWLIST
+    ``--include-seed`` is a legitimate flag — staging depends on it — so it sits
+    on ``_PASSTHROUGH_FLAGS``. But "legitimate" is target-dependent in a way a
+    flat allowlist cannot express: seeding staging is routine, and seeding
+    PRODUCTION would insert fictional companies into the live catalog.
+
+    Until now the only thing standing in the way was Supabase's own default
+    refusal for a remote with no ``db.seed`` block. That is a real gate, but it
+    is SOMEONE ELSE'S gate: this guard would happily hand the flag over and let
+    the CLI decide. If that default ever changes, or a block is added for the
+    wrong target, nothing here notices. A guard that depends on a third party's
+    default is a guard that reports success for a condition it never checked —
+    the #1028 lesson, one layer up.
+
+    So the rule is now enforced on both sides, and it is expressed as OPT-IN
+    rather than "not production": a target seeds only if ``config.toml`` says
+    so. A future environment is refused by default rather than by being
+    remembered.
+    """
+    if "--include-seed" not in {f.partition("=")[0] for f in flags}:
+        return
+    if target in opted_in:
+        return
+    allowed = ", ".join(sorted(opted_in)) or "(none)"
+    raise GuardError(
+        f"REFUSING: --include-seed is not permitted for target {target!r}.\n"
+        f"  Targets that opt in: {allowed}\n"
+        "  Seeding inserts FICTIONAL data (supabase/seed.sql). A target opts in\n"
+        "  with an explicit [remotes.<name>.db.seed] enabled = true block in\n"
+        "  supabase/config.toml — absence is a refusal, not an oversight.\n"
+        "  Supabase refuses this too, but that is its default, not our check."
+    )
+
+
 def linked_ref(link_file: Path) -> str | None:
     """The project ref the CLI is currently linked to, or ``None``."""
     try:
@@ -371,6 +436,9 @@ def main(argv: list[str] | None = None) -> int:
         # side of the command line it arrived on. Validating only `extra` is
         # what let `--run 'db push --db-url <prod>'` through.
         passthrough = checked_passthrough([*run_flags, *passthrough])
+        # Target-dependent flag rules run AFTER the flat allowlist: a flag has
+        # to be recognised before asking whether this target may use it.
+        checked_seed_flag(args.target, passthrough, seed_enabled_targets(config_text))
         if base:
             base = checked_command(base)
     except GuardError as exc:
