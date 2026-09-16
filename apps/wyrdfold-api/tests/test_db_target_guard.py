@@ -39,6 +39,17 @@ enabled = true
 project_id = "{STAGING}"
 """
 
+# Same shape as CONFIG, plus the opt-in staging actually carries. Note the
+# `[remotes.production.auth] enabled = true` already present above: a near-miss
+# that a loose parser would read as a production seed permit.
+CONFIG_WITH_SEED = (
+    CONFIG
+    + """
+[remotes.staging.db.seed]
+enabled = true
+"""
+)
+
 
 # ---- parsing ---------------------------------------------------------------
 
@@ -227,14 +238,14 @@ def test_missing_supabase_cli_refuses_instead_of_raising(monkeypatch, tmp_path) 
 
 
 def test_allowed_flag_reaches_the_cli(monkeypatch, tmp_path) -> None:
-    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG_WITH_SEED, linked=STAGING)
     rc = mod.main(["--target", "staging", "--run", "db push", "--include-seed"])
     assert rc == 0
     assert calls == [[SUPABASE, "db", "push", "--include-seed"]]
 
 
 def test_several_allowed_flags_keep_their_order(monkeypatch, tmp_path) -> None:
-    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG_WITH_SEED, linked=STAGING)
     rc = mod.main(["--target", "staging", "--run", "db push", "--include-seed", "--dry-run"])
     assert rc == 0
     assert calls == [[SUPABASE, "db", "push", "--include-seed", "--dry-run"]]
@@ -461,6 +472,81 @@ def test_flags_from_both_placements_are_validated_together(monkeypatch, tmp_path
 
 def test_both_placements_combine_when_all_are_allowed(monkeypatch, tmp_path) -> None:
     """And the legitimate version of the same shape still works, in order."""
-    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG_WITH_SEED, linked=STAGING)
     assert mod.main(["--target", "staging", "--run", "db push --include-seed", "--dry-run"]) == 0
     assert calls == [[SUPABASE, "db", "push", "--include-seed", "--dry-run"]]
+
+
+# --------------------------------------------------------------------------
+# --include-seed is target-dependent.
+#
+# The flag is legitimate — staging depends on it — so it lives on the flat
+# allowlist. But seeding PRODUCTION would insert fictional companies into the
+# live catalog. Until this check existed, the only thing preventing that was
+# Supabase's own default refusal: a real gate, but someone else's. This guard
+# handed the flag over and let the CLI decide.
+# --------------------------------------------------------------------------
+
+
+def test_include_seed_is_refused_for_a_target_that_did_not_opt_in(monkeypatch, tmp_path) -> None:
+    """The hole this closes: production could be handed --include-seed."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG_WITH_SEED, linked=PROD)
+    rc = mod.main(["--target", "production", "--run", "db push --include-seed"])
+    assert rc == 2
+    assert calls == [], "seeding reached the CLI for production"
+
+
+def test_include_seed_is_allowed_for_a_target_that_opted_in(monkeypatch, tmp_path) -> None:
+    """Guards the refusal above against being satisfiable by refusing all."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG_WITH_SEED, linked=STAGING)
+    rc = mod.main(["--target", "staging", "--run", "db push --include-seed"])
+    assert rc == 0
+    assert calls == [[SUPABASE, "db", "push", "--include-seed"]]
+
+
+def test_an_auth_block_is_not_a_seed_opt_in() -> None:
+    """`[remotes.production.auth] enabled = true` is in the fixture. A parser
+    that keyed on `enabled = true` under any remotes.* header would grant
+    production a seed permit it never asked for."""
+    from scripts.db_target_guard import seed_enabled_targets
+
+    assert "production" not in seed_enabled_targets(CONFIG_WITH_SEED)
+    assert seed_enabled_targets(CONFIG_WITH_SEED) == {"staging"}
+
+
+def test_the_base_db_seed_section_grants_no_remote() -> None:
+    """`[db.seed]` configures the LOCAL stack. It must not be read as a remote
+    opt-in, or every remote inherits a permit from local dev config."""
+    from scripts.db_target_guard import seed_enabled_targets
+
+    local_only = CONFIG + "\n[db.seed]\nenabled = true\n"
+    assert seed_enabled_targets(local_only) == set()
+
+
+def test_seed_refusal_survives_the_equals_form(monkeypatch, tmp_path) -> None:
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG_WITH_SEED, linked=PROD)
+    assert mod.main(["--target", "production", "--run", "db push --include-seed=true"]) == 2
+    assert calls == []
+
+
+def test_seed_refusal_applies_from_either_placement(monkeypatch, tmp_path) -> None:
+    """Inside --run and appended after --target must behave identically."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG_WITH_SEED, linked=PROD)
+    assert mod.main(["--target", "production", "--run", "db push", "--include-seed"]) == 2
+    assert calls == []
+
+
+def test_with_no_opt_in_anywhere_every_target_is_refused(monkeypatch, tmp_path) -> None:
+    """Absence is a refusal, not an oversight — a new environment is safe by
+    default rather than by being remembered."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG, linked=STAGING)
+    assert mod.main(["--target", "staging", "--run", "db push --include-seed"]) == 2
+    assert calls == []
+
+
+def test_other_flags_are_unaffected_for_production(monkeypatch, tmp_path) -> None:
+    """The rule is scoped to seeding. A production migration push must still
+    work, or the guard becomes something people route around."""
+    mod, calls = _wire(monkeypatch, tmp_path, config=CONFIG_WITH_SEED, linked=PROD)
+    assert mod.main(["--target", "production", "--run", "db push --dry-run"]) == 0
+    assert calls == [[SUPABASE, "db", "push", "--dry-run"]]

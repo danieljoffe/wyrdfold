@@ -364,11 +364,22 @@ additional_redirect_urls = [
 # seed is fictional data on an RFC 2606 domain with every source disabled, so
 # re-seeding it costs nothing and can poll nothing.
 #
-# There is deliberately NO equivalent block for [remotes.production]. Supabase's
-# default already refuses there, and that default is load-bearing: `db push
-# --include-seed` aimed at production would insert fictional companies into the
-# live catalog. Leaving the default in place means production refuses even if
-# someone types the flag by mistake — the same fail-closed posture as the
-# target guard itself.
+# There is deliberately NO equivalent block for [remotes.production], and the
+# absence is the whole mechanism: `db push --include-seed` aimed at production
+# would insert fictional companies into the live catalog.
+#
+# TWO INDEPENDENT GATES now refuse it, and the repo's own is authoritative:
+#
+#   1. scripts/db_target_guard.py (`checked_seed_flag`) refuses BEFORE the
+#      supabase CLI is ever invoked, for any target without an explicit
+#      opt-in block here. This is the gate to reason about — it lives in this
+#      repository, it is tested, and it fails closed for environments that do
+#      not exist yet.
+#   2. Supabase's own default refusal for a remote with no db.seed config.
+#
+# An earlier revision of this comment called (2) "load-bearing". It is not,
+# and had not been since the guard shipped: depending on a third party's
+# default means depending on a decision nobody here reviews or is notified
+# about when it changes. (2) is now defence in depth, not the mechanism.
 [remotes.staging.db.seed]
 enabled = true
