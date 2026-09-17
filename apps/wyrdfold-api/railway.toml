@@ -30,13 +30,28 @@ dockerfilePath = "apps/wyrdfold-api/Dockerfile"
 # reads as "that release contained no API changes" rather than "the API change
 # never shipped".
 #
-# tests/test_deploy_config.py derives the required paths from the Dockerfile's
-# own COPY lines, so a new build input cannot be added without either
-# extending this list or failing the build.
+# .dockerignore is here because it never appears as a COPY operand yet decides
+# what is present in the build context at all — an edit excluding uv.lock or
+# the app source would change the image while matching no other pattern.
+#
+# tests/test_deploy_config.py derives the required paths rather than restating
+# them: COPY/ADD operands decoded from the Dockerfile (plain, JSON and
+# line-continued forms; --from= stage copies excluded as they are not repo
+# inputs), plus the implicit inputs — the Dockerfile itself and .dockerignore.
+# The parser FAILS CLOSED: a form it cannot decode raises rather than returning
+# a short list, since silently under-reporting sources would certify a watch
+# set that misses a real input.
+#
+# Scope, precisely: this covers files the BUILD reads. It does not model build
+# args, or files a future build script might reach for. Over-watching is the
+# deliberate direction — apps/wyrdfold-api/tests/** is excluded from the image
+# by .dockerignore but still watched, so test-only edits trigger a rebuild that
+# produces an identical image. A wasted build is cheap; a missed one is not.
 watchPatterns = [
   "apps/wyrdfold-api/**",
   "pyproject.toml",
   "uv.lock",
+  ".dockerignore",
 ]
 
 # NOTE: Railway config-as-code only covers the build/deploy SETTINGS sections
