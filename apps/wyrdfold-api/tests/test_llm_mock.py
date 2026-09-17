@@ -205,6 +205,25 @@ async def test_complete_tool_use_records_tool_name_in_call_log() -> None:
     assert client.calls[0]["tool_name"] == "return_Foo"
 
 
+async def test_complete_tool_use_records_temperature_hint_in_call_log() -> None:
+    """#1065: callers pass ``temperature`` as a provider-neutral hint. The mock
+    records it so a caller's test can assert the request it made — the real
+    Anthropic transport forwards it only where the model accepts it, and that
+    is covered separately by the signature-validating routing tests."""
+    client = MockLLMClient(scripted={"tool": "{}"})
+    await client.complete_tool_use(
+        model="claude-haiku-4-5",
+        system="",
+        messages=[Message(role="user", content="x")],
+        tool_name="return_Foo",
+        tool_description="d",
+        tool_input_schema={"type": "object"},
+        purpose="tool",
+        temperature=0.0,
+    )
+    assert client.calls[0]["temperature"] == 0.0
+
+
 # ---- dev-default responses (local `LLM_PROVIDER=mock` realism) ----------------
 
 

@@ -27,7 +27,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
-from typing import Any, cast
+from typing import Any, Literal, NamedTuple, cast
 
 import httpx
 
@@ -45,18 +45,35 @@ _OPENROUTER_BASE_URL = "https://openrouter.ai/api"
 # The OpenAI-compatible endpoint is the full path (no SDK to append /v1).
 _OPENROUTER_OPENAI_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Map our internal ModelId to OpenRouter's namespaced slugs (dotted versions).
-# Extend this dict when ModelId gains new entries.
-_MODEL_SLUG_MAP: dict[str, str] = {
-    "claude-opus-4-7": "anthropic/claude-opus-4.7",
-    "claude-sonnet-4-6": "anthropic/claude-sonnet-4.6",
-    "claude-haiku-4-5": "anthropic/claude-haiku-4.5",
-    "deepseek-v3-2": "deepseek/deepseek-v3.2",
+_WireShape = Literal["anthropic", "openai"]
+
+
+class _Route(NamedTuple):
+    """How one internal ModelId reaches OpenRouter."""
+
+    slug: str  # OpenRouter's namespaced, dotted-version slug
+    shape: _WireShape  # "anthropic" = SDK /messages; "openai" = raw /chat/completions
+
+
+# THE routing table (#1065): one entry per ModelId, owning both the slug and the
+# wire shape, so a new id cannot be added to one and forgotten in the other.
+# "anthropic" keeps forced tool_choice, cache_control breakpoints, complete()
+# and stream(); "openai" is the narrower function-calling path DeepSeek needs
+# because OpenRouter's Anthropic shim cannot force a named tool for it (#935).
+# ``tests/test_openrouter_client.py`` asserts every ModelId literal has a row.
+_ROUTES: dict[str, _Route] = {
+    "claude-opus-4-7": _Route("anthropic/claude-opus-4.7", "anthropic"),
+    "claude-sonnet-4-6": _Route("anthropic/claude-sonnet-4.6", "anthropic"),
+    "claude-haiku-4-5": _Route("anthropic/claude-haiku-4.5", "anthropic"),
+    "deepseek-v3-2": _Route("deepseek/deepseek-v3.2", "openai"),
 }
 
-# Models that must use the OpenAI-compatible /chat/completions endpoint
-# (function calling) rather than the Anthropic /messages endpoint.
-_OPENAI_SHAPED_MODELS: frozenset[str] = frozenset({"deepseek-v3-2"})
+# Derived views — kept as names so call sites and tests read naturally. Do not
+# populate these directly; edit ``_ROUTES``.
+_MODEL_SLUG_MAP: dict[str, str] = {m: r.slug for m, r in _ROUTES.items()}
+_OPENAI_SHAPED_MODELS: frozenset[str] = frozenset(
+    m for m, r in _ROUTES.items() if r.shape == "openai"
+)
 
 # Provider slugs whose endpoints declare they CANNOT honor a forced NAMED
 # function (``supports_tool_choice.function=false`` in OpenRouter's endpoint
@@ -260,13 +277,13 @@ class OpenRouterLLMClient(AnthropicLLMClient):
         self._openai_http: httpx.AsyncClient | None = None
 
     def _resolve_model(self, model: ModelId) -> str:
-        slug = _MODEL_SLUG_MAP.get(model)
-        if slug is None:
+        route = _ROUTES.get(model)
+        if route is None:
             raise ValueError(
-                f"No OpenRouter slug mapped for ModelId={model!r}. "
-                f"Add it to _MODEL_SLUG_MAP in openrouter_client.py."
+                f"No OpenRouter route for ModelId={model!r}. "
+                f"Add a _Route (slug + wire shape) to _ROUTES in openrouter_client.py."
             )
-        return slug
+        return route.slug
 
     def _openai_client(self) -> httpx.AsyncClient:
         if self._openai_http is None:

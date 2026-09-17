@@ -640,9 +640,7 @@ def prose_xml_tool_call(tool_name: str, **params: Any) -> str:
         if isinstance(value, str):
             lines.append(f'<parameter name="{name}" string="true">{value}</parameter>')
         else:
-            lines.append(
-                f'<parameter name="{name}" string="false">{json.dumps(value)}</parameter>'
-            )
+            lines.append(f'<parameter name="{name}" string="false">{json.dumps(value)}</parameter>')
     lines.append("</invoke>")
     return "\n".join(lines)
 
@@ -878,6 +876,10 @@ class MockLLMClient:
                 "cache_system": cache_system,
                 "max_tokens": max_tokens,
                 "tool_name": tool_name,
+                # #1065: the neutral contract carries ``temperature`` as a HINT.
+                # Recorded so a caller's test can assert what it requested,
+                # independent of whether a real transport can honour it.
+                "temperature": temperature,
             }
         )
 
