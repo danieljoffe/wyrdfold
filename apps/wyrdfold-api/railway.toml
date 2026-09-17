@@ -2,6 +2,58 @@
 builder = "DOCKERFILE"
 dockerfilePath = "apps/wyrdfold-api/Dockerfile"
 
+# WATCH PATHS MUST COVER EVERY BUILD INPUT, NOT JUST THE SERVICE DIRECTORY.
+#
+# Railway rebuilds only when a changed file matches one of these. The Docker
+# build context is the MONOREPO ROOT (the Dockerfile does `COPY pyproject.toml
+# uv.lock ./`), so the image depends on files that do NOT live under
+# apps/wyrdfold-api/.
+#
+# Before this existed, the filter covered only the service directory. A Python
+# dependency bump changes the ROOT uv.lock and nothing else, so Railway
+# reported SKIPPED and no image was built.
+#
+# The effect was not that dependency bumps never shipped — it is subtler and
+# worse than that. They shipped LATE, silently, carried into an image by the
+# next unrelated commit that happened to touch apps/wyrdfold-api/**. So the
+# deployed dependency set was never what any release said it was; it was
+# whatever uv.lock contained when some other change last forced a rebuild.
+# A security bump could sit unbuilt indefinitely for want of an unrelated edit.
+#
+# Observed 2026-09-16: `main` was at anthropic 1.5.0 while production ran an
+# image built from c006bcbe (1.4.0). The stranded release changed exactly one
+# file, root uv.lock, matching no watch pattern. The three prior bumps
+# (1.2.0, 1.3.0, 1.4.0) had each landed only via a later piggybacking commit.
+#
+# This failure is invisible by construction: SKIPPED is a success state, the
+# API stays healthy, and /version keeps reporting the older commit — which
+# reads as "that release contained no API changes" rather than "the API change
+# never shipped".
+#
+# .dockerignore is here because it never appears as a COPY operand yet decides
+# what is present in the build context at all — an edit excluding uv.lock or
+# the app source would change the image while matching no other pattern.
+#
+# tests/test_deploy_config.py derives the required paths rather than restating
+# them: COPY/ADD operands decoded from the Dockerfile (plain, JSON and
+# line-continued forms; --from= stage copies excluded as they are not repo
+# inputs), plus the implicit inputs — the Dockerfile itself and .dockerignore.
+# The parser FAILS CLOSED: a form it cannot decode raises rather than returning
+# a short list, since silently under-reporting sources would certify a watch
+# set that misses a real input.
+#
+# Scope, precisely: this covers files the BUILD reads. It does not model build
+# args, or files a future build script might reach for. Over-watching is the
+# deliberate direction — apps/wyrdfold-api/tests/** is excluded from the image
+# by .dockerignore but still watched, so test-only edits trigger a rebuild that
+# produces an identical image. A wasted build is cheap; a missed one is not.
+watchPatterns = [
+  "apps/wyrdfold-api/**",
+  "pyproject.toml",
+  "uv.lock",
+  ".dockerignore",
+]
+
 # NOTE: Railway config-as-code only covers the build/deploy SETTINGS sections
 # — it cannot define service environment variables (those live in the Railway
 # dashboard / CLI `railway variables`). Set these there for production:
