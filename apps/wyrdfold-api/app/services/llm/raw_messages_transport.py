@@ -303,7 +303,20 @@ class RawMessagesTransport:
             last = resp
             if attempt >= self._max_retries:
                 break
-            await openrouter_http._sleep(retry_delay(resp, attempt))
+            delay = retry_delay(resp, attempt)
+            # The same production-visible signal the POST helper emits for a
+            # retryable status: a handshake 429/5xx storm must not retry
+            # silently (review of #1077).
+            logger.warning(
+                "openrouter transient status=%s on stream handshake %s attempt=%d/%d; "
+                "retrying in %.2fs",
+                last.status_code,
+                self._url,
+                attempt + 1,
+                self._max_retries + 1,
+                delay,
+            )
+            await openrouter_http._sleep(delay)
         if last is None:  # pragma: no cover - the loop always sets it before breaking
             raise LLMUpstreamUnavailableError()
         translated = translate_api_status_error(last)
