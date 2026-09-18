@@ -842,3 +842,13 @@ async def test_openai_path_reported_cost_survives_cache_hit_bookkeeping(monkeypa
     # …but the cost is the billed one, untouched by our cache arithmetic.
     assert result.cost_usd == pytest.approx(0.000123)
     assert result.cost_source == "reported"
+
+
+@pytest.mark.asyncio
+async def test_openai_path_results_carry_http_transport_provenance(monkeypatch) -> None:
+    """#1067: the OpenAI-shaped path is raw httpx already; its rows say so."""
+    client = OpenRouterLLMClient(api_key="sk-test")
+    fake = _FakeHttpSeq([_http_resp(_GOOD)])
+    monkeypatch.setattr(client, "_openai_client", lambda: fake)
+    _, result = await _call(client)
+    assert result.transport == "chat_completions_http"

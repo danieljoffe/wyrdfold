@@ -818,6 +818,7 @@ class MockLLMClient:
             usage=usage,
             cost_usd=cost,
             latency_ms=self._default_latency_ms,
+            transport="mock",
         )
 
     async def complete_tool_use(
@@ -912,6 +913,7 @@ class MockLLMClient:
             usage=usage,
             cost_usd=cost,
             latency_ms=self._default_latency_ms,
+            transport="mock",
         )
 
     async def stream(
@@ -970,6 +972,7 @@ class MockLLMClient:
                 usage=usage,
                 cost_usd=cost,
                 latency_ms=self._default_latency_ms,
+                transport="mock",
             )
         )
 

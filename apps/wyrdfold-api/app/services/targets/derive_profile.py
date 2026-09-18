@@ -212,6 +212,7 @@ def _cache_hit_result(model: ModelId) -> LLMResult:
         usage=LLMUsage(),
         cost_usd=0.0,
         latency_ms=0,
+        transport="cache",
     )
 
 

@@ -160,7 +160,13 @@ def _row_for(
         # answerable from the table itself rather than by reading the code.
         # Embedding rows carry no cost_source: Voyage reports no cost, so
         # `_embedding_row_for` is always a table estimate.
-        "metadata": {**(metadata or {}), "cost_source": result.cost_source},
+        # ``transport`` (#1067): which wire path produced the result, merged
+        # here for every row so a transport rollout reconciles from the ledger.
+        "metadata": {
+            **(metadata or {}),
+            "cost_source": result.cost_source,
+            "transport": result.transport or "unknown",
+        },
     }
 
 
