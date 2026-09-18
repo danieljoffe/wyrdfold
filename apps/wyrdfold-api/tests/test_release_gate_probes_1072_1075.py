@@ -6,7 +6,9 @@ registered handlers, not through the service functions alone.
 
 from __future__ import annotations
 
+import contextlib
 import json
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -29,6 +31,34 @@ from app.services.targets import from_input
 from app.services.validate import ValidationResult
 
 RAW_TITLE = "Senior Product Builder (Product Manager), Enterprise Readiness & Admin Platform"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _overrides_untouched_by_this_module() -> Iterator[None]:
+    """Isolation assertion (review of #1076): whatever this module does to the
+    module-global ``app.dependency_overrides``, it must hand the mapping back
+    exactly as it found it, or module teardown errors."""
+    before = dict(app.dependency_overrides)
+    yield
+    assert app.dependency_overrides == before, "release-gate probes leaked dependency overrides"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_dependency_overrides() -> Iterator[None]:
+    """Snapshot, clear, and restore the app's global dependency overrides
+    around every test here. These probes override auth, Supabase, the LLM
+    client and the budget gate; a leak would hand later tests a fixed
+    identity and stub clients and let them pass without exercising their own
+    dependencies."""
+    saved = dict(app.dependency_overrides)
+    app.dependency_overrides.clear()
+    try:
+        yield
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(saved)
+
+
 MARKER = "Enterprise Readiness"
 
 
@@ -65,6 +95,13 @@ def _from_url_seams(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]:
 
 
 def _client(llm: MockLLMClient) -> TestClient:
+    """A client over the real app with this probe's overrides installed.
+
+    Callers close it with ``contextlib.closing`` (deterministic transport
+    close) rather than ``with TestClient(app)``: entering the TestClient
+    context runs the app lifespan, which validates production settings and
+    starts the pools and scheduler, none of which these probes want.
+    """
     app.dependency_overrides[get_async_service_supabase] = lambda: object()
     app.dependency_overrides[get_current_user_id] = lambda: "u1"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "u1"
@@ -81,7 +118,8 @@ def test_from_url_blank_label_is_a_fixed_502_and_never_reaches_matching_or_creat
     The response is the fixed 502; the raw title never reaches the matcher,
     the create, or the body."""
     llm = MockLLMClient(scripted={"target.normalize_posting_title": json.dumps({"label": "   "})})
-    resp = _client(llm).post("/targets/from-url", json={"jd_url": "https://example.com/jobs/1"})
+    with contextlib.closing(_client(llm)) as client:
+        resp = client.post("/targets/from-url", json={"jd_url": "https://example.com/jobs/1"})
     assert resp.status_code == 502
     assert resp.json() == {
         "detail": LLMMalformedOutputError.user_message,
@@ -99,7 +137,8 @@ def test_from_url_prose_refusal_is_a_fixed_502_without_model_content(
     llm = MockLLMClient(
         scripted={"target.normalize_posting_title": f"Sure! ZZ_MODEL_TEXT_ZZ {RAW_TITLE}"}
     )
-    resp = _client(llm).post("/targets/from-url", json={"jd_url": "https://example.com/jobs/1"})
+    with contextlib.closing(_client(llm)) as client:
+        resp = client.post("/targets/from-url", json={"jd_url": "https://example.com/jobs/1"})
     assert resp.status_code == 502
     assert resp.json()["code"] == "missing_tool_call"
     assert "ZZ_MODEL_TEXT_ZZ" not in resp.text
@@ -135,7 +174,8 @@ def test_from_url_canonical_label_reaches_the_create_through_the_http_layer(
             "target.normalize_posting_title": json.dumps({"label": "  Senior Product Manager  "})
         }
     )
-    resp = _client(llm).post("/targets/from-url", json={"jd_url": "https://example.com/jobs/1"})
+    with contextlib.closing(_client(llm)) as client:
+        resp = client.post("/targets/from-url", json={"jd_url": "https://example.com/jobs/1"})
     assert resp.status_code == 201, resp.text
     assert seen == {"matched": "Senior Product Manager", "created": "Senior Product Manager"}
     assert MARKER not in json.dumps(seen)
@@ -196,7 +236,10 @@ def test_derive_stream_mid_stream_error_frame_is_a_fixed_sse_error_without_diagn
     app.dependency_overrides[get_llm_client] = lambda: client
     app.dependency_overrides[enforce_llm_budget] = lambda: None
 
-    with TestClient(app).stream("POST", "/experience/derive/stream") as r:
+    with (
+        contextlib.closing(TestClient(app)) as client,
+        client.stream("POST", "/experience/derive/stream") as r,
+    ):
         assert r.status_code == 200
         text = "".join(r.iter_text())
     frames = [f for f in text.split("\n\n") if f.strip()]
