@@ -77,6 +77,9 @@ class LLMResult(BaseModel):
     # Wire-path provenance (#1067). ``None`` only for results built by code
     # that predates the field; ``cost_log`` records those as "unknown".
     transport: TransportId | None = None
+    # The upstream that served the call, when the gateway names it (OpenRouter
+    # does on both wire shapes); ``None`` for direct Anthropic, the mock, cache.
+    provider: str | None = None
 
 
 class LLMStreamDelta(BaseModel):

@@ -1,0 +1,26 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "text/event-stream"
+  },
+  "request": {
+    "model": "anthropic/claude-sonnet-4.6",
+    "max_tokens": 24,
+    "stream": true,
+    "system": [
+      {
+        "type": "text",
+        "text": "<11600 chars of repeated filler; >=1024 tokens so the block is cacheable>",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello in five words."
+      }
+    ]
+  }
+}

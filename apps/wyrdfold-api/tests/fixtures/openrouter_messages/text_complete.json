@@ -1,0 +1,60 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "request": {
+    "model": "anthropic/claude-sonnet-4.6",
+    "max_tokens": 32,
+    "system": "Answer in one short sentence.",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is a r\u00e9sum\u00e9?"
+      }
+    ]
+  },
+  "body": {
+    "id": "gen-1789715139-3DDtbs3TlNrAyioeTNtA",
+    "type": "message",
+    "role": "assistant",
+    "container": null,
+    "content": [
+      {
+        "type": "text",
+        "text": "A r\u00e9sum\u00e9 is a brief document summarizing a person's education, work experience, skills, and achievements, typically submitted when applying for a job.",
+        "citations": []
+      }
+    ],
+    "model": "anthropic/claude-sonnet-4.6",
+    "stop_reason": "max_tokens",
+    "stop_details": null,
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 21,
+      "output_tokens": 32,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "inference_geo": null,
+      "server_tool_use": null,
+      "service_tier": null,
+      "speed": "standard",
+      "cost": 0.001234,
+      "is_byok": false,
+      "cost_details": {
+        "upstream_inference_cost": 0.001234,
+        "upstream_inference_prompt_cost": 0.001,
+        "upstream_inference_completions_cost": 0.000234
+      }
+    },
+    "context_management": null,
+    "provider": "Amazon Bedrock"
+  }
+}

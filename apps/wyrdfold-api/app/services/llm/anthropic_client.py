@@ -156,6 +156,11 @@ class AnthropicLLMClient:
             base_url=base_url,
         )
 
+    def _transport_for(self, purpose: str, method: str) -> MessagesTransport:
+        """Which transport serves this call. The base client has one;
+        ``OpenRouterLLMClient`` routes by purpose (#1067 rollout knob)."""
+        return self._transport
+
     @property
     def _client(self) -> Any:
         """The SDK client behind the default transport, built on first access.
@@ -213,7 +218,8 @@ class AnthropicLLMClient:
         api_messages = _api_messages(messages)
 
         start = time.perf_counter()
-        response = await self._transport.create(
+        transport = self._transport_for(purpose, "complete")
+        response = await transport.create(
             model=cast(Any, self._resolve_model(model)),
             max_tokens=max_tokens,
             system=system_param,
@@ -238,7 +244,8 @@ class AnthropicLLMClient:
             cost_usd=cost,
             cost_source=cost_source,
             latency_ms=latency_ms,
-            transport=self._transport.transport_id,
+            transport=transport.transport_id,
+            provider=response.provider,
         )
 
     async def complete_tool_use(
@@ -308,7 +315,8 @@ class AnthropicLLMClient:
                 _note_temperature_omitted(model, temperature)
 
         start = time.perf_counter()
-        response = await self._transport.create(**create_kwargs)
+        transport = self._transport_for(purpose, "complete_tool_use")
+        response = await transport.create(**create_kwargs)
         latency_ms = int((time.perf_counter() - start) * 1000)
 
         # Find the tool_use block. The forced tool_choice guarantees one
@@ -352,7 +360,8 @@ class AnthropicLLMClient:
             cost_usd=cost,
             cost_source=cost_source,
             latency_ms=latency_ms,
-            transport=self._transport.transport_id,
+            transport=transport.transport_id,
+            provider=response.provider,
         )
         return tool_input, result
 
@@ -397,8 +406,9 @@ class AnthropicLLMClient:
         start = time.perf_counter()
         # The transport translates handshake and mid-stream failures into the
         # typed hierarchy; this loop only interprets the normalised events.
+        transport = self._transport_for(purpose, "stream")
         final_message: MessagesResponse | None = None
-        async for event in self._transport.stream(
+        async for event in transport.stream(
             model=cast(Any, self._resolve_model(model)),
             max_tokens=max_tokens,
             system=system_param,
@@ -436,6 +446,7 @@ class AnthropicLLMClient:
                 cost_usd=cost,
                 cost_source=cost_source,
                 latency_ms=latency_ms,
-                transport=self._transport.transport_id,
+                transport=transport.transport_id,
+                provider=final_message.provider,
             )
         )

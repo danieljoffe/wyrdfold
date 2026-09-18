@@ -22,7 +22,6 @@ ZDR (Zero Data Retention) is enabled account-wide via the OpenRouter dashboard.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -32,6 +31,7 @@ from typing import Any, Literal, NamedTuple, cast
 
 import httpx
 
+from app.config import settings
 from app.models.llm import LLMResult, LLMStreamEvent, LLMUsage, Message, ModelId
 from app.services.llm.anthropic_client import AnthropicLLMClient
 from app.services.llm.errors import (
@@ -41,7 +41,10 @@ from app.services.llm.errors import (
     MissingToolCallError,
     translate_api_status_error,
 )
+from app.services.llm.messages_transport import MessagesTransport
+from app.services.llm.openrouter_http import post_json_with_retry
 from app.services.llm.pricing import resolve_cost
+from app.services.llm.raw_messages_transport import RawMessagesTransport, classify_error_response
 
 # Anthropic SDK appends "/v1/messages" to base_url internally, so omit /v1 here.
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api"
@@ -324,6 +327,7 @@ class OpenRouterLLMClient(AnthropicLLMClient):
         api_key: str | None = None,
         timeout: float = 600.0,
         max_retries: int = 3,
+        raw_purposes: frozenset[str] | None = None,
     ) -> None:
         super().__init__(
             api_key=api_key,
@@ -338,6 +342,30 @@ class OpenRouterLLMClient(AnthropicLLMClient):
         self._timeout = timeout
         self._max_retries = max_retries
         self._openai_http: httpx.AsyncClient | None = None
+        # #1067 rollout: purposes served by the raw ``/v1/messages`` transport
+        # instead of the SDK. Read from settings at construction (the cached
+        # client is process-lived; a variable change restarts the process).
+        self._raw_purposes: frozenset[str] = (
+            raw_purposes if raw_purposes is not None else settings.llm_raw_transport_purposes_set
+        )
+        self._raw: RawMessagesTransport | None = None
+
+    def _raw_transport(self) -> RawMessagesTransport:
+        if self._raw is None:
+            self._raw = RawMessagesTransport(
+                api_key=self._api_key,
+                timeout=self._timeout,
+                max_retries=self._max_retries,
+                base_url=_OPENROUTER_BASE_URL,
+            )
+        return self._raw
+
+    def _transport_for(self, purpose: str, method: str) -> MessagesTransport:
+        # Stream purposes stay on the SDK until the raw stream lands (PR C):
+        # the knob cannot route them there even if listed.
+        if method != "stream" and purpose in self._raw_purposes:
+            return self._raw_transport()
+        return self._transport
 
     def _resolve_model(self, model: ModelId) -> str:
         route = _ROUTES.get(model)
@@ -498,29 +526,18 @@ class OpenRouterLLMClient(AnthropicLLMClient):
 
         http = self._openai_client()
         start = time.perf_counter()
-        resp: httpx.Response | None = None
-        for attempt in range(self._max_retries + 1):
-            try:
-                resp = await http.post(_OPENROUTER_OPENAI_URL, json=body)
-                resp.raise_for_status()
-                break
-            except httpx.HTTPStatusError as exc:
-                status = exc.response.status_code
-                if status in _TRANSIENT_STATUSES and attempt < self._max_retries:
-                    await asyncio.sleep(_BACKOFF_BASE_SECONDS * (2**attempt))
-                    continue
-                translated = translate_api_status_error(exc.response)
-                if translated is not None:
-                    raise translated from exc
-                raise  # 4xx application bug (bad schema/request) → bubble as 500
-            except httpx.TransportError as exc:  # timeouts + connection errors
-                if attempt < self._max_retries:
-                    await asyncio.sleep(_BACKOFF_BASE_SECONDS * (2**attempt))
-                    continue
-                raise LLMUpstreamUnavailableError() from exc
-
-        if resp is None:  # unreachable: the loop breaks with resp or raises
-            raise LLMUpstreamUnavailableError()
+        # One retry policy for both OpenRouter shapes (#1067 item 1): transient
+        # statuses and transport errors retried with Retry-After honoured;
+        # anything else comes back for classification here.
+        resp = await post_json_with_retry(
+            http, _OPENROUTER_OPENAI_URL, body, max_retries=self._max_retries
+        )
+        if resp.status_code < 200 or resp.status_code >= 300:
+            # Same taxonomy as the Messages shape: typed provider conditions
+            # (402/401/403) keep their errors; a 400 schema rejection is our bug
+            # and surfaces as LLMRequestRejectedError (500 + Sentry), no longer
+            # a raw httpx exception.
+            raise classify_error_response(resp)
         latency_ms = int((time.perf_counter() - start) * 1000)
 
         try:
@@ -555,5 +572,6 @@ class OpenRouterLLMClient(AnthropicLLMClient):
             cost_source=cost_source,
             latency_ms=latency_ms,
             transport="chat_completions_http",
+            provider=data.get("provider") if isinstance(data.get("provider"), str) else None,
         )
         return tool_input, result
