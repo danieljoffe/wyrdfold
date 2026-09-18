@@ -1566,3 +1566,52 @@ async def test_apply_fit_score_logs_when_there_is_no_payload_at_all(
     assert stub_crud.by_name("link") == []  # nothing written
     messages = [r.getMessage() for r in caplog.records]
     assert any("t-unscored" in m for m in messages), messages
+
+
+# ---- #1084 review: an active create must carry a limit -----------------------
+
+
+@pytest.mark.asyncio
+async def test_create_and_link_active_without_a_limit_is_refused_before_any_call() -> None:
+    """The database refuses the shape too (PT400 LIMIT_REQUIRED); refusing here
+    keeps the uncapped active create inexpressible from application code."""
+    supabase = MagicMock()
+    supabase.rpc.return_value.execute = AsyncMock()
+
+    with pytest.raises(ValueError, match="active_limit is required"):
+        await from_input.create_and_link(
+            supabase,
+            user_id="u-1",
+            payload=TargetCreate(label="Product Manager"),
+            is_active=True,
+        )
+
+    supabase.rpc.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_and_link_active_sends_both_the_flag_and_the_limit() -> None:
+    supabase = MagicMock()
+    supabase.rpc.return_value.execute = AsyncMock(
+        return_value=MagicMock(
+            data={
+                "target": _target().model_dump(mode="json"),
+                "user_target": _user_target(target_id="t-1").model_dump(mode="json"),
+                "was_created": True,
+            }
+        )
+    )
+
+    target, link, was_created = await from_input.create_and_link(
+        supabase,
+        user_id="u-1",
+        payload=TargetCreate(label="Product Manager"),
+        is_active=True,
+        active_limit=2,
+    )
+
+    _, params = supabase.rpc.call_args.args
+    assert params["p_is_active"] is True
+    assert params["p_active_limit"] == 2
+    assert was_created is True
+    assert link.target_id == "t-1"

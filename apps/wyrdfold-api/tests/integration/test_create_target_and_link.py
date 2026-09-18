@@ -609,3 +609,22 @@ def test_concurrent_active_writes_across_both_paths_admit_exactly_one_at_the_cap
     # If the create path lost, its target insert was rolled back with it.
     if create_result[0] == "cap":
         assert new_rows == []
+
+
+def test_active_create_without_a_limit_is_refused_before_any_write(
+    service_client: Client, two_seeded_users: tuple[str, str]
+) -> None:
+    """#1084 review: p_is_active with a NULL limit used to create the target
+    and activate the membership with no cap check. Now it is refused before
+    the first insert: no target row, no membership."""
+    uid, _ = two_seeded_users
+    label = f"NullLimit {uuid.uuid4()}"
+
+    with pytest.raises(APIError) as exc:
+        _call(service_client, user_id=uid, label=label, is_active=True, active_limit=None)
+
+    assert exc.value.code == "PT400"
+    assert json.loads(exc.value.details) == {"error": "LIMIT_REQUIRED"}
+    assert _rows_for(service_client, label.strip().lower()) == []
+    assert _active_count(service_client, uid) == 0
+    assert service_client.table("user_targets").select("id").eq("user_id", uid).execute().data == []
