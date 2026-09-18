@@ -89,7 +89,9 @@ def _sdk_client(api_key: str, capture: _Capture) -> OpenRouterLLMClient:
 def _raw_client(api_key: str, capture: _Capture) -> OpenRouterLLMClient:
     client = OpenRouterLLMClient(
         api_key=api_key,
-        raw_purposes=frozenset({"parity.tool_use", "parity.complete", "parity.cache"}),
+        raw_purposes=frozenset(
+            {"parity.tool_use", "parity.complete", "parity.cache", "parity.stream"}
+        ),
     )
     http = httpx.AsyncClient(
         timeout=httpx.Timeout(120.0, connect=10.0), event_hooks={"request": [capture.hook]}
@@ -117,7 +119,7 @@ async def main(out_path: str) -> int:
     report: dict[str, Any] = {"model": MODEL, "methods": {}, "cache_pair": {}}
     ok = True
 
-    for method in ("complete_tool_use", "complete"):
+    for method in ("complete_tool_use", "complete", "stream"):
         rows: dict[str, Any] = {}
         for name, factory in (("sdk", _sdk_client), ("raw", _raw_client)):
             cap = _Capture()
@@ -136,6 +138,26 @@ async def main(out_path: str) -> int:
                     temperature=0.0,
                 )
                 content: Any = tool_input
+            elif method == "stream":
+                deltas: list[str] = []
+                final = None
+                async for ev in client.stream(
+                    model=MODEL,
+                    system="Answer in one short sentence.",
+                    messages=[Message(role="user", content="What is a résumé?")],
+                    purpose="parity.stream",
+                    max_tokens=40,
+                ):
+                    if ev.type == "delta":
+                        deltas.append(ev.text)
+                    else:
+                        final = ev.result
+                if final is None:
+                    raise RuntimeError("stream ended without a final event")
+                result = final
+                content = "".join(deltas)
+                if content != final.content:
+                    raise RuntimeError("streamed deltas do not add up to the final content")
             else:
                 result = await client.complete(
                     model=MODEL,

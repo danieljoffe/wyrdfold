@@ -361,9 +361,9 @@ class OpenRouterLLMClient(AnthropicLLMClient):
         return self._raw
 
     def _transport_for(self, purpose: str, method: str) -> MessagesTransport:
-        # Stream purposes stay on the SDK until the raw stream lands (PR C):
-        # the knob cannot route them there even if listed.
-        if method != "stream" and purpose in self._raw_purposes:
+        # The rollout knob routes a listed purpose raw for every method; the
+        # raw transport streams too since #1067 PR C.
+        if purpose in self._raw_purposes:
             return self._raw_transport()
         return self._transport
 
