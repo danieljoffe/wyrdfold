@@ -13,6 +13,26 @@ from app.models.llm import ModelId
 _TEST_ENV_FILE: str | None = None if os.environ.get("WYRDFOLD_API_TESTING") == "1" else ".env"
 
 
+#: Environment names the app accepts when a check depends on "where am I
+#: running". Railway injects ``production`` / ``staging``; ``development`` and
+#: ``local`` are for a laptop or a local Docker run. Anything else is treated
+#: as unnamed, so a typo cannot pass as "not production".
+KNOWN_ENVIRONMENTS: frozenset[str] = frozenset({"production", "staging", "development", "local"})
+
+
+def runtime_environment() -> str | None:
+    """The deployment environment's name, canonicalized, or ``None`` if unnamed.
+
+    ``RAILWAY_ENVIRONMENT_NAME`` is injected by Railway; ``APP_ENV`` is the
+    portable override for any other host (a laptop, a local Docker run).
+    Stripped and lower-cased once, here, so ``GET /version`` and every startup
+    guard that keys off the environment read the same value (#1079).
+    """
+    raw = os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("APP_ENV") or ""
+    name = raw.strip().lower()
+    return name or None
+
+
 class Settings(BaseSettings):
     # extra="ignore": unknown keys in the dotenv file must not crash boot —
     # self-hosters commonly keep unrelated vars (PORT, tooling keys) in .env.

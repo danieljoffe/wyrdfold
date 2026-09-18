@@ -17,7 +17,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import Receive, Scope, Send
 
-from app.config import Settings, settings
+from app.config import KNOWN_ENVIRONMENTS, Settings, runtime_environment, settings
 from app.dependencies import prewarm_and_start_jwks_refresher
 from app.http_client import close_http_client, close_safe_http_client
 from app.logging_config import init_logging
@@ -137,9 +137,62 @@ def _validate_settings(s: Settings) -> None:
             "per-IP rate limit can be bypassed via X-Forwarded-For (SEC-5). "
             "Set it on both the API (Railway) and the BFF (Vercel) to enforce."
         )
+    _validate_stripe_key_mode(s.stripe_secret_key, runtime_environment())
 
 
 _LEGACY_KEY_DISABLED_SIGNATURE = "Legacy API keys are disabled"
+
+
+def _stripe_key_mode(key: str) -> str | None:
+    """``"live"`` / ``"test"`` from a secret key's prefix, ``None`` if neither."""
+    if key.startswith("sk_live_"):
+        return "live"
+    if key.startswith("sk_test_"):
+        return "test"
+    return None
+
+
+def _validate_stripe_key_mode(stripe_secret_key: str, environment: str | None) -> None:
+    """Refuse to start when the Stripe key's mode does not fit the environment (#1079).
+
+    In plain terms: a test key on production means nobody can pay; a live key
+    anywhere else means a test run charges real cards. Both happened once
+    (#861: the keys were inverted across environments). Until now the only
+    protection was a person remembering to look at the key's prefix.
+
+    Fail-closed on purpose, in every direction: a key with no recognizable
+    mode, and a key with no named environment to check it against, are both
+    configuration errors that belong in the deploy log, not in a customer's
+    checkout. The message never includes any part of the key.
+    """
+    key = stripe_secret_key.strip()
+    if not key:
+        return  # billing disabled; nothing to check
+    mode = _stripe_key_mode(key)
+    if mode is None:
+        raise RuntimeError(
+            "STRIPE_SECRET_KEY is set but is neither an sk_test_ nor an sk_live_ "
+            "secret key. Paste the SECRET key from the Stripe dashboard (not a "
+            "publishable pk_ key or a restricted rk_ key)."
+        )
+    if environment is None or environment not in KNOWN_ENVIRONMENTS:
+        where = "unnamed" if environment is None else f"{environment!r}, which is not a known name"
+        raise RuntimeError(
+            f"STRIPE_SECRET_KEY is set but the environment is {where}. Set "
+            "RAILWAY_ENVIRONMENT_NAME (Railway) or APP_ENV to one of "
+            f"{', '.join(sorted(KNOWN_ENVIRONMENTS))} so the key's mode can be "
+            "checked against it (#1079)."
+        )
+    if environment == "production" and mode != "live":
+        raise RuntimeError(
+            "production is configured with a TEST Stripe key: no customer can pay. "
+            "Set the live secret key on the production environment (#861)."
+        )
+    if environment != "production" and mode == "live":
+        raise RuntimeError(
+            f"{environment} is configured with a LIVE Stripe key: a test run here "
+            "would charge real cards. Use a test key outside production."
+        )
 
 
 async def _probe_supabase_keys(
@@ -670,7 +723,7 @@ async def version() -> dict[str, str | None]:
     return {
         "commit": os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("BUILD_SHA"),
         "built_at": os.getenv("BUILD_TIME"),
-        "environment": os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("APP_ENV"),
+        "environment": runtime_environment(),
     }
 
 
