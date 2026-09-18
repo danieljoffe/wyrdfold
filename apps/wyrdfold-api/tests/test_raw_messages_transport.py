@@ -350,6 +350,25 @@ async def test_transient_retries_are_logged_at_warning(
     )
 
 
+async def test_transport_error_retries_are_logged_at_warning(
+    _no_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review of #1077: a connect / DNS / read-timeout storm must leave a
+    per-retry production signal, like a retryable status does."""
+    t = _transport(
+        httpx.ConnectError("refused"), json_response(200, wire_text("ok")), max_retries=1
+    )
+    with caplog.at_level("WARNING", logger="app.services.llm.openrouter_http"):
+        await t.create(**_PARAMS)
+    hits = [
+        r for r in caplog.records if "openrouter transport error ConnectError" in r.getMessage()
+    ]
+    assert len(hits) == 1
+    assert hits[0].levelname == "WARNING"
+    assert "attempt=1/2" in hits[0].getMessage()
+    assert "/v1/messages" in hits[0].getMessage()
+
+
 async def test_transport_errors_retry_then_upstream_unavailable(_no_sleep: list[float]) -> None:
     t = _transport(httpx.ConnectError("refused"), httpx.ReadTimeout("slow"), max_retries=1)
     with pytest.raises(LLMUpstreamUnavailableError):

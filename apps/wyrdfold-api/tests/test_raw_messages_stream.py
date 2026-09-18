@@ -239,6 +239,23 @@ async def test_handshake_retries_transient_then_streams(_no_sleep: list[float]) 
     assert _no_sleep == [1.0]
 
 
+async def test_handshake_transport_error_retries_are_logged_at_warning(
+    _no_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    ok, _ = sse_response(_ok_frames())
+    t = _transport(httpx.ConnectError("refused"), ok, max_retries=1)
+    with caplog.at_level("WARNING", logger="app.services.llm.raw_messages_transport"):
+        events = await _collect(t)
+    assert isinstance(events[-1], StreamFinal)
+    hits = [
+        r
+        for r in caplog.records
+        if "openrouter transport error ConnectError on stream handshake" in r.getMessage()
+    ]
+    assert len(hits) == 1 and hits[0].levelname == "WARNING"
+    assert "attempt=1/2" in hits[0].getMessage()
+
+
 async def test_handshake_rejection_is_a_server_fault() -> None:
     t = _transport(json_response(400, wire_error(400, "ZZ_VENDOR_TEXT")))
     with pytest.raises(LLMRequestRejectedError) as excinfo:

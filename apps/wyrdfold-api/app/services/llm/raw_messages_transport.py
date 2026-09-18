@@ -283,9 +283,17 @@ class RawMessagesTransport:
                 resp = await cm.__aenter__()
             except httpx.TransportError as exc:
                 if attempt < self._max_retries:
-                    await openrouter_http._sleep(
-                        _backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS)
+                    delay = _backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS)
+                    logger.warning(
+                        "openrouter transport error %s on stream handshake %s attempt=%d/%d; "
+                        "retrying in %.2fs",
+                        type(exc).__name__,
+                        self._url,
+                        attempt + 1,
+                        self._max_retries + 1,
+                        delay,
                     )
+                    await openrouter_http._sleep(delay)
                     continue
                 raise LLMUpstreamUnavailableError() from exc
             if not should_retry(resp):

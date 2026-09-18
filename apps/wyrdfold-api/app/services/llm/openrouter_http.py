@@ -45,10 +45,10 @@ _sleep = asyncio.sleep
 def should_retry(resp: httpx.Response) -> bool:
     """The SDK-equivalent retry decision for one response.
 
-    ``x-should-retry: true`` forces a retry of any status and
-    ``x-should-retry: false`` forbids one, exactly as the Anthropic SDK's
-    ``_should_retry`` does; without the header, 408/409/425/429 and every 5xx
-    are transient. Callers classify whatever is NOT retried.
+    A 2xx is never retried. For an error status, ``x-should-retry: true``
+    forces a retry and ``x-should-retry: false`` forbids one, exactly as the
+    Anthropic SDK's ``_should_retry`` does; without the header, 408/409/425/429
+    and every 5xx are transient. Callers classify whatever is NOT retried.
     """
     # A success is never retried, whatever the header says: the SDK consults
     # ``x-should-retry`` only for error-status responses, and re-POSTing a
@@ -107,7 +107,19 @@ async def post_json_with_retry(
             )
         except httpx.TransportError as exc:  # timeouts + connection errors
             if attempt < max_retries:
-                await _sleep(_backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS))
+                delay = _backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS)
+                # Same production-visible signal as a retryable status: a
+                # DNS / connect / read-timeout storm must not consume retry
+                # time silently (review of #1077).
+                logger.warning(
+                    "openrouter transport error %s on POST %s attempt=%d/%d; retrying in %.2fs",
+                    type(exc).__name__,
+                    url,
+                    attempt + 1,
+                    max_retries + 1,
+                    delay,
+                )
+                await _sleep(delay)
                 continue
             raise LLMUpstreamUnavailableError() from exc
         if not should_retry(resp):
