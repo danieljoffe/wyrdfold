@@ -5,6 +5,7 @@ triggers LLM-powered profile derivation and merges the result into the
 target's composite scoring profile.
 """
 
+import json
 import logging
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -574,33 +575,6 @@ async def _update_target_async(
     return crud._parse_target(rows[0]) if rows else None
 
 
-async def _set_link_active(
-    supabase: AsyncClient, *, user_id: str, target_id: str, active: bool
-) -> None:
-    """Flip one link's ``is_active`` with no cap check.
-
-    Used by the activate-with-swap path. Bypassing the cap is correct for
-    both of its uses: deactivating always lowers the count, and the rollback
-    only restores a link that was active moments earlier — re-checking the
-    cap there could refuse to undo our own change and strand the user with
-    nothing active. The restore still runs through the one activation path
-    (serialized under the per-user lock, limit NULL) so it never races
-    another active write (#1071 review).
-    """
-    if active:
-        await _activate_user_target_async(
-            supabase, user_id=user_id, target_id=target_id, enforce_cap=False
-        )
-        return
-    await (
-        supabase.table(crud.USER_TARGETS_TABLE)
-        .update({"is_active": active, "updated_at": datetime.now(UTC).isoformat()})
-        .eq("user_id", user_id)
-        .eq("target_id", target_id)
-        .execute()
-    )
-
-
 async def _set_user_target_inactive_async(
     supabase: AsyncClient, user_id: str, target_id: str
 ) -> UserTarget | None:
@@ -890,15 +864,17 @@ async def _activate_link_with_optional_swap(
 ) -> None:
     """Activate ``target_id``, optionally freeing a slot first.
 
-    ``swap_out`` makes this a SWAP. Ordering is forced: the cap check counts
-    active links, so the deactivation must land before the activation. Doing
-    both here rather than as two client calls keeps the window where the user
-    has NEITHER target active server-side and short, instead of spanning a
-    network round-trip they could navigate away from.
+    ``swap_out`` makes this a SWAP. It used to be three writes (deactivate,
+    activate, restore on failure), and the restore ran uncapped, so a
+    concurrent activation between the first two could leave the user over
+    the cap once the restore landed (#1080 review). It is now ONE database
+    transaction under the per-user lock (`swap_user_target_active`): the cap
+    check counts after the deactivation, and a rejection unwinds the
+    deactivation with it, so a failed swap never leaves the user with fewer
+    active targets and nothing is ever restored.
 
-    Any failure after the deactivation rolls it back. Without that, a failed
-    swap leaves the user with fewer active targets than they started with —
-    strictly worse than the refusal they were trying to get past.
+    The two cheap validations stay here for their messages; the function
+    re-checks them under the lock and they map onto the same 400s.
 
     Raises ``HTTPException`` (400 for an invalid swap, 409 for the cap).
     """
@@ -906,7 +882,7 @@ async def _activate_link_with_optional_swap(
         if swap_out == target_id:
             raise HTTPException(
                 status_code=400,
-                detail="Cannot deactivate the target being activated.",
+                detail=_INVALID_SWAP_MESSAGES["SWAP_SELF"],
             )
         # Only a target the user currently has ACTIVE may be swapped out.
         # Otherwise this endpoint doubles as "deactivate any target by id" as
@@ -915,26 +891,18 @@ async def _activate_link_with_optional_swap(
         if swap_out not in {t["id"] for t in active_now}:
             raise HTTPException(
                 status_code=400,
-                detail="That target is not currently active.",
+                detail=_INVALID_SWAP_MESSAGES["SWAP_NOT_ACTIVE"],
             )
-        await _set_link_active(supabase, user_id=user_id, target_id=swap_out, active=False)
-
     try:
-        await _link_user_to_target_async(
-            supabase, user_id=user_id, target_id=target_id, is_active=True
+        await _activate_user_target_async(
+            supabase, user_id=user_id, target_id=target_id, swap_out=swap_out or None
         )
     except crud.ActiveTargetLimitError as e:
-        if swap_out:
-            await _set_link_active(supabase, user_id=user_id, target_id=swap_out, active=True)
         # 409 Conflict — well-formed, but conflicts with current state.
         # ``error`` lets the frontend switch on this case specifically,
         # ``message`` is what it shows when it doesn't, and
         # ``active_targets`` is what its swap picker lists.
         raise _active_limit_error(e, await _active_target_choices(supabase, user_id)) from e
-    except Exception:
-        if swap_out:
-            await _set_link_active(supabase, user_id=user_id, target_id=swap_out, active=True)
-        raise
 
 
 def _active_limit_error(
@@ -1027,7 +995,7 @@ async def _activate_user_target_async(
     *,
     user_id: str,
     target_id: str,
-    enforce_cap: bool = True,
+    swap_out: str | None = None,
     fit_score: int | None = None,
     fit_score_reasoning: str | None = None,
     fit_score_prose_doc_id: str | None = None,
@@ -1040,34 +1008,66 @@ async def _activate_user_target_async(
     no longer both pass a cap of one. Before, each route counted in the app
     and then wrote, with nothing serializing the count against the write.
 
-    ``enforce_cap=False`` is serialized but uncapped, reserved for restoring
-    a link the same request just deactivated (the activate-with-swap
-    rollback); the hard ceiling trigger still applies. The cap itself is
-    plan-derived, resolved here and passed in.
+    ``swap_out`` makes it a SWAP: the deactivation of ``swap_out`` and the
+    activation of ``target_id`` are one transaction under the same lock, so a
+    cap rejection unwinds the deactivation with it. There is no uncapped
+    activation and no separate restore write. The cap itself is plan-derived,
+    resolved here and passed in.
     """
-    limit = await _effective_active_target_cap_async(supabase, user_id) if enforce_cap else None
+    limit = await _effective_active_target_cap_async(supabase, user_id)
     params: dict[str, Any] = {
         "p_user_id": user_id,
         "p_target_id": target_id,
         "p_active_limit": limit,
     }
+    if swap_out is not None:
+        params["p_swap_out"] = swap_out
     if fit_score is not None:
         params["p_fit_score"] = fit_score
     if fit_score_reasoning is not None:
         params["p_fit_score_reasoning"] = fit_score_reasoning
     if fit_score_prose_doc_id is not None:
         params["p_fit_score_prose_doc_id"] = fit_score_prose_doc_id
+    function = "swap_user_target_active" if swap_out is not None else "activate_user_target"
     try:
-        resp = await supabase.rpc("activate_user_target", params).execute()
+        resp = await supabase.rpc(function, params).execute()
     except APIError as e:
         cap = from_input.active_cap_error(e, limit)
-        if cap is None:
-            raise
-        raise cap from e
+        if cap is not None:
+            raise cap from e
+        invalid = _invalid_swap_error(e)
+        if invalid is not None:
+            raise invalid from e
+        raise
     data = cast(dict[str, Any] | None, resp.data)
     if not data:
-        raise RuntimeError("activate_user_target returned no row")
+        raise RuntimeError(f"{function} returned no row")
     return crud._parse_user_target(data)
+
+
+#: SQLSTATE the swap function raises for an invalid swap (PostgREST maps the PT
+#: class to the HTTP status in its digits); DETAIL names which check failed.
+_INVALID_SWAP_SQLSTATE = "PT400"
+_INVALID_SWAP_MESSAGES = {
+    "SWAP_SELF": "Cannot deactivate the target being activated.",
+    "SWAP_NOT_ACTIVE": "That target is not currently active.",
+}
+
+
+def _invalid_swap_error(e: APIError) -> HTTPException | None:
+    """The 400 the swap route always sent, now sourced from the function's
+    authoritative check (it runs under the lock, so a swap-out that a
+    concurrent request just deactivated is refused here, not silently)."""
+    if e.code != _INVALID_SWAP_SQLSTATE:
+        return None
+    try:
+        reason = str(json.loads(e.details or "")["error"])
+    except (TypeError, ValueError, KeyError):
+        reason = ""
+    return HTTPException(
+        status_code=400,
+        detail=_INVALID_SWAP_MESSAGES.get(reason, "Invalid swap."),
+    )
 
 
 async def _set_app_active_async(supabase: AsyncClient, target_id: str) -> JobTarget | None:

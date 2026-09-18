@@ -389,22 +389,171 @@ def test_activate_user_target_writes_fit_fields_only_when_supplied(
     assert (bare["fit_score"], bare["fit_score_reasoning"]) == (71, "strong overlap")
 
 
-def test_uncapped_activation_is_allowed_only_with_a_null_limit(
+def test_a_null_limit_is_refused_so_no_uncapped_activation_exists(
     service_client: Client, two_seeded_users: tuple[str, str], cleanup_targets: list[str]
 ) -> None:
-    """The swap-rollback shape: NULL limit skips the cap (the hard ceiling
-    trigger still applies), an integer limit does not."""
     uid, _ = two_seeded_users
-    a = _call(service_client, user_id=uid, label=f"Null1 {uuid.uuid4()}")
-    b = _call(service_client, user_id=uid, label=f"Null2 {uuid.uuid4()}")
-    cleanup_targets += [a["target"]["id"], b["target"]["id"]]
-    _activate(service_client, user_id=uid, target_id=a["target"]["id"], active_limit=1)
+    a = _call(service_client, user_id=uid, label=f"Null {uuid.uuid4()}")
+    cleanup_targets.append(a["target"]["id"])
 
-    restored = _activate(
-        service_client, user_id=uid, target_id=b["target"]["id"], active_limit=None
+    with pytest.raises(APIError) as exc:
+        _activate(service_client, user_id=uid, target_id=a["target"]["id"], active_limit=None)
+
+    assert exc.value.code == "PT400"
+    assert json.loads(exc.value.details) == {"error": "LIMIT_REQUIRED"}
+    assert _active_count(service_client, uid) == 0
+
+
+def _swap(
+    client: Client, *, user_id: str, swap_out: str, target_id: str, active_limit: int | None
+) -> dict[str, Any]:
+    return (
+        client.rpc(
+            "swap_user_target_active",
+            {
+                "p_user_id": user_id,
+                "p_swap_out": swap_out,
+                "p_target_id": target_id,
+                "p_active_limit": active_limit,
+            },
+        )
+        .execute()
+        .data
     )
-    assert restored["is_active"] is True
-    assert _active_count(service_client, uid) == 2
+
+
+def test_swap_is_one_transaction_and_a_rejection_unwinds_the_deactivation(
+    service_client: Client, two_seeded_users: tuple[str, str], cleanup_targets: list[str]
+) -> None:
+    """The race the review named: a swap used to be deactivate, activate,
+    restore. Now a rejected swap leaves the swapped-out target exactly as
+    active as it was, in the same transaction."""
+    uid, _ = two_seeded_users
+    a = _call(service_client, user_id=uid, label=f"SwapA {uuid.uuid4()}")
+    x = _call(service_client, user_id=uid, label=f"SwapX {uuid.uuid4()}")
+    b = _call(service_client, user_id=uid, label=f"SwapB {uuid.uuid4()}")
+    cleanup_targets += [a["target"]["id"], x["target"]["id"], b["target"]["id"]]
+    a_id, x_id, b_id = a["target"]["id"], x["target"]["id"], b["target"]["id"]
+    _activate(service_client, user_id=uid, target_id=a_id, active_limit=2)
+    _activate(service_client, user_id=uid, target_id=x_id, active_limit=2)
+
+    # Swap A for B at a cap of 2: A out, B in, still 2 active.
+    swapped = _swap(service_client, user_id=uid, swap_out=a_id, target_id=b_id, active_limit=2)
+    assert swapped["target_id"] == b_id and swapped["is_active"] is True
+    active = {
+        r["target_id"]
+        for r in service_client.table("user_targets")
+        .select("target_id")
+        .eq("user_id", uid)
+        .eq("is_active", True)
+        .execute()
+        .data
+    }
+    assert active == {x_id, b_id}
+
+    # Swap B back for A at a cap of 1: after deactivating B, X still holds
+    # the only slot, so the activation is refused and B stays ACTIVE.
+    with pytest.raises(APIError) as exc:
+        _swap(service_client, user_id=uid, swap_out=b_id, target_id=a_id, active_limit=1)
+    assert exc.value.code == "PT409"
+    assert json.loads(exc.value.details)["active_count"] == 1
+    active_after = {
+        r["target_id"]
+        for r in service_client.table("user_targets")
+        .select("target_id")
+        .eq("user_id", uid)
+        .eq("is_active", True)
+        .execute()
+        .data
+    }
+    assert active_after == {x_id, b_id}
+
+
+def test_swap_input_checks_are_400s_that_write_nothing(
+    service_client: Client, two_seeded_users: tuple[str, str], cleanup_targets: list[str]
+) -> None:
+    uid, _ = two_seeded_users
+    a = _call(service_client, user_id=uid, label=f"Bad {uuid.uuid4()}")
+    b = _call(service_client, user_id=uid, label=f"Bad2 {uuid.uuid4()}")
+    cleanup_targets += [a["target"]["id"], b["target"]["id"]]
+
+    with pytest.raises(APIError) as self_swap:
+        _swap(
+            service_client,
+            user_id=uid,
+            swap_out=a["target"]["id"],
+            target_id=a["target"]["id"],
+            active_limit=5,
+        )
+    assert (self_swap.value.code, json.loads(self_swap.value.details)) == (
+        "PT400",
+        {"error": "SWAP_SELF"},
+    )
+
+    # A is not active, so it cannot be swapped out.
+    with pytest.raises(APIError) as not_active:
+        _swap(
+            service_client,
+            user_id=uid,
+            swap_out=a["target"]["id"],
+            target_id=b["target"]["id"],
+            active_limit=5,
+        )
+    assert json.loads(not_active.value.details) == {"error": "SWAP_NOT_ACTIVE"}
+    assert _active_count(service_client, uid) == 0
+
+
+def test_concurrent_swap_and_activation_never_exceed_the_cap(
+    service_client: Client, two_seeded_users: tuple[str, str], cleanup_targets: list[str]
+) -> None:
+    """The interleaving from the review: A active at cap 1; one connection
+    swaps A for B while another activates C. Whatever the order, the user
+    ends with exactly one active target, because the swap's deactivation and
+    activation are one critical section and nothing runs uncapped."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from supabase import create_client
+
+    from tests.integration.conftest import LOCAL_URL, SERVICE_KEY
+
+    uid, _ = two_seeded_users
+    c1, c2 = create_client(LOCAL_URL, SERVICE_KEY), create_client(LOCAL_URL, SERVICE_KEY)
+
+    def one_round() -> tuple[tuple[str, Any], tuple[str, Any]]:
+        a = _call(service_client, user_id=uid, label=f"RaceA {uuid.uuid4()}")
+        b = _call(service_client, user_id=uid, label=f"RaceB {uuid.uuid4()}")
+        c = _call(service_client, user_id=uid, label=f"RaceC {uuid.uuid4()}")
+        cleanup_targets.extend([a["target"]["id"], b["target"]["id"], c["target"]["id"]])
+        a_id, b_id, c_id = a["target"]["id"], b["target"]["id"], c["target"]["id"]
+        _activate(service_client, user_id=uid, target_id=a_id, active_limit=1)
+        gate = threading.Barrier(2)
+
+        def run(fn: Any) -> tuple[str, Any]:
+            gate.wait()
+            try:
+                return ("ok", fn())
+            except APIError as e:
+                return ("cap", e.code)
+
+        def swap_path() -> dict[str, Any]:
+            return _swap(c1, user_id=uid, swap_out=a_id, target_id=b_id, active_limit=1)
+
+        def activate_path() -> dict[str, Any]:
+            return _activate(c2, user_id=uid, target_id=c_id, active_limit=1)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            r1, r2 = pool.submit(run, swap_path), pool.submit(run, activate_path)
+            return r1.result(timeout=30), r2.result(timeout=30)
+
+    for _ in range(3):
+        swap_result, activate_result = one_round()
+        assert _active_count(service_client, uid) == 1, (swap_result, activate_result)
+        assert "cap" in {swap_result[0], activate_result[0]}
+        # reset for the next round
+        service_client.table("user_targets").update({"is_active": False}).eq(
+            "user_id", uid
+        ).execute()
 
 
 def test_concurrent_active_writes_across_both_paths_admit_exactly_one_at_the_cap(

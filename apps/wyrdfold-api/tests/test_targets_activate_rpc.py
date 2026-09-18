@@ -162,28 +162,62 @@ async def test_other_database_errors_propagate_unchanged(cap: dict[str, Any]) ->
 
 
 @pytest.mark.asyncio
-async def test_swap_restore_is_serialized_but_uncapped(cap: dict[str, Any]) -> None:
-    """The rollback of a failed swap re-activates a link the same request just
-    deactivated: it goes through the same function (one lock) with no limit."""
+async def test_swap_calls_the_swap_function_with_both_ids_and_the_cap(cap: dict[str, Any]) -> None:
     supabase = _supabase(rpc_result=_row())
 
-    await router._set_link_active(supabase, user_id="u-1", target_id="t-1", active=True)
+    await router._activate_user_target_async(
+        supabase, user_id="u-1", target_id="t-new", swap_out="t-old"
+    )
 
     name, params = supabase.rpc.call_args.args
-    assert name == "activate_user_target"
-    assert params["p_active_limit"] is None
-    assert cap["resolved_for"] == []
+    assert name == "swap_user_target_active"
+    assert params == {
+        "p_user_id": "u-1",
+        "p_target_id": "t-new",
+        "p_active_limit": 2,
+        "p_swap_out": "t-old",
+    }
 
 
 @pytest.mark.asyncio
-async def test_swap_deactivate_is_a_plain_update(cap: dict[str, Any]) -> None:
-    supabase = _supabase()
+async def test_swap_rejected_by_the_function_maps_onto_the_400_messages(
+    cap: dict[str, Any],
+) -> None:
+    """The function re-checks the swap under the lock; a swap-out that a
+    concurrent request just deactivated is refused there, with the same
+    message the router's own precheck uses."""
+    from fastapi import HTTPException
 
-    await router._set_link_active(supabase, user_id="u-1", target_id="t-1", active=False)
+    not_active = APIError(
+        {
+            "message": "swap-out target is not active for this user",
+            "code": "PT400",
+            "details": json.dumps({"error": "SWAP_NOT_ACTIVE"}),
+            "hint": "",
+        }
+    )
+    supabase = _supabase(rpc_error=not_active)
 
-    supabase.rpc.assert_not_called()
-    payload = supabase.table.return_value.update.call_args.args[0]
-    assert payload["is_active"] is False
+    with pytest.raises(HTTPException) as exc:
+        await router._activate_user_target_async(
+            supabase, user_id="u-1", target_id="t-new", swap_out="t-old"
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "That target is not currently active."
+
+
+@pytest.mark.asyncio
+async def test_the_cap_is_always_resolved_and_passed(cap: dict[str, Any]) -> None:
+    """No uncapped activation exists in the router any more: every call
+    carries the resolved limit (the function refuses a NULL one)."""
+    supabase = _supabase(rpc_result=_row())
+
+    await router._activate_user_target_async(supabase, user_id="u-1", target_id="t-1")
+
+    _, params = supabase.rpc.call_args.args
+    assert params["p_active_limit"] == 2
+    assert cap["resolved_for"] == ["u-1"]
 
 
 @pytest.mark.asyncio

@@ -26,9 +26,13 @@
 --   * activate_user_target is the one path for activating an existing or new
 --     membership: lock, count the user's OTHER active memberships, refuse at
 --     p_active_limit, upsert active (fit-score fields written only when
---     supplied, so a bare activation never blanks a stored score). A NULL limit
---     is "serialized but uncapped": reserved for restoring a link the same
---     request just deactivated (the activate-with-swap rollback).
+--     supplied, so a bare activation never blanks a stored score). The limit
+--     is required: there is no uncapped activation.
+--   * swap_user_target_active deactivates one membership and activates another
+--     in ONE transaction under the same lock, by calling activate_user_target
+--     after the deactivation. A cap rejection rolls the deactivation back with
+--     it, so a failed swap can never leave the user with fewer active targets,
+--     and no separate "restore" write exists to race another request.
 --
 -- Rejections raise SQLSTATE PT409, which PostgREST maps to HTTP 409; DETAIL
 -- carries {error, active_count, limit} as JSON so the app builds the same
@@ -161,28 +165,34 @@ DECLARE
     v_link         public.user_targets%ROWTYPE;
     v_active_count integer;
 BEGIN
+    IF p_active_limit IS NULL THEN
+        -- No uncapped activation exists. A caller that "knows" the cap does
+        -- not apply is exactly the caller that would recreate the race.
+        RAISE EXCEPTION 'activate_user_target: p_active_limit is required'
+            USING ERRCODE = 'PT400',
+                  DETAIL  = '{"error": "LIMIT_REQUIRED"}';
+    END IF;
+
     -- The one lock every active write serializes on (see header).
     PERFORM pg_advisory_xact_lock(hashtext('user_targets_ceiling:' || p_user_id::text));
 
-    IF p_active_limit IS NOT NULL THEN
-        -- The membership being activated is excluded from the count, so an
-        -- idempotent re-activation of a link the user already holds active
-        -- is exempt (same rule as the application's advisory check).
-        SELECT count(*) INTO v_active_count
-          FROM public.user_targets
-         WHERE user_id = p_user_id
-           AND is_active
-           AND target_id <> p_target_id;
-        IF v_active_count >= p_active_limit THEN
-            RAISE EXCEPTION 'active target limit reached (% of %)', v_active_count, p_active_limit
-                USING ERRCODE = 'PT409',
-                      DETAIL  = jsonb_build_object(
-                                    'error', 'ACTIVE_LIMIT',
-                                    'active_count', v_active_count,
-                                    'limit', p_active_limit
-                                )::text,
-                      HINT    = 'Deactivate a target first.';
-        END IF;
+    -- The membership being activated is excluded from the count, so an
+    -- idempotent re-activation of a link the user already holds active is
+    -- exempt (same rule as the application's advisory check).
+    SELECT count(*) INTO v_active_count
+      FROM public.user_targets
+     WHERE user_id = p_user_id
+       AND is_active
+       AND target_id <> p_target_id;
+    IF v_active_count >= p_active_limit THEN
+        RAISE EXCEPTION 'active target limit reached (% of %)', v_active_count, p_active_limit
+            USING ERRCODE = 'PT409',
+                  DETAIL  = jsonb_build_object(
+                                'error', 'ACTIVE_LIMIT',
+                                'active_count', v_active_count,
+                                'limit', p_active_limit
+                            )::text,
+                  HINT    = 'Deactivate a target first.';
     END IF;
 
     INSERT INTO public.user_targets (
@@ -213,7 +223,62 @@ COMMENT ON FUNCTION public.activate_user_target(uuid, uuid, integer, integer, te
   'ceiling lock, counts the user''s other active memberships, refuses at '
   'p_active_limit with PT409 + JSON DETAIL {error, active_count, limit}, and '
   'upserts the link active in the same transaction. Fit-score fields are '
-  'written only when supplied. A NULL limit is serialized but uncapped, for '
-  'restoring a link the same request just deactivated.';
+  'written only when supplied. The limit is required (PT400 otherwise).';
+
+
+CREATE OR REPLACE FUNCTION public.swap_user_target_active(
+    p_user_id uuid,
+    p_swap_out uuid,
+    p_target_id uuid,
+    p_active_limit integer,
+    p_fit_score integer DEFAULT NULL,
+    p_fit_score_reasoning text DEFAULT NULL,
+    p_fit_score_prose_doc_id uuid DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+VOLATILE
+SET search_path TO 'public', 'pg_catalog'
+AS $function$
+DECLARE
+    v_out public.user_targets%ROWTYPE;
+BEGIN
+    IF p_swap_out = p_target_id THEN
+        RAISE EXCEPTION 'cannot swap a target out for itself'
+            USING ERRCODE = 'PT400',
+                  DETAIL  = '{"error": "SWAP_SELF"}';
+    END IF;
+
+    -- Same lock as every other active write; activate_user_target re-takes it
+    -- re-entrantly below, so deactivate + count + activate are one critical
+    -- section and one transaction.
+    PERFORM pg_advisory_xact_lock(hashtext('user_targets_ceiling:' || p_user_id::text));
+
+    -- Only a membership the user currently holds ACTIVE may be swapped out;
+    -- otherwise this doubles as "deactivate any target by id".
+    UPDATE public.user_targets
+       SET is_active = false, updated_at = now()
+     WHERE user_id = p_user_id AND target_id = p_swap_out AND is_active
+    RETURNING * INTO v_out;
+    IF v_out.id IS NULL THEN
+        RAISE EXCEPTION 'swap-out target is not active for this user'
+            USING ERRCODE = 'PT400',
+                  DETAIL  = '{"error": "SWAP_NOT_ACTIVE"}';
+    END IF;
+
+    -- A PT409 raised here unwinds the deactivation above with it.
+    RETURN public.activate_user_target(
+        p_user_id, p_target_id, p_active_limit,
+        p_fit_score, p_fit_score_reasoning, p_fit_score_prose_doc_id
+    );
+END;
+$function$;
+
+COMMENT ON FUNCTION public.swap_user_target_active(uuid, uuid, uuid, integer, integer, text, uuid) IS
+  'Deactivate p_swap_out and activate p_target_id for one user in ONE '
+  'transaction under the per-user ceiling lock (#1071). A cap rejection '
+  '(PT409) rolls the deactivation back, so a failed swap never leaves the '
+  'user with fewer active targets and there is no separate restore write to '
+  'race another request. PT400 {SWAP_SELF | SWAP_NOT_ACTIVE} for invalid input.';
 
 NOTIFY pgrst, 'reload schema';
