@@ -554,5 +554,6 @@ class OpenRouterLLMClient(AnthropicLLMClient):
             cost_usd=cost,
             cost_source=cost_source,
             latency_ms=latency_ms,
+            transport="chat_completions_http",
         )
         return tool_input, result
