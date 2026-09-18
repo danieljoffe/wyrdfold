@@ -248,6 +248,71 @@ async def test_exhausted_429_stays_rate_limited_and_5xx_stays_upstream(
         await t.create(**_PARAMS)
 
 
+async def test_409_is_transient_like_the_sdk(_no_sleep: list[float]) -> None:
+    """The SDK retries 408/409/429/5xx; 409 was missing from the first cut
+    (review blocker on #1074)."""
+    t = _transport(
+        json_response(409, wire_error(409, "conflict")),
+        json_response(200, wire_text("ok")),
+        max_retries=1,
+    )
+    out = await t.create(**_PARAMS)
+    assert out.content[0].text == "ok"
+    assert len(_no_sleep) == 1
+
+
+async def test_any_5xx_is_transient_not_only_the_enumerated_ones(_no_sleep: list[float]) -> None:
+    t = _transport(
+        json_response(520, wire_error(520, "cloudflare-ish")),
+        json_response(200, wire_text("ok")),
+        max_retries=1,
+    )
+    await t.create(**_PARAMS)
+    assert len(_no_sleep) == 1
+
+
+async def test_x_should_retry_true_forces_a_retry_of_a_non_transient_status(
+    _no_sleep: list[float],
+) -> None:
+    cap = WireCapture()
+    t = _transport(
+        json_response(400, wire_error(400, "try again"), headers={"x-should-retry": "true"}),
+        json_response(200, wire_text("ok")),
+        capture=cap,
+        max_retries=1,
+    )
+    out = await t.create(**_PARAMS)
+    assert out.content[0].text == "ok"
+    assert len(cap.requests) == 2
+    assert len(_no_sleep) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (503, LLMUpstreamUnavailableError),
+        (429, LLMRateLimitedError),
+        (409, LLMRequestRejectedError),
+    ],
+)
+async def test_x_should_retry_false_stops_a_normally_transient_status(
+    _no_sleep: list[float], status: int, expected: type[Exception]
+) -> None:
+    """Header precedence: ``x-should-retry: false`` on a status the policy
+    would otherwise retry means one attempt, then classification as usual."""
+    cap = WireCapture()
+    t = _transport(
+        json_response(status, wire_error(status, "stop"), headers={"x-should-retry": "false"}),
+        json_response(200, wire_text("never reached")),
+        capture=cap,
+        max_retries=2,
+    )
+    with pytest.raises(expected):
+        await t.create(**_PARAMS)
+    assert len(cap.requests) == 1
+    assert _no_sleep == []
+
+
 async def test_transport_errors_retry_then_upstream_unavailable(_no_sleep: list[float]) -> None:
     t = _transport(httpx.ConnectError("refused"), httpx.ReadTimeout("slow"), max_retries=1)
     with pytest.raises(LLMUpstreamUnavailableError):

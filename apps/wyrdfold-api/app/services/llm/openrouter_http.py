@@ -29,14 +29,33 @@ from app.services.llm.errors import LLMUpstreamUnavailableError, translate_api_s
 
 logger = logging.getLogger(__name__)
 
-# 408/425 (request timeout / too early) join the LLM set the OpenAI path
-# already retried; 529 is Anthropic's "overloaded".
-TRANSIENT_STATUSES: frozenset[int] = frozenset({408, 425, 429, 500, 502, 503, 504, 529})
+# The SDK's retry set: 408 (request timeout), 409 (conflict), 429 (rate
+# limit) and every 5xx, including 529 (Anthropic's "overloaded"); 425 (too
+# early) joins because ``app.http_client`` already treats it that way.
+# ``should_retry`` also honours the ``x-should-retry`` response header in both
+# directions, as the SDK does, and that header wins over the status.
+TRANSIENT_STATUSES: frozenset[int] = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
 _BACKOFF_BASE_SECONDS = 0.5
 _BACKOFF_CAP_SECONDS = 8.0
 
 # Indirection so tests can patch the sleep without touching asyncio.
 _sleep = asyncio.sleep
+
+
+def should_retry(resp: httpx.Response) -> bool:
+    """The SDK-equivalent retry decision for one response.
+
+    ``x-should-retry: true`` forces a retry of any status and
+    ``x-should-retry: false`` forbids one, exactly as the Anthropic SDK's
+    ``_should_retry`` does; without the header, 408/409/425/429 and every 5xx
+    are transient. Callers classify whatever is NOT retried.
+    """
+    directive = resp.headers.get("x-should-retry", "").strip().lower()
+    if directive == "true":
+        return True
+    if directive == "false":
+        return False
+    return resp.status_code in TRANSIENT_STATUSES or resp.status_code >= 500
 
 
 async def post_json_with_retry(
@@ -47,12 +66,17 @@ async def post_json_with_retry(
     max_retries: int,
     headers: Mapping[str, str] | None = None,
 ) -> httpx.Response:
-    """POST ``body`` as JSON; retry transient statuses and transport errors.
+    """POST ``body`` as JSON; retry per ``should_retry`` and on transport errors.
 
     Delay between attempts honours ``Retry-After`` when the server sends one
     (integer seconds, clamped to ``_MAX_RETRY_AFTER_S``), else exponential
     backoff with jitter. ``max_retries`` is the number of RETRIES, so the
-    call is attempted ``max_retries + 1`` times.
+    call is attempted ``max_retries + 1`` times. When retries are spent, the
+    last response is classified: 429 stays ``LLMRateLimitedError``, 5xx stays
+    ``LLMUpstreamUnavailableError``, and an exhausted 408/409/425 is reported
+    as upstream-unavailable too (the SDK would raise its 4xx error class
+    there; a 503 "try again" is the kinder outcome for a status that was, by
+    definition, transient).
     """
     last: httpx.Response | None = None
     for attempt in range(max_retries + 1):
@@ -69,7 +93,7 @@ async def post_json_with_retry(
                 await _sleep(_backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS))
                 continue
             raise LLMUpstreamUnavailableError() from exc
-        if resp.status_code not in TRANSIENT_STATUSES:
+        if not should_retry(resp):
             return resp
         last = resp
         if attempt >= max_retries:
