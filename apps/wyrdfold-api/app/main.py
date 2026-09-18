@@ -137,7 +137,7 @@ def _validate_settings(s: Settings) -> None:
             "per-IP rate limit can be bypassed via X-Forwarded-For (SEC-5). "
             "Set it on both the API (Railway) and the BFF (Vercel) to enforce."
         )
-    _validate_stripe_key_mode(s.stripe_secret_key, runtime_environment())
+    _validate_stripe_key_mode(s.stripe_secret_key, runtime_environment(s))
 
 
 _LEGACY_KEY_DISABLED_SIGNATURE = "Legacy API keys are disabled"
@@ -165,7 +165,8 @@ def _validate_stripe_key_mode(stripe_secret_key: str, environment: str | None) -
     configuration errors that belong in the deploy log, not in a customer's
     checkout. The message never includes any part of the key.
     """
-    key = stripe_secret_key.strip()
+    # ``Settings`` strips the key at load, so this is the exact runtime value.
+    key = stripe_secret_key
     if not key:
         return  # billing disabled; nothing to check
     mode = _stripe_key_mode(key)
@@ -723,7 +724,7 @@ async def version() -> dict[str, str | None]:
     return {
         "commit": os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("BUILD_SHA"),
         "built_at": os.getenv("BUILD_TIME"),
-        "environment": runtime_environment(),
+        "environment": runtime_environment(settings),
     }
 
 

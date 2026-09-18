@@ -6,6 +6,8 @@ silently drop a check and turn a misconfig into a runtime 503.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -224,6 +226,56 @@ def test_railway_environment_name_wins_over_app_env_like_version_does(
 
     monkeypatch.setenv("RAILWAY_ENVIRONMENT_NAME", " Production ")
     monkeypatch.setenv("APP_ENV", "local")
-    assert runtime_environment() == "production"
+    assert runtime_environment(_good_settings()) == "production"
     with pytest.raises(RuntimeError, match="TEST Stripe key"):
         _validate_settings(_good_settings(stripe_secret_key="sk_test_abc123"))
+
+
+def test_padded_stripe_key_is_stripped_at_load_so_stripe_gets_the_checked_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard must validate the exact value ``billing._client()`` hands to
+    Stripe, so normalization lives in ``Settings``, not in a local copy."""
+    _named(monkeypatch, "production")
+    s = _good_settings(stripe_secret_key=" sk_live_abc123 ", stripe_webhook_secret=" whsec_x ")
+    assert s.stripe_secret_key == "sk_live_abc123"
+    assert s.stripe_webhook_secret == "whsec_x"
+    _validate_settings(s)
+
+
+def test_app_env_and_key_supplied_through_a_dotenv_file_reach_the_guard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The documented local path: nothing in the process environment, both
+    values in ``.env``. A file-only ``APP_ENV`` must name the environment."""
+    _named(monkeypatch, None)
+    env_file = tmp_path / ".env"
+    env_file.write_text("APP_ENV=local\nSTRIPE_SECRET_KEY=sk_test_abc123\n")
+    s = Settings(  # type: ignore[call-arg]
+        _env_file=str(env_file),
+        allowed_hosts="*",
+        supabase_url="https://example.supabase.co",
+        supabase_service_role_key="sk-test",
+        supabase_anon_key="anon-test",
+        llm_provider="mock",
+        embeddings_provider="mock",
+    )
+    assert s.app_env == "local"
+    assert s.stripe_secret_key == "sk_test_abc123"
+    from app.config import runtime_environment
+
+    assert runtime_environment(s) == "local"
+    _validate_settings(s)
+
+    env_file.write_text("APP_ENV=production\nSTRIPE_SECRET_KEY=sk_test_abc123\n")
+    s = Settings(  # type: ignore[call-arg]
+        _env_file=str(env_file),
+        allowed_hosts="*",
+        supabase_url="https://example.supabase.co",
+        supabase_service_role_key="sk-test",
+        supabase_anon_key="anon-test",
+        llm_provider="mock",
+        embeddings_provider="mock",
+    )
+    with pytest.raises(RuntimeError, match="TEST Stripe key"):
+        _validate_settings(s)
