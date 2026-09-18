@@ -27,6 +27,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any, Literal, NamedTuple, cast
 
 import httpx
@@ -166,10 +167,21 @@ def _parse_openai_tool_response(
     chat/completions response. Fails loud on every way the structured
     contract can break — the caller's fallback engages rather than a
     silently-wrong dict flowing downstream (mirrors the Anthropic path, #47).
+
+    Every failure here is an ``LLMMalformedOutputError`` (#1066): no choices,
+    prose instead of the tool call (``MissingToolCallError``), truncation,
+    non-JSON or non-object arguments. None is a plain ``ValueError``, so the
+    raw envelope text these diagnostics carry can only reach a log line.
     """
     choices = data.get("choices") or []
     if not choices:
-        raise ValueError(f"OpenRouter returned no choices for {tool_name!r}: {str(data)[:300]!r}")
+        # A 200 with no completion at all (missing or empty ``choices``) is an
+        # unusable answer like the rest of this family (#1066): typed, fixed
+        # user copy, the bounded raw envelope only in the log line.
+        raise LLMMalformedOutputError(
+            f"OpenRouter returned no choices for {tool_name!r}: {str(data)[:300]!r}",
+            reason="missing_choices",
+        )
     choice = choices[0]
     finish = choice.get("finish_reason")
     # OpenRouter names the endpoint that actually served the call on every
@@ -480,9 +492,26 @@ class OpenRouterLLMClient(AnthropicLLMClient):
             code = err.get("code")
             if isinstance(code, int) and code in _TRANSIENT_STATUSES:
                 raise LLMUpstreamUnavailableError()
-            raise ValueError(
+            # A classified non-transient status in the body (402 credits,
+            # 401/403 key) gets the same typed error the HTTP-status path
+            # gives it, so the breaker and the 503 copy behave identically
+            # whether OpenRouter put the code on the wire or in the envelope.
+            translated = (
+                translate_api_status_error(SimpleNamespace(status_code=code))
+                if isinstance(code, int)
+                else None
+            )
+            if translated is not None:
+                raise translated
+            # Anything else (a grammar-compile 400, an unknown envelope) is an
+            # unusable answer (#1066): typed, fixed user copy, the provider's
+            # message only in the log line. Never a plain ``ValueError``, which
+            # an ``except ValueError as exc: HTTPException(detail=str(exc))``
+            # would serialise.
+            raise LLMMalformedOutputError(
                 f"OpenRouter error body for {tool_name!r} (code={code}): "
-                f"{str(err.get('message'))[:200]!r}"
+                f"{str(err.get('message'))[:200]!r}",
+                reason="provider_error_body",
             )
 
         tool_input = _parse_openai_tool_response(

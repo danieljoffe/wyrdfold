@@ -15,6 +15,7 @@ import pytest
 from app.models.llm import LLMUsage, Message
 from app.services.llm.errors import (
     LLMMalformedOutputError,
+    LLMQuotaExhaustedError,
     LLMRateLimitedError,
     LLMUpstreamUnavailableError,
     MissingToolCallError,
@@ -59,9 +60,53 @@ def test_parse_happy_path() -> None:
     assert out == {"verdicts": [{"id": 1, "promising": True}]}
 
 
-def test_parse_no_choices_raises() -> None:
-    with pytest.raises(ValueError, match="no choices"):
-        _parse_openai_tool_response({"choices": []}, tool_name="return_X", max_tokens=1000)
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param({"choices": [], "id": "ZZ_RAW_ENVELOPE_MARKER_ZZ"}, id="empty-choices"),
+        pytest.param({"id": "ZZ_RAW_ENVELOPE_MARKER_ZZ"}, id="missing-choices"),
+    ],
+)
+def test_parse_no_choices_is_typed_and_keeps_the_envelope_out_of_user_copy(data: dict) -> None:
+    """#1066 review blocker: a 200 with no completion is a member of the
+    malformed-output family, never a plain ``ValueError`` carrying the raw
+    envelope. The envelope stays on the (bounded) diagnostic for the log line."""
+    with pytest.raises(LLMMalformedOutputError, match="no choices") as excinfo:
+        _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    exc = excinfo.value
+    assert exc.reason == "missing_choices"
+    assert not isinstance(exc, ValueError)
+    assert "ZZ_RAW_ENVELOPE_MARKER_ZZ" in exc.diagnostic
+    assert len(exc.diagnostic) < 400
+    assert "ZZ_RAW_ENVELOPE_MARKER_ZZ" not in exc.user_message
+
+
+def test_no_choices_reaches_the_client_as_the_fixed_502_copy() -> None:
+    """Response-level proof for the review blocker: through the registered
+    handler function, the no-choices error is a 502 whose body carries only
+    the fixed copy and the reason, never the raw envelope."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.main import _llm_malformed_output_handler
+
+    probe = FastAPI()
+    probe.add_exception_handler(LLMMalformedOutputError, _llm_malformed_output_handler)
+
+    @probe.get("/probe")
+    async def _probe() -> dict:
+        _parse_openai_tool_response(
+            {"choices": [], "id": "ZZ_RAW_ENVELOPE_MARKER_ZZ"}, tool_name="return_X", max_tokens=1
+        )
+        return {}
+
+    resp = TestClient(probe).get("/probe")
+    assert resp.status_code == 502
+    assert resp.json() == {
+        "detail": LLMMalformedOutputError.user_message,
+        "code": "missing_choices",
+    }
+    assert "ZZ_RAW_ENVELOPE_MARKER_ZZ" not in resp.text
 
 
 def test_parse_missing_tool_call_raises() -> None:
@@ -451,9 +496,32 @@ async def test_grammar_400_error_body_surfaces_clearly(monkeypatch) -> None:
             }
         },
     )
-    # NOT a confusing "no choices" — a clear error-body message with the code.
-    with pytest.raises(ValueError, match=r"error body.*code=400"):
+    # NOT a confusing "no choices" — a clear error-body message with the code,
+    # typed (#1066) so the provider's text can only reach the log line.
+    with pytest.raises(LLMMalformedOutputError, match=r"error body.*code=400") as excinfo:
         await _call(client)
+    assert excinfo.value.reason == "provider_error_body"
+    assert not isinstance(excinfo.value, ValueError)
+    assert "compile json grammar" not in excinfo.value.user_message
+
+
+@pytest.mark.asyncio
+async def test_402_error_body_maps_to_the_quota_error_like_the_status_path(monkeypatch) -> None:
+    """A classified non-transient code in the envelope gets the same typed
+    error as the HTTP-status path: the breaker latches on it and the user sees
+    the 503 copy, never the vendor's credits message."""
+    client = _error_body_client(
+        monkeypatch,
+        {
+            "error": {
+                "message": "Insufficient credits. Add more using https://openrouter.ai",
+                "code": 402,
+            }
+        },
+    )
+    with pytest.raises(LLMQuotaExhaustedError) as excinfo:
+        await _call(client)
+    assert "credits" not in excinfo.value.user_message.lower()
 
 
 # ---- single-attempt contract: no retry on any parse failure (#935) ----------
