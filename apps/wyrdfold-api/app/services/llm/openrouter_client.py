@@ -42,7 +42,7 @@ from app.services.llm.errors import (
     translate_api_status_error,
 )
 from app.services.llm.messages_transport import MessagesTransport
-from app.services.llm.openrouter_http import post_json_with_retry
+from app.services.llm.openrouter_http import TRANSIENT_STATUSES, post_json_with_retry
 from app.services.llm.pricing import resolve_cost
 from app.services.llm.raw_messages_transport import RawMessagesTransport, classify_error_response
 
@@ -120,7 +120,6 @@ _NO_FORCED_FUNCTION_PROVIDERS: tuple[str, ...] = (
 )
 
 # HTTP statuses worth a retry (transient); others translate + raise immediately.
-_TRANSIENT_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 529})
 # Envelope codes that mean OpenRouter rejected OUR request: a schema the
 # grammar compiler cannot inline (400), a slug with no endpoints (404), a
 # payload it will not take (413/415), a validation failure (422). Application
@@ -263,7 +262,8 @@ def _classify_error_envelope(err: dict[str, Any], *, tool_name: str) -> Exceptio
     answer, so nothing here is an ``LLMMalformedOutputError``, and nothing is a
     plain ``ValueError`` that an ``except ValueError`` could serialise.
 
-    - transient (``_TRANSIENT_STATUSES``): ``LLMUpstreamUnavailableError``;
+    - transient (``openrouter_http.TRANSIENT_STATUSES`` or any 5xx):
+      ``LLMUpstreamUnavailableError``;
       the caller's fallback engages.
     - classified provider condition (402 credits, 401/403 key): the same typed
       error the HTTP-status path gives it, via ``translate_api_status_error``,
@@ -279,7 +279,10 @@ def _classify_error_envelope(err: dict[str, Any], *, tool_name: str) -> Exceptio
     code = err.get("code")
     message = str(err.get("message"))[:200]
     if isinstance(code, int):
-        if code in _TRANSIENT_STATUSES:
+        # The same transient set as the status-line path (408/409/425/429 and
+        # every 5xx): an envelope timeout must not become "our bug" while the
+        # identical status on the wire is retried (release gate 2026-09-18).
+        if code in TRANSIENT_STATUSES or code >= 500:
             return LLMUpstreamUnavailableError()
         translated = translate_api_status_error(SimpleNamespace(status_code=code))
         if translated is not None:
@@ -349,6 +352,13 @@ class OpenRouterLLMClient(AnthropicLLMClient):
             raw_purposes if raw_purposes is not None else settings.llm_raw_transport_purposes_set
         )
         self._raw: RawMessagesTransport | None = None
+        if self._raw_purposes:
+            # Visible in prod logs at every client construction so a rollout
+            # (or a typo that routes nothing) is never silent.
+            logger.warning(
+                "raw /v1/messages transport enabled for purposes: %s",
+                ", ".join(sorted(self._raw_purposes)),
+            )
 
     def _raw_transport(self) -> RawMessagesTransport:
         if self._raw is None:
@@ -537,7 +547,7 @@ class OpenRouterLLMClient(AnthropicLLMClient):
             # (402/401/403) keep their errors; a 400 schema rejection is our bug
             # and surfaces as LLMRequestRejectedError (500 + Sentry), no longer
             # a raw httpx exception.
-            raise classify_error_response(resp)
+            raise classify_error_response(resp, endpoint="/chat/completions")
         latency_ms = int((time.perf_counter() - start) * 1000)
 
         try:

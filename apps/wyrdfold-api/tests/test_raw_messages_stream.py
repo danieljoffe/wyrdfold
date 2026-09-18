@@ -288,3 +288,41 @@ def test_router_no_longer_pins_stream_to_the_sdk() -> None:
     client = OpenRouterLLMClient(api_key="k", raw_purposes=frozenset({"p"}))
     assert isinstance(client._transport_for("p", "stream"), raw.RawMessagesTransport)
     assert client._transport_for("q", "stream") is client._transport
+
+
+# ---- release gate 2026-09-18 -------------------------------------------------
+
+
+async def test_client_level_cancellation_closes_the_transport_synchronously() -> None:
+    """The derive route closes the CLIENT generator on disconnect; the
+    transport generator underneath must be closed in that same await, not by
+    the event loop's async-generator finalizer a tick or two later."""
+    resp, stream = sse_response(fixture_sse("stream_cache_create.sse"), chunk_size=16)
+    client = OpenRouterLLMClient(api_key="k", raw_purposes=frozenset({"p"}))
+    client._raw = _transport(resp)
+    gen = client.stream(
+        model="claude-sonnet-4-6",
+        system="s",
+        messages=[Message(role="user", content="x")],
+        purpose="p",
+    )
+    first = await gen.__anext__()
+    assert first.type == "delta"
+    assert not stream.closed
+    await gen.aclose()
+    assert stream.closed  # immediately, with no further loop iteration
+
+
+async def test_a_failing_close_does_not_mask_the_typed_stream_error() -> None:
+    body = sse_frames(
+        ("message_start", {"type": "message_start", "message": {"usage": {"input_tokens": 3}}}),
+        ("error", {"type": "error", "error": {"type": "rate_limit_error", "message": "slow"}}),
+    )
+    resp, stream = sse_response(body)
+
+    async def _boom() -> None:
+        raise httpx.ReadError("close failed")
+
+    stream.aclose = _boom  # type: ignore[method-assign]
+    with pytest.raises(LLMRateLimitedError):
+        await _collect(_transport(resp))

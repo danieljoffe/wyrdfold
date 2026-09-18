@@ -27,7 +27,7 @@ kwargs against the installed SDK signature (#1065) keep running unchanged.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -105,7 +105,7 @@ class MessagesTransport(Protocol):
 
     async def create(self, **params: Any) -> MessagesResponse: ...
 
-    def stream(self, **params: Any) -> AsyncIterator[StreamEvent]: ...
+    def stream(self, **params: Any) -> AsyncGenerator[StreamEvent, None]: ...
 
 
 # ---- Error translation -------------------------------------------------------
@@ -240,7 +240,7 @@ class SdkMessagesTransport:
             raise LLMUpstreamUnavailableError() from exc
         return _response_from_sdk(response)
 
-    async def stream(self, **params: Any) -> AsyncIterator[StreamEvent]:
+    async def stream(self, **params: Any) -> AsyncGenerator[StreamEvent, None]:
         # The SDK raises APIStatusError on the initial HTTP handshake (which
         # surfaces from ``async with .stream(...)``) and may raise mid-stream
         # on chunked-transfer errors; the whole region translates uniformly.

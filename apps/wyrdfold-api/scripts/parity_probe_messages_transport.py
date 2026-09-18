@@ -1,6 +1,6 @@
 """#1067 flip gate: the same prompt through ``transport=sdk`` and ``transport=raw``.
 
-For each non-stream method, diff the OUTBOUND JSON bodies the two transports
+For each method (complete_tool_use, complete, stream), diff the OUTBOUND JSON bodies the two transports
 put on the wire and reconcile the responses pairwise (``stop_reason``, token
 fields, ``cost_source``, ``is_byok``, ``provider``). Then a cache pair per
 transport (create, then read) so cache accounting reconciles from a real

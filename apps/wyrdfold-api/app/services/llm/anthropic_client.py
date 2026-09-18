@@ -23,6 +23,7 @@ Combined with the cached system block, the whole static prompt prefix
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import time
@@ -408,19 +409,26 @@ class AnthropicLLMClient:
         # typed hierarchy; this loop only interprets the normalised events.
         transport = self._transport_for(purpose, "stream")
         final_message: MessagesResponse | None = None
-        async for event in transport.stream(
+        events = transport.stream(
             model=cast(Any, self._resolve_model(model)),
             max_tokens=max_tokens,
             system=system_param,
             messages=cast(Any, api_messages),
-        ):
-            if isinstance(event, StreamTextDelta):
-                if event.text:
-                    yield LLMStreamDelta(text=event.text)
-            elif isinstance(event, StreamUsageDelta):
-                reported = event.reported or reported
-            elif isinstance(event, StreamFinal):
-                final_message = event.message
+        )
+        # ``aclosing``: when OUR consumer stops early (the derive route's
+        # disconnect path calls aclose() on this generator), the transport's
+        # generator is closed here, synchronously, so its finally releases the
+        # upstream socket now rather than whenever the event loop's
+        # async-generator finalizer gets to it (release gate 2026-09-18).
+        async with contextlib.aclosing(events):
+            async for event in events:
+                if isinstance(event, StreamTextDelta):
+                    if event.text:
+                        yield LLMStreamDelta(text=event.text)
+                elif isinstance(event, StreamUsageDelta):
+                    reported = event.reported or reported
+                elif isinstance(event, StreamFinal):
+                    final_message = event.message
         if final_message is None:
             # A transport that ends without its final frame lost the
             # connection mid-stream; the caller's retry path is the right one.

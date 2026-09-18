@@ -222,16 +222,6 @@ async def test_retries_transient_and_honours_retry_after(_no_sleep: list[float])
     assert _no_sleep == [2.0]
 
 
-async def test_retry_after_is_clamped(_no_sleep: list[float]) -> None:
-    t = _transport(
-        json_response(503, wire_error(503, "x"), headers={"Retry-After": "86400"}),
-        json_response(200, wire_text("ok")),
-        max_retries=1,
-    )
-    await t.create(**_PARAMS)
-    assert _no_sleep == [60.0]
-
-
 async def test_exhausted_429_stays_rate_limited_and_5xx_stays_upstream(
     _no_sleep: list[float],
 ) -> None:
@@ -311,6 +301,53 @@ async def test_x_should_retry_false_stops_a_normally_transient_status(
         await t.create(**_PARAMS)
     assert len(cap.requests) == 1
     assert _no_sleep == []
+
+
+async def test_x_should_retry_true_on_a_success_is_ignored(_no_sleep: list[float]) -> None:
+    """Release gate 2026-09-18: the header is consulted only for error
+    statuses. A completed (billed) call carrying it must be returned, not
+    re-POSTed and then thrown away as upstream-unavailable(200)."""
+    cap = WireCapture()
+    t = _transport(
+        json_response(200, wire_text("ok"), headers={"x-should-retry": "true"}),
+        json_response(200, wire_text("never reached")),
+        capture=cap,
+        max_retries=2,
+    )
+    out = await t.create(**_PARAMS)
+    assert out.content[0].text == "ok"
+    assert len(cap.requests) == 1
+    assert _no_sleep == []
+
+
+@pytest.mark.parametrize("retry_after", ["3600", "0", "-5"])
+async def test_retry_after_outside_the_sdk_window_falls_back_to_backoff(
+    _no_sleep: list[float], retry_after: str
+) -> None:
+    """The SDK honours Retry-After only for 0 < s <= 60 and otherwise backs
+    off; the first cut clamped an hour to a sixty-second park."""
+    t = _transport(
+        json_response(503, wire_error(503, "x"), headers={"Retry-After": retry_after}),
+        json_response(200, wire_text("ok")),
+        max_retries=1,
+    )
+    await t.create(**_PARAMS)
+    assert len(_no_sleep) == 1
+    assert _no_sleep[0] < 9.0  # backoff (0.5 * 2**0 plus <= 0.25 jitter), never 60
+
+
+async def test_transient_retries_are_logged_at_warning(
+    _no_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    t = _transport(
+        json_response(503, wire_error(503, "x")), json_response(200, wire_text("ok")), max_retries=1
+    )
+    with caplog.at_level("WARNING", logger="app.services.llm.openrouter_http"):
+        await t.create(**_PARAMS)
+    assert any(
+        "openrouter transient status=503" in r.getMessage() and r.levelname == "WARNING"
+        for r in caplog.records
+    )
 
 
 async def test_transport_errors_retry_then_upstream_unavailable(_no_sleep: list[float]) -> None:
