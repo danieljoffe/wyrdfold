@@ -34,6 +34,7 @@ import httpx
 from app.models.llm import LLMResult, LLMStreamEvent, LLMUsage, Message, ModelId
 from app.services.llm.anthropic_client import AnthropicLLMClient
 from app.services.llm.errors import (
+    LLMMalformedOutputError,
     LLMUpstreamUnavailableError,
     MissingToolCallError,
     translate_api_status_error,
@@ -189,7 +190,7 @@ def _parse_openai_tool_response(
     if not tool_calls:
         # One warning at the RAISE site so the provider-labelled signal is
         # production telemetry by construction, independent of how any caller
-        # catches this ValueError subclass. (Today's callers keep the text
+        # catches this error. (Today's callers keep the text
         # anyway — triage's and grading's broad handlers both
         # ``logger.exception`` the traceback — but a future quiet catch must
         # not be able to erase the drift signal.)
@@ -211,21 +212,24 @@ def _parse_openai_tool_response(
     # the parsed dict would be incomplete. Fail loud (matches Anthropic's
     # stop_reason==max_tokens guard).
     if finish == "length":
-        raise ValueError(
+        raise LLMMalformedOutputError(
             f"Tool input for {tool_name!r} was truncated at max_tokens={max_tokens}; "
-            "the structured response is incomplete"
+            "the structured response is incomplete",
+            reason="truncated",
         )
     args_str = tool_calls[0].get("function", {}).get("arguments", "")
     try:
         tool_input = json.loads(args_str)
     except (json.JSONDecodeError, TypeError) as exc:
-        raise ValueError(
-            f"Tool arguments for {tool_name!r} were not valid JSON: {str(exc)[:120]}"
+        raise LLMMalformedOutputError(
+            f"Tool arguments for {tool_name!r} were not valid JSON: {str(exc)[:120]}",
+            reason="malformed_arguments",
         ) from exc
     if not isinstance(tool_input, dict):
-        raise ValueError(
+        raise LLMMalformedOutputError(
             f"Tool arguments for {tool_name!r} decoded to "
-            f"{type(tool_input).__name__}, not an object"
+            f"{type(tool_input).__name__}, not an object",
+            reason="malformed_arguments",
         )
     return tool_input
 

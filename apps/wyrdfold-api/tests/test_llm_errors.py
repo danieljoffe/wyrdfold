@@ -33,10 +33,12 @@ from app.models.llm import Message
 from app.services.llm.anthropic_client import AnthropicLLMClient
 from app.services.llm.errors import (
     LLMAuthError,
+    LLMMalformedOutputError,
     LLMQuotaExhaustedError,
     LLMRateLimitedError,
     LLMServiceError,
     LLMUpstreamUnavailableError,
+    MissingToolCallError,
     translate_api_status_error,
 )
 
@@ -256,3 +258,47 @@ def test_user_messages_are_safe_strings() -> None:
         assert "anthropic" not in msg.lower()
         assert "api key" not in msg.lower()
         assert "http" not in msg.lower()
+    # The malformed-output family (#1066) carries a diagnostic with raw model
+    # content; the user-facing copy must be the fixed class attribute.
+    for exc in (LLMMalformedOutputError("DIAG http://x"), MissingToolCallError("DIAG http://x")):
+        msg = exc.user_message
+        assert msg
+        assert "DIAG" not in msg
+        assert "http" not in msg.lower()
+        assert "openrouter" not in msg.lower()
+        assert "anthropic" not in msg.lower()
+
+
+# -- Malformed output: the sibling family (#1066) ------------------------------
+
+
+def test_malformed_output_is_a_sibling_with_a_fixed_user_message() -> None:
+    """The diagnostic (raw model content, provider label) must never be the
+    user-facing message, and the family must not be an ``LLMServiceError``:
+    the provider-breaker handlers key on that class."""
+    exc = LLMMalformedOutputError(
+        "Expected a forced tool_call, got provider='x', content='RAW_MODEL_TEXT'",
+    )
+    assert not isinstance(exc, LLMServiceError)
+    assert not isinstance(exc, ValueError)
+    assert exc.http_status == 502
+    assert exc.reason == "malformed_output"
+    assert "RAW_MODEL_TEXT" in str(exc)
+    assert "RAW_MODEL_TEXT" in exc.diagnostic
+    assert "RAW_MODEL_TEXT" not in exc.user_message
+    assert exc.user_message == LLMMalformedOutputError.user_message
+
+    truncated = LLMMalformedOutputError("cut", reason="truncated")
+    assert truncated.reason == "truncated"
+    assert truncated.user_message == LLMMalformedOutputError.user_message
+
+
+def test_missing_tool_call_is_malformed_output_not_value_error() -> None:
+    """#1066 dropped the ``ValueError`` base: an ``except ValueError as exc:
+    HTTPException(detail=str(exc))`` would otherwise serve the diagnostic."""
+    exc = MissingToolCallError("Expected a forced tool_call, got prose content='RAW'")
+    assert isinstance(exc, LLMMalformedOutputError)
+    assert not isinstance(exc, ValueError)
+    assert not isinstance(exc, LLMServiceError)
+    assert exc.reason == "missing_tool_call"
+    assert "RAW" not in exc.user_message

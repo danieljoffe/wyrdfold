@@ -14,6 +14,7 @@ import pytest
 
 from app.models.llm import LLMUsage, Message
 from app.services.llm.errors import (
+    LLMMalformedOutputError,
     LLMRateLimitedError,
     LLMUpstreamUnavailableError,
     MissingToolCallError,
@@ -66,8 +67,9 @@ def test_parse_no_choices_raises() -> None:
 def test_parse_missing_tool_call_raises() -> None:
     # Model refused / answered in prose instead of calling the forced function.
     data = _resp([], finish="stop", content="I can't help with that")
-    with pytest.raises(ValueError, match="Expected a forced tool_call"):
+    with pytest.raises(MissingToolCallError, match="Expected a forced tool_call") as excinfo:
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert excinfo.value.reason == "missing_tool_call"
 
 
 def test_parse_truncated_at_length_raises() -> None:
@@ -76,34 +78,39 @@ def test_parse_truncated_at_length_raises() -> None:
     # Valid JSON here isolates the finish_reason=="length" guard — the JSON guard
     # alone would not catch this, so removing the length check fails this test.
     data = _resp(_tool_calls('{"verdicts": []}'), finish="length")
-    with pytest.raises(ValueError, match="truncated"):
+    with pytest.raises(LLMMalformedOutputError, match="truncated") as excinfo:
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert excinfo.value.reason == "truncated"
 
 
 def test_parse_malformed_json_raises() -> None:
     data = _resp(_tool_calls("{not valid json"))
-    with pytest.raises(ValueError, match="not valid JSON"):
+    with pytest.raises(LLMMalformedOutputError, match="not valid JSON") as excinfo:
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert excinfo.value.reason == "malformed_arguments"
 
 
 def test_parse_fenced_json_raises() -> None:
     # Some models wrap arguments in a markdown fence — invalid JSON, fail loud.
     data = _resp(_tool_calls('```json\n{"a": 1}\n```'))
-    with pytest.raises(ValueError, match="not valid JSON"):
+    with pytest.raises(LLMMalformedOutputError, match="not valid JSON") as excinfo:
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert excinfo.value.reason == "malformed_arguments"
 
 
 def test_parse_non_object_json_raises() -> None:
     # Valid JSON but a list/scalar, not the object our schema needs.
     data = _resp(_tool_calls("[1, 2, 3]"))
-    with pytest.raises(ValueError, match="not an object"):
+    with pytest.raises(LLMMalformedOutputError, match="not an object") as excinfo:
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert excinfo.value.reason == "malformed_arguments"
 
 
 def test_parse_empty_arguments_raises() -> None:
     data = _resp(_tool_calls(""))
-    with pytest.raises(ValueError, match="not valid JSON"):
+    with pytest.raises(LLMMalformedOutputError, match="not valid JSON") as excinfo:
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert excinfo.value.reason == "malformed_arguments"
 
 
 # ---- _openai_usage ----------------------------------------------------------
@@ -503,7 +510,7 @@ async def test_other_parse_failures_do_not_retry(monkeypatch) -> None:
     fake = _FakeHttpSeq([_http_resp(bad_args), _http_resp(_GOOD)])
     monkeypatch.setattr(client, "_openai_client", lambda: fake)
 
-    with pytest.raises(ValueError, match="not valid JSON"):
+    with pytest.raises(LLMMalformedOutputError, match="not valid JSON"):
         await _call(client)
     assert len(fake.posted) == 1
 
@@ -556,9 +563,7 @@ def test_prose_answers_raise_instead_of_salvaging(content: str) -> None:
     guards existed to police, this time without the guards."""
     data = _resp([], finish="stop", content=content)
     with pytest.raises(MissingToolCallError, match="Expected a forced tool_call"):
-        _parse_openai_tool_response(
-            data, tool_name="return_TitleTriageResponse", max_tokens=1000
-        )
+        _parse_openai_tool_response(data, tool_name="return_TitleTriageResponse", max_tokens=1000)
 
 
 def test_missing_tool_call_failure_names_the_responding_provider() -> None:
@@ -575,7 +580,7 @@ def test_missing_tool_call_emits_a_provider_labelled_warning(
 ) -> None:
     """Production telemetry must retain the provider WITHOUT relying on any
     caller logging the exception text: the raise site itself emits one
-    warning. A future handler that quietly catches this ValueError subclass
+    warning. A future handler that quietly catches this error
     cannot erase the endpoint-drift signal."""
     data = _resp([], finish="stop", content="I refuse.", provider="SambaNova")
     with caplog.at_level(logging.WARNING, logger="app.services.llm.openrouter_client"):

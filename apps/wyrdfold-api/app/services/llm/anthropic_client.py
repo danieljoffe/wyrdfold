@@ -41,7 +41,9 @@ from app.models.llm import (
     ModelId,
 )
 from app.services.llm.errors import (
+    LLMMalformedOutputError,
     LLMUpstreamUnavailableError,
+    MissingToolCallError,
     translate_api_status_error,
 )
 from app.services.llm.pricing import resolve_cost
@@ -333,7 +335,7 @@ class AnthropicLLMClient:
 
         if tool_input is None:
             stop_reason = getattr(response, "stop_reason", "unknown")
-            raise ValueError(
+            raise MissingToolCallError(
                 f"Expected tool_use block for {tool_name!r}, got stop_reason="
                 f"{stop_reason!r} with content blocks "
                 f"{[b.type for b in response.content]!r}"
@@ -347,9 +349,10 @@ class AnthropicLLMClient:
         # ``complete_json``; this also catches the ones that stay schema-valid
         # (a list cut short, a value clipped). (#47)
         if getattr(response, "stop_reason", None) == "max_tokens":
-            raise ValueError(
+            raise LLMMalformedOutputError(
                 f"Tool input for {tool_name!r} was truncated at "
-                f"max_tokens={max_tokens}; the structured response is incomplete"
+                f"max_tokens={max_tokens}; the structured response is incomplete",
+                reason="truncated",
             )
 
         usage = LLMUsage(

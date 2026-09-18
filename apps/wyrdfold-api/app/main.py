@@ -47,7 +47,7 @@ from app.routers import (
 )
 from app.scheduler import start_scheduler_if_enabled
 from app.services.llm.cost_log_buffer import buffer as cost_log_buffer
-from app.services.llm.errors import LLMServiceError
+from app.services.llm.errors import LLMMalformedOutputError, LLMServiceError
 from app.services.owner_provisioning import provision_owner
 from app.services.search_events import buffer as search_events_buffer
 from app.supabase_pool import (
@@ -399,6 +399,35 @@ async def _llm_service_error_handler(request: Request, exc: LLMServiceError) -> 
         sentry_sdk.capture_exception(exc)
     except ImportError:  # pragma: no cover
         pass
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={"detail": exc.user_message, "code": exc.reason},
+    )
+
+
+@app.exception_handler(LLMMalformedOutputError)
+async def _llm_malformed_output_handler(
+    request: Request, exc: LLMMalformedOutputError
+) -> JSONResponse:
+    """The provider answered, but the answer is unusable (#1066): prose
+    instead of the forced tool call, a truncated tool input, or a payload
+    that fails the caller's schema.
+
+    Deliberately separate from the ``LLMServiceError`` handler above. The
+    exception's diagnostic carries raw model content and a provider label, so
+    only the fixed ``user_message`` is ever serialised; the diagnostic goes to
+    the log line, bounded, where the ``provider=`` label keeps a prose refusal
+    correlatable per endpoint (the #935 routing signal). No Sentry capture:
+    this is an upstream hiccup the client is told to retry, not a server
+    fault, and at prod volume one event per prose answer per request would
+    drown the alerts that matter.
+    """
+    _log.warning(
+        "llm_malformed_output path=%s reason=%s diagnostic=%s",
+        request.url.path,
+        exc.reason,
+        exc.diagnostic[:600],
+    )
     return JSONResponse(
         status_code=exc.http_status,
         content={"detail": exc.user_message, "code": exc.reason},
