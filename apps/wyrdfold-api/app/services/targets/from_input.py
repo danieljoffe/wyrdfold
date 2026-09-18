@@ -39,10 +39,12 @@ so this module holds no locally-obtained SYNC service client at all.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 from typing import Any, cast
 
+from postgrest.exceptions import APIError
 from supabase import AsyncClient
 
 from app.background import spawn_detached
@@ -132,14 +134,56 @@ async def _get(supabase: AsyncClient, target_id: str) -> JobTarget | None:
     return crud._parse_target(rows[0]) if rows else None
 
 
-async def _create_and_link(
+#: SQLSTATE the ``create_target_and_link`` function raises at the active-target
+#: cap (PostgREST maps the PT class to the HTTP status in its digits). Matched by
+#: code, never by message text.
+ACTIVE_CAP_SQLSTATE = "PT409"
+
+
+def _active_cap_from_error(e: APIError, fallback_limit: int | None) -> tuple[int, int]:
+    """``(current_count, limit)`` from the function's JSON ``DETAIL``.
+
+    Defensive on purpose: a rejection whose detail cannot be parsed is still a
+    rejection, reported as "at the cap" rather than swallowed.
+    """
+    try:
+        detail = json.loads(e.details or "")
+        return int(detail["active_count"]), int(detail["limit"])
+    except (TypeError, ValueError, KeyError):
+        limit = fallback_limit if fallback_limit is not None else 0
+        return limit, limit
+
+
+def active_cap_error(e: APIError, fallback_limit: int | None) -> crud.ActiveTargetLimitError | None:
+    """The app's cap error for a PT409 rejection, or ``None`` if ``e`` is something else.
+
+    Every caller of a cap-checked database function maps the rejection here,
+    by SQLSTATE, so the 409 payload is identical whichever path refused.
+    """
+    if e.code != ACTIVE_CAP_SQLSTATE:
+        return None
+    current, limit = _active_cap_from_error(e, fallback_limit)
+    return crud.ActiveTargetLimitError(current, limit)
+
+
+async def create_and_link(
     supabase: AsyncClient,
     *,
     user_id: str,
     payload: TargetCreate,
     activation_status: str | None = None,
-) -> tuple[JobTarget, UserTarget]:
+    is_active: bool = False,
+    active_limit: int | None = None,
+) -> tuple[JobTarget, UserTarget, bool]:
     """Find-or-create a target and link the caller to it, ATOMICALLY (#667).
+
+    ``is_active=True`` links ACTIVE and enforces the caller's active-target cap
+    (``active_limit``, plan-derived and resolved by the caller) inside the same
+    transaction, raising ``crud.ActiveTargetLimitError`` and leaving no target
+    row behind on rejection (#1071). The third element, ``was_created``, is
+    insert vs conflict: a caller that lost the exact-key race to a concurrent
+    request gets ``False`` and must treat the row as shared, never as its own
+    to derive over.
 
     Replaces the create -> update-status -> link trio of round-trips. Between
     the first and the last, the target existed with `app_active = false` and no
@@ -155,24 +199,39 @@ async def _create_and_link(
     Semantics are unchanged — see the RPC's own comment for how the
     find-or-create idempotence and the activation-status update are preserved.
     """
-    resp = await supabase.rpc(
-        "create_target_and_link",
-        {
-            "p_user_id": user_id,
-            "p_label": payload.label,
-            "p_normalized_label": crud.normalize_label(payload.label),
-            "p_activation_status": activation_status,
-            "p_description": payload.description,
-            "p_scoring_profile": payload.scoring_profile.model_dump(),
-            "p_search_keywords": payload.search_keywords,
-        },
-    ).execute()
+    params: dict[str, Any] = {
+        "p_user_id": user_id,
+        "p_label": payload.label,
+        "p_normalized_label": crud.normalize_label(payload.label),
+        "p_activation_status": activation_status,
+        "p_description": payload.description,
+        "p_scoring_profile": payload.scoring_profile.model_dump(),
+        "p_search_keywords": payload.search_keywords,
+    }
+    if is_active:
+        params["p_is_active"] = True
+        params["p_active_limit"] = active_limit
+    try:
+        resp = await supabase.rpc("create_target_and_link", params).execute()
+    except APIError as e:
+        cap = active_cap_error(e, active_limit)
+        if cap is None:
+            raise
+        raise cap from e
     data = cast(dict[str, Any] | None, resp.data)
     if not data or "target" not in data or "user_target" not in data:
         raise RuntimeError("create_target_and_link returned no target/user_target")
+    if "was_created" not in data:
+        # Fail closed rather than degrade: without the flag every create would
+        # look like a race loss and silently skip derivation.
+        raise RuntimeError(
+            "create_target_and_link returned no was_created: migration "
+            "20260918170000_create_target_and_link_active_cap has not been applied"
+        )
     return (
         crud._parse_target(cast(dict[str, Any], data["target"])),
         crud._parse_user_target(cast(dict[str, Any], data["user_target"])),
+        bool(data["was_created"]),
     )
 
 
@@ -672,7 +731,7 @@ async def _create_or_link_from_suggestion(
     # optional. The rich per-user rationale still reaches the UI in the
     # suggestion RESPONSE; it just stops being written to a row it doesn't
     # belong in.
-    target, link = await _create_and_link(
+    target, link, _was_created = await create_and_link(
         supabase,
         user_id=user_id,
         payload=TargetCreate(label=suggestion.label),
@@ -822,15 +881,21 @@ def _raw_url_label(extracted_title: str | None) -> str:
     return ((extracted_title or "").strip() or "Untitled Target")[:200]
 
 
-async def _canonical_url_label(
+async def canonical_posting_label(
     supabase: AsyncClient,
     llm: LLMClient,
     *,
-    user_id: str,
+    user_id: str | None,
     extracted_title: str | None,
     jd_text: str,
 ) -> str:
     """Canonical role label for a posting.
+
+    Shared by ``from_url`` and the router's create-from-posting path (#1071):
+    both mint ``targets.normalized_label`` from a posting title, so both must
+    canonicalize the same way and fail the same way. ``user_id`` is optional
+    because the from-posting route also serves api-key callers with no user;
+    the ledger accepts an unattributed row.
 
     Fatal on any normalization failure, by design (#1066). The label becomes
     ``targets.normalized_label``, the UNIQUE catalog dedup key, and
@@ -860,7 +925,7 @@ async def _canonical_url_label(
             user_id=user_id,
             purpose=NORMALIZE_TITLE_PURPOSE,
             result=norm_result,
-            metadata={"user_id": user_id, "raw_label": raw},
+            metadata={"user_id": user_id or "", "raw_label": raw},
         )
     except Exception:
         logger.warning("cost_log for normalize_posting_title failed", exc_info=True)
@@ -899,7 +964,7 @@ async def from_url(
     the UNIQUE key. Canonicalizing has to precede ``find_matching_target``:
     the canonical form is what matches and what becomes the dedup key.
     """
-    label = await _canonical_url_label(
+    label = await canonical_posting_label(
         supabase,
         llm,
         user_id=user_id,
@@ -925,7 +990,7 @@ async def from_url(
         )
         return CreateOrLinkResult(user_target=link, target=matched, was_matched=True)
 
-    target, link = await _create_and_link(
+    target, link, _was_created = await create_and_link(
         supabase,
         user_id=user_id,
         payload=TargetCreate(label=label),
