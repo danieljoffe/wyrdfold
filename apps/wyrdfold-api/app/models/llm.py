@@ -23,6 +23,12 @@ ModelId = Literal[
 
 TurnRole = Literal["user", "assistant"]
 
+# Which wire path produced an ``LLMResult`` (#1067). Stamped by the client that
+# made the call and merged into every cost row by ``cost_log._row_for``, so a
+# transport rollout is reconcilable from the ledger without touching call
+# sites. ``cache`` marks a synthetic zero-cost result (no wire call at all).
+TransportId = Literal["anthropic_sdk", "messages_http", "chat_completions_http", "mock", "cache"]
+
 
 class Message(BaseModel):
     role: TurnRole
@@ -68,6 +74,12 @@ class LLMResult(BaseModel):
     # Defaults to "estimated" so every existing constructor (the mock, the
     # embedding-free test fixtures) stays valid; the real clients set it.
     cost_source: CostSource = "estimated"
+    # Wire-path provenance (#1067). ``None`` only for results built by code
+    # that predates the field; ``cost_log`` records those as "unknown".
+    transport: TransportId | None = None
+    # The upstream that served the call, when the gateway names it (OpenRouter
+    # does on both wire shapes); ``None`` for direct Anthropic, the mock, cache.
+    provider: str | None = None
 
 
 class LLMStreamDelta(BaseModel):

@@ -47,7 +47,11 @@ from app.routers import (
 )
 from app.scheduler import start_scheduler_if_enabled
 from app.services.llm.cost_log_buffer import buffer as cost_log_buffer
-from app.services.llm.errors import LLMServiceError
+from app.services.llm.errors import (
+    LLMMalformedOutputError,
+    LLMRequestRejectedError,
+    LLMServiceError,
+)
 from app.services.owner_provisioning import provision_owner
 from app.services.search_events import buffer as search_events_buffer
 from app.supabase_pool import (
@@ -402,6 +406,75 @@ async def _llm_service_error_handler(request: Request, exc: LLMServiceError) -> 
     return JSONResponse(
         status_code=exc.http_status,
         content={"detail": exc.user_message, "code": exc.reason},
+    )
+
+
+@app.exception_handler(LLMMalformedOutputError)
+async def _llm_malformed_output_handler(
+    request: Request, exc: LLMMalformedOutputError
+) -> JSONResponse:
+    """The provider answered, but the answer is unusable (#1066): prose
+    instead of the forced tool call, a truncated tool input, or a payload
+    that fails the caller's schema.
+
+    Deliberately separate from the ``LLMServiceError`` handler above. The
+    exception's diagnostic carries raw model content and a provider label, so
+    only the fixed ``user_message`` is ever serialised; the diagnostic goes to
+    the log line, bounded, where the ``provider=`` label keeps a prose refusal
+    correlatable per endpoint (the #935 routing signal). No Sentry capture:
+    this is an upstream hiccup the client is told to retry, not a server
+    fault, and at prod volume one event per prose answer per request would
+    drown the alerts that matter.
+    """
+    _log.warning(
+        "llm_malformed_output path=%s reason=%s diagnostic=%s",
+        request.url.path,
+        exc.reason,
+        exc.diagnostic[:600],
+    )
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={"detail": exc.user_message, "code": exc.reason},
+    )
+
+
+@app.exception_handler(LLMRequestRejectedError)
+async def _llm_request_rejected_handler(
+    request: Request, exc: LLMRequestRejectedError
+) -> JSONResponse:
+    """The provider rejected our request (#1066 review): an application bug
+    that arrived through OpenRouter's HTTP-200 error envelope (a grammar-
+    compile 400, a 404 slug, a 422) or an envelope code we do not classify.
+
+    Same observability as an unhandled 500 (ERROR log, Sentry capture with
+    ``llm.reason`` / ``llm.upstream_code`` tags) and the same generic body as
+    ``_unhandled_exception_handler``: the bounded vendor diagnostic goes to
+    the log line, and to the body only when ``DEBUG_ERRORS`` is on. An
+    explicit handler, rather than letting it fall through, so the diagnostic
+    can never ride an exception message into a response.
+    """
+    _log.error(
+        "llm_request_rejected path=%s reason=%s upstream_code=%s diagnostic=%s",
+        request.url.path,
+        exc.reason,
+        exc.upstream_code,
+        exc.diagnostic[:600],
+    )
+    try:
+        import sentry_sdk
+
+        sentry_sdk.set_tag("llm.reason", exc.reason)
+        if exc.upstream_code is not None:
+            sentry_sdk.set_tag("llm.upstream_code", str(exc.upstream_code))
+        sentry_sdk.capture_exception(exc)
+    except ImportError:  # pragma: no cover
+        pass
+    detail = (
+        f"{type(exc).__name__}: {exc.diagnostic}" if settings.debug_errors else exc.user_message
+    )
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={"detail": detail, "code": exc.reason, "path": request.url.path},
     )
 
 

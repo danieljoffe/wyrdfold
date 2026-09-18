@@ -41,6 +41,7 @@ from app.models.targets import (
     TargetSuggestions,
     UserTarget,
 )
+from app.services.llm.errors import LLMMalformedOutputError
 from app.services.llm.mock import MockLLMClient
 from app.services.targets import match as match_module
 from app.services.targets.match import suggest_and_match_from_query
@@ -280,6 +281,34 @@ def test_endpoint_malformed_model_output_is_502(
     )
     resp = _client(llm).post("/targets/suggest-from-query", json={"query": "frontend"})
     assert resp.status_code == 502
+    # #1066: the 502 now comes from the global ``LLMMalformedOutputError``
+    # handler with fixed copy; the pydantic detail (which echoes the model's
+    # input values) stays out of the body.
+    assert resp.json() == {
+        "detail": LLMMalformedOutputError.user_message,
+        "code": "schema_violation",
+    }
+    assert "no label here" not in resp.text
+
+
+def test_endpoint_prose_answer_never_leaks_model_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Response-safety assertion for #1066: a prose refusal's diagnostic embeds
+    the raw model content; the 502 body must carry only the fixed copy, through
+    the real app and its registered handler."""
+    _stub_endpoint_deps(monkeypatch, doc=None)
+    marker = "ZZ_RAW_MODEL_CONTENT_MARKER_ZZ"
+    llm = MockLLMClient(
+        scripted={QUERY_DEFAULT_PURPOSE: f"Sure! {marker} here is my answer in prose."}
+    )
+    resp = _client(llm).post("/targets/suggest-from-query", json={"query": "frontend"})
+    assert resp.status_code == 502
+    assert marker not in resp.text
+    assert resp.json() == {
+        "detail": LLMMalformedOutputError.user_message,
+        "code": "missing_tool_call",
+    }
 
 
 def test_endpoint_empty_suggestions_returns_200_empty(

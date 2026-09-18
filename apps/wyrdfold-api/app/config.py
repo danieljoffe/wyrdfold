@@ -120,6 +120,12 @@ class Settings(BaseSettings):
     openrouter_api_key: str = Field(default="", repr=False)
     openrouter_timeout_seconds: float = Field(default=600.0, ge=1.0, le=3600.0)
     openrouter_max_retries: int = Field(default=3, ge=0, le=10)
+    # #1067 rollout knob: comma-separated LLM ``purpose`` strings whose Claude
+    # calls through OpenRouter use the raw ``/v1/messages`` transport instead
+    # of the Anthropic SDK. Default empty (everything on the SDK). Read once at
+    # client construction; a Railway variable change restarts the process,
+    # which is the rollback.
+    llm_raw_transport_purposes: str = ""
 
     # LLM credit-runway alarm. Three OpenRouter credit drains (2026-06-25,
     # 2026-07-04, 2026-07-13) were each discovered only AFTER grading
@@ -1244,6 +1250,10 @@ class Settings(BaseSettings):
     @property
     def allowed_hosts_list(self) -> list[str]:
         return [h.strip() for h in self.allowed_hosts.split(",") if h.strip()]
+
+    @property
+    def llm_raw_transport_purposes_set(self) -> frozenset[str]:
+        return frozenset(p.strip() for p in self.llm_raw_transport_purposes.split(",") if p.strip())
 
 
 settings = Settings()

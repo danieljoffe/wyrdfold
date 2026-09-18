@@ -39,7 +39,7 @@ makes the key depend on how a JD happens to read. Two postings with identical
 titles would fork into two catalog rows. The whole point is that they converge.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.models.llm import LLMResult, Message, ModelId
 from app.services.llm.client import LLMClient, complete_json
@@ -64,6 +64,15 @@ class NormalizedTitle(BaseModel):
         max_length=MAX_LABEL_CHARS,
         description="Canonical, reusable role title.",
     )
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def _strip(cls, value: object) -> object:
+        # Whitespace-only output must fail INSIDE the LLM boundary (#1066):
+        # ``min_length`` alone accepts "   ", which the caller then replaced
+        # with the raw posting title, the dedup-key defect this validator
+        # closes. Non-strings fall through to pydantic's own type error.
+        return value.strip() if isinstance(value, str) else value
 
 
 SYSTEM_PROMPT = """\

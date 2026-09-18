@@ -1,0 +1,25 @@
+{
+  "status": 400,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "request": {
+    "model": "anthropic/claude-does-not-exist",
+    "max_tokens": 8,
+    "messages": [
+      {
+        "role": "user",
+        "content": "x"
+      }
+    ]
+  },
+  "body": {
+    "type": "error",
+    "error": {
+      "type": "invalid_request_error",
+      "message": "anthropic/claude-does-not-exist is not a valid model ID",
+      "error_type": "invalid_request"
+    },
+    "request_id": "gen-1789715144-TgE3NpLup9Jq2B5dpfX4"
+  }
+}

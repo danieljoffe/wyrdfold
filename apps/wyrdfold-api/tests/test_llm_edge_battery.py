@@ -34,7 +34,7 @@ from app.models.targets import TargetSuggestion, TargetSuggestions
 from app.services.analysis.analyze import analyze_job
 from app.services.experience.derive import derive_from_prose
 from app.services.llm.client import strip_markdown_fence
-from app.services.llm.errors import MissingToolCallError
+from app.services.llm.errors import LLMMalformedOutputError, MissingToolCallError
 from app.services.llm.mock import MockLLMClient
 from app.services.tailor.tailor import tailor_resume
 from app.services.targets.suggest import suggest_targets_from_query
@@ -215,8 +215,11 @@ async def test_schema_violation_is_rejected_at_the_boundary(
     """A schema-violating tool input must raise ValidationError at the
     complete_json boundary — never leak a half-parsed object downstream."""
     llm = MockLLMClient(scripted={surface.purpose: json.dumps(broken)})
-    with pytest.raises(ValidationError):
+    with pytest.raises(LLMMalformedOutputError) as excinfo:
         await surface.call(llm)
+    # #1066: classified at the boundary, pydantic detail kept on the cause.
+    assert excinfo.value.reason == "schema_violation"
+    assert isinstance(excinfo.value.__cause__, ValidationError)
 
 
 @pytest.mark.parametrize("surface", SURFACES, ids=lambda s: s.name)

@@ -17,6 +17,7 @@ import pytest
 
 from app.models.llm import LLMUsage, Message
 from app.services.llm.anthropic_client import AnthropicLLMClient, _reported_usage
+from app.services.llm.errors import LLMMalformedOutputError, MissingToolCallError
 from app.services.llm.pricing import calculate_cost, reported_cost_usd
 from tests.support.sdk_fakes import validating_create_mock
 
@@ -278,7 +279,7 @@ async def test_complete_tool_use_raises_on_max_tokens_truncation() -> None:
             stop_reason="max_tokens",
         )
     )
-    with pytest.raises(ValueError, match="truncated"):
+    with pytest.raises(LLMMalformedOutputError, match="truncated") as excinfo:
         await client.complete_tool_use(
             model="claude-sonnet-4-6",
             system="sys",
@@ -288,6 +289,7 @@ async def test_complete_tool_use_raises_on_max_tokens_truncation() -> None:
             tool_input_schema={"type": "object"},
             purpose="test",
         )
+    assert excinfo.value.reason == "truncated"
 
 
 async def test_complete_tool_use_forces_tool_choice() -> None:
@@ -328,7 +330,7 @@ async def test_complete_tool_use_raises_when_no_tool_block() -> None:
     response.stop_reason = "end_turn"
 
     client, _ = _client_with_mocked_sdk(response)
-    with pytest.raises(ValueError, match="Expected tool_use block"):
+    with pytest.raises(MissingToolCallError, match="Expected tool_use block"):
         await client.complete_tool_use(
             model="claude-haiku-4-5",
             system="sys",

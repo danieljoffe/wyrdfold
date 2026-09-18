@@ -1,0 +1,101 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "request": {
+    "model": "anthropic/claude-sonnet-4.6",
+    "max_tokens": 64,
+    "system": [
+      {
+        "type": "text",
+        "text": "You are a job-market taxonomist. Return the canonical role title.",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": "Title: Senior Product Builder (Product Manager), Enterprise Readiness & Admin Platform"
+      }
+    ],
+    "tools": [
+      {
+        "name": "return_NormalizedTitle",
+        "description": "Record the response.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "label": {
+              "$ref": "#/$defs/Label"
+            }
+          },
+          "required": ["label"],
+          "$defs": {
+            "Label": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80
+            }
+          }
+        }
+      }
+    ],
+    "tool_choice": {
+      "type": "tool",
+      "name": "return_NormalizedTitle"
+    },
+    "temperature": 0.0
+  },
+  "body": {
+    "id": "gen-1789715138-ZPHX1lMUNgYA8x4TFh6c",
+    "type": "message",
+    "role": "assistant",
+    "container": null,
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "toolu_bdrk_01K8GX7v95QmZY9BFpWogpco",
+        "caller": {
+          "type": "direct"
+        },
+        "name": "return_NormalizedTitle",
+        "input": {
+          "label": "Senior Product Manager"
+        }
+      }
+    ],
+    "model": "anthropic/claude-sonnet-4.6",
+    "stop_reason": "tool_use",
+    "stop_details": null,
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 724,
+      "output_tokens": 35,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cache_creation": {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0
+      },
+      "inference_geo": null,
+      "server_tool_use": null,
+      "service_tier": null,
+      "speed": "standard",
+      "cost": 0.001234,
+      "is_byok": false,
+      "cost_details": {
+        "upstream_inference_cost": 0.001234,
+        "upstream_inference_prompt_cost": 0.001,
+        "upstream_inference_completions_cost": 0.000234
+      }
+    },
+    "context_management": null,
+    "provider": "Amazon Bedrock"
+  }
+}

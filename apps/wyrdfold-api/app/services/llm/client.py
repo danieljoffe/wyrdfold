@@ -21,9 +21,10 @@ from collections.abc import AsyncIterator
 from functools import lru_cache
 from typing import Any, Protocol, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.models.llm import LLMResult, LLMStreamEvent, Message, ModelId
+from app.services.llm.errors import LLMMalformedOutputError
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -162,7 +163,8 @@ async def complete_json(
     """Call the model with a single forced tool whose ``input_schema`` is
     derived from ``schema``. The API parses + validates the tool input
     against the schema before returning, eliminating field-name drift and
-    JSON-shape errors from prose-only instructions.
+    JSON-shape errors from prose-only instructions. A payload that still
+    fails the schema raises ``LLMMalformedOutputError`` (#1066).
 
     ``temperature`` defaults to 0 as a variance-reduction HINT, honoured only
     where the transport's API accepts it (see ``LLMClient.complete_tool_use``).
@@ -184,5 +186,18 @@ async def complete_json(
         cache_system=cache_system,
         temperature=temperature,
     )
-    parsed = schema.model_validate(raw_input)
+    try:
+        parsed = schema.model_validate(raw_input)
+    except ValidationError as exc:
+        # Model-output failure, classified at the boundary (#1066): the API
+        # accepted the call and the model emitted the forced tool, but the
+        # payload does not satisfy the caller's schema. Callers see one typed
+        # family for "the model answered badly" (prose, truncation, schema),
+        # distinct from the provider hierarchy, and never a raw pydantic error
+        # that an ``except ValueError`` somewhere would turn into a 422 with
+        # model content in the detail.
+        raise LLMMalformedOutputError(
+            f"{schema.__name__} tool input for {purpose!r} failed validation: {str(exc)[:600]}",
+            reason="schema_violation",
+        ) from exc
     return parsed, result

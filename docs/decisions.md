@@ -3,6 +3,56 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-09-18 — The SDK is a drift surface; OpenRouter Claude calls get a raw Messages transport (#1067)
+
+anthropic 1.0 removed the sampling kwargs (#1065) and swapped httpx for httpx2
+(#908); both bit a gateway call that had nothing to do with Anthropic's API
+changing on our side, because `OpenRouterLLMClient` reached OpenRouter's
+Anthropic-compatible `/api/v1/messages` through the SDK. Decided: a
+`MessagesTransport` seam behind `AnthropicLLMClient` (the client imports nothing
+from `anthropic`, guarded by a test), the SDK constructed lazily, and a raw-httpx
+`RawMessagesTransport` for the OpenRouter route with the same body, the same
+headers (`x-api-key` + `anthropic-version`, verified live), the same typed
+errors and one shared `Retry-After`-honouring retry loop for both OpenRouter
+shapes. Translating Claude through `/chat/completions` was rejected: six
+semantic-mapping items the raw path does not need. Rollout is by LLM purpose
+(`LLM_RAW_TRANSPORT_PURPOSES`), never by model (Opus has no callers, Haiku is one
+flow, Sonnet is everything), gated by a per-transport parity probe rather than
+the product evals (most of which bypass the app client). Provenance
+(`transport`, `provider`) rides on `LLMResult` and is merged into every cost row
+centrally, so the rollout reconciles from the ledger. Exit: delete the SDK
+transport once every purpose has run raw with clean logs. Lives in
+`app/services/llm/messages_transport.py`, `raw_messages_transport.py`,
+`openrouter_http.py`, and `tests/fixtures/openrouter_messages/README.md`.
+
+## 2026-09-18 — A bare except turned a TypeError into a wrong catalog identity (#1066)
+
+`from_input._canonical_url_label` wrapped the title normalizer in `except
+Exception` and returned the raw posting title, on the #745 premise that the
+step "only improves the name". The label it returns is
+`targets.normalized_label`, the UNIQUE dedup key, so the fallback minted rows
+that could never converge, and when anthropic 1.0 removed `temperature` (#1065)
+the resulting `TypeError` on every call was logged as a normalization warning
+for three weeks.
+
+Decided: model-output failures are one typed family, `LLMMalformedOutputError`
+(prose refusal, truncation, schema violation), raised at the LLM boundary and
+served as a 502 with fixed copy. It is a sibling of `LLMServiceError`, not a
+child: that hierarchy's positional argument is the user-facing message, and
+three handlers read `except LLMServiceError` as "provider condition" (breaker
+latch, silent NULL). It is not a `ValueError` either: an `except ValueError as
+exc: HTTPException(detail=str(exc))` would serve the raw model content. The
+normalizer fallback is gone; the create fails before matching or creation and
+the user retries. The review added a third sibling, `LLMRequestRejectedError`:
+a provider envelope that rejects OUR request (grammar 400, 404 slug, 422) is
+an application bug and keeps 500 + Sentry semantics with a generic body,
+because a 502 "try again" would launder a deterministic defect into model
+output; unknown envelope codes land there too, deliberately, so they get
+classified on evidence. Rule: never convert an LLM failure into a persisted value.
+Per-item loops may isolate and retry with a full traceback; nothing may mint
+identity from a degraded step. Lives in `app/services/llm/errors.py` and
+`tests/test_targets_from_input.py`.
+
 ## 2026-08-29 — A 404 describes the identifier, not the company (#912)
 
 #913 made `consecutive_failures` count for the first time, and 139 enabled

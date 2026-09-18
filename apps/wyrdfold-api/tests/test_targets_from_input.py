@@ -48,6 +48,11 @@ from app.models.targets import (
     UserTarget,
 )
 from app.services.llm import cost_log
+from app.services.llm.errors import (
+    LLMMalformedOutputError,
+    LLMUpstreamUnavailableError,
+    MissingToolCallError,
+)
 from app.services.targets import from_input
 from app.services.targets.fit_score import FitScoreResult
 from app.services.targets.normalize_posting_title import NormalizedTitle
@@ -438,36 +443,29 @@ async def test_from_manual_new_creates_deriving_and_schedules_derivation(
 
 
 @pytest.mark.asyncio
-async def test_from_manual_malformed_llm_output_raises_clean_502(
+async def test_from_manual_malformed_llm_output_propagates_the_typed_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A malformed LLM response (fails TargetSuggestion validation) yields a
-    clean 502 HTTPException, not an unhandled pydantic ValidationError /
-    raw 500 (Finding 2)."""
-    import pydantic
-    from fastapi import HTTPException
-
-    # Reproduce the real failure: the schema parse inside
-    # normalize_manual_input raises a pydantic.ValidationError.
-    def _validation_error() -> pydantic.ValidationError:
-        try:
-            TargetSuggestion.model_validate({})  # missing required fields
-        except pydantic.ValidationError as exc:
-            return exc
-        raise AssertionError("expected TargetSuggestion validation to fail")
+    """A malformed LLM response is ``LLMMalformedOutputError`` from the LLM
+    boundary (#1066) and propagates untouched; the global handler turns it into
+    the 502 (response safety is proven at the endpoint level in
+    ``test_targets_suggest_from_query``). Matching must never run on a payload
+    the model got wrong."""
 
     async def fake_normalize(llm, *, label, description, payload):  # type: ignore[no-untyped-def]
-        raise _validation_error()
+        raise LLMMalformedOutputError(
+            "TargetSuggestion tool input failed validation: RAW_MODEL_TEXT",
+            reason="schema_violation",
+        )
 
     monkeypatch.setattr(from_input, "normalize_manual_input", fake_normalize)
-    # If the guard works, matching/crud are never reached — fail loudly if they are.
     monkeypatch.setattr(
         from_input,
         "find_matching_target",
         AsyncMock(side_effect=AssertionError("should not reach matching on malformed LLM")),
     )
 
-    with pytest.raises(HTTPException) as exc_info:
+    with pytest.raises(LLMMalformedOutputError) as exc_info:
         await from_input.from_manual(
             MagicMock(),
             MagicMock(),
@@ -477,12 +475,8 @@ async def test_from_manual_malformed_llm_output_raises_clean_502(
             payload=OptimizedPayload(),
         )
 
-    assert exc_info.value.status_code == 502
-    detail = exc_info.value.detail.lower()
-    # User-facing, retry-friendly message — no traceback / pydantic internals.
-    assert "try again" in detail
-    assert "validationerror" not in detail
-    assert "field required" not in detail
+    assert exc_info.value.reason == "schema_violation"
+    assert "RAW_MODEL_TEXT" not in exc_info.value.user_message
 
 
 # ---- derive_manual_target_bg: background path -------------------------------
@@ -1283,73 +1277,88 @@ async def test_from_url_links_an_existing_target_when_canonicalization_collides(
 @pytest.mark.parametrize(
     "boom",
     [
-        RuntimeError("provider 5xx"),
-        ValueError("schema violation"),
-        TimeoutError("provider hung"),
+        pytest.param(LLMUpstreamUnavailableError(), id="provider-503"),
+        pytest.param(
+            MissingToolCallError("Expected a forced tool_call, got prose content='RAW'"),
+            id="prose-refusal",
+        ),
+        pytest.param(
+            LLMMalformedOutputError("NormalizedTitle failed validation", reason="schema_violation"),
+            id="schema-violation",
+        ),
+        pytest.param(
+            LLMMalformedOutputError("cut at max_tokens", reason="truncated"), id="truncated"
+        ),
+        pytest.param(
+            TypeError("create() got an unexpected keyword argument 'temperature'"),
+            id="programming-error-TypeError",
+        ),
+        pytest.param(
+            AttributeError("'NoneType' object has no attribute 'content'"),
+            id="programming-error-AttributeError",
+        ),
     ],
 )
-async def test_from_url_falls_back_to_the_raw_title_when_the_normalizer_fails(
+async def test_from_url_propagates_every_normalizer_failure_before_matching_or_creation(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
     sched: Any,
     boom: Exception,
 ) -> None:
-    """Cosmetics must never cost the user the whole flow.
-
-    The normalizer improves the NAME; it is not what makes the target work. A
-    provider outage, malformed JSON, or schema violation must degrade to
-    today's exact behavior (the raw posting title) rather than 502 the create.
-    """
+    """#1066: the label IS the catalog dedup key, so a normalizer failure of
+    ANY class must fail the create, never degrade to the raw posting title.
+    Provider and malformed-output failures reach the global handlers (503 /
+    502); programming errors propagate unchanged instead of being laundered
+    into a warning and a wrong identity (#1065 stayed invisible that way).
+    Matching and creation must not run at all."""
 
     async def fake_norm(llm, *, title, jd_text):  # type: ignore[no-untyped-def]
         raise boom
 
     monkeypatch.setattr(from_input, "normalize_posting_title", fake_norm)
-
-    seen_labels: list[str] = []
-
-    async def _match(_s, label):  # type: ignore[no-untyped-def]
-        seen_labels.append(label)
-        return None
-
-    monkeypatch.setattr(from_input, "find_matching_target", _match)
-
-    async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
-        target = _target(id="new", label=payload.label)
-        return target, _user_target(target_id=target.id)
-
-    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
-
-    result = await from_input.from_url(
-        MagicMock(),
-        MagicMock(),
-        user_id="user-1",
-        final_url="https://example.com/jobs/x",
-        extracted_title="  Staff Backend Engineer  ",
-        jd_text="x" * 200,
-        company_name="Acme",
-        location=None,
-        salary_text=None,
-        payload=OptimizedPayload(),
+    monkeypatch.setattr(
+        from_input,
+        "find_matching_target",
+        AsyncMock(side_effect=AssertionError("must not match on a failed normalization")),
+    )
+    monkeypatch.setattr(
+        from_input,
+        "_create_and_link",
+        AsyncMock(side_effect=AssertionError("must not create on a failed normalization")),
     )
 
-    # Degraded, not failed — and the raw title is still trimmed as before.
-    assert seen_labels == ["Staff Backend Engineer"]
-    assert result.was_matched is False
+    with pytest.raises(type(boom)) as exc_info:
+        await from_input.from_url(
+            MagicMock(),
+            MagicMock(),
+            user_id="user-1",
+            final_url="https://example.com/jobs/x",
+            extracted_title="  Staff Backend Engineer  ",
+            jd_text="x" * 200,
+            company_name="Acme",
+            location=None,
+            salary_text=None,
+            payload=OptimizedPayload(),
+        )
+    assert exc_info.value is boom
 
 
 @pytest.mark.asyncio
-async def test_from_url_falls_back_when_the_normalizer_returns_a_blank_label(
+async def test_from_url_uses_the_stripped_canonical_label_and_never_the_raw_title(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
     sched: Any,
 ) -> None:
-    """A whitespace label would render a blank card and a useless dedup key."""
+    """The matcher and the create both see the canonical label. A blank label
+    cannot reach here: ``NormalizedTitle`` strips and rejects it inside the LLM
+    boundary (``test_llm_mock``), so the old ``else raw`` fallback is gone."""
+    raw_title = "Staff Backend Engineer (Remote) - Acme Platform"
 
     async def fake_norm(llm, *, title, jd_text):  # type: ignore[no-untyped-def]
-        return NormalizedTitle(label="   "), _llm_result()
+        assert title == raw_title
+        return NormalizedTitle(label="  Staff Backend Engineer  "), _llm_result()
 
     monkeypatch.setattr(from_input, "normalize_posting_title", fake_norm)
 
@@ -1361,7 +1370,10 @@ async def test_from_url_falls_back_when_the_normalizer_returns_a_blank_label(
 
     monkeypatch.setattr(from_input, "find_matching_target", _match)
 
+    created: list[str] = []
+
     async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
+        created.append(payload.label)
         target = _target(id="new", label=payload.label)
         return target, _user_target(target_id=target.id)
 
@@ -1372,7 +1384,7 @@ async def test_from_url_falls_back_when_the_normalizer_returns_a_blank_label(
         MagicMock(),
         user_id="user-1",
         final_url="https://example.com/jobs/x",
-        extracted_title="Data Engineer",
+        extracted_title=raw_title,
         jd_text="x" * 200,
         company_name="Acme",
         location=None,
@@ -1380,22 +1392,26 @@ async def test_from_url_falls_back_when_the_normalizer_returns_a_blank_label(
         payload=OptimizedPayload(),
     )
 
-    assert seen_labels == ["Data Engineer"]
+    assert seen_labels == ["Staff Backend Engineer"]
+    assert created == ["Staff Backend Engineer"]
 
 
 @pytest.mark.asyncio
-async def test_from_url_still_falls_back_to_untitled_for_a_missing_title(
+async def test_from_url_normalizes_the_untitled_placeholder_for_a_missing_title(
     monkeypatch: pytest.MonkeyPatch,
     stub_llm_helpers: _Recorder,
     stub_crud: _Recorder,
     sched: Any,
 ) -> None:
-    """The pre-existing no-title contract survives canonicalization."""
+    """The pre-existing no-title contract: a posting without a title reaches
+    the normalizer as "Untitled Target" (the raw label) and the normalizer's
+    verdict is the label. Since #1066 a normalizer failure here propagates
+    like any other instead of falling back to the placeholder."""
     seen_titles: list[str] = []
 
     async def fake_norm(llm, *, title, jd_text):  # type: ignore[no-untyped-def]
         seen_titles.append(title)
-        raise RuntimeError("normalizer unavailable")
+        return NormalizedTitle(label="Data Engineer"), _llm_result()
 
     monkeypatch.setattr(from_input, "normalize_posting_title", fake_norm)
 
@@ -1427,7 +1443,7 @@ async def test_from_url_still_falls_back_to_untitled_for_a_missing_title(
     )
 
     assert seen_titles == ["Untitled Target"]
-    assert seen_labels == ["Untitled Target"]
+    assert seen_labels == ["Data Engineer"]
 
 
 @pytest.mark.asyncio

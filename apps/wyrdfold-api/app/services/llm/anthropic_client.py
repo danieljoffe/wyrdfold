@@ -23,13 +23,12 @@ Combined with the cached system block, the whole static prompt prefix
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import time
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, cast
-
-from anthropic import APIConnectionError, APIStatusError, APITimeoutError, AsyncAnthropic
 
 from app.models.llm import (
     LLMResult,
@@ -41,28 +40,31 @@ from app.models.llm import (
     ModelId,
 )
 from app.services.llm.errors import (
+    LLMMalformedOutputError,
     LLMUpstreamUnavailableError,
-    translate_api_status_error,
+    MissingToolCallError,
+)
+from app.services.llm.messages_transport import (
+    MessagesResponse,
+    MessagesTransport,
+    MessagesUsage,
+    SdkMessagesTransport,
+    StreamFinal,
+    StreamTextDelta,
+    StreamUsageDelta,
+    _reported_usage,  # noqa: F401  re-exported: tests/test_llm_anthropic.py imports it from here
+    translate_or_reraise,
 )
 from app.services.llm.pricing import resolve_cost
 
 
-def _reported_usage(sdk_usage: object) -> Mapping[str, Any] | None:
-    """The provider-reported billing fields hanging off an SDK usage object.
-
-    The Anthropic SDK types only Anthropic's own usage fields, so anything the
-    server adds lands in pydantic's ``model_extra``. When this client points
-    at OpenRouter (see ``openrouter_client``) that is where ``cost``,
-    ``cost_details`` and ``is_byok`` arrive — verified against a live response.
-    A direct api.anthropic.com call has no such extras, so this returns
-    ``None`` and the caller falls back to the static table.
-
-    Guarded with ``isinstance(Mapping)`` rather than a truthiness check
-    because our test doubles are ``MagicMock``s, whose every attribute is
-    itself a truthy Mock; a looser check would hand ``resolve_cost`` a Mock.
-    """
-    extra = getattr(sdk_usage, "model_extra", None)
-    return extra if isinstance(extra, Mapping) else None
+def _llm_usage(usage: MessagesUsage) -> LLMUsage:
+    return LLMUsage(
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cache_read_input_tokens=usage.cache_read_input_tokens,
+        cache_creation_input_tokens=usage.cache_creation_input_tokens,
+    )
 
 
 def _api_message_content(message: Message) -> Any:
@@ -141,19 +143,37 @@ class AnthropicLLMClient:
         timeout: float = 600.0,
         max_retries: int = 2,
         base_url: str | None = None,
+        transport: MessagesTransport | None = None,
     ) -> None:
-        # ``base_url`` is an extension point for backends that speak the
-        # Anthropic API shape but live behind a different host — e.g.
-        # OpenRouter (see openrouter_client.py). Default None keeps the
-        # SDK at its built-in https://api.anthropic.com endpoint.
-        kwargs: dict[str, Any] = {
-            "api_key": api_key,
-            "timeout": timeout,
-            "max_retries": max_retries,
-        }
-        if base_url is not None:
-            kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
+        # The wire path is a seam (#1067, ``messages_transport``). Default:
+        # the Anthropic SDK, constructed lazily on the first call. ``base_url``
+        # is the extension point for backends that speak the Anthropic API
+        # shape behind a different host (OpenRouter, see openrouter_client.py);
+        # None keeps the SDK at its built-in https://api.anthropic.com.
+        self._transport: MessagesTransport = transport or SdkMessagesTransport(
+            api_key=api_key,
+            timeout=timeout,
+            max_retries=max_retries,
+            base_url=base_url,
+        )
+
+    def _transport_for(self, purpose: str, method: str) -> MessagesTransport:
+        """Which transport serves this call. The base client has one;
+        ``OpenRouterLLMClient`` routes by purpose (#1067 rollout knob)."""
+        return self._transport
+
+    @property
+    def _client(self) -> Any:
+        """The SDK client behind the default transport, built on first access.
+
+        Kept for the suite, which patches ``messages.create`` /
+        ``messages.stream`` on it; production code never touches it. Raises
+        when the transport is not the SDK, which is the point: nothing may
+        assume the SDK is there.
+        """
+        if isinstance(self._transport, SdkMessagesTransport):
+            return self._transport.sdk_client
+        raise AttributeError("this client's transport is not the Anthropic SDK")
 
     def _resolve_model(self, model: ModelId) -> str:
         """Translate an internal ModelId to the string the underlying
@@ -164,17 +184,10 @@ class AnthropicLLMClient:
         return model
 
     @staticmethod
-    def _translate_or_reraise(exc: APIStatusError) -> None:
-        """Convert an SDK status error into a typed LLM service error
-        when the status maps to one of our user-facing transient
-        categories (402/429/5xx/auth). Otherwise re-raise so the
-        unhandled-exception handler logs it as a 500 — those status
-        codes indicate a bug in our request, not a transient outage.
-        """
-        translated = translate_api_status_error(exc)
-        if translated is None:
-            raise exc
-        raise translated from exc
+    def _translate_or_reraise(exc: Any) -> None:
+        """Kept for callers and tests; the translation lives on the transport
+        seam now (``messages_transport.translate_or_reraise``)."""
+        translate_or_reraise(exc)
 
     async def complete(
         self,
@@ -206,36 +219,24 @@ class AnthropicLLMClient:
         api_messages = _api_messages(messages)
 
         start = time.perf_counter()
-        try:
-            response = await self._client.messages.create(
-                model=cast(Any, self._resolve_model(model)),
-                max_tokens=max_tokens,
-                system=system_param,
-                messages=cast(Any, api_messages),
-            )
-        except APIStatusError as exc:
-            self._translate_or_reraise(exc)
-            raise  # pragma: no cover - _translate_or_reraise always raises
-        except (APIConnectionError, APITimeoutError) as exc:
-            raise LLMUpstreamUnavailableError() from exc
+        transport = self._transport_for(purpose, "complete")
+        response = await transport.create(
+            model=cast(Any, self._resolve_model(model)),
+            max_tokens=max_tokens,
+            system=system_param,
+            messages=cast(Any, api_messages),
+        )
         latency_ms = int((time.perf_counter() - start) * 1000)
 
         # Join every text block. Thinking / tool-use blocks are not expected
         # on this call site (we don't enable thinking, we don't declare tools),
         # but we defensively filter to type=="text" rather than assuming
         # response.content[0].
-        text_parts = [b.text for b in response.content if b.type == "text"]
+        text_parts = [b.text or "" for b in response.content if b.type == "text"]
         content = "".join(text_parts)
 
-        usage = LLMUsage(
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            cache_read_input_tokens=(getattr(response.usage, "cache_read_input_tokens", 0) or 0),
-            cache_creation_input_tokens=(
-                getattr(response.usage, "cache_creation_input_tokens", 0) or 0
-            ),
-        )
-        cost, cost_source = resolve_cost(model, usage, reported=_reported_usage(response.usage))
+        usage = _llm_usage(response.usage)
+        cost, cost_source = resolve_cost(model, usage, reported=response.usage.reported)
 
         return LLMResult(
             content=content,
@@ -244,6 +245,8 @@ class AnthropicLLMClient:
             cost_usd=cost,
             cost_source=cost_source,
             latency_ms=latency_ms,
+            transport=transport.transport_id,
+            provider=response.provider,
         )
 
     async def complete_tool_use(
@@ -313,13 +316,8 @@ class AnthropicLLMClient:
                 _note_temperature_omitted(model, temperature)
 
         start = time.perf_counter()
-        try:
-            response = await self._client.messages.create(**create_kwargs)
-        except APIStatusError as exc:
-            self._translate_or_reraise(exc)
-            raise  # pragma: no cover - _translate_or_reraise always raises
-        except (APIConnectionError, APITimeoutError) as exc:
-            raise LLMUpstreamUnavailableError() from exc
+        transport = self._transport_for(purpose, "complete_tool_use")
+        response = await transport.create(**create_kwargs)
         latency_ms = int((time.perf_counter() - start) * 1000)
 
         # Find the tool_use block. The forced tool_choice guarantees one
@@ -333,7 +331,7 @@ class AnthropicLLMClient:
 
         if tool_input is None:
             stop_reason = getattr(response, "stop_reason", "unknown")
-            raise ValueError(
+            raise MissingToolCallError(
                 f"Expected tool_use block for {tool_name!r}, got stop_reason="
                 f"{stop_reason!r} with content blocks "
                 f"{[b.type for b in response.content]!r}"
@@ -347,20 +345,14 @@ class AnthropicLLMClient:
         # ``complete_json``; this also catches the ones that stay schema-valid
         # (a list cut short, a value clipped). (#47)
         if getattr(response, "stop_reason", None) == "max_tokens":
-            raise ValueError(
+            raise LLMMalformedOutputError(
                 f"Tool input for {tool_name!r} was truncated at "
-                f"max_tokens={max_tokens}; the structured response is incomplete"
+                f"max_tokens={max_tokens}; the structured response is incomplete",
+                reason="truncated",
             )
 
-        usage = LLMUsage(
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            cache_read_input_tokens=(getattr(response.usage, "cache_read_input_tokens", 0) or 0),
-            cache_creation_input_tokens=(
-                getattr(response.usage, "cache_creation_input_tokens", 0) or 0
-            ),
-        )
-        cost, cost_source = resolve_cost(model, usage, reported=_reported_usage(response.usage))
+        usage = _llm_usage(response.usage)
+        cost, cost_source = resolve_cost(model, usage, reported=response.usage.reported)
 
         result = LLMResult(
             content=json.dumps(tool_input),
@@ -369,6 +361,8 @@ class AnthropicLLMClient:
             cost_usd=cost,
             cost_source=cost_source,
             latency_ms=latency_ms,
+            transport=transport.transport_id,
+            provider=response.provider,
         )
         return tool_input, result
 
@@ -411,50 +405,45 @@ class AnthropicLLMClient:
         reported: Mapping[str, Any] | None = None
 
         start = time.perf_counter()
-        # SDK raises APIStatusError on the initial HTTP handshake (which
-        # surfaces from ``async with .stream(...)``) and may raise mid-
-        # stream on chunked-transfer errors. Wrap the whole region so
-        # either path translates uniformly.
-        try:
-            async with self._client.messages.stream(
-                model=cast(Any, self._resolve_model(model)),
-                max_tokens=max_tokens,
-                system=system_param,
-                messages=cast(Any, api_messages),
-            ) as stream:
-                async for event in stream:
-                    if event.type == "content_block_delta" and event.delta.type == "text_delta":
-                        if event.delta.text:
-                            yield LLMStreamDelta(text=event.delta.text)
-                    elif event.type == "message_delta":
-                        reported = _reported_usage(event.usage) or reported
-
-                final_message = await stream.get_final_message()
-        except APIStatusError as exc:
-            self._translate_or_reraise(exc)
-            raise  # pragma: no cover - _translate_or_reraise always raises
-        except (APIConnectionError, APITimeoutError) as exc:
-            raise LLMUpstreamUnavailableError() from exc
+        # The transport translates handshake and mid-stream failures into the
+        # typed hierarchy; this loop only interprets the normalised events.
+        transport = self._transport_for(purpose, "stream")
+        final_message: MessagesResponse | None = None
+        events = transport.stream(
+            model=cast(Any, self._resolve_model(model)),
+            max_tokens=max_tokens,
+            system=system_param,
+            messages=cast(Any, api_messages),
+        )
+        # ``aclosing``: when OUR consumer stops early (the derive route's
+        # disconnect path calls aclose() on this generator), the transport's
+        # generator is closed here, synchronously, so its finally releases the
+        # upstream socket now rather than whenever the event loop's
+        # async-generator finalizer gets to it (release gate 2026-09-18).
+        async with contextlib.aclosing(events):
+            async for event in events:
+                if isinstance(event, StreamTextDelta):
+                    if event.text:
+                        yield LLMStreamDelta(text=event.text)
+                elif isinstance(event, StreamUsageDelta):
+                    reported = event.reported or reported
+                elif isinstance(event, StreamFinal):
+                    final_message = event.message
+        if final_message is None:
+            # A transport that ends without its final frame lost the
+            # connection mid-stream; the caller's retry path is the right one.
+            raise LLMUpstreamUnavailableError()
 
         latency_ms = int((time.perf_counter() - start) * 1000)
 
-        text_parts = [b.text for b in final_message.content if b.type == "text"]
+        text_parts = [b.text or "" for b in final_message.content if b.type == "text"]
         content = "".join(text_parts)
 
-        usage = LLMUsage(
-            input_tokens=final_message.usage.input_tokens,
-            output_tokens=final_message.usage.output_tokens,
-            cache_read_input_tokens=(
-                getattr(final_message.usage, "cache_read_input_tokens", 0) or 0
-            ),
-            cache_creation_input_tokens=(
-                getattr(final_message.usage, "cache_creation_input_tokens", 0) or 0
-            ),
-        )
+        usage = _llm_usage(final_message.usage)
         # Fall back to the final message's own extras when no message_delta
         # carried a cost (direct Anthropic never does).
         cost, cost_source = resolve_cost(
-            model, usage, reported=reported or _reported_usage(final_message.usage)
+            model, usage, reported=reported or final_message.usage.reported
         )
 
         yield LLMStreamFinal(
@@ -465,5 +454,7 @@ class AnthropicLLMClient:
                 cost_usd=cost,
                 cost_source=cost_source,
                 latency_ms=latency_ms,
+                transport=transport.transport_id,
+                provider=final_message.provider,
             )
         )

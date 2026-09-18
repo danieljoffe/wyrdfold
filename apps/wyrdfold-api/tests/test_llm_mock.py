@@ -9,13 +9,14 @@ import pytest
 from app.models.llm import Message
 from app.models.targets import TargetSuggestions
 from app.services.llm.client import complete_json
-from app.services.llm.errors import MissingToolCallError
+from app.services.llm.errors import LLMMalformedOutputError, MissingToolCallError
 from app.services.llm.mock import (
     QUERY_SUGGEST_PURPOSE,
     MockLLMClient,
     dev_default_responses,
     prose_json_tool_call,
     prose_xml_tool_call,
+    truncated_tool_input,
 )
 
 
@@ -1069,3 +1070,70 @@ async def test_mock_never_claims_a_provider_reported_cost() -> None:
         assert result.cost_source == "estimated"
         # …and the number really is the table's, not a coincidence.
         assert result.cost_usd == pytest.approx(calculate_cost(result.model, result.usage))
+
+
+# ---- #1066: the malformed-output family through the mock -------------------
+
+
+async def test_truncated_tool_input_raises_the_typed_truncation_error() -> None:
+    """``truncated_tool_input()`` models a forced tool call cut off at
+    ``max_tokens``; the mock raises what the real clients raise, so a surface
+    can prove its handling without a partial dict ever reaching it."""
+    client = MockLLMClient(scripted={"test.trunc": truncated_tool_input()})
+    with pytest.raises(LLMMalformedOutputError, match="truncated") as excinfo:
+        await client.complete_tool_use(
+            model="claude-haiku-4-5",
+            system="sys",
+            messages=[Message(role="user", content="x")],
+            tool_name="return_x",
+            tool_description="d",
+            tool_input_schema={"type": "object"},
+            purpose="test.trunc",
+        )
+    assert excinfo.value.reason == "truncated"
+    assert not isinstance(excinfo.value, ValueError)
+
+
+async def test_prose_answer_is_a_member_of_the_malformed_output_family() -> None:
+    client = MockLLMClient(scripted={"test.prose": "Sure! Here is my answer in prose."})
+    with pytest.raises(LLMMalformedOutputError) as excinfo:
+        await client.complete_tool_use(
+            model="claude-haiku-4-5",
+            system="sys",
+            messages=[Message(role="user", content="x")],
+            tool_name="return_x",
+            tool_description="d",
+            tool_input_schema={"type": "object"},
+            purpose="test.prose",
+        )
+    assert isinstance(excinfo.value, MissingToolCallError)
+    assert excinfo.value.reason == "missing_tool_call"
+    assert "Sure!" not in excinfo.value.user_message
+
+
+def test_normalized_title_strips_and_rejects_whitespace_only_labels() -> None:
+    """#1066: ``min_length`` alone accepted "   "; the validator now strips
+    inside the boundary so a blank label fails there, never at a caller."""
+    from app.services.targets.normalize_posting_title import NormalizedTitle
+
+    assert NormalizedTitle.model_validate({"label": "  Data Engineer  "}).label == "Data Engineer"
+    with pytest.raises(pydantic.ValidationError):
+        NormalizedTitle.model_validate({"label": "   "})
+
+
+async def test_whitespace_only_title_is_malformed_output_through_complete_json() -> None:
+    from app.services.targets.normalize_posting_title import NormalizedTitle
+
+    client = MockLLMClient(
+        scripted={"target.normalize_posting_title": json.dumps({"label": "   "})}
+    )
+    with pytest.raises(LLMMalformedOutputError) as excinfo:
+        await complete_json(
+            client,
+            model="claude-sonnet-4-6",
+            system="sys",
+            messages=[Message(role="user", content="Staff Backend Engineer")],
+            schema=NormalizedTitle,
+            purpose="target.normalize_posting_title",
+        )
+    assert excinfo.value.reason == "schema_violation"

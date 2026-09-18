@@ -27,7 +27,7 @@ from app.models.llm import (
     Message,
     ModelId,
 )
-from app.services.llm.errors import MissingToolCallError
+from app.services.llm.errors import LLMMalformedOutputError, MissingToolCallError
 from app.services.llm.pricing import calculate_cost
 
 
@@ -737,6 +737,23 @@ def dev_default_responses() -> dict[str, ResponseSource]:
     }
 
 
+# Scripting a ``max_tokens`` truncation (#1066). A scripted response of exactly
+# this string models a forced tool call that stopped at the token cap. The
+# real clients raise ``LLMMalformedOutputError(reason="truncated")`` for
+# ``stop_reason == "max_tokens"`` (Anthropic) / ``finish_reason == "length"``
+# (OpenAI-shaped); the mock mirrors that so a surface can prove its handling
+# of the truncation shape without a partial dict ever reaching it. (A cut-off
+# JSON string, as in ``triage_verdicts(variant="truncated")``, models the
+# same stop on a transport that hands the caller the partial text and is
+# raised as the prose error; both are the one typed family.)
+TRUNCATED_TOOL_INPUT = "__mock_truncated_at_max_tokens__"
+
+
+def truncated_tool_input() -> str:
+    """Corpus builder: script a forced tool call cut off at ``max_tokens``."""
+    return TRUNCATED_TOOL_INPUT
+
+
 class MockLLMClient:
     """Implements the LLMClient Protocol. Not used in production."""
 
@@ -801,6 +818,7 @@ class MockLLMClient:
             usage=usage,
             cost_usd=cost,
             latency_ms=self._default_latency_ms,
+            transport="mock",
         )
 
     async def complete_tool_use(
@@ -831,6 +849,12 @@ class MockLLMClient:
             messages[-1].content,
         )
         response_text = self._render_response(purpose, latest_user, messages)
+        if response_text == TRUNCATED_TOOL_INPUT:
+            raise LLMMalformedOutputError(
+                f"Tool input for {tool_name!r} was truncated at max_tokens={max_tokens}; "
+                "the structured response is incomplete",
+                reason="truncated",
+            )
         # A non-JSON script models the model answering in PROSE instead of
         # emitting the forced tool call — raise the same typed error the real
         # client does so downstream surfaces inherit the exact failure shape
@@ -889,6 +913,7 @@ class MockLLMClient:
             usage=usage,
             cost_usd=cost,
             latency_ms=self._default_latency_ms,
+            transport="mock",
         )
 
     async def stream(
@@ -947,6 +972,7 @@ class MockLLMClient:
                 usage=usage,
                 cost_usd=cost,
                 latency_ms=self._default_latency_ms,
+                transport="mock",
             )
         )
 

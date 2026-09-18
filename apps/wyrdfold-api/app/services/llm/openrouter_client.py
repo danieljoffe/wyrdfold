@@ -22,23 +22,29 @@ ZDR (Zero Data Retention) is enabled account-wide via the OpenRouter dashboard.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any, Literal, NamedTuple, cast
 
 import httpx
 
+from app.config import settings
 from app.models.llm import LLMResult, LLMStreamEvent, LLMUsage, Message, ModelId
 from app.services.llm.anthropic_client import AnthropicLLMClient
 from app.services.llm.errors import (
+    LLMMalformedOutputError,
+    LLMRequestRejectedError,
     LLMUpstreamUnavailableError,
     MissingToolCallError,
     translate_api_status_error,
 )
+from app.services.llm.messages_transport import MessagesTransport
+from app.services.llm.openrouter_http import TRANSIENT_STATUSES, post_json_with_retry
 from app.services.llm.pricing import resolve_cost
+from app.services.llm.raw_messages_transport import RawMessagesTransport, classify_error_response
 
 # Anthropic SDK appends "/v1/messages" to base_url internally, so omit /v1 here.
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api"
@@ -114,7 +120,12 @@ _NO_FORCED_FUNCTION_PROVIDERS: tuple[str, ...] = (
 )
 
 # HTTP statuses worth a retry (transient); others translate + raise immediately.
-_TRANSIENT_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 529})
+# Envelope codes that mean OpenRouter rejected OUR request: a schema the
+# grammar compiler cannot inline (400), a slug with no endpoints (404), a
+# payload it will not take (413/415), a validation failure (422). Application
+# bugs, surfaced as ``LLMRequestRejectedError`` (500 + Sentry), never retried
+# and never described to the user as something to try again.
+_REQUEST_REJECTED_CODES: frozenset[int] = frozenset({400, 404, 405, 413, 415, 422})
 
 logger = logging.getLogger(__name__)
 _BACKOFF_BASE_SECONDS = 0.5
@@ -165,10 +176,21 @@ def _parse_openai_tool_response(
     chat/completions response. Fails loud on every way the structured
     contract can break — the caller's fallback engages rather than a
     silently-wrong dict flowing downstream (mirrors the Anthropic path, #47).
+
+    Every failure here is an ``LLMMalformedOutputError`` (#1066): no choices,
+    prose instead of the tool call (``MissingToolCallError``), truncation,
+    non-JSON or non-object arguments. None is a plain ``ValueError``, so the
+    raw envelope text these diagnostics carry can only reach a log line.
     """
     choices = data.get("choices") or []
     if not choices:
-        raise ValueError(f"OpenRouter returned no choices for {tool_name!r}: {str(data)[:300]!r}")
+        # A 200 with no completion at all (missing or empty ``choices``) is an
+        # unusable answer like the rest of this family (#1066): typed, fixed
+        # user copy, the bounded raw envelope only in the log line.
+        raise LLMMalformedOutputError(
+            f"OpenRouter returned no choices for {tool_name!r}: {str(data)[:300]!r}",
+            reason="missing_choices",
+        )
     choice = choices[0]
     finish = choice.get("finish_reason")
     # OpenRouter names the endpoint that actually served the call on every
@@ -189,7 +211,7 @@ def _parse_openai_tool_response(
     if not tool_calls:
         # One warning at the RAISE site so the provider-labelled signal is
         # production telemetry by construction, independent of how any caller
-        # catches this ValueError subclass. (Today's callers keep the text
+        # catches this error. (Today's callers keep the text
         # anyway — triage's and grading's broad handlers both
         # ``logger.exception`` the traceback — but a future quiet catch must
         # not be able to erase the drift signal.)
@@ -211,23 +233,70 @@ def _parse_openai_tool_response(
     # the parsed dict would be incomplete. Fail loud (matches Anthropic's
     # stop_reason==max_tokens guard).
     if finish == "length":
-        raise ValueError(
+        raise LLMMalformedOutputError(
             f"Tool input for {tool_name!r} was truncated at max_tokens={max_tokens}; "
-            "the structured response is incomplete"
+            "the structured response is incomplete",
+            reason="truncated",
         )
     args_str = tool_calls[0].get("function", {}).get("arguments", "")
     try:
         tool_input = json.loads(args_str)
     except (json.JSONDecodeError, TypeError) as exc:
-        raise ValueError(
-            f"Tool arguments for {tool_name!r} were not valid JSON: {str(exc)[:120]}"
+        raise LLMMalformedOutputError(
+            f"Tool arguments for {tool_name!r} were not valid JSON: {str(exc)[:120]}",
+            reason="malformed_arguments",
         ) from exc
     if not isinstance(tool_input, dict):
-        raise ValueError(
+        raise LLMMalformedOutputError(
             f"Tool arguments for {tool_name!r} decoded to "
-            f"{type(tool_input).__name__}, not an object"
+            f"{type(tool_input).__name__}, not an object",
+            reason="malformed_arguments",
         )
     return tool_input
+
+
+def _classify_error_envelope(err: dict[str, Any], *, tool_name: str) -> Exception:
+    """Map OpenRouter's HTTP-200 error envelope onto the typed families.
+
+    Deliberate, per code (#1066 review): the envelope is NOT the model's
+    answer, so nothing here is an ``LLMMalformedOutputError``, and nothing is a
+    plain ``ValueError`` that an ``except ValueError`` could serialise.
+
+    - transient (``openrouter_http.TRANSIENT_STATUSES`` or any 5xx):
+      ``LLMUpstreamUnavailableError``;
+      the caller's fallback engages.
+    - classified provider condition (402 credits, 401/403 key): the same typed
+      error the HTTP-status path gives it, via ``translate_api_status_error``,
+      so the breaker and the 503 copy behave identically whether OpenRouter
+      put the code on the wire or in the body.
+    - request rejection (``_REQUEST_REJECTED_CODES``):
+      ``LLMRequestRejectedError`` — our bug; 500 + Sentry, generic body.
+    - anything else, including a missing or non-integer code:
+      ``LLMRequestRejectedError(reason="unclassified_error_envelope")`` — also
+      500 + Sentry, so a new code gets classified on evidence instead of
+      inheriting a neighbour's behaviour.
+    """
+    code = err.get("code")
+    message = str(err.get("message"))[:200]
+    if isinstance(code, int):
+        # The same transient set as the status-line path (408/409/425/429 and
+        # every 5xx): an envelope timeout must not become "our bug" while the
+        # identical status on the wire is retried (release gate 2026-09-18).
+        if code in TRANSIENT_STATUSES or code >= 500:
+            return LLMUpstreamUnavailableError()
+        translated = translate_api_status_error(SimpleNamespace(status_code=code))
+        if translated is not None:
+            return translated
+        if code in _REQUEST_REJECTED_CODES:
+            return LLMRequestRejectedError(
+                f"OpenRouter error body for {tool_name!r} (code={code}): {message!r}",
+                upstream_code=code,
+            )
+    return LLMRequestRejectedError(
+        f"OpenRouter error body for {tool_name!r} (code={code!r}): {message!r}",
+        reason="unclassified_error_envelope",
+        upstream_code=code if isinstance(code, int) else None,
+    )
 
 
 def _openai_usage(data: dict[str, Any]) -> LLMUsage:
@@ -261,6 +330,7 @@ class OpenRouterLLMClient(AnthropicLLMClient):
         api_key: str | None = None,
         timeout: float = 600.0,
         max_retries: int = 3,
+        raw_purposes: frozenset[str] | None = None,
     ) -> None:
         super().__init__(
             api_key=api_key,
@@ -275,6 +345,37 @@ class OpenRouterLLMClient(AnthropicLLMClient):
         self._timeout = timeout
         self._max_retries = max_retries
         self._openai_http: httpx.AsyncClient | None = None
+        # #1067 rollout: purposes served by the raw ``/v1/messages`` transport
+        # instead of the SDK. Read from settings at construction (the cached
+        # client is process-lived; a variable change restarts the process).
+        self._raw_purposes: frozenset[str] = (
+            raw_purposes if raw_purposes is not None else settings.llm_raw_transport_purposes_set
+        )
+        self._raw: RawMessagesTransport | None = None
+        if self._raw_purposes:
+            # Visible in prod logs at every client construction so a rollout
+            # (or a typo that routes nothing) is never silent.
+            logger.warning(
+                "raw /v1/messages transport enabled for purposes: %s",
+                ", ".join(sorted(self._raw_purposes)),
+            )
+
+    def _raw_transport(self) -> RawMessagesTransport:
+        if self._raw is None:
+            self._raw = RawMessagesTransport(
+                api_key=self._api_key,
+                timeout=self._timeout,
+                max_retries=self._max_retries,
+                base_url=_OPENROUTER_BASE_URL,
+            )
+        return self._raw
+
+    def _transport_for(self, purpose: str, method: str) -> MessagesTransport:
+        # The rollout knob routes a listed purpose raw for every method; the
+        # raw transport streams too since #1067 PR C.
+        if purpose in self._raw_purposes:
+            return self._raw_transport()
+        return self._transport
 
     def _resolve_model(self, model: ModelId) -> str:
         route = _ROUTES.get(model)
@@ -435,29 +536,18 @@ class OpenRouterLLMClient(AnthropicLLMClient):
 
         http = self._openai_client()
         start = time.perf_counter()
-        resp: httpx.Response | None = None
-        for attempt in range(self._max_retries + 1):
-            try:
-                resp = await http.post(_OPENROUTER_OPENAI_URL, json=body)
-                resp.raise_for_status()
-                break
-            except httpx.HTTPStatusError as exc:
-                status = exc.response.status_code
-                if status in _TRANSIENT_STATUSES and attempt < self._max_retries:
-                    await asyncio.sleep(_BACKOFF_BASE_SECONDS * (2**attempt))
-                    continue
-                translated = translate_api_status_error(exc.response)
-                if translated is not None:
-                    raise translated from exc
-                raise  # 4xx application bug (bad schema/request) → bubble as 500
-            except httpx.TransportError as exc:  # timeouts + connection errors
-                if attempt < self._max_retries:
-                    await asyncio.sleep(_BACKOFF_BASE_SECONDS * (2**attempt))
-                    continue
-                raise LLMUpstreamUnavailableError() from exc
-
-        if resp is None:  # unreachable: the loop breaks with resp or raises
-            raise LLMUpstreamUnavailableError()
+        # One retry policy for both OpenRouter shapes (#1067 item 1): transient
+        # statuses and transport errors retried with Retry-After honoured;
+        # anything else comes back for classification here.
+        resp = await post_json_with_retry(
+            http, _OPENROUTER_OPENAI_URL, body, max_retries=self._max_retries
+        )
+        if resp.status_code < 200 or resp.status_code >= 300:
+            # Same taxonomy as the Messages shape: typed provider conditions
+            # (402/401/403) keep their errors; a 400 schema rejection is our bug
+            # and surfaces as LLMRequestRejectedError (500 + Sentry), no longer
+            # a raw httpx exception.
+            raise classify_error_response(resp, endpoint="/chat/completions")
         latency_ms = int((time.perf_counter() - start) * 1000)
 
         try:
@@ -468,18 +558,11 @@ class OpenRouterLLMClient(AnthropicLLMClient):
         # OpenRouter sometimes returns HTTP 200 with the upstream error in the
         # BODY (a transient 5xx/timeout, or a grammar-compile 400) — the
         # status-based retry above never saw it, and _parse_openai_tool_response
-        # would surface it as a confusing "no choices". Detect it: map transient
-        # codes to the retryable upstream error (engages the caller's fallback);
-        # surface the rest clearly with the provider message.
+        # would surface it as a confusing "no choices". Detect it and classify
+        # the code deliberately (see ``_classify_error_envelope``).
         err = data.get("error") if isinstance(data, dict) else None
         if isinstance(err, dict):
-            code = err.get("code")
-            if isinstance(code, int) and code in _TRANSIENT_STATUSES:
-                raise LLMUpstreamUnavailableError()
-            raise ValueError(
-                f"OpenRouter error body for {tool_name!r} (code={code}): "
-                f"{str(err.get('message'))[:200]!r}"
-            )
+            raise _classify_error_envelope(err, tool_name=tool_name)
 
         tool_input = _parse_openai_tool_response(
             data,
@@ -498,5 +581,7 @@ class OpenRouterLLMClient(AnthropicLLMClient):
             cost_usd=cost,
             cost_source=cost_source,
             latency_ms=latency_ms,
+            transport="chat_completions_http",
+            provider=data.get("provider") if isinstance(data.get("provider"), str) else None,
         )
         return tool_input, result

@@ -212,6 +212,7 @@ def test_enqueue_carries_metadata_when_provided() -> None:
         "job_id": "abc",
         "target_id": "xyz",
         "cost_source": "estimated",
+        "transport": "unknown",
     }
     # user_id=None (a cron enqueue) is stamped SYSTEM at row-build time (#88
     # groundwork) — the buffered write is no longer a NULL-owner row.
@@ -270,7 +271,11 @@ async def test_record_async_awaits_insert_and_returns_record() -> None:
     assert inserted["purpose"] == "experience.derive"
     assert inserted["cost_usd"] == 0.01
     assert inserted["output_tokens"] == 5
-    assert inserted["metadata"] == {"prose_doc_id": "p1", "cost_source": "estimated"}
+    assert inserted["metadata"] == {
+        "prose_doc_id": "p1",
+        "cost_source": "estimated",
+        "transport": "unknown",
+    }
     sb.table.return_value.insert.return_value.execute.assert_awaited_once()
 
 
@@ -548,4 +553,4 @@ async def test_record_async_stamps_the_cost_provenance() -> None:
     await cost_log.record_async(sb, user_id="u1", purpose="p", result=result)
 
     inserted = sb.table.return_value.insert.call_args[0][0]
-    assert inserted["metadata"] == {"cost_source": "reported"}
+    assert inserted["metadata"] == {"cost_source": "reported", "transport": "unknown"}

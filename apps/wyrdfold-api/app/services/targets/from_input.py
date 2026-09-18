@@ -39,19 +39,15 @@ so this module holds no locally-obtained SYNC service client at all.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from datetime import UTC, datetime
 from typing import Any, cast
 
-import pydantic
-from fastapi import HTTPException
 from supabase import AsyncClient
 
 from app.background import spawn_detached
 from app.config import settings
 from app.models.experience import OptimizedPayload
-from app.models.llm import LLMResult
 from app.models.targets import (
     CreateOrLinkResult,
     JobTarget,
@@ -623,48 +619,6 @@ async def derive_url_target_bg(
 # ---- Inline create-or-link orchestration -----------------------------------
 
 
-# User-facing message when the LLM returns output we can't parse into a
-# TargetSuggestion. 502 (Bad Gateway): the upstream LLM gave us a malformed
-# response, not the client's fault. Matches the transient, retry-friendly
-# framing of the LLM error hierarchy in app/services/llm/errors.py without
-# leaking the raw pydantic/JSON traceback.
-_MALFORMED_SUGGESTION_DETAIL = (
-    "Couldn't derive a target profile from the role title — please try again."
-)
-
-
-async def _normalize_suggestion(
-    llm: LLMClient,
-    *,
-    label: str,
-    description: str | None,
-    payload: OptimizedPayload,
-) -> tuple[TargetSuggestion, LLMResult]:
-    """Normalize user input into a ``TargetSuggestion``, guarding the parse.
-
-    ``normalize_manual_input`` validates the LLM's tool output against the
-    ``TargetSuggestion`` schema. A real LLM occasionally returns output that
-    doesn't match (missing/extra fields, non-JSON), which raises
-    ``pydantic.ValidationError`` (or a JSON decode error). Left unhandled
-    these propagate as a raw 500 with a traceback. Translate them into a
-    clean 502 so the caller gets an actionable, retry-friendly message.
-
-    Centralized here so every entry point that derives a ``TargetSuggestion``
-    inline (currently ``from_manual``) shares the same guard.
-    """
-    try:
-        return await normalize_manual_input(
-            llm, label=label, description=description, payload=payload
-        )
-    except (pydantic.ValidationError, json.JSONDecodeError) as exc:
-        logger.warning(
-            "LLM returned malformed TargetSuggestion for label=%r: %s",
-            label,
-            exc,
-        )
-        raise HTTPException(status_code=502, detail=_MALFORMED_SUGGESTION_DETAIL) from exc
-
-
 async def _create_or_link_from_suggestion(
     supabase: AsyncClient,
     llm: LLMClient,
@@ -758,7 +712,10 @@ async def from_manual(
     3. If matched, link the user; defer the fit score
     4. If new, create in ``deriving`` status, link, defer profile + fit score
     """
-    suggestion, norm_result = await _normalize_suggestion(
+    # Malformed model output is ``LLMMalformedOutputError`` from the LLM
+    # boundary (#1066) and reaches the global handler as a 502; the guard that
+    # used to translate ``pydantic.ValidationError`` here is gone with it.
+    suggestion, norm_result = await normalize_manual_input(
         llm, label=label, description=description, payload=payload
     )
     await cost_log.record_async(
@@ -873,13 +830,19 @@ async def _canonical_url_label(
     extracted_title: str | None,
     jd_text: str,
 ) -> str:
-    """Canonical role label for a posting, falling back to the raw title.
+    """Canonical role label for a posting.
 
-    Deliberately non-fatal. This step improves the NAME; it is not what makes
-    the target work. A normalizer outage (provider 5xx, malformed JSON, schema
-    violation, budget breaker) must not turn a working create-from-URL into a
-    502 — the user would lose the whole flow to cosmetics. On any failure we
-    keep today's behavior exactly: the raw posting title.
+    Fatal on any normalization failure, by design (#1066). The label becomes
+    ``targets.normalized_label``, the UNIQUE catalog dedup key, and
+    ``normalize_posting_title``'s own docs say canonicalization has to happen
+    BEFORE ``find_matching_target`` because the canonical form is what gets
+    matched. Until #1066 this wrapped the call in a bare ``except Exception``
+    and returned the raw posting title: a provider outage minted a raw-keyed
+    catalog row that could never converge (no user-facing rename exists), and
+    a programming error (#1065's ``TypeError``) was laundered into a warning
+    and a wrong identity for three weeks. Now ``LLMServiceError`` (503) and
+    ``LLMMalformedOutputError`` (502) propagate to the global handlers before
+    matching or creation runs; the FE renders ``detail`` on the create route.
 
     The call is billed like every other: an unlogged LLM call makes the cost
     ledger under-report real spend, which both loosens ``enforce_llm_budget``
@@ -887,15 +850,7 @@ async def _canonical_url_label(
     path has always recorded its normalize call; this one must too.
     """
     raw = _raw_url_label(extracted_title)
-    try:
-        normalized, norm_result = await normalize_posting_title(llm, title=raw, jd_text=jd_text)
-    except Exception:
-        logger.warning(
-            "normalize_posting_title failed; falling back to the raw posting title",
-            exc_info=True,
-            extra={"raw_label": raw},
-        )
-        return raw
+    normalized, norm_result = await normalize_posting_title(llm, title=raw, jd_text=jd_text)
 
     # Record before returning, and never let a ledger write cost the user the
     # create — the label is already in hand by this point.
@@ -910,11 +865,10 @@ async def _canonical_url_label(
     except Exception:
         logger.warning("cost_log for normalize_posting_title failed", exc_info=True)
 
-    canonical = normalized.label.strip()
-    # An empty/whitespace label would produce a blank card and a useless dedup
-    # key; the schema's min_length should prevent it, but the fallback is one
-    # line and the failure mode is user-visible.
-    return canonical[:200] if canonical else raw
+    # ``NormalizedTitle`` strips and enforces ``min_length`` inside the LLM
+    # boundary, so a blank label is an ``LLMMalformedOutputError`` upstream of
+    # here, never a fallback to the raw title.
+    return normalized.label
 
 
 async def from_url(
