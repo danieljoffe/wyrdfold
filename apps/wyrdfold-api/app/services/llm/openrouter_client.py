@@ -27,6 +27,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any, Literal, NamedTuple, cast
 
 import httpx
@@ -34,6 +35,8 @@ import httpx
 from app.models.llm import LLMResult, LLMStreamEvent, LLMUsage, Message, ModelId
 from app.services.llm.anthropic_client import AnthropicLLMClient
 from app.services.llm.errors import (
+    LLMMalformedOutputError,
+    LLMRequestRejectedError,
     LLMUpstreamUnavailableError,
     MissingToolCallError,
     translate_api_status_error,
@@ -115,6 +118,12 @@ _NO_FORCED_FUNCTION_PROVIDERS: tuple[str, ...] = (
 
 # HTTP statuses worth a retry (transient); others translate + raise immediately.
 _TRANSIENT_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 529})
+# Envelope codes that mean OpenRouter rejected OUR request: a schema the
+# grammar compiler cannot inline (400), a slug with no endpoints (404), a
+# payload it will not take (413/415), a validation failure (422). Application
+# bugs, surfaced as ``LLMRequestRejectedError`` (500 + Sentry), never retried
+# and never described to the user as something to try again.
+_REQUEST_REJECTED_CODES: frozenset[int] = frozenset({400, 404, 405, 413, 415, 422})
 
 logger = logging.getLogger(__name__)
 _BACKOFF_BASE_SECONDS = 0.5
@@ -165,10 +174,21 @@ def _parse_openai_tool_response(
     chat/completions response. Fails loud on every way the structured
     contract can break — the caller's fallback engages rather than a
     silently-wrong dict flowing downstream (mirrors the Anthropic path, #47).
+
+    Every failure here is an ``LLMMalformedOutputError`` (#1066): no choices,
+    prose instead of the tool call (``MissingToolCallError``), truncation,
+    non-JSON or non-object arguments. None is a plain ``ValueError``, so the
+    raw envelope text these diagnostics carry can only reach a log line.
     """
     choices = data.get("choices") or []
     if not choices:
-        raise ValueError(f"OpenRouter returned no choices for {tool_name!r}: {str(data)[:300]!r}")
+        # A 200 with no completion at all (missing or empty ``choices``) is an
+        # unusable answer like the rest of this family (#1066): typed, fixed
+        # user copy, the bounded raw envelope only in the log line.
+        raise LLMMalformedOutputError(
+            f"OpenRouter returned no choices for {tool_name!r}: {str(data)[:300]!r}",
+            reason="missing_choices",
+        )
     choice = choices[0]
     finish = choice.get("finish_reason")
     # OpenRouter names the endpoint that actually served the call on every
@@ -189,7 +209,7 @@ def _parse_openai_tool_response(
     if not tool_calls:
         # One warning at the RAISE site so the provider-labelled signal is
         # production telemetry by construction, independent of how any caller
-        # catches this ValueError subclass. (Today's callers keep the text
+        # catches this error. (Today's callers keep the text
         # anyway — triage's and grading's broad handlers both
         # ``logger.exception`` the traceback — but a future quiet catch must
         # not be able to erase the drift signal.)
@@ -211,23 +231,66 @@ def _parse_openai_tool_response(
     # the parsed dict would be incomplete. Fail loud (matches Anthropic's
     # stop_reason==max_tokens guard).
     if finish == "length":
-        raise ValueError(
+        raise LLMMalformedOutputError(
             f"Tool input for {tool_name!r} was truncated at max_tokens={max_tokens}; "
-            "the structured response is incomplete"
+            "the structured response is incomplete",
+            reason="truncated",
         )
     args_str = tool_calls[0].get("function", {}).get("arguments", "")
     try:
         tool_input = json.loads(args_str)
     except (json.JSONDecodeError, TypeError) as exc:
-        raise ValueError(
-            f"Tool arguments for {tool_name!r} were not valid JSON: {str(exc)[:120]}"
+        raise LLMMalformedOutputError(
+            f"Tool arguments for {tool_name!r} were not valid JSON: {str(exc)[:120]}",
+            reason="malformed_arguments",
         ) from exc
     if not isinstance(tool_input, dict):
-        raise ValueError(
+        raise LLMMalformedOutputError(
             f"Tool arguments for {tool_name!r} decoded to "
-            f"{type(tool_input).__name__}, not an object"
+            f"{type(tool_input).__name__}, not an object",
+            reason="malformed_arguments",
         )
     return tool_input
+
+
+def _classify_error_envelope(err: dict[str, Any], *, tool_name: str) -> Exception:
+    """Map OpenRouter's HTTP-200 error envelope onto the typed families.
+
+    Deliberate, per code (#1066 review): the envelope is NOT the model's
+    answer, so nothing here is an ``LLMMalformedOutputError``, and nothing is a
+    plain ``ValueError`` that an ``except ValueError`` could serialise.
+
+    - transient (``_TRANSIENT_STATUSES``): ``LLMUpstreamUnavailableError``;
+      the caller's fallback engages.
+    - classified provider condition (402 credits, 401/403 key): the same typed
+      error the HTTP-status path gives it, via ``translate_api_status_error``,
+      so the breaker and the 503 copy behave identically whether OpenRouter
+      put the code on the wire or in the body.
+    - request rejection (``_REQUEST_REJECTED_CODES``):
+      ``LLMRequestRejectedError`` — our bug; 500 + Sentry, generic body.
+    - anything else, including a missing or non-integer code:
+      ``LLMRequestRejectedError(reason="unclassified_error_envelope")`` — also
+      500 + Sentry, so a new code gets classified on evidence instead of
+      inheriting a neighbour's behaviour.
+    """
+    code = err.get("code")
+    message = str(err.get("message"))[:200]
+    if isinstance(code, int):
+        if code in _TRANSIENT_STATUSES:
+            return LLMUpstreamUnavailableError()
+        translated = translate_api_status_error(SimpleNamespace(status_code=code))
+        if translated is not None:
+            return translated
+        if code in _REQUEST_REJECTED_CODES:
+            return LLMRequestRejectedError(
+                f"OpenRouter error body for {tool_name!r} (code={code}): {message!r}",
+                upstream_code=code,
+            )
+    return LLMRequestRejectedError(
+        f"OpenRouter error body for {tool_name!r} (code={code!r}): {message!r}",
+        reason="unclassified_error_envelope",
+        upstream_code=code if isinstance(code, int) else None,
+    )
 
 
 def _openai_usage(data: dict[str, Any]) -> LLMUsage:
@@ -468,18 +531,11 @@ class OpenRouterLLMClient(AnthropicLLMClient):
         # OpenRouter sometimes returns HTTP 200 with the upstream error in the
         # BODY (a transient 5xx/timeout, or a grammar-compile 400) — the
         # status-based retry above never saw it, and _parse_openai_tool_response
-        # would surface it as a confusing "no choices". Detect it: map transient
-        # codes to the retryable upstream error (engages the caller's fallback);
-        # surface the rest clearly with the provider message.
+        # would surface it as a confusing "no choices". Detect it and classify
+        # the code deliberately (see ``_classify_error_envelope``).
         err = data.get("error") if isinstance(data, dict) else None
         if isinstance(err, dict):
-            code = err.get("code")
-            if isinstance(code, int) and code in _TRANSIENT_STATUSES:
-                raise LLMUpstreamUnavailableError()
-            raise ValueError(
-                f"OpenRouter error body for {tool_name!r} (code={code}): "
-                f"{str(err.get('message'))[:200]!r}"
-            )
+            raise _classify_error_envelope(err, tool_name=tool_name)
 
         tool_input = _parse_openai_tool_response(
             data,

@@ -3,6 +3,34 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-09-18 — A bare except turned a TypeError into a wrong catalog identity (#1066)
+
+`from_input._canonical_url_label` wrapped the title normalizer in `except
+Exception` and returned the raw posting title, on the #745 premise that the
+step "only improves the name". The label it returns is
+`targets.normalized_label`, the UNIQUE dedup key, so the fallback minted rows
+that could never converge, and when anthropic 1.0 removed `temperature` (#1065)
+the resulting `TypeError` on every call was logged as a normalization warning
+for three weeks.
+
+Decided: model-output failures are one typed family, `LLMMalformedOutputError`
+(prose refusal, truncation, schema violation), raised at the LLM boundary and
+served as a 502 with fixed copy. It is a sibling of `LLMServiceError`, not a
+child: that hierarchy's positional argument is the user-facing message, and
+three handlers read `except LLMServiceError` as "provider condition" (breaker
+latch, silent NULL). It is not a `ValueError` either: an `except ValueError as
+exc: HTTPException(detail=str(exc))` would serve the raw model content. The
+normalizer fallback is gone; the create fails before matching or creation and
+the user retries. The review added a third sibling, `LLMRequestRejectedError`:
+a provider envelope that rejects OUR request (grammar 400, 404 slug, 422) is
+an application bug and keeps 500 + Sentry semantics with a generic body,
+because a 502 "try again" would launder a deterministic defect into model
+output; unknown envelope codes land there too, deliberately, so they get
+classified on evidence. Rule: never convert an LLM failure into a persisted value.
+Per-item loops may isolate and retry with a full traceback; nothing may mint
+identity from a degraded step. Lives in `app/services/llm/errors.py` and
+`tests/test_targets_from_input.py`.
+
 ## 2026-08-29 — A 404 describes the identifier, not the company (#912)
 
 #913 made `consecutive_failures` count for the first time, and 139 enabled

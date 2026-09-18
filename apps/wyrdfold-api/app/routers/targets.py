@@ -12,7 +12,6 @@ from typing import Any, cast
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from postgrest.types import CountMethod
-from pydantic import ValidationError
 from supabase import AsyncClient, Client
 
 from app.background import spawn_detached
@@ -1380,20 +1379,11 @@ async def suggest_lateral(
     # list — exactly what we want for personalised suggestions.
     current = await _list_for_user_async(supabase, user_id)
 
-    try:
-        suggestions, result = await suggest_lateral_targets(
-            llm, payload=doc.payload, current_targets=current
-        )
-    except ValidationError:
-        # The prose-cap overflows are truncated in-schema now; anything
-        # still failing here is a structurally malformed model response
-        # (wrong types, missing fields). That's an upstream hiccup, not a
-        # server bug — tell the client to retry instead of 500ing.
-        logger.warning("suggest-lateral: model returned malformed suggestions", exc_info=True)
-        raise HTTPException(
-            status_code=502,
-            detail="The model returned malformed suggestions — please retry.",
-        ) from None
+    # A structurally malformed model response is ``LLMMalformedOutputError``
+    # from the LLM boundary (#1066) and reaches the global handler as a 502.
+    suggestions, result = await suggest_lateral_targets(
+        llm, payload=doc.payload, current_targets=current
+    )
     await cost_log.record_async(
         supabase,
         user_id=user_id,
@@ -1435,18 +1425,11 @@ async def suggest_from_query(
     """
     doc = await _optimized_latest(supabase, user_id)
     payload = doc.payload if doc is not None else None
-    try:
-        matched, result = await suggest_and_match_from_query(
-            supabase, llm, query=body.query, user_id=user_id, payload=payload
-        )
-    except ValidationError:
-        # Structurally malformed model response (wrong types/missing fields).
-        # An upstream hiccup, not a server bug — tell the client to retry.
-        logger.warning("suggest-from-query: model returned malformed suggestions", exc_info=True)
-        raise HTTPException(
-            status_code=502,
-            detail="The model returned malformed suggestions — please retry.",
-        ) from None
+    # Malformed model output is ``LLMMalformedOutputError`` (#1066): a 502
+    # from the global handler, fixed copy, model content never in the body.
+    matched, result = await suggest_and_match_from_query(
+        supabase, llm, query=body.query, user_id=user_id, payload=payload
+    )
     await cost_log.record_async(
         supabase,
         user_id=user_id,
@@ -2398,6 +2381,10 @@ async def add_reference_jd(
     # Derive profile from JD via LLM (cached by content hash + prompt version).
     # An empty/garbage JD (failed fetch, paywall) is rejected before it can
     # poison the shared target's cached profile (#47).
+    # Only the short-JD guard raises ``ValueError`` here; malformed model
+    # output is ``LLMMalformedOutputError`` (not a ``ValueError`` since #1066)
+    # and reaches the global handler as a 502 with fixed copy, so the raw
+    # diagnostic can no longer ride ``str(exc)`` into a 422 detail.
     try:
         derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=supabase)
     except ValueError as exc:

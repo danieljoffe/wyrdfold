@@ -58,7 +58,49 @@ class TrialExpiredError(Exception):
         super().__init__("trial window has expired for this user")
 
 
-class MissingToolCallError(ValueError):
+class LLMMalformedOutputError(Exception):
+    """The provider answered, but the answer is unusable.
+
+    Three shapes, all model-output failures rather than provider failures: a
+    prose reply where a forced tool call was required
+    (:class:`MissingToolCallError`), a tool input truncated at ``max_tokens``
+    (``reason="truncated"``), and a tool input that fails the caller's schema
+    (``reason="schema_violation"``, raised by ``complete_json`` with the
+    ``pydantic.ValidationError`` as ``__cause__``).
+
+    Deliberately a SIBLING of :class:`LLMServiceError`, not a subclass (#1066):
+
+    - ``LLMServiceError`` takes its first positional argument as the
+      user-facing ``user_message`` and the global handler serves it verbatim.
+      The diagnostic here carries raw model content (up to 600 chars of the
+      prose answer) and a provider label, which belongs in logs and never in a
+      response body. So ``user_message`` is a fixed class attribute and the
+      constructor's positional argument is the ``diagnostic``.
+    - Three handlers give ``except LLMServiceError`` the meaning "a provider
+      condition, not this row's fault": ``tagger.tag_job`` re-raises to latch
+      the poller's fast-fail breaker, ``materialize.ensure_job_tags`` leaves
+      the row NULL without a trace, ``title_triage`` logs one line and drops
+      the stack. A prose answer for one title must not latch a breaker or lose
+      its traceback, so it must not be an ``LLMServiceError``.
+
+    Served by its own handler in ``app/main.py``: HTTP 502, fixed ``detail``,
+    WARNING log carrying the bounded diagnostic, no Sentry capture by default.
+    No retry, no salvage: the #935/#1037 contract recorded on
+    :class:`MissingToolCallError` applies to the whole family.
+    """
+
+    reason: str = "malformed_output"
+    user_message: str = "The AI service returned an unusable answer. Please try again."
+    http_status: int = 502
+
+    def __init__(self, diagnostic: str, *, reason: str | None = None) -> None:
+        self.diagnostic = diagnostic
+        if reason is not None:
+            self.reason = reason
+        super().__init__(diagnostic)
+
+
+class MissingToolCallError(LLMMalformedOutputError):
     """The model answered in PROSE instead of emitting the forced tool call.
 
     Single-attempt, fail-closed (#935): no retry and no salvage — the
@@ -77,11 +119,58 @@ class MissingToolCallError(ValueError):
     two salvage parsers recovered complete prose answers; all three were
     removed when the probe proved the provider-capability cause unroutable.)
 
-    Subclasses ``ValueError`` so existing broad handlers (triage's
-    defer-not-admit, ``complete_json`` fallbacks) are unchanged. The mock
-    client raises it for prose scripts, mirroring the real client
+    An :class:`LLMMalformedOutputError` since #1066, and no longer a
+    ``ValueError``: the broad handlers it used to lean on are ``except
+    Exception`` and never needed the base, while an ``except ValueError as
+    exc: HTTPException(detail=str(exc))`` on the reference-JD route would have
+    served this diagnostic, raw model content included, to the client. The
+    mock client raises it for prose scripts, mirroring the real client
     (llm-surfaces bug corpus).
     """
+
+    reason = "missing_tool_call"
+
+
+class LLMRequestRejectedError(Exception):
+    """The provider rejected OUR request, or answered with an error envelope we
+    do not classify: an application bug, not a provider condition and not the
+    model's answer (#1066 review).
+
+    Today this is OpenRouter's HTTP-200 error envelope with a non-transient,
+    non-classified code: the grammar-compile ``400`` on a schema it cannot
+    inline, a ``404`` for a slug with no endpoints, a ``422``. The HTTP-status
+    twin of those codes already stays an unhandled 500 (see
+    :func:`translate_api_status_error`); this class gives the envelope form the
+    same semantics with a safe body.
+
+    A sibling of the other families, deliberately: not ``LLMServiceError``
+    (the breaker must not latch on one row's schema bug, and a 503 "try again"
+    would hide a deterministic defect), not ``LLMMalformedOutputError`` (a 502
+    retry copy would launder an operator bug into model output), not
+    ``ValueError`` (no ``except ValueError as exc: HTTPException(detail=
+    str(exc))`` may serialise the vendor text).
+
+    Served by its own handler in ``app/main.py``: HTTP 500, the generic
+    server-error body, Sentry capture tagged ``llm.reason`` /
+    ``llm.upstream_code``, ERROR log carrying the bounded vendor diagnostic.
+    """
+
+    reason: str = "request_rejected"
+    user_message: str = "Internal server error"
+    http_status: int = 500
+
+    def __init__(
+        self,
+        diagnostic: str,
+        *,
+        reason: str | None = None,
+        upstream_code: int | None = None,
+    ) -> None:
+        self.diagnostic = diagnostic
+        self.upstream_code = upstream_code
+        if reason is not None:
+            self.reason = reason
+        super().__init__(diagnostic)
 
 
 class LLMServiceError(Exception):

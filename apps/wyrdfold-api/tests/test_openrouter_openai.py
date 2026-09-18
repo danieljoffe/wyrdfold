@@ -14,7 +14,11 @@ import pytest
 
 from app.models.llm import LLMUsage, Message
 from app.services.llm.errors import (
+    LLMMalformedOutputError,
+    LLMQuotaExhaustedError,
     LLMRateLimitedError,
+    LLMRequestRejectedError,
+    LLMServiceError,
     LLMUpstreamUnavailableError,
     MissingToolCallError,
 )
@@ -22,6 +26,7 @@ from app.services.llm.openrouter_client import (
     _OPENAI_SHAPED_MODELS,
     _OPENROUTER_OPENAI_URL,
     OpenRouterLLMClient,
+    _classify_error_envelope,
     _inline_defs,
     _openai_usage,
     _parse_openai_tool_response,
@@ -58,16 +63,61 @@ def test_parse_happy_path() -> None:
     assert out == {"verdicts": [{"id": 1, "promising": True}]}
 
 
-def test_parse_no_choices_raises() -> None:
-    with pytest.raises(ValueError, match="no choices"):
-        _parse_openai_tool_response({"choices": []}, tool_name="return_X", max_tokens=1000)
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param({"choices": [], "id": "ZZ_RAW_ENVELOPE_MARKER_ZZ"}, id="empty-choices"),
+        pytest.param({"id": "ZZ_RAW_ENVELOPE_MARKER_ZZ"}, id="missing-choices"),
+    ],
+)
+def test_parse_no_choices_is_typed_and_keeps_the_envelope_out_of_user_copy(data: dict) -> None:
+    """#1066 review blocker: a 200 with no completion is a member of the
+    malformed-output family, never a plain ``ValueError`` carrying the raw
+    envelope. The envelope stays on the (bounded) diagnostic for the log line."""
+    with pytest.raises(LLMMalformedOutputError, match="no choices") as excinfo:
+        _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    exc = excinfo.value
+    assert exc.reason == "missing_choices"
+    assert not isinstance(exc, ValueError)
+    assert "ZZ_RAW_ENVELOPE_MARKER_ZZ" in exc.diagnostic
+    assert len(exc.diagnostic) < 400
+    assert "ZZ_RAW_ENVELOPE_MARKER_ZZ" not in exc.user_message
+
+
+def test_no_choices_reaches_the_client_as_the_fixed_502_copy() -> None:
+    """Response-level proof for the review blocker: through the registered
+    handler function, the no-choices error is a 502 whose body carries only
+    the fixed copy and the reason, never the raw envelope."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.main import _llm_malformed_output_handler
+
+    probe = FastAPI()
+    probe.add_exception_handler(LLMMalformedOutputError, _llm_malformed_output_handler)
+
+    @probe.get("/probe")
+    async def _probe() -> dict:
+        _parse_openai_tool_response(
+            {"choices": [], "id": "ZZ_RAW_ENVELOPE_MARKER_ZZ"}, tool_name="return_X", max_tokens=1
+        )
+        return {}
+
+    resp = TestClient(probe).get("/probe")
+    assert resp.status_code == 502
+    assert resp.json() == {
+        "detail": LLMMalformedOutputError.user_message,
+        "code": "missing_choices",
+    }
+    assert "ZZ_RAW_ENVELOPE_MARKER_ZZ" not in resp.text
 
 
 def test_parse_missing_tool_call_raises() -> None:
     # Model refused / answered in prose instead of calling the forced function.
     data = _resp([], finish="stop", content="I can't help with that")
-    with pytest.raises(ValueError, match="Expected a forced tool_call"):
+    with pytest.raises(MissingToolCallError, match="Expected a forced tool_call") as excinfo:
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert excinfo.value.reason == "missing_tool_call"
 
 
 def test_parse_truncated_at_length_raises() -> None:
@@ -76,34 +126,39 @@ def test_parse_truncated_at_length_raises() -> None:
     # Valid JSON here isolates the finish_reason=="length" guard — the JSON guard
     # alone would not catch this, so removing the length check fails this test.
     data = _resp(_tool_calls('{"verdicts": []}'), finish="length")
-    with pytest.raises(ValueError, match="truncated"):
+    with pytest.raises(LLMMalformedOutputError, match="truncated") as excinfo:
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert excinfo.value.reason == "truncated"
 
 
 def test_parse_malformed_json_raises() -> None:
     data = _resp(_tool_calls("{not valid json"))
-    with pytest.raises(ValueError, match="not valid JSON"):
+    with pytest.raises(LLMMalformedOutputError, match="not valid JSON") as excinfo:
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert excinfo.value.reason == "malformed_arguments"
 
 
 def test_parse_fenced_json_raises() -> None:
     # Some models wrap arguments in a markdown fence — invalid JSON, fail loud.
     data = _resp(_tool_calls('```json\n{"a": 1}\n```'))
-    with pytest.raises(ValueError, match="not valid JSON"):
+    with pytest.raises(LLMMalformedOutputError, match="not valid JSON") as excinfo:
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert excinfo.value.reason == "malformed_arguments"
 
 
 def test_parse_non_object_json_raises() -> None:
     # Valid JSON but a list/scalar, not the object our schema needs.
     data = _resp(_tool_calls("[1, 2, 3]"))
-    with pytest.raises(ValueError, match="not an object"):
+    with pytest.raises(LLMMalformedOutputError, match="not an object") as excinfo:
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert excinfo.value.reason == "malformed_arguments"
 
 
 def test_parse_empty_arguments_raises() -> None:
     data = _resp(_tool_calls(""))
-    with pytest.raises(ValueError, match="not valid JSON"):
+    with pytest.raises(LLMMalformedOutputError, match="not valid JSON") as excinfo:
         _parse_openai_tool_response(data, tool_name="return_X", max_tokens=1000)
+    assert excinfo.value.reason == "malformed_arguments"
 
 
 # ---- _openai_usage ----------------------------------------------------------
@@ -445,8 +500,104 @@ async def test_grammar_400_error_body_surfaces_clearly(monkeypatch) -> None:
         },
     )
     # NOT a confusing "no choices" — a clear error-body message with the code.
-    with pytest.raises(ValueError, match=r"error body.*code=400"):
+    # A grammar/schema rejection is OUR bug (#1066 review): a server fault that
+    # keeps 500 + Sentry semantics, never retryable model output, never a plain
+    # ``ValueError`` whose text a route could serialise.
+    with pytest.raises(LLMRequestRejectedError, match=r"error body.*code=400") as excinfo:
         await _call(client)
+    exc = excinfo.value
+    assert exc.reason == "request_rejected"
+    assert exc.upstream_code == 400
+    assert exc.http_status == 500
+    assert not isinstance(exc, ValueError)
+    assert not isinstance(exc, LLMServiceError)
+    assert not isinstance(exc, LLMMalformedOutputError)
+    assert "compile json grammar" in exc.diagnostic
+    assert "compile json grammar" not in exc.user_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "expected_reason"),
+    [
+        pytest.param(404, "request_rejected", id="404-no-endpoints"),
+        pytest.param(422, "request_rejected", id="422-validation"),
+        pytest.param(418, "unclassified_error_envelope", id="418-unknown"),
+        pytest.param("E_WEIRD", "unclassified_error_envelope", id="non-integer-code"),
+        pytest.param(None, "unclassified_error_envelope", id="missing-code"),
+    ],
+)
+async def test_non_transient_envelopes_are_classified_deliberately(
+    monkeypatch, code: object, expected_reason: str
+) -> None:
+    """Every non-transient, non-provider-condition envelope lands in the
+    server-fault family: known request rejections by code, and anything else
+    as ``unclassified_error_envelope`` so a new code is classified on evidence
+    rather than inheriting a neighbour's behaviour."""
+    body: dict = {"error": {"message": "ZZ_VENDOR_TEXT_MARKER_ZZ"}}
+    if code is not None:
+        body["error"]["code"] = code
+    client = _error_body_client(monkeypatch, body)
+    with pytest.raises(LLMRequestRejectedError) as excinfo:
+        await _call(client)
+    exc = excinfo.value
+    assert exc.reason == expected_reason
+    assert exc.upstream_code == (code if isinstance(code, int) else None)
+    assert "ZZ_VENDOR_TEXT_MARKER_ZZ" in exc.diagnostic
+    assert "ZZ_VENDOR_TEXT_MARKER_ZZ" not in exc.user_message
+
+
+def test_request_rejection_is_a_sentry_visible_500_with_a_generic_body(monkeypatch) -> None:
+    """Response-level proof for the #1066 review blocker: through the registered
+    handler function the rejection is a 500 whose body is the generic server-
+    error copy (vendor marker absent), and Sentry sees the exception."""
+    import sentry_sdk
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.main import _llm_request_rejected_handler, settings
+
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", lambda exc: captured.append(exc))
+    monkeypatch.setattr(settings, "debug_errors", False)
+
+    probe = FastAPI()
+    probe.add_exception_handler(LLMRequestRejectedError, _llm_request_rejected_handler)
+
+    @probe.get("/probe")
+    async def _probe() -> dict:
+        raise _classify_error_envelope(
+            {"code": 400, "message": "grammar: ZZ_VENDOR_TEXT_MARKER_ZZ"}, tool_name="return_X"
+        )
+
+    resp = TestClient(probe, raise_server_exceptions=False).get("/probe")
+    assert resp.status_code == 500
+    assert resp.json() == {
+        "detail": "Internal server error",
+        "code": "request_rejected",
+        "path": "/probe",
+    }
+    assert "ZZ_VENDOR_TEXT_MARKER_ZZ" not in resp.text
+    assert len(captured) == 1 and isinstance(captured[0], LLMRequestRejectedError)
+
+
+@pytest.mark.asyncio
+async def test_402_error_body_maps_to_the_quota_error_like_the_status_path(monkeypatch) -> None:
+    """A classified non-transient code in the envelope gets the same typed
+    error as the HTTP-status path: the breaker latches on it and the user sees
+    the 503 copy, never the vendor's credits message."""
+    client = _error_body_client(
+        monkeypatch,
+        {
+            "error": {
+                "message": "Insufficient credits. Add more using https://openrouter.ai",
+                "code": 402,
+            }
+        },
+    )
+    with pytest.raises(LLMQuotaExhaustedError) as excinfo:
+        await _call(client)
+    assert "credits" not in excinfo.value.user_message.lower()
 
 
 # ---- single-attempt contract: no retry on any parse failure (#935) ----------
@@ -503,7 +654,7 @@ async def test_other_parse_failures_do_not_retry(monkeypatch) -> None:
     fake = _FakeHttpSeq([_http_resp(bad_args), _http_resp(_GOOD)])
     monkeypatch.setattr(client, "_openai_client", lambda: fake)
 
-    with pytest.raises(ValueError, match="not valid JSON"):
+    with pytest.raises(LLMMalformedOutputError, match="not valid JSON"):
         await _call(client)
     assert len(fake.posted) == 1
 
@@ -556,9 +707,7 @@ def test_prose_answers_raise_instead_of_salvaging(content: str) -> None:
     guards existed to police, this time without the guards."""
     data = _resp([], finish="stop", content=content)
     with pytest.raises(MissingToolCallError, match="Expected a forced tool_call"):
-        _parse_openai_tool_response(
-            data, tool_name="return_TitleTriageResponse", max_tokens=1000
-        )
+        _parse_openai_tool_response(data, tool_name="return_TitleTriageResponse", max_tokens=1000)
 
 
 def test_missing_tool_call_failure_names_the_responding_provider() -> None:
@@ -575,7 +724,7 @@ def test_missing_tool_call_emits_a_provider_labelled_warning(
 ) -> None:
     """Production telemetry must retain the provider WITHOUT relying on any
     caller logging the exception text: the raise site itself emits one
-    warning. A future handler that quietly catches this ValueError subclass
+    warning. A future handler that quietly catches this error
     cannot erase the endpoint-drift signal."""
     data = _resp([], finish="stop", content="I refuse.", provider="SambaNova")
     with caplog.at_level(logging.WARNING, logger="app.services.llm.openrouter_client"):
