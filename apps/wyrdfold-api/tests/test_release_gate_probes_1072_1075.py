@@ -236,9 +236,12 @@ def test_derive_stream_mid_stream_error_frame_is_a_fixed_sse_error_without_diagn
     app.dependency_overrides[get_llm_client] = lambda: client
     app.dependency_overrides[enforce_llm_budget] = lambda: None
 
+    # ``http``, not ``client``: the LLM-client override above closes over the
+    # name ``client`` (the OpenRouterLLMClient); rebinding it here would hand
+    # the route a TestClient as its LLM.
     with (
-        contextlib.closing(TestClient(app)) as client,
-        client.stream("POST", "/experience/derive/stream") as r,
+        contextlib.closing(TestClient(app)) as http,
+        http.stream("POST", "/experience/derive/stream") as r,
     ):
         assert r.status_code == 200
         text = "".join(r.iter_text())
