@@ -18,6 +18,7 @@ import pytest
 from app.models.llm import LLMUsage, Message
 from app.services.llm.anthropic_client import AnthropicLLMClient, _reported_usage
 from app.services.llm.pricing import calculate_cost, reported_cost_usd
+from tests.support.sdk_fakes import validating_create_mock
 
 
 def _fake_response(
@@ -55,8 +56,12 @@ def _fake_response(
 
 
 def _client_with_mocked_sdk(response: Any) -> tuple[AnthropicLLMClient, AsyncMock]:
+    """The stand-in for ``messages.create`` VALIDATES kwargs against the
+    installed SDK's real signature (#1065). A permissive ``AsyncMock`` let a
+    removed kwarg pass for weeks; this one raises the same ``TypeError`` the
+    SDK does, so every test in this module also proves the request shape."""
     client = AnthropicLLMClient(api_key="test-key")
-    create_mock = AsyncMock(return_value=response)
+    create_mock = validating_create_mock(response)
     client._client.messages.create = create_mock  # type: ignore[method-assign]
     return client, create_mock
 
@@ -470,25 +475,33 @@ async def test_cache_prefix_chars_applies_to_tool_use_path() -> None:
     assert msg["content"][0]["text"] + msg["content"][1]["text"] == "AB"
 
 
-async def test_temperature_forwarded_to_sdk_when_set() -> None:
-    client, create_mock = _client_with_mocked_sdk(
-        _fake_tool_use_response(tool_name="return_X", tool_input={})
-    )
-    await client.complete_tool_use(
-        model="claude-sonnet-4-6",
-        system="s",
-        messages=[Message(role="user", content="x")],
-        tool_name="return_X",
-        tool_description="d",
-        tool_input_schema={"type": "object", "properties": {}},
-        purpose="test",
-        temperature=0.0,
-    )
-    assert create_mock.call_args.kwargs["temperature"] == 0.0
+async def test_temperature_travels_in_extra_body_for_accepting_models() -> None:
+    """#1065: anthropic >= 1.0 has NO ``temperature`` kwarg (the validating
+    fake rejects it exactly as the SDK does). For models whose API still
+    accepts the parameter — Sonnet 4.6, Haiku 4.5 — the hint goes through the
+    SDK's ``extra_body`` escape hatch, which is merged into the request JSON."""
+    for model in ("claude-sonnet-4-6", "claude-haiku-4-5"):
+        client, create_mock = _client_with_mocked_sdk(
+            _fake_tool_use_response(tool_name="return_X", tool_input={})
+        )
+        await client.complete_tool_use(
+            model=model,  # type: ignore[arg-type]
+            system="s",
+            messages=[Message(role="user", content="x")],
+            tool_name="return_X",
+            tool_description="d",
+            tool_input_schema={"type": "object", "properties": {}},
+            purpose="test",
+            temperature=0.0,
+        )
+        kwargs = create_mock.call_args.kwargs
+        assert kwargs["extra_body"] == {"temperature": 0.0}, model
+        assert "temperature" not in kwargs, model
 
 
 async def test_temperature_omitted_when_none() -> None:
-    """``None`` keeps the provider default — we must not send temperature=None."""
+    """``None`` keeps the provider default — neither a kwarg nor an
+    ``extra_body`` entry may be sent."""
     client, create_mock = _client_with_mocked_sdk(
         _fake_tool_use_response(tool_name="return_X", tool_input={})
     )
@@ -501,12 +514,49 @@ async def test_temperature_omitted_when_none() -> None:
         tool_input_schema={"type": "object", "properties": {}},
         purpose="test",
     )
-    assert "temperature" not in create_mock.call_args.kwargs
+    kwargs = create_mock.call_args.kwargs
+    assert "temperature" not in kwargs
+    assert "extra_body" not in kwargs
 
 
-async def test_complete_json_pins_temperature_to_zero() -> None:
-    """The structured-output path (grading / triage / derive / learner) is
-    deterministic by default — complete_json pins temperature to 0 (#47)."""
+async def test_temperature_omitted_and_logged_once_for_rejecting_models(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Opus 4.7 returns 400 on ANY temperature (the default included), so the
+    hint is dropped — deliberately and observably: one INFO line per model
+    per process, not one per call."""
+    from app.services.llm import anthropic_client as mod
+
+    mod._temperature_omission_logged.discard("claude-opus-4-7")  # isolate
+    client, create_mock = _client_with_mocked_sdk(
+        _fake_tool_use_response(tool_name="return_X", tool_input={})
+    )
+    with caplog.at_level("INFO", logger=mod.__name__):
+        for _ in range(3):
+            await client.complete_tool_use(
+                model="claude-opus-4-7",
+                system="s",
+                messages=[Message(role="user", content="x")],
+                tool_name="return_X",
+                tool_description="d",
+                tool_input_schema={"type": "object", "properties": {}},
+                purpose="test",
+                temperature=0.0,
+            )
+    kwargs = create_mock.call_args.kwargs
+    assert "temperature" not in kwargs
+    assert "extra_body" not in kwargs
+    hits = [r for r in caplog.records if "temperature hint not forwarded" in r.message]
+    assert len(hits) == 1, [r.message for r in caplog.records]
+    assert hits[0].model == "claude-opus-4-7"  # type: ignore[attr-defined]
+    assert hits[0].temperature == 0.0  # type: ignore[attr-defined]
+
+
+async def test_complete_json_requests_temperature_zero_where_accepted() -> None:
+    """The structured-output path (grading / triage / derive / learner)
+    requests temperature 0 as a variance-reduction hint (#47). On an accepting
+    model that request must reach the wire — via ``extra_body``, never as the
+    removed kwarg."""
     from pydantic import BaseModel
 
     from app.services.llm.client import complete_json
@@ -525,21 +575,9 @@ async def test_complete_json_pins_temperature_to_zero() -> None:
         schema=_Thing,
         purpose="test",
     )
-    assert create_mock.call_args.kwargs["temperature"] == 0.0
-
-
-# ---- provider-reported cost vs the static table (#933) ----------------------
-#
-# `OpenRouterLLMClient` subclasses this client, so Claude models reached via
-# OpenRouter come back through the Anthropic-shaped path here. OpenRouter adds
-# `cost` to the usage object; the SDK types only Anthropic's own fields, so it
-# lands in pydantic's `model_extra`. Shape verified against a live response:
-#
-#   usage.model_extra == {"speed": "standard", "cost": 0.000824,
-#                         "is_byok": False, "cost_details": {...}}
-#
-# Direct api.anthropic.com has no such field, so the table must remain the
-# fallback there.
+    kwargs = create_mock.call_args.kwargs
+    assert kwargs["extra_body"] == {"temperature": 0.0}
+    assert "temperature" not in kwargs
 
 
 def _usage_extra(cost: float) -> dict[str, Any]:

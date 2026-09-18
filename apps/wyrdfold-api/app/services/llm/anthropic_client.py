@@ -24,6 +24,7 @@ Combined with the cached system block, the whole static prompt prefix
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, cast
@@ -91,6 +92,43 @@ def _api_message_content(message: Message) -> Any:
 
 def _api_messages(messages: list[Message]) -> list[dict[str, Any]]:
     return [{"role": m.role, "content": _api_message_content(m)} for m in messages]
+
+
+logger = logging.getLogger(__name__)
+
+# Models whose Messages API still ACCEPTS a ``temperature`` (#1065).
+#
+# anthropic 1.0.0 removed ``temperature`` / ``top_p`` / ``top_k`` from
+# ``messages.create()`` — passing one is a ``TypeError`` before any HTTP. The
+# parameters are gone from the SDK signature, not from the API: Opus 4.7 and
+# later return 400 on any value (the default included), Sonnet 5 rejects
+# non-default values, and the 4.6 / 4.5 line still accepts them. The SDK's own
+# 1.x upgrade guide (Step 6) says to forward via ``extra_body`` only where the
+# call pins an accepting model AND visibly depends on the setting. We do:
+# ``normalize_posting_title`` pins Sonnet 4.6, its output is the UNIQUE catalog
+# dedup key, and its convergence eval was certified at temperature 0.
+#
+# Keyed by the INTERNAL ModelId, before ``_resolve_model`` — OpenRouter resolves
+# ``claude-sonnet-4-6`` to ``anthropic/claude-sonnet-4.6``, so a check against the
+# resolved slug would silently drop the hint on exactly the path this repairs.
+#
+# Rot direction is safe: a model missing from this set OMITS the hint (never a
+# 400). Add a new id here only with evidence it accepts sampling params.
+_TEMPERATURE_ACCEPTING_MODELS: frozenset[str] = frozenset({"claude-sonnet-4-6", "claude-haiku-4-5"})
+
+# One structured log line per (process, model) the first time the hint is
+# dropped — observable without flooding a hot loop.
+_temperature_omission_logged: set[str] = set()
+
+
+def _note_temperature_omitted(model: str, temperature: float) -> None:
+    if model in _temperature_omission_logged:
+        return
+    _temperature_omission_logged.add(model)
+    logger.info(
+        "temperature hint not forwarded: model does not accept sampling params",
+        extra={"model": model, "temperature": temperature},
+    )
 
 
 class AnthropicLLMClient:
@@ -227,8 +265,10 @@ class AnthropicLLMClient:
         server-side before returning it, so we get a typed dict back rather
         than a JSON string the model may have shaped wrong.
 
-        ``temperature`` is forwarded only when set (``None`` = provider
-        default); ``complete_json`` pins it to 0 for deterministic output.
+        ``temperature`` is a best-effort hint. It is forwarded — via the SDK's
+        ``extra_body`` escape hatch, never as a direct kwarg — only for models
+        in ``_TEMPERATURE_ACCEPTING_MODELS``; for any other model it is omitted
+        and logged once. ``None`` keeps the provider default. See #1065.
         """
         if not messages:
             raise ValueError("AnthropicLLMClient.complete_tool_use requires at least one message")
@@ -263,7 +303,14 @@ class AnthropicLLMClient:
             "tool_choice": cast(Any, tool_choice),
         }
         if temperature is not None:
-            create_kwargs["temperature"] = temperature
+            # Keyed on the internal id, NOT the resolved slug (see the
+            # allowlist comment). ``extra_body`` is merged into the request
+            # JSON as-is; a direct ``temperature=`` kwarg is a TypeError on
+            # anthropic >= 1.0.
+            if model in _TEMPERATURE_ACCEPTING_MODELS:
+                create_kwargs["extra_body"] = {"temperature": temperature}
+            else:
+                _note_temperature_omitted(model, temperature)
 
         start = time.perf_counter()
         try:
