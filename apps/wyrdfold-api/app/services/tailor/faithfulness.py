@@ -92,7 +92,9 @@ async def review_resume_faithfulness(
     purpose: str = FAITHFULNESS_REVIEW_PURPOSE,
 ) -> tuple[FaithfulnessReview, LLMResult]:
     """Run the faithfulness review. Returns ``(review, llm_result)`` so the
-    caller cost-logs the spend. Deterministic (``complete_json`` pins temp 0)."""
+    caller cost-logs the spend. ``complete_json`` requests temperature 0 as a
+    variance-reduction hint where the model accepts it; not a determinism
+    guarantee (#1065)."""
     return await complete_json(
         llm,
         model=model,

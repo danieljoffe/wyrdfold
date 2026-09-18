@@ -85,9 +85,13 @@ class LLMClient(Protocol):
     ) -> tuple[dict[str, Any], LLMResult]:
         """Run a completion that's forced to call a single tool.
 
-        ``temperature`` is forwarded to the model when set; ``None`` keeps the
-        provider default. Structured-output callers (via ``complete_json``)
-        pin it to 0 for reproducible grading/triage/derive.
+        ``temperature`` is a best-effort, provider-neutral HINT: each transport
+        forwards it where its API accepts it and omits it otherwise (the
+        Anthropic SDK dropped the parameter in 1.0 and current Claude
+        generations reject it — see #1065). ``None`` keeps the provider
+        default. Structured-output callers (via ``complete_json``) request 0
+        to reduce run-to-run variance where the model honours it; that is
+        not a determinism guarantee.
 
         The API enforces ``input_schema`` server-side and returns the tool's
         input as a typed dict. This is the reliable path for structured
@@ -159,6 +163,11 @@ async def complete_json(
     derived from ``schema``. The API parses + validates the tool input
     against the schema before returning, eliminating field-name drift and
     JSON-shape errors from prose-only instructions.
+
+    ``temperature`` defaults to 0 as a variance-reduction HINT, honoured only
+    where the transport's API accepts it (see ``LLMClient.complete_tool_use``).
+    Do not read it as a determinism guarantee; the dedup-key and eval paths
+    that depend on stable output are covered by their own convergence evals.
 
     Returns ``(parsed_schema, llm_result)``. Callers log cost via the
     result; the parsed object is the typed payload.
