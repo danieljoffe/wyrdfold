@@ -45,17 +45,34 @@ _sleep = asyncio.sleep
 def should_retry(resp: httpx.Response) -> bool:
     """The SDK-equivalent retry decision for one response.
 
-    ``x-should-retry: true`` forces a retry of any status and
-    ``x-should-retry: false`` forbids one, exactly as the Anthropic SDK's
-    ``_should_retry`` does; without the header, 408/409/425/429 and every 5xx
-    are transient. Callers classify whatever is NOT retried.
+    A 2xx is never retried. For an error status, ``x-should-retry: true``
+    forces a retry and ``x-should-retry: false`` forbids one, exactly as the
+    Anthropic SDK's ``_should_retry`` does; without the header, 408/409/425/429
+    and every 5xx are transient. Callers classify whatever is NOT retried.
     """
+    # A success is never retried, whatever the header says: the SDK consults
+    # ``x-should-retry`` only for error-status responses, and re-POSTing a
+    # completed call would bill a duplicate completion (release gate 2026-09-18).
+    if resp.is_success:
+        return False
     directive = resp.headers.get("x-should-retry", "").strip().lower()
     if directive == "true":
         return True
     if directive == "false":
         return False
     return resp.status_code in TRANSIENT_STATUSES or resp.status_code >= 500
+
+
+def retry_delay(resp: httpx.Response, attempt: int) -> float:
+    """Seconds to wait before retrying ``resp``: ``Retry-After`` when the
+    server sends one within the SDK's window (0 < seconds <= 60), else
+    exponential backoff with jitter. A ``Retry-After`` beyond the window is
+    IGNORED rather than clamped, as the Anthropic SDK does: a server asking
+    for an hour gets the backoff, not a sixty-second park."""
+    retry_after = _retry_after_seconds(resp)
+    if retry_after is not None and 0 < retry_after <= _MAX_RETRY_AFTER_S:
+        return retry_after
+    return _backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS)
 
 
 async def post_json_with_retry(
@@ -68,9 +85,9 @@ async def post_json_with_retry(
 ) -> httpx.Response:
     """POST ``body`` as JSON; retry per ``should_retry`` and on transport errors.
 
-    Delay between attempts honours ``Retry-After`` when the server sends one
-    (integer seconds, clamped to ``_MAX_RETRY_AFTER_S``), else exponential
-    backoff with jitter. ``max_retries`` is the number of RETRIES, so the
+    Delay between attempts is ``retry_delay``: ``Retry-After`` when the server
+    sends one within the SDK's 60-second window, else exponential backoff
+    with jitter. ``max_retries`` is the number of RETRIES, so the
     call is attempted ``max_retries + 1`` times. When retries are spent, the
     last response is classified: 429 stays ``LLMRateLimitedError``, 5xx stays
     ``LLMUpstreamUnavailableError``, and an exhausted 408/409/425 is reported
@@ -90,7 +107,19 @@ async def post_json_with_retry(
             )
         except httpx.TransportError as exc:  # timeouts + connection errors
             if attempt < max_retries:
-                await _sleep(_backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS))
+                delay = _backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS)
+                # Same production-visible signal as a retryable status: a
+                # DNS / connect / read-timeout storm must not consume retry
+                # time silently (review of #1077).
+                logger.warning(
+                    "openrouter transport error %s on POST %s attempt=%d/%d; retrying in %.2fs",
+                    type(exc).__name__,
+                    url,
+                    attempt + 1,
+                    max_retries + 1,
+                    delay,
+                )
+                await _sleep(delay)
                 continue
             raise LLMUpstreamUnavailableError() from exc
         if not should_retry(resp):
@@ -98,13 +127,11 @@ async def post_json_with_retry(
         last = resp
         if attempt >= max_retries:
             break
-        retry_after = _retry_after_seconds(resp)
-        delay = (
-            min(retry_after, _MAX_RETRY_AFTER_S)
-            if retry_after is not None
-            else _backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS)
-        )
-        logger.info(
+        delay = retry_delay(resp, attempt)
+        # WARNING, not INFO: prod hides INFO, and a retry storm must be
+        # visible in the logs rather than surfacing only as per-source
+        # budget cancellations downstream.
+        logger.warning(
             "openrouter transient status=%s attempt=%d/%d; retrying in %.2fs",
             resp.status_code,
             attempt + 1,

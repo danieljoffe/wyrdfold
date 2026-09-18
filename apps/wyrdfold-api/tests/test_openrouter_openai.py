@@ -852,3 +852,30 @@ async def test_openai_path_results_carry_http_transport_provenance(monkeypatch) 
     monkeypatch.setattr(client, "_openai_client", lambda: fake)
     _, result = await _call(client)
     assert result.transport == "chat_completions_http"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [408, 409, 425, 520])
+async def test_transient_envelope_codes_match_the_status_line_set(monkeypatch, code: int) -> None:
+    """Release gate 2026-09-18: an envelope 408/409/425 (and any 5xx) is the
+    same transient condition as the status-line form and must not be
+    classified as our bug."""
+    client = _error_body_client(monkeypatch, {"error": {"message": "timeout-ish", "code": code}})
+    with pytest.raises(LLMUpstreamUnavailableError):
+        await _call(client)
+
+
+@pytest.mark.asyncio
+async def test_status_line_400_on_the_openai_path_names_its_own_endpoint(monkeypatch) -> None:
+    client = OpenRouterLLMClient(api_key="sk-test")
+    resp = httpx.Response(
+        400,
+        request=httpx.Request("POST", _OPENROUTER_OPENAI_URL),
+        json={"error": {"type": "invalid_request_error", "message": "grammar"}},
+    )
+    fake = _FakeHttpSeq([resp])
+    monkeypatch.setattr(client, "_openai_client", lambda: fake)
+    with pytest.raises(LLMRequestRejectedError) as excinfo:
+        await _call(client)
+    assert "/chat/completions" in excinfo.value.diagnostic
+    assert "/v1/messages" not in excinfo.value.diagnostic

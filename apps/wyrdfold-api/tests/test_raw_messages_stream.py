@@ -239,6 +239,46 @@ async def test_handshake_retries_transient_then_streams(_no_sleep: list[float]) 
     assert _no_sleep == [1.0]
 
 
+async def test_handshake_transport_error_retries_are_logged_at_warning(
+    _no_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    ok, _ = sse_response(_ok_frames())
+    t = _transport(httpx.ConnectError("refused"), ok, max_retries=1)
+    with caplog.at_level("WARNING", logger="app.services.llm.raw_messages_transport"):
+        events = await _collect(t)
+    assert isinstance(events[-1], StreamFinal)
+    hits = [
+        r
+        for r in caplog.records
+        if "openrouter transport error ConnectError on stream handshake" in r.getMessage()
+    ]
+    assert len(hits) == 1 and hits[0].levelname == "WARNING"
+    assert "attempt=1/2" in hits[0].getMessage()
+
+
+async def test_handshake_status_retries_are_logged_at_warning(
+    _no_sleep: list[float], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review of #1077, round 2: the handshake's retryable-STATUS branch must
+    log the same way the POST helper does, not only its transport-error branch."""
+    ok, _ = sse_response(_ok_frames())
+    t = _transport(
+        json_response(429, wire_error(429, "slow"), headers={"Retry-After": "1"}), ok, max_retries=1
+    )
+    with caplog.at_level("WARNING", logger="app.services.llm.raw_messages_transport"):
+        events = await _collect(t)
+    assert isinstance(events[-1], StreamFinal)
+    hits = [
+        r
+        for r in caplog.records
+        if "openrouter transient status=429 on stream handshake" in r.getMessage()
+    ]
+    assert len(hits) == 1 and hits[0].levelname == "WARNING"
+    assert "attempt=1/2" in hits[0].getMessage()
+    assert "retrying in 1.00s" in hits[0].getMessage()
+    assert "slow" not in hits[0].getMessage()  # no response-body content
+
+
 async def test_handshake_rejection_is_a_server_fault() -> None:
     t = _transport(json_response(400, wire_error(400, "ZZ_VENDOR_TEXT")))
     with pytest.raises(LLMRequestRejectedError) as excinfo:
@@ -288,3 +328,41 @@ def test_router_no_longer_pins_stream_to_the_sdk() -> None:
     client = OpenRouterLLMClient(api_key="k", raw_purposes=frozenset({"p"}))
     assert isinstance(client._transport_for("p", "stream"), raw.RawMessagesTransport)
     assert client._transport_for("q", "stream") is client._transport
+
+
+# ---- release gate 2026-09-18 -------------------------------------------------
+
+
+async def test_client_level_cancellation_closes_the_transport_synchronously() -> None:
+    """The derive route closes the CLIENT generator on disconnect; the
+    transport generator underneath must be closed in that same await, not by
+    the event loop's async-generator finalizer a tick or two later."""
+    resp, stream = sse_response(fixture_sse("stream_cache_create.sse"), chunk_size=16)
+    client = OpenRouterLLMClient(api_key="k", raw_purposes=frozenset({"p"}))
+    client._raw = _transport(resp)
+    gen = client.stream(
+        model="claude-sonnet-4-6",
+        system="s",
+        messages=[Message(role="user", content="x")],
+        purpose="p",
+    )
+    first = await gen.__anext__()
+    assert first.type == "delta"
+    assert not stream.closed
+    await gen.aclose()
+    assert stream.closed  # immediately, with no further loop iteration
+
+
+async def test_a_failing_close_does_not_mask_the_typed_stream_error() -> None:
+    body = sse_frames(
+        ("message_start", {"type": "message_start", "message": {"usage": {"input_tokens": 3}}}),
+        ("error", {"type": "error", "error": {"type": "rate_limit_error", "message": "slow"}}),
+    )
+    resp, stream = sse_response(body)
+
+    async def _boom() -> None:
+        raise httpx.ReadError("close failed")
+
+    stream.aclose = _boom  # type: ignore[method-assign]
+    with pytest.raises(LLMRateLimitedError):
+        await _collect(_transport(resp))

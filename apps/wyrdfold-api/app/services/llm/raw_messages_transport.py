@@ -32,13 +32,13 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from typing import Any
 
 import httpx
 
-from app.http_client import _MAX_RETRY_AFTER_S, _backoff_seconds, _retry_after_seconds
+from app.http_client import _backoff_seconds
 from app.models.llm import TransportId
 from app.services.llm import openrouter_http
 from app.services.llm.errors import (
@@ -62,6 +62,7 @@ from app.services.llm.openrouter_http import (
     _BACKOFF_BASE_SECONDS,
     _BACKOFF_CAP_SECONDS,
     post_json_with_retry,
+    retry_delay,
     should_retry,
 )
 
@@ -139,7 +140,7 @@ def response_from_wire(data: Mapping[str, Any]) -> MessagesResponse:
     )
 
 
-def classify_error_response(resp: httpx.Response) -> Exception:
+def classify_error_response(resp: httpx.Response, *, endpoint: str = "/v1/messages") -> Exception:
     """A non-2xx, non-transient ``/v1/messages`` response, classified the way
     the SDK path's ``translate_or_reraise`` classifies an ``APIStatusError``:
     402 / 401 / 403 / 5xx keep their typed provider errors; anything else
@@ -158,7 +159,7 @@ def classify_error_response(resp: httpx.Response) -> Exception:
     except ValueError:
         detail = resp.text[:200]
     return LLMRequestRejectedError(
-        f"OpenRouter /v1/messages rejected the request (status={resp.status_code}): {detail!r}",
+        f"OpenRouter {endpoint} rejected the request (status={resp.status_code}): {detail!r}",
         upstream_code=resp.status_code,
     )
 
@@ -282,9 +283,17 @@ class RawMessagesTransport:
                 resp = await cm.__aenter__()
             except httpx.TransportError as exc:
                 if attempt < self._max_retries:
-                    await openrouter_http._sleep(
-                        _backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS)
+                    delay = _backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS)
+                    logger.warning(
+                        "openrouter transport error %s on stream handshake %s attempt=%d/%d; "
+                        "retrying in %.2fs",
+                        type(exc).__name__,
+                        self._url,
+                        attempt + 1,
+                        self._max_retries + 1,
+                        delay,
                     )
+                    await openrouter_http._sleep(delay)
                     continue
                 raise LLMUpstreamUnavailableError() from exc
             if not should_retry(resp):
@@ -294,12 +303,20 @@ class RawMessagesTransport:
             last = resp
             if attempt >= self._max_retries:
                 break
-            retry_after = _retry_after_seconds(resp)
-            await openrouter_http._sleep(
-                min(retry_after, _MAX_RETRY_AFTER_S)
-                if retry_after is not None
-                else _backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS)
+            delay = retry_delay(resp, attempt)
+            # The same production-visible signal the POST helper emits for a
+            # retryable status: a handshake 429/5xx storm must not retry
+            # silently (review of #1077).
+            logger.warning(
+                "openrouter transient status=%s on stream handshake %s attempt=%d/%d; "
+                "retrying in %.2fs",
+                last.status_code,
+                self._url,
+                attempt + 1,
+                self._max_retries + 1,
+                delay,
             )
+            await openrouter_http._sleep(delay)
         if last is None:  # pragma: no cover - the loop always sets it before breaking
             raise LLMUpstreamUnavailableError()
         translated = translate_api_status_error(last)
@@ -307,7 +324,7 @@ class RawMessagesTransport:
             raise translated
         raise LLMUpstreamUnavailableError(upstream_status=last.status_code)
 
-    async def stream(self, **params: Any) -> AsyncIterator[StreamEvent]:
+    async def stream(self, **params: Any) -> AsyncGenerator[StreamEvent, None]:
         body = wire_body(params, stream=True)
         cm, resp = await self._open_stream(body)
         if resp.status_code < 200 or resp.status_code >= 300:
@@ -369,8 +386,13 @@ class RawMessagesTransport:
             # Normal end, an error, or the consumer stopping early (its
             # ``aclose()`` raises GeneratorExit at the yield): the response and
             # its socket are closed here, so an abandoned derive stops
-            # spending tokens upstream the moment the client goes away.
-            await cm.__aexit__(None, None, None)
+            # spending tokens upstream the moment the client goes away. A
+            # failure while closing must not replace the typed error that is
+            # already in flight, so it is logged and dropped.
+            try:
+                await cm.__aexit__(None, None, None)
+            except httpx.HTTPError:
+                logger.warning("raw messages stream: closing the response failed", exc_info=True)
         if not stopped:
             # The connection ended before ``message_stop``: the frames so far
             # are a partial answer, which no caller may persist as complete.
