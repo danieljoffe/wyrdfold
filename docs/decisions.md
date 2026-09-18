@@ -3,6 +3,28 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-09-18 — The SDK is a drift surface; OpenRouter Claude calls get a raw Messages transport (#1067)
+
+anthropic 1.0 removed the sampling kwargs (#1065) and swapped httpx for httpx2
+(#908); both bit a gateway call that had nothing to do with Anthropic's API
+changing on our side, because `OpenRouterLLMClient` reached OpenRouter's
+Anthropic-compatible `/api/v1/messages` through the SDK. Decided: a
+`MessagesTransport` seam behind `AnthropicLLMClient` (the client imports nothing
+from `anthropic`, guarded by a test), the SDK constructed lazily, and a raw-httpx
+`RawMessagesTransport` for the OpenRouter route with the same body, the same
+headers (`x-api-key` + `anthropic-version`, verified live), the same typed
+errors and one shared `Retry-After`-honouring retry loop for both OpenRouter
+shapes. Translating Claude through `/chat/completions` was rejected: six
+semantic-mapping items the raw path does not need. Rollout is by LLM purpose
+(`LLM_RAW_TRANSPORT_PURPOSES`), never by model (Opus has no callers, Haiku is one
+flow, Sonnet is everything), gated by a per-transport parity probe rather than
+the product evals (most of which bypass the app client). Provenance
+(`transport`, `provider`) rides on `LLMResult` and is merged into every cost row
+centrally, so the rollout reconciles from the ledger. Exit: delete the SDK
+transport once every purpose has run raw with clean logs. Lives in
+`app/services/llm/messages_transport.py`, `raw_messages_transport.py`,
+`openrouter_http.py`, and `tests/fixtures/openrouter_messages/README.md`.
+
 ## 2026-09-18 — A bare except turned a TypeError into a wrong catalog identity (#1066)
 
 `from_input._canonical_url_label` wrapped the title normalizer in `except

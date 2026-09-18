@@ -67,6 +67,9 @@ class MessagesResponse:
     content: list[ContentBlock]
     stop_reason: str | None
     usage: MessagesUsage
+    # OpenRouter names the upstream that served the call (a top-level extra,
+    # verified live 2026-09-18); direct api.anthropic.com sends none.
+    provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -178,10 +181,13 @@ def _block_from_sdk(block: object) -> ContentBlock:
 def _response_from_sdk(response: object) -> MessagesResponse:
     stop_reason = getattr(response, "stop_reason", None)
     content = getattr(response, "content", None) or []
+    extra = getattr(response, "model_extra", None)
+    provider = extra.get("provider") if isinstance(extra, Mapping) else None
     return MessagesResponse(
         content=[_block_from_sdk(b) for b in content],
         stop_reason=stop_reason if isinstance(stop_reason, str) else None,
         usage=_usage_from_sdk(getattr(response, "usage", None)),
+        provider=provider if isinstance(provider, str) else None,
     )
 
 

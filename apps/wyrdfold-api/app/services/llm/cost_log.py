@@ -166,6 +166,7 @@ def _row_for(
             **(metadata or {}),
             "cost_source": result.cost_source,
             "transport": result.transport or "unknown",
+            **({"provider": result.provider} if result.provider else {}),
         },
     }
 
