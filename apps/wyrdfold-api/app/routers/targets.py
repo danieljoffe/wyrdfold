@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from postgrest.exceptions import APIError
 from postgrest.types import CountMethod
 from supabase import AsyncClient, Client
 
@@ -576,14 +577,21 @@ async def _update_target_async(
 async def _set_link_active(
     supabase: AsyncClient, *, user_id: str, target_id: str, active: bool
 ) -> None:
-    """Flip one link's ``is_active`` directly, with no cap check.
+    """Flip one link's ``is_active`` with no cap check.
 
     Used by the activate-with-swap path. Bypassing the cap is correct for
     both of its uses: deactivating always lowers the count, and the rollback
     only restores a link that was active moments earlier — re-checking the
     cap there could refuse to undo our own change and strand the user with
-    nothing active.
+    nothing active. The restore still runs through the one activation path
+    (serialized under the per-user lock, limit NULL) so it never races
+    another active write (#1071 review).
     """
+    if active:
+        await _activate_user_target_async(
+            supabase, user_id=user_id, target_id=target_id, enforce_cap=False
+        )
+        return
     await (
         supabase.table(crud.USER_TARGETS_TABLE)
         .update({"is_active": active, "updated_at": datetime.now(UTC).isoformat()})
@@ -970,15 +978,26 @@ async def _link_user_to_target_async(
     fit_score_reasoning: str | None = None,
     fit_score_prose_doc_id: str | None = None,
 ) -> UserTarget:
-    """Async inline of ``crud.link_user_to_target`` (crud stays sync for its
-    poller/operator callers, #57 PR-G2e-4/5). Same active-cap contract: raises
-    ``crud.ActiveTargetLimitError`` only when this upsert introduces a NEW active
-    link that would push the user over the cap (re-activating an already-active
-    link is exempt so idempotent refreshes stay free). The optional fit-score
-    columns follow crud's conditional shape (written only when non-None) so the
-    link route can stamp a freshly-derived score + its E2 version marker."""
+    """Link the caller to a target; an ACTIVE link goes through the database's
+    one cap-checked activation path (#1071 review).
+
+    Same active-cap contract as before, now enforced where it can be atomic:
+    ``crud.ActiveTargetLimitError`` only when this write introduces a NEW
+    active link that would push the user over the cap (re-activating an
+    already-active link is exempt so idempotent refreshes stay free). The
+    optional fit-score columns follow the conditional shape (written only when
+    non-None) so the link route can stamp a freshly-derived score + its E2
+    version marker. An inactive link is a plain upsert, as before.
+    """
     if is_active:
-        await _raise_if_active_limit_async(supabase, user_id, target_id)
+        return await _activate_user_target_async(
+            supabase,
+            user_id=user_id,
+            target_id=target_id,
+            fit_score=fit_score,
+            fit_score_reasoning=fit_score_reasoning,
+            fit_score_prose_doc_id=fit_score_prose_doc_id,
+        )
 
     row: dict[str, Any] = {
         "user_id": user_id,
@@ -1001,6 +1020,54 @@ async def _link_user_to_target_async(
     if not rows:
         raise RuntimeError("Failed to upsert user_targets row")
     return crud._parse_user_target(rows[0])
+
+
+async def _activate_user_target_async(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    target_id: str,
+    enforce_cap: bool = True,
+    fit_score: int | None = None,
+    fit_score_reasoning: str | None = None,
+    fit_score_prose_doc_id: str | None = None,
+) -> UserTarget:
+    """The one path for making a membership ACTIVE (#1071 review).
+
+    In plain terms: every screen that can switch a target on for a user ends
+    up in the same database function, which checks the plan cap and writes
+    the membership under one per-user lock. Two requests from two screens can
+    no longer both pass a cap of one. Before, each route counted in the app
+    and then wrote, with nothing serializing the count against the write.
+
+    ``enforce_cap=False`` is serialized but uncapped, reserved for restoring
+    a link the same request just deactivated (the activate-with-swap
+    rollback); the hard ceiling trigger still applies. The cap itself is
+    plan-derived, resolved here and passed in.
+    """
+    limit = await _effective_active_target_cap_async(supabase, user_id) if enforce_cap else None
+    params: dict[str, Any] = {
+        "p_user_id": user_id,
+        "p_target_id": target_id,
+        "p_active_limit": limit,
+    }
+    if fit_score is not None:
+        params["p_fit_score"] = fit_score
+    if fit_score_reasoning is not None:
+        params["p_fit_score_reasoning"] = fit_score_reasoning
+    if fit_score_prose_doc_id is not None:
+        params["p_fit_score_prose_doc_id"] = fit_score_prose_doc_id
+    try:
+        resp = await supabase.rpc("activate_user_target", params).execute()
+    except APIError as e:
+        cap = from_input.active_cap_error(e, limit)
+        if cap is None:
+            raise
+        raise cap from e
+    data = cast(dict[str, Any] | None, resp.data)
+    if not data:
+        raise RuntimeError("activate_user_target returned no row")
+    return crud._parse_user_target(data)
 
 
 async def _set_app_active_async(supabase: AsyncClient, target_id: str) -> JobTarget | None:

@@ -225,7 +225,13 @@ def test_was_created_reports_insert_vs_conflict(
     uid_a, uid_b = two_seeded_users
     label = f"Race {uuid.uuid4()}"
 
-    first = _call(service_client, user_id=uid_a, label=label)
+    first = _call(
+        service_client,
+        user_id=uid_a,
+        label=label,
+        activation_status="deriving",
+        description="the winner's shared description",
+    )
     cleanup_targets.append(first["target"]["id"])
     second = _call(service_client, user_id=uid_b, label=label, is_active=True, active_limit=5)
 
@@ -233,6 +239,25 @@ def test_was_created_reports_insert_vs_conflict(
     assert second["was_created"] is False
     assert second["target"]["id"] == first["target"]["id"]
     assert len(_rows_for(service_client, label.strip().lower())) == 1
+    # The loser passed no status, so the winner's row is untouched: label,
+    # description, profile, lifecycle status and error fields all as written.
+    winner = (
+        service_client.table("targets")
+        .select("*")
+        .eq("id", first["target"]["id"])
+        .execute()
+        .data[0]
+    )
+    for field in (
+        "label",
+        "description",
+        "scoring_profile",
+        "search_keywords",
+        "activation_status",
+        "activation_error",
+    ):
+        assert winner[field] == first["target"][field], field
+    assert winner["activation_status"] == "deriving"
 
 
 def test_active_request_links_active_and_activates_an_existing_inactive_link(
@@ -291,3 +316,147 @@ def test_reactivating_the_held_link_is_exempt_from_the_cap(
 
     assert repeat["was_created"] is False
     assert repeat["user_target"]["is_active"] is True
+
+
+# ---- activate_user_target: the one activation path -------------------------
+
+
+def _activate(
+    client: Client, *, user_id: str, target_id: str, active_limit: int | None, **fit: Any
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "p_user_id": user_id,
+        "p_target_id": target_id,
+        "p_active_limit": active_limit,
+    }
+    params.update({f"p_{k}": v for k, v in fit.items()})
+    return client.rpc("activate_user_target", params).execute().data
+
+
+def _active_count(client: Client, user_id: str) -> int:
+    rows = (
+        client.table("user_targets")
+        .select("target_id")
+        .eq("user_id", user_id)
+        .eq("is_active", True)
+        .execute()
+        .data
+    )
+    return len(rows)
+
+
+def test_activate_user_target_enforces_the_cap_and_exempts_the_held_link(
+    service_client: Client, two_seeded_users: tuple[str, str], cleanup_targets: list[str]
+) -> None:
+    uid, _ = two_seeded_users
+    first = _call(service_client, user_id=uid, label=f"Act1 {uuid.uuid4()}")
+    second = _call(service_client, user_id=uid, label=f"Act2 {uuid.uuid4()}")
+    cleanup_targets += [first["target"]["id"], second["target"]["id"]]
+
+    held = _activate(service_client, user_id=uid, target_id=first["target"]["id"], active_limit=1)
+    assert held["is_active"] is True
+
+    with pytest.raises(APIError) as exc:
+        _activate(service_client, user_id=uid, target_id=second["target"]["id"], active_limit=1)
+    assert exc.value.code == "PT409"
+    assert json.loads(exc.value.details) == {"error": "ACTIVE_LIMIT", "active_count": 1, "limit": 1}
+
+    # Re-activating the held link changes no count, so it is exempt.
+    again = _activate(service_client, user_id=uid, target_id=first["target"]["id"], active_limit=1)
+    assert again["is_active"] is True
+    assert _active_count(service_client, uid) == 1
+
+
+def test_activate_user_target_writes_fit_fields_only_when_supplied(
+    service_client: Client, two_seeded_users: tuple[str, str], cleanup_targets: list[str]
+) -> None:
+    uid, _ = two_seeded_users
+    made = _call(service_client, user_id=uid, label=f"Fit {uuid.uuid4()}")
+    cleanup_targets.append(made["target"]["id"])
+    tid = made["target"]["id"]
+
+    scored = _activate(
+        service_client,
+        user_id=uid,
+        target_id=tid,
+        active_limit=5,
+        fit_score=71,
+        fit_score_reasoning="strong overlap",
+    )
+    assert (scored["fit_score"], scored["fit_score_reasoning"]) == (71, "strong overlap")
+
+    bare = _activate(service_client, user_id=uid, target_id=tid, active_limit=5)
+    assert (bare["fit_score"], bare["fit_score_reasoning"]) == (71, "strong overlap")
+
+
+def test_uncapped_activation_is_allowed_only_with_a_null_limit(
+    service_client: Client, two_seeded_users: tuple[str, str], cleanup_targets: list[str]
+) -> None:
+    """The swap-rollback shape: NULL limit skips the cap (the hard ceiling
+    trigger still applies), an integer limit does not."""
+    uid, _ = two_seeded_users
+    a = _call(service_client, user_id=uid, label=f"Null1 {uuid.uuid4()}")
+    b = _call(service_client, user_id=uid, label=f"Null2 {uuid.uuid4()}")
+    cleanup_targets += [a["target"]["id"], b["target"]["id"]]
+    _activate(service_client, user_id=uid, target_id=a["target"]["id"], active_limit=1)
+
+    restored = _activate(
+        service_client, user_id=uid, target_id=b["target"]["id"], active_limit=None
+    )
+    assert restored["is_active"] is True
+    assert _active_count(service_client, uid) == 2
+
+
+def test_concurrent_active_writes_across_both_paths_admit_exactly_one_at_the_cap(
+    service_client: Client, two_seeded_users: tuple[str, str], cleanup_targets: list[str]
+) -> None:
+    """The cross-path race the review named: one request creates-and-links
+    active, another activates an existing follow, on two distinct
+    connections, released together, at a cap of one. Under the shared lock
+    exactly one commits and the user ends with exactly one active target;
+    without it both application prechecks would have seen zero."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from supabase import create_client
+
+    from tests.integration.conftest import LOCAL_URL, SERVICE_KEY
+
+    uid, _ = two_seeded_users
+    followed = _call(service_client, user_id=uid, label=f"Race2 {uuid.uuid4()}")
+    cleanup_targets.append(followed["target"]["id"])
+    label_new = f"Race1 {uuid.uuid4()}"
+
+    c1, c2 = create_client(LOCAL_URL, SERVICE_KEY), create_client(LOCAL_URL, SERVICE_KEY)
+    gate = threading.Barrier(2)
+
+    def run(fn: Any) -> tuple[str, Any]:
+        gate.wait()
+        try:
+            return ("ok", fn())
+        except APIError as e:
+            return ("cap", (e.code, json.loads(e.details)))
+
+    def create_path() -> dict[str, Any]:
+        return _call(c1, user_id=uid, label=label_new, is_active=True, active_limit=1)
+
+    def activate_path() -> dict[str, Any]:
+        return _activate(c2, user_id=uid, target_id=followed["target"]["id"], active_limit=1)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        r1, r2 = pool.submit(run, create_path), pool.submit(run, activate_path)
+        create_result, activate_result = r1.result(timeout=30), r2.result(timeout=30)
+
+    new_rows = _rows_for(service_client, label_new.strip().lower())
+    for row in new_rows:
+        cleanup_targets.append(row["id"])
+
+    outcomes = sorted([create_result[0], activate_result[0]])
+    assert outcomes == ["cap", "ok"], (create_result, activate_result)
+    loser = create_result if create_result[0] == "cap" else activate_result
+    assert loser[1][0] == "PT409"
+    assert loser[1][1] == {"error": "ACTIVE_LIMIT", "active_count": 1, "limit": 1}
+    assert _active_count(service_client, uid) == 1
+    # If the create path lost, its target insert was rolled back with it.
+    if create_result[0] == "cap":
+        assert new_rows == []

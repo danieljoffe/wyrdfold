@@ -154,6 +154,18 @@ def _active_cap_from_error(e: APIError, fallback_limit: int | None) -> tuple[int
         return limit, limit
 
 
+def active_cap_error(e: APIError, fallback_limit: int | None) -> crud.ActiveTargetLimitError | None:
+    """The app's cap error for a PT409 rejection, or ``None`` if ``e`` is something else.
+
+    Every caller of a cap-checked database function maps the rejection here,
+    by SQLSTATE, so the 409 payload is identical whichever path refused.
+    """
+    if e.code != ACTIVE_CAP_SQLSTATE:
+        return None
+    current, limit = _active_cap_from_error(e, fallback_limit)
+    return crud.ActiveTargetLimitError(current, limit)
+
+
 async def create_and_link(
     supabase: AsyncClient,
     *,
@@ -202,10 +214,10 @@ async def create_and_link(
     try:
         resp = await supabase.rpc("create_target_and_link", params).execute()
     except APIError as e:
-        if e.code == ACTIVE_CAP_SQLSTATE:
-            current, limit = _active_cap_from_error(e, active_limit)
-            raise crud.ActiveTargetLimitError(current, limit) from e
-        raise
+        cap = active_cap_error(e, active_limit)
+        if cap is None:
+            raise
+        raise cap from e
     data = cast(dict[str, Any] | None, resp.data)
     if not data or "target" not in data or "user_target" not in data:
         raise RuntimeError("create_target_and_link returned no target/user_target")
