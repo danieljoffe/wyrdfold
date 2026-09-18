@@ -77,6 +77,7 @@ from app.services.extract import (
 )
 from app.services.llm import cost_log
 from app.services.llm.client import LLMClient
+from app.services.llm.errors import LLMMalformedOutputError, LLMServiceError
 from app.services.poller import _global_budget_exhausted, poll_sources_for_target
 from app.services.relevance.phase1_backfill import backfill_phase1_for_target
 from app.services.scoring import strip_html
@@ -109,6 +110,7 @@ from app.services.targets.lateral_discovery import (
 )
 from app.services.targets.learning_projection import project_profile_impact
 from app.services.targets.match import (
+    find_matching_target,
     suggest_and_match,
     suggest_and_match_from_query,
 )
@@ -514,8 +516,17 @@ async def _live_scored_job_count(supabase: AsyncClient, target_id: str) -> int:
 # match, resolve, source_discovery, cost_log) are out of this slice's scope.
 
 
-async def _create_target_async(supabase: AsyncClient, payload: TargetCreate) -> JobTarget:
-    """Async inline of ``crud.create`` — find-or-create on ``normalized_label``."""
+async def _find_or_create_target_async(
+    supabase: AsyncClient, payload: TargetCreate
+) -> tuple[JobTarget, bool]:
+    """Async inline of ``crud.create`` — find-or-create on ``normalized_label``.
+
+    The second element is ``was_created``. The ignore-duplicates upsert returns
+    the row only when it inserted it, so an empty result means the canonical
+    row already existed (a concurrent create, or one this request's matcher
+    did not see). A caller that derives a profile must do so only on ``True``:
+    the existing row is shared and is never derived over (#1071).
+    """
     normalized = crud.normalize_label(payload.label)
     row: dict[str, Any] = {
         "label": payload.label,
@@ -531,7 +542,7 @@ async def _create_target_async(supabase: AsyncClient, payload: TargetCreate) -> 
     )
     rows = cast(list[dict[str, Any]], resp.data or [])
     if rows:
-        return crud._parse_target(rows[0])
+        return crud._parse_target(rows[0]), True
     # Conflict → the canonical row already existed; return it rather than 500.
     existing = await (
         supabase.table(crud.TARGETS_TABLE)
@@ -542,8 +553,14 @@ async def _create_target_async(supabase: AsyncClient, payload: TargetCreate) -> 
     )
     existing_rows = cast(list[dict[str, Any]], existing.data or [])
     if existing_rows:
-        return crud._parse_target(existing_rows[0])
+        return crud._parse_target(existing_rows[0]), False
     raise RuntimeError("Failed to insert or locate targets row")
+
+
+async def _create_target_async(supabase: AsyncClient, payload: TargetCreate) -> JobTarget:
+    """Find-or-create on ``normalized_label``; see ``_find_or_create_target_async``."""
+    target, _was_created = await _find_or_create_target_async(supabase, payload)
+    return target
 
 
 async def _update_target_async(
@@ -2116,9 +2133,11 @@ async def create_target_from_posting(
 ) -> JobTarget:
     """Create a target from an existing job posting.
 
-    Reads the posting's title and description, creates a target, derives a
-    scoring profile from the description via LLM, stores the JD as a
-    reference, and activates the target.
+    Canonicalizes the posting's title into a role label (one LLM call),
+    matches it against the catalog, creates the target only when nothing
+    matches, attaches the caller, then derives a scoring profile from the
+    description and stores the JD as a reference. Same order and same
+    failure semantics as ``from_input.from_url`` (#1071).
     """
     # ``derive_profile_from_jd`` (content-hash cache) takes the async client on its
     # async cache path, and the active-cap link / ``app_active`` writes ride the
@@ -2128,79 +2147,165 @@ async def create_target_from_posting(
     if posting is None:
         raise HTTPException(status_code=404, detail="Job posting not found")
 
-    title = posting.get("title") or "Untitled Role"
     description_html: str = posting.get("description_html") or ""
     absolute_url: str | None = posting.get("absolute_url")
-
-    # Create the target
-    target = await _create_target_async(supabase, payload=TargetCreate(label=title))
-
-    # Derive scoring profile from description if substantial
     jd_text = strip_html(description_html)
-    if len(jd_text) >= 50:
-        try:
-            derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=supabase)
-            await cost_log.record_async(
-                supabase,
-                user_id=user_id,
-                purpose=DEFAULT_PURPOSE,
-                result=result,
-                metadata={
-                    "target_id": target.id,
-                    "posting_id": posting_id,
-                    "jd_url": absolute_url or "",
-                },
-            )
 
-            await _add_reference_jd_async(
-                supabase,
-                target_id=target.id,
-                jd_text=jd_text,
-                jd_url=absolute_url,
-                extracted_profile=derived.scoring_profile,
-            )
-
-            # Update target with the derived profile + search keywords
-            await _update_target_async(
-                supabase,
-                target.id,
-                TargetUpdate(
-                    scoring_profile=derived.scoring_profile,
-                    search_keywords=derived.search_keywords,
-                    example_promising_titles=derived.example_promising_titles,
-                    example_unpromising_titles=derived.example_unpromising_titles,
-                ),
-            )
-        except Exception:
-            logger.exception("Profile derivation failed for posting %s", posting_id)
-
-    # Link the calling user to the new target (multi-user flow) so it
-    # actually shows up in ``/targets/mine``. Without this insert, the
-    # onboarding "I have a resume and a role in mind" path completes
-    # with "All set!" but the user lands on a dashboard with zero
-    # targets — the catalog row is created and globally active, but
-    # ``user_targets`` was never populated, so every per-user view is
-    # empty. For real users the active membership itself makes the
-    # target pipeline-active (derived predicate, no catalog write).
-    # api-key (cron) callers have no user identity to link — raise the
-    # instance floor (``app_active``) instead so the target still
-    # enters the pipeline.
+    # A signed-in caller lands on an ACTIVE target, so refuse at the cap
+    # BEFORE any LLM call is billed (#1071; the #865 shape). Advisory only:
+    # the atomic create-and-link below is what enforces under a race.
+    active_limit: int | None = None
     if user_id is not None:
+        active_limit = await _effective_active_target_cap_async(supabase, user_id)
+        current = await _count_active_for_user_async(supabase, user_id)
+        if current >= active_limit:
+            raise _active_limit_error(
+                crud.ActiveTargetLimitError(current, active_limit),
+                await _active_target_choices(supabase, user_id),
+            )
+
+    # Canonicalize BEFORE matching or creating (#1071). The label becomes
+    # ``targets.normalized_label``, the UNIQUE catalog key, so the employer-
+    # decorated posting title must never reach it: until #1071 every
+    # from-posting create minted a raw-title catalog row (the #745 defect,
+    # fixed for ``from_url`` and still live here). Same helper and the same
+    # failure semantics as ``from_url``: a normalizer failure propagates to
+    # the #1066 global handlers before any row is written.
+    label = await from_input.canonical_posting_label(
+        supabase,
+        llm,
+        user_id=user_id,
+        extracted_title=posting.get("title"),
+        jd_text=jd_text,
+    )
+
+    matched = await find_matching_target(supabase, label)
+    if matched is not None:
+        # The catalog row owns its own profile lifecycle; attaching the
+        # caller is all a match needs (mirrors ``from_url``).
+        return await _attach_caller_to_target(supabase, user_id=user_id, target=matched)
+
+    if user_id is None:
+        # api-key (cron) caller: no membership to write, so the instance floor
+        # (``app_active``) is raised instead and the target still enters the
+        # pipeline. Find-or-create on the exact key; a row that already
+        # existed is shared and is never derived over.
+        target, was_created = await _find_or_create_target_async(
+            supabase, payload=TargetCreate(label=label)
+        )
+        target = await _set_app_active_async(supabase, target.id) or target
+    else:
+        # Create, link ACTIVE and enforce the cap in ONE transaction: a cap
+        # rejection leaves no target row behind, and a concurrent create of
+        # the same exact key comes back as ``was_created=False``.
         try:
-            await _link_user_to_target_async(
+            target, _link, was_created = await from_input.create_and_link(
                 supabase,
                 user_id=user_id,
-                target_id=target.id,
+                payload=TargetCreate(label=label),
                 is_active=True,
+                active_limit=active_limit,
             )
         except crud.ActiveTargetLimitError as e:
             raise _active_limit_error(e, await _active_target_choices(supabase, user_id)) from e
-        # Re-read the target row so the response reflects any writes the
-        # linking flow made.
-        refreshed = await _target_get(supabase, target.id)
-        return refreshed or target
-    activated = await _set_app_active_async(supabase, target.id)
-    return activated or target
+
+    if not was_created:
+        # A concurrent request won the exact key. The row is shared (and
+        # possibly another user's): exactly the matched case, no derivation.
+        return target
+
+    # Derive the scoring profile from the description if it is substantial.
+    if len(jd_text) < 50:
+        return target
+    try:
+        derived, result = await derive_profile_from_jd(llm, jd_text=jd_text, supabase=supabase)
+        await cost_log.record_async(
+            supabase,
+            user_id=user_id,
+            purpose=DEFAULT_PURPOSE,
+            result=result,
+            metadata={
+                "target_id": target.id,
+                "posting_id": posting_id,
+                "jd_url": absolute_url or "",
+            },
+        )
+        await _add_reference_jd_async(
+            supabase,
+            target_id=target.id,
+            jd_text=jd_text,
+            jd_url=absolute_url,
+            extracted_profile=derived.scoring_profile,
+            # The seed JD belongs to the person who created the target, so
+            # contributor de-bias and account cleanup see the right owner;
+            # an api-key caller stays an unattributed (operator) contribution.
+            user_id=user_id,
+        )
+        updated = await _update_target_async(
+            supabase,
+            target.id,
+            TargetUpdate(
+                scoring_profile=derived.scoring_profile,
+                search_keywords=derived.search_keywords,
+                example_promising_titles=derived.example_promising_titles,
+                example_unpromising_titles=derived.example_unpromising_titles,
+            ),
+        )
+        return updated or target
+    except (LLMServiceError, LLMMalformedOutputError):
+        # The provider or the model failed (#1066 taxonomy): an explicit,
+        # retryable error state instead of a silently empty profile. Until
+        # #1071 a bare ``except Exception`` logged a traceback and returned a
+        # target that scored nothing, with nothing telling the user why.
+        logger.warning(
+            "Profile derivation failed for posting %s; target %s marked for retry",
+            posting_id,
+            target.id,
+            exc_info=True,
+        )
+        return await _mark_derivation_failed(supabase, target)
+    except Exception:
+        # A programming error or a rejected request is a server fault: stamp
+        # the same error state so the target is not left half-built, then let
+        # it surface (500, Sentry) instead of laundering it into data.
+        await _mark_derivation_failed(supabase, target)
+        raise
+
+
+async def _attach_caller_to_target(
+    supabase: AsyncClient, *, user_id: str | None, target: JobTarget
+) -> JobTarget:
+    """Make a from-posting target the caller's and return the row as it now is.
+
+    A signed-in user gets an ACTIVE membership (the onboarding "I have a role
+    in mind" path lands on a target that scores immediately), subject to the
+    active-target cap. Without the membership the catalog row exists but never
+    shows up in ``/targets/mine``: the wizard used to finish with "All set!"
+    onto an empty dashboard. An api-key (cron) caller has no user identity to
+    link, so the instance floor (``app_active``) is raised instead and the
+    target still enters the pipeline.
+    """
+    if user_id is None:
+        activated = await _set_app_active_async(supabase, target.id)
+        return activated or target
+    try:
+        await _link_user_to_target_async(
+            supabase, user_id=user_id, target_id=target.id, is_active=True
+        )
+    except crud.ActiveTargetLimitError as e:
+        raise _active_limit_error(e, await _active_target_choices(supabase, user_id)) from e
+    refreshed = await _target_get(supabase, target.id)
+    return refreshed or target
+
+
+async def _mark_derivation_failed(supabase: AsyncClient, target: JobTarget) -> JobTarget:
+    """Stamp the retryable error state that ``POST /targets/{id}/activate`` clears."""
+    updated = await _update_target_async(
+        supabase,
+        target.id,
+        TargetUpdate(activation_status="error", activation_error=ActivationError.PIPELINE_FAILED),
+    )
+    return updated or target
 
 
 # ---- Reference JDs ---------------------------------------------------------

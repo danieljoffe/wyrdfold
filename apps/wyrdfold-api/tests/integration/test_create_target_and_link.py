@@ -15,11 +15,13 @@ Self-skips when the local stack is unreachable (see conftest).
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
+from postgrest.exceptions import APIError
 from supabase import Client
 
 pytestmark = pytest.mark.integration
@@ -33,23 +35,24 @@ def _call(
     normalized: str | None = None,
     activation_status: str | None = None,
     description: str | None = None,
+    is_active: bool = False,
+    active_limit: int | None = None,
 ) -> dict[str, Any]:
-    return (
-        service_client.rpc(
-            "create_target_and_link",
-            {
-                "p_user_id": user_id,
-                "p_label": label,
-                "p_normalized_label": normalized or label.strip().lower(),
-                "p_activation_status": activation_status,
-                "p_description": description,
-                "p_scoring_profile": {},
-                "p_search_keywords": [],
-            },
-        )
-        .execute()
-        .data
-    )
+    params: dict[str, Any] = {
+        "p_user_id": user_id,
+        "p_label": label,
+        "p_normalized_label": normalized or label.strip().lower(),
+        "p_activation_status": activation_status,
+        "p_description": description,
+        "p_scoring_profile": {},
+        "p_search_keywords": [],
+    }
+    if is_active:
+        # The legacy seven-key shape is what every pre-#1071 caller sends;
+        # only the active shape adds the two new keys.
+        params["p_is_active"] = True
+        params["p_active_limit"] = active_limit
+    return service_client.rpc("create_target_and_link", params).execute().data
 
 
 @pytest.fixture
@@ -198,3 +201,93 @@ def test_null_activation_status_leaves_an_existing_row_alone(
     )
 
     assert second["target"]["activation_status"] == "polling"
+
+
+# ---- #1071: active linking, the cap, and was_created ------------------------
+
+
+def _rows_for(service_client: Client, normalized: str) -> list[dict[str, Any]]:
+    return (
+        service_client.table("targets")
+        .select("id")
+        .eq("normalized_label", normalized)
+        .execute()
+        .data
+    )
+
+
+def test_was_created_reports_insert_vs_conflict(
+    service_client: Client, two_seeded_users: tuple[str, str], cleanup_targets: list[str]
+) -> None:
+    """The flag the from-posting route derives on: only the request that
+    inserted the row gets ``true``; a later (or concurrent) exact-key call
+    gets ``false`` and the same single row."""
+    uid_a, uid_b = two_seeded_users
+    label = f"Race {uuid.uuid4()}"
+
+    first = _call(service_client, user_id=uid_a, label=label)
+    cleanup_targets.append(first["target"]["id"])
+    second = _call(service_client, user_id=uid_b, label=label, is_active=True, active_limit=5)
+
+    assert first["was_created"] is True
+    assert second["was_created"] is False
+    assert second["target"]["id"] == first["target"]["id"]
+    assert len(_rows_for(service_client, label.strip().lower())) == 1
+
+
+def test_active_request_links_active_and_activates_an_existing_inactive_link(
+    service_client: Client, two_seeded_users: tuple[str, str], cleanup_targets: list[str]
+) -> None:
+    uid, _ = two_seeded_users
+    label = f"Activate {uuid.uuid4()}"
+
+    followed = _call(service_client, user_id=uid, label=label)
+    cleanup_targets.append(followed["target"]["id"])
+    assert followed["user_target"]["is_active"] is False
+
+    active = _call(service_client, user_id=uid, label=label, is_active=True, active_limit=5)
+
+    assert active["was_created"] is False
+    assert active["user_target"]["is_active"] is True
+    # Re-running the legacy shape never deactivates what the user activated.
+    again = _call(service_client, user_id=uid, label=label)
+    assert again["user_target"]["is_active"] is True
+
+
+def test_cap_rejection_is_pt409_with_json_detail_and_leaves_no_target_row(
+    service_client: Client, two_seeded_users: tuple[str, str], cleanup_targets: list[str]
+) -> None:
+    """The property the whole design rests on: a rejected active create rolls
+    its own target insert back, so nothing owned by nobody is ever visible."""
+    uid, _ = two_seeded_users
+    held = _call(
+        service_client, user_id=uid, label=f"Held {uuid.uuid4()}", is_active=True, active_limit=1
+    )
+    cleanup_targets.append(held["target"]["id"])
+    assert held["was_created"] is True
+    assert held["user_target"]["is_active"] is True
+
+    rejected_label = f"Rejected {uuid.uuid4()}"
+    with pytest.raises(APIError) as exc:
+        _call(service_client, user_id=uid, label=rejected_label, is_active=True, active_limit=1)
+
+    assert exc.value.code == "PT409"
+    detail = json.loads(exc.value.details)
+    assert detail == {"error": "ACTIVE_LIMIT", "active_count": 1, "limit": 1}
+    assert _rows_for(service_client, rejected_label.strip().lower()) == []
+
+
+def test_reactivating_the_held_link_is_exempt_from_the_cap(
+    service_client: Client, two_seeded_users: tuple[str, str], cleanup_targets: list[str]
+) -> None:
+    """Re-activating a link the user already holds active changes no count,
+    so an idempotent repeat at the cap succeeds (the app's rule, mirrored)."""
+    uid, _ = two_seeded_users
+    label = f"Repeat {uuid.uuid4()}"
+    first = _call(service_client, user_id=uid, label=label, is_active=True, active_limit=1)
+    cleanup_targets.append(first["target"]["id"])
+
+    repeat = _call(service_client, user_id=uid, label=label, is_active=True, active_limit=1)
+
+    assert repeat["was_created"] is False
+    assert repeat["user_target"]["is_active"] is True

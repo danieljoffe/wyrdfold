@@ -90,7 +90,7 @@ def _from_url_seams(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]:
     matcher = AsyncMock(side_effect=AssertionError("must not match on a failed normalization"))
     creator = AsyncMock(side_effect=AssertionError("must not create on a failed normalization"))
     monkeypatch.setattr(from_input, "find_matching_target", matcher)
-    monkeypatch.setattr(from_input, "_create_and_link", creator)
+    monkeypatch.setattr(from_input, "create_and_link", creator)
     return {"matcher": matcher, "creator": creator}
 
 
@@ -163,10 +163,10 @@ def test_from_url_canonical_label_reaches_the_create_through_the_http_layer(
     async def _create(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
         seen["created"] = payload.label
         target = _target(id="new", label=payload.label)
-        return target, _user_target(target_id=target.id)
+        return target, _user_target(target_id=target.id), True
 
     monkeypatch.setattr(from_input, "find_matching_target", _match)
-    monkeypatch.setattr(from_input, "_create_and_link", _create)
+    monkeypatch.setattr(from_input, "create_and_link", _create)
     monkeypatch.setattr(from_input, "spawn_detached", lambda *a, **k: None)
     monkeypatch.setattr(from_input.cost_log, "record_async", AsyncMock(return_value=None))
     llm = MockLLMClient(
