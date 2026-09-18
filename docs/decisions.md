@@ -21,7 +21,12 @@ three handlers read `except LLMServiceError` as "provider condition" (breaker
 latch, silent NULL). It is not a `ValueError` either: an `except ValueError as
 exc: HTTPException(detail=str(exc))` would serve the raw model content. The
 normalizer fallback is gone; the create fails before matching or creation and
-the user retries. Rule: never convert an LLM failure into a persisted value.
+the user retries. The review added a third sibling, `LLMRequestRejectedError`:
+a provider envelope that rejects OUR request (grammar 400, 404 slug, 422) is
+an application bug and keeps 500 + Sentry semantics with a generic body,
+because a 502 "try again" would launder a deterministic defect into model
+output; unknown envelope codes land there too, deliberately, so they get
+classified on evidence. Rule: never convert an LLM failure into a persisted value.
 Per-item loops may isolate and retry with a full traceback; nothing may mint
 identity from a degraded step. Lives in `app/services/llm/errors.py` and
 `tests/test_targets_from_input.py`.

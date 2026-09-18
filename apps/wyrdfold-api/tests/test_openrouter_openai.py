@@ -17,6 +17,8 @@ from app.services.llm.errors import (
     LLMMalformedOutputError,
     LLMQuotaExhaustedError,
     LLMRateLimitedError,
+    LLMRequestRejectedError,
+    LLMServiceError,
     LLMUpstreamUnavailableError,
     MissingToolCallError,
 )
@@ -24,6 +26,7 @@ from app.services.llm.openrouter_client import (
     _OPENAI_SHAPED_MODELS,
     _OPENROUTER_OPENAI_URL,
     OpenRouterLLMClient,
+    _classify_error_envelope,
     _inline_defs,
     _openai_usage,
     _parse_openai_tool_response,
@@ -496,13 +499,86 @@ async def test_grammar_400_error_body_surfaces_clearly(monkeypatch) -> None:
             }
         },
     )
-    # NOT a confusing "no choices" — a clear error-body message with the code,
-    # typed (#1066) so the provider's text can only reach the log line.
-    with pytest.raises(LLMMalformedOutputError, match=r"error body.*code=400") as excinfo:
+    # NOT a confusing "no choices" — a clear error-body message with the code.
+    # A grammar/schema rejection is OUR bug (#1066 review): a server fault that
+    # keeps 500 + Sentry semantics, never retryable model output, never a plain
+    # ``ValueError`` whose text a route could serialise.
+    with pytest.raises(LLMRequestRejectedError, match=r"error body.*code=400") as excinfo:
         await _call(client)
-    assert excinfo.value.reason == "provider_error_body"
-    assert not isinstance(excinfo.value, ValueError)
-    assert "compile json grammar" not in excinfo.value.user_message
+    exc = excinfo.value
+    assert exc.reason == "request_rejected"
+    assert exc.upstream_code == 400
+    assert exc.http_status == 500
+    assert not isinstance(exc, ValueError)
+    assert not isinstance(exc, LLMServiceError)
+    assert not isinstance(exc, LLMMalformedOutputError)
+    assert "compile json grammar" in exc.diagnostic
+    assert "compile json grammar" not in exc.user_message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "expected_reason"),
+    [
+        pytest.param(404, "request_rejected", id="404-no-endpoints"),
+        pytest.param(422, "request_rejected", id="422-validation"),
+        pytest.param(418, "unclassified_error_envelope", id="418-unknown"),
+        pytest.param("E_WEIRD", "unclassified_error_envelope", id="non-integer-code"),
+        pytest.param(None, "unclassified_error_envelope", id="missing-code"),
+    ],
+)
+async def test_non_transient_envelopes_are_classified_deliberately(
+    monkeypatch, code: object, expected_reason: str
+) -> None:
+    """Every non-transient, non-provider-condition envelope lands in the
+    server-fault family: known request rejections by code, and anything else
+    as ``unclassified_error_envelope`` so a new code is classified on evidence
+    rather than inheriting a neighbour's behaviour."""
+    body: dict = {"error": {"message": "ZZ_VENDOR_TEXT_MARKER_ZZ"}}
+    if code is not None:
+        body["error"]["code"] = code
+    client = _error_body_client(monkeypatch, body)
+    with pytest.raises(LLMRequestRejectedError) as excinfo:
+        await _call(client)
+    exc = excinfo.value
+    assert exc.reason == expected_reason
+    assert exc.upstream_code == (code if isinstance(code, int) else None)
+    assert "ZZ_VENDOR_TEXT_MARKER_ZZ" in exc.diagnostic
+    assert "ZZ_VENDOR_TEXT_MARKER_ZZ" not in exc.user_message
+
+
+def test_request_rejection_is_a_sentry_visible_500_with_a_generic_body(monkeypatch) -> None:
+    """Response-level proof for the #1066 review blocker: through the registered
+    handler function the rejection is a 500 whose body is the generic server-
+    error copy (vendor marker absent), and Sentry sees the exception."""
+    import sentry_sdk
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.main import _llm_request_rejected_handler, settings
+
+    captured: list[BaseException] = []
+    monkeypatch.setattr(sentry_sdk, "capture_exception", lambda exc: captured.append(exc))
+    monkeypatch.setattr(settings, "debug_errors", False)
+
+    probe = FastAPI()
+    probe.add_exception_handler(LLMRequestRejectedError, _llm_request_rejected_handler)
+
+    @probe.get("/probe")
+    async def _probe() -> dict:
+        raise _classify_error_envelope(
+            {"code": 400, "message": "grammar: ZZ_VENDOR_TEXT_MARKER_ZZ"}, tool_name="return_X"
+        )
+
+    resp = TestClient(probe, raise_server_exceptions=False).get("/probe")
+    assert resp.status_code == 500
+    assert resp.json() == {
+        "detail": "Internal server error",
+        "code": "request_rejected",
+        "path": "/probe",
+    }
+    assert "ZZ_VENDOR_TEXT_MARKER_ZZ" not in resp.text
+    assert len(captured) == 1 and isinstance(captured[0], LLMRequestRejectedError)
 
 
 @pytest.mark.asyncio

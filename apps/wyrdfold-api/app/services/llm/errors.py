@@ -131,6 +131,48 @@ class MissingToolCallError(LLMMalformedOutputError):
     reason = "missing_tool_call"
 
 
+class LLMRequestRejectedError(Exception):
+    """The provider rejected OUR request, or answered with an error envelope we
+    do not classify: an application bug, not a provider condition and not the
+    model's answer (#1066 review).
+
+    Today this is OpenRouter's HTTP-200 error envelope with a non-transient,
+    non-classified code: the grammar-compile ``400`` on a schema it cannot
+    inline, a ``404`` for a slug with no endpoints, a ``422``. The HTTP-status
+    twin of those codes already stays an unhandled 500 (see
+    :func:`translate_api_status_error`); this class gives the envelope form the
+    same semantics with a safe body.
+
+    A sibling of the other families, deliberately: not ``LLMServiceError``
+    (the breaker must not latch on one row's schema bug, and a 503 "try again"
+    would hide a deterministic defect), not ``LLMMalformedOutputError`` (a 502
+    retry copy would launder an operator bug into model output), not
+    ``ValueError`` (no ``except ValueError as exc: HTTPException(detail=
+    str(exc))`` may serialise the vendor text).
+
+    Served by its own handler in ``app/main.py``: HTTP 500, the generic
+    server-error body, Sentry capture tagged ``llm.reason`` /
+    ``llm.upstream_code``, ERROR log carrying the bounded vendor diagnostic.
+    """
+
+    reason: str = "request_rejected"
+    user_message: str = "Internal server error"
+    http_status: int = 500
+
+    def __init__(
+        self,
+        diagnostic: str,
+        *,
+        reason: str | None = None,
+        upstream_code: int | None = None,
+    ) -> None:
+        self.diagnostic = diagnostic
+        self.upstream_code = upstream_code
+        if reason is not None:
+            self.reason = reason
+        super().__init__(diagnostic)
+
+
 class LLMServiceError(Exception):
     """Base class for all LLM-provider failures we expose to callers.
 

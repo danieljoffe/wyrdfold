@@ -36,6 +36,7 @@ from app.services.llm.errors import (
     LLMMalformedOutputError,
     LLMQuotaExhaustedError,
     LLMRateLimitedError,
+    LLMRequestRejectedError,
     LLMServiceError,
     LLMUpstreamUnavailableError,
     MissingToolCallError,
@@ -260,7 +261,11 @@ def test_user_messages_are_safe_strings() -> None:
         assert "http" not in msg.lower()
     # The malformed-output family (#1066) carries a diagnostic with raw model
     # content; the user-facing copy must be the fixed class attribute.
-    for exc in (LLMMalformedOutputError("DIAG http://x"), MissingToolCallError("DIAG http://x")):
+    for exc in (
+        LLMMalformedOutputError("DIAG http://x"),
+        MissingToolCallError("DIAG http://x"),
+        LLMRequestRejectedError("DIAG http://x"),
+    ):
         msg = exc.user_message
         assert msg
         assert "DIAG" not in msg
@@ -302,3 +307,21 @@ def test_missing_tool_call_is_malformed_output_not_value_error() -> None:
     assert not isinstance(exc, LLMServiceError)
     assert exc.reason == "missing_tool_call"
     assert "RAW" not in exc.user_message
+
+
+def test_request_rejected_is_a_server_fault_sibling() -> None:
+    """#1066 review: a request rejection (grammar 400, 404 slug, 422) is our
+    bug. It must keep 500 + Sentry semantics, so it is neither retryable model
+    output nor a provider condition, and never a ``ValueError``."""
+    exc = LLMRequestRejectedError("OpenRouter error body (code=400): 'VENDOR'", upstream_code=400)
+    assert not isinstance(exc, LLMServiceError)
+    assert not isinstance(exc, LLMMalformedOutputError)
+    assert not isinstance(exc, ValueError)
+    assert exc.http_status == 500
+    assert exc.reason == "request_rejected"
+    assert exc.upstream_code == 400
+    assert "VENDOR" in exc.diagnostic
+    assert "VENDOR" not in exc.user_message
+    unclassified = LLMRequestRejectedError("x", reason="unclassified_error_envelope")
+    assert unclassified.reason == "unclassified_error_envelope"
+    assert unclassified.upstream_code is None
