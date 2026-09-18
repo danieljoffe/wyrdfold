@@ -1,7 +1,7 @@
 import os
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.models.llm import ModelId
@@ -11,6 +11,29 @@ from app.models.llm import ModelId
 # RECENCY_DECAY_ENABLED / PHASE1_TRIAGE_ENABLED) can't leak into the
 # test process and silently switch code paths. See #28.
 _TEST_ENV_FILE: str | None = None if os.environ.get("WYRDFOLD_API_TESTING") == "1" else ".env"
+
+
+#: Environment names the app accepts when a check depends on "where am I
+#: running". Railway injects ``production`` / ``staging``; ``development`` and
+#: ``local`` are for a laptop or a local Docker run. Anything else is treated
+#: as unnamed, so a typo cannot pass as "not production".
+KNOWN_ENVIRONMENTS: frozenset[str] = frozenset({"production", "staging", "development", "local"})
+
+
+def runtime_environment(s: "Settings") -> str | None:
+    """The deployment environment's name, canonicalized, or ``None`` if unnamed.
+
+    ``RAILWAY_ENVIRONMENT_NAME`` is injected by Railway into the process
+    environment (never a file), so it is read from there and wins.
+    ``APP_ENV`` is the portable override for any other host (a laptop, a local
+    Docker run) and is a real setting, so a value supplied through ``.env`` is
+    loaded by the same dotenv-aware source as everything else. Stripped and
+    lower-cased once, here, so ``GET /version`` and every startup guard that
+    keys off the environment read the same value (#1079).
+    """
+    raw = os.getenv("RAILWAY_ENVIRONMENT_NAME") or s.app_env or ""
+    name = raw.strip().lower()
+    return name or None
 
 
 class Settings(BaseSettings):
@@ -81,6 +104,13 @@ class Settings(BaseSettings):
     # Sentry — leave DSN empty to disable (local dev, tests).
     sentry_dsn: str = Field(default="", repr=False)
     sentry_environment: str = "development"
+    # Which deployment this process believes it is (production / staging /
+    # development / local). Read through ``runtime_environment()``, which lets
+    # Railway's injected ``RAILWAY_ENVIRONMENT_NAME`` win; set this anywhere
+    # Railway is not (a laptop, a local Docker run). Environment-dependent
+    # startup checks (the Stripe key-mode guard, #1079) refuse to start when a
+    # Stripe key is configured and this is unset or unknown.
+    app_env: str = ""
     sentry_traces_sample_rate: float = Field(default=0.1, ge=0.0, le=1.0)
 
     # Verbose 500 bodies — FAIL-CLOSED. The unhandled-exception handler
@@ -175,6 +205,16 @@ class Settings(BaseSettings):
     # routes entirely (they 404) — the self_host default: a self-hosted
     # instance has no subscriptions.
     stripe_secret_key: str = Field(default="", repr=False)
+
+    @field_validator("stripe_secret_key", "stripe_webhook_secret", mode="before")
+    @classmethod
+    def _strip_stripe_secret(cls, value: object) -> object:
+        """Normalize once at load, so the value the startup guard checks is
+        byte-identical to the value handed to ``stripe.StripeClient`` and to
+        webhook signature verification. A padded secret would otherwise pass
+        the prefix check and then be rejected by Stripe at runtime (#1079)."""
+        return value.strip() if isinstance(value, str) else value
+
     # Webhook endpoint signing secret (whsec_...). The webhook route
     # refuses everything until this is set — never process an unsigned
     # billing event.
