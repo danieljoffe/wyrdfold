@@ -115,3 +115,47 @@ def json_response(
     status: int, body: dict[str, Any], headers: dict[str, str] | None = None
 ) -> httpx.Response:
     return httpx.Response(status, json=body, headers=headers or {})
+
+
+class ClosableByteStream(httpx.AsyncByteStream):
+    """Streams ``raw`` in chunks and records whether the reader closed it,
+    so a test can prove the transport releases the socket when its consumer
+    stops early."""
+
+    def __init__(self, raw: bytes, chunk_size: int = 48) -> None:
+        self._raw = raw
+        self._chunk = chunk_size
+        self.closed = False
+        self.chunks_served = 0
+
+    async def __aiter__(self) -> Any:
+        for i in range(0, len(self._raw), self._chunk):
+            self.chunks_served += 1
+            yield self._raw[i : i + self._chunk]
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def sse_response(
+    raw: bytes | str, *, status: int = 200, chunk_size: int = 48
+) -> tuple[httpx.Response, ClosableByteStream]:
+    """A streaming ``text/event-stream`` response over a closable byte stream."""
+    data = raw.encode() if isinstance(raw, str) else raw
+    stream = ClosableByteStream(data, chunk_size=chunk_size)
+    response = httpx.Response(status, stream=stream, headers={"content-type": "text/event-stream"})
+    return response, stream
+
+
+def fixture_sse(name: str) -> bytes:
+    return (FIXTURES / name).read_bytes()
+
+
+def sse_frames(*frames: tuple[str, Any]) -> bytes:
+    """Build an SSE body from ``(event, payload)`` pairs; a str payload is
+    sent verbatim (``"[DONE]"``), anything else is JSON-encoded."""
+    out = []
+    for event, payload in frames:
+        data = payload if isinstance(payload, str) else json.dumps(payload, separators=(",", ":"))
+        out.append(f"event: {event}\ndata: {data}\n\n")
+    return "".join(out).encode()

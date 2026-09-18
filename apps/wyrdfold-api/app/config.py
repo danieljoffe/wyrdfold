@@ -124,7 +124,7 @@ class Settings(BaseSettings):
     # calls through OpenRouter use the raw ``/v1/messages`` transport instead
     # of the Anthropic SDK. Default empty (everything on the SDK). Read once at
     # client construction; a Railway variable change restarts the process,
-    # which is the rollback. Stream purposes stay on the SDK until PR C.
+    # which is the rollback.
     llm_raw_transport_purposes: str = ""
 
     # LLM credit-runway alarm. Three OpenRouter credit drains (2026-06-25,

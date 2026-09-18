@@ -320,13 +320,6 @@ async def test_transport_errors_retry_then_upstream_unavailable(_no_sleep: list[
     assert len(_no_sleep) == 1
 
 
-async def test_stream_is_not_implemented_until_pr_c() -> None:
-    t = _transport()
-    with pytest.raises(NotImplementedError, match="PR C"):
-        async for _ in t.stream(model="m", max_tokens=1, system="", messages=[]):
-            pass
-
-
 # ---- routing through OpenRouterLLMClient ------------------------------------
 
 
@@ -378,12 +371,6 @@ async def test_unlisted_purpose_stays_on_the_sdk() -> None:
         purpose="p.other",
     )
     assert result.transport == "anthropic_sdk"
-
-
-async def test_stream_purposes_stay_on_the_sdk_even_when_listed() -> None:
-    client = _client_with_raw(purposes=frozenset({"p.stream"}))
-    assert client._transport_for("p.stream", "stream") is client._transport
-    assert client._transport_for("p.stream", "complete") is client._raw
 
 
 def test_default_client_reads_the_knob_from_settings(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -7,8 +7,15 @@ both verified live on 2026-09-18), same typed errors, and the same normalised
 response types as ``SdkMessagesTransport``. What it removes is the SDK from
 the drift surface (#1065 / #905) and the ``httpx2`` second stack (#908).
 
-``stream()`` lands in PR C; until then ``OpenRouterLLMClient`` routes every
-stream purpose to the SDK regardless of the rollout knob.
+``stream()`` reads the SSE frames itself: ``message_start`` carries the
+input and cache token counts, ``message_delta`` the output tokens, the
+``stop_reason`` and OpenRouter's ``cost`` extras (the wart the SDK path had to
+fish out of the event stream because its accumulated message dropped them),
+``message_stop`` ends the message and an OpenAI-style ``data: [DONE]`` trailer
+ends the connection. A mid-stream ``event: error`` frame maps onto the typed
+hierarchy the way the SDK maps its ``APIStatusError``; the socket closes on
+normal end, on error, and when the consumer stops iterating (the client's
+disconnect path in ``routers/experience.py``).
 
 Wire facts this parser relies on, from the recorded corpus in
 ``tests/fixtures/openrouter_messages/``:
@@ -23,14 +30,21 @@ Wire facts this parser relies on, from the recorded corpus in
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator, Mapping
+from contextlib import AbstractAsyncContextManager
 from typing import Any
 
 import httpx
 
+from app.http_client import _MAX_RETRY_AFTER_S, _backoff_seconds, _retry_after_seconds
 from app.models.llm import TransportId
+from app.services.llm import openrouter_http
 from app.services.llm.errors import (
+    LLMAuthError,
+    LLMQuotaExhaustedError,
+    LLMRateLimitedError,
     LLMRequestRejectedError,
     LLMUpstreamUnavailableError,
     translate_api_status_error,
@@ -40,8 +54,16 @@ from app.services.llm.messages_transport import (
     MessagesResponse,
     MessagesUsage,
     StreamEvent,
+    StreamFinal,
+    StreamTextDelta,
+    StreamUsageDelta,
 )
-from app.services.llm.openrouter_http import post_json_with_retry
+from app.services.llm.openrouter_http import (
+    _BACKOFF_BASE_SECONDS,
+    _BACKOFF_CAP_SECONDS,
+    post_json_with_retry,
+    should_retry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +163,53 @@ def classify_error_response(resp: httpx.Response) -> Exception:
     )
 
 
+async def _sse_events(lines: AsyncIterator[str]) -> AsyncIterator[tuple[str, str]]:
+    """Server-sent events, one ``(event, data)`` per blank-line-terminated
+    frame. Comment lines (``:``) and unknown fields (``id:``, ``retry:``) are
+    ignored; multi-line ``data:`` joins with newlines per the SSE spec."""
+    event: str | None = None
+    data_parts: list[str] = []
+    async for raw_line in lines:
+        line = raw_line.rstrip("\r")
+        if line == "":
+            if event is not None or data_parts:
+                yield event or "message", "\n".join(data_parts)
+            event, data_parts = None, []
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event = line[6:].strip()
+        elif line.startswith("data:"):
+            data_parts.append(line[5:].strip())
+    if event is not None or data_parts:
+        yield event or "message", "\n".join(data_parts)
+
+
+def classify_stream_error(err: Mapping[str, Any]) -> Exception:
+    """A mid-stream ``event: error`` frame, mapped like the SDK maps the
+    ``APIStatusError`` it raises for the same frame: provider conditions keep
+    their typed errors, a request rejection is a server fault, and an
+    unrecognised type is classified deliberately as one too."""
+    etype = err.get("type")
+    etype = etype if isinstance(etype, str) else ""
+    message = str(err.get("message"))[:200]
+    if etype in ("overloaded_error", "api_error"):
+        return LLMUpstreamUnavailableError()
+    if etype == "rate_limit_error":
+        return LLMRateLimitedError()
+    if etype in ("authentication_error", "permission_error"):
+        return LLMAuthError()
+    if etype == "billing_error":
+        return LLMQuotaExhaustedError()
+    if etype == "invalid_request_error":
+        return LLMRequestRejectedError(f"OpenRouter /v1/messages stream error {etype}: {message!r}")
+    return LLMRequestRejectedError(
+        f"OpenRouter /v1/messages stream error {etype or '<none>'}: {message!r}",
+        reason="unclassified_error_envelope",
+    )
+
+
 class RawMessagesTransport:
     """``MessagesTransport`` over httpx against OpenRouter's ``/v1/messages``."""
 
@@ -199,8 +268,130 @@ class RawMessagesTransport:
             )
         return response_from_wire(data)
 
+    async def _open_stream(
+        self, body: dict[str, Any]
+    ) -> tuple[AbstractAsyncContextManager[httpx.Response], httpx.Response]:
+        """The streaming handshake, retried like ``post_json_with_retry`` while
+        no frame has been consumed (a transient status or a transport error
+        before the first byte is safe to retry; after that, nothing is)."""
+        client = self._client()
+        last: httpx.Response | None = None
+        for attempt in range(self._max_retries + 1):
+            cm = client.stream("POST", self._url, json=body, headers=self._headers)
+            try:
+                resp = await cm.__aenter__()
+            except httpx.TransportError as exc:
+                if attempt < self._max_retries:
+                    await openrouter_http._sleep(
+                        _backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS)
+                    )
+                    continue
+                raise LLMUpstreamUnavailableError() from exc
+            if not should_retry(resp):
+                return cm, resp
+            await resp.aread()
+            await cm.__aexit__(None, None, None)
+            last = resp
+            if attempt >= self._max_retries:
+                break
+            retry_after = _retry_after_seconds(resp)
+            await openrouter_http._sleep(
+                min(retry_after, _MAX_RETRY_AFTER_S)
+                if retry_after is not None
+                else _backoff_seconds(attempt, _BACKOFF_BASE_SECONDS, _BACKOFF_CAP_SECONDS)
+            )
+        if last is None:  # pragma: no cover - the loop always sets it before breaking
+            raise LLMUpstreamUnavailableError()
+        translated = translate_api_status_error(last)
+        if translated is not None:
+            raise translated
+        raise LLMUpstreamUnavailableError(upstream_status=last.status_code)
+
     async def stream(self, **params: Any) -> AsyncIterator[StreamEvent]:
-        raise NotImplementedError(
-            "raw Messages streaming lands in #1067 PR C; stream purposes stay on the SDK"
+        body = wire_body(params, stream=True)
+        cm, resp = await self._open_stream(body)
+        if resp.status_code < 200 or resp.status_code >= 300:
+            await resp.aread()
+            await cm.__aexit__(None, None, None)
+            raise classify_error_response(resp)
+
+        text_parts: list[str] = []
+        start_usage: Mapping[str, Any] = {}
+        delta_usage: Mapping[str, Any] = {}
+        stop_reason: str | None = None
+        provider: str | None = None
+        stopped = False
+        try:
+            async for event, data in _sse_events(resp.aiter_lines()):
+                if data == "[DONE]":
+                    break
+                if event == "ping" or not data:
+                    continue
+                try:
+                    payload = json.loads(data)
+                except ValueError:
+                    logger.warning(
+                        "raw messages stream: skipping a non-JSON frame (event=%s)", event
+                    )
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                ptype = payload.get("type") or event
+                if ptype == "error":
+                    err = payload.get("error")
+                    raise classify_stream_error(err if isinstance(err, Mapping) else {})
+                if ptype == "message_start":
+                    message = payload.get("message")
+                    if isinstance(message, Mapping):
+                        u = message.get("usage")
+                        start_usage = u if isinstance(u, Mapping) else {}
+                        p = message.get("provider")
+                        provider = p if isinstance(p, str) else None
+                elif ptype == "content_block_delta":
+                    delta = payload.get("delta")
+                    if isinstance(delta, Mapping) and delta.get("type") == "text_delta":
+                        text = delta.get("text")
+                        if isinstance(text, str) and text:
+                            text_parts.append(text)
+                            yield StreamTextDelta(text=text)
+                elif ptype == "message_delta":
+                    u = payload.get("usage")
+                    delta_usage = u if isinstance(u, Mapping) else {}
+                    d = payload.get("delta")
+                    sr = d.get("stop_reason") if isinstance(d, Mapping) else None
+                    stop_reason = sr if isinstance(sr, str) else stop_reason
+                    yield StreamUsageDelta(reported=delta_usage or None)
+                elif ptype == "message_stop":
+                    stopped = True
+        except httpx.TransportError as exc:
+            raise LLMUpstreamUnavailableError() from exc
+        finally:
+            # Normal end, an error, or the consumer stopping early (its
+            # ``aclose()`` raises GeneratorExit at the yield): the response and
+            # its socket are closed here, so an abandoned derive stops
+            # spending tokens upstream the moment the client goes away.
+            await cm.__aexit__(None, None, None)
+        if not stopped:
+            # The connection ended before ``message_stop``: the frames so far
+            # are a partial answer, which no caller may persist as complete.
+            raise LLMUpstreamUnavailableError()
+
+        def _pick(key: str) -> int:
+            value = _int(delta_usage.get(key))
+            return value if value else _int(start_usage.get(key))
+
+        usage = MessagesUsage(
+            input_tokens=_pick("input_tokens"),
+            output_tokens=_int(delta_usage.get("output_tokens")),
+            cache_read_input_tokens=_pick("cache_read_input_tokens"),
+            cache_creation_input_tokens=_pick("cache_creation_input_tokens"),
+            reported=delta_usage or None,
         )
-        yield  # type: ignore[unreachable]  # pragma: no cover - async-generator marker
+        yield StreamFinal(
+            message=MessagesResponse(
+                content=[ContentBlock(type="text", text="".join(text_parts))],
+                stop_reason=stop_reason,
+                usage=usage,
+                provider=provider,
+            )
+        )
