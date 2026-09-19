@@ -12,7 +12,7 @@ is spawned as a DETACHED loop task — these tests assert both halves:
   and upsert the fit score — marking the target ``error`` on failure.
 
 #57 PR-G2b: ``from_input`` runs on the pooled async service client. Its crud
-reads/writes are module-inline async helpers (``_create_and_link`` / ``_update`` /
+reads/writes are module-inline async helpers (``create_and_link`` / ``_update`` /
 ``_link`` / ``_get`` / ``_add_reference_jd`` / ``_list_reference_jds`` /
 ``_count_user_reference_jds``), the cost ledger is ``cost_log.record_async``,
 the #191 merge is ``apply_profile_merge_rpc_async``, and the deferred work is
@@ -332,9 +332,9 @@ async def test_from_manual_matched_links_inline_defers_fit_score(
 
     async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
         create_calls.append(payload)
-        return matched, _user_target(target_id=matched.id)
+        return matched, _user_target(target_id=matched.id), True
 
-    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+    monkeypatch.setattr(from_input, "create_and_link", fake_create_and_link)
 
     result = await from_input.from_manual(
         supabase,
@@ -390,9 +390,9 @@ async def test_from_manual_new_creates_deriving_and_schedules_derivation(
         target = created.model_copy(
             update={"activation_status": activation_status or created.activation_status}
         )
-        return target, _user_target(target_id=target.id)
+        return target, _user_target(target_id=target.id), True
 
-    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+    monkeypatch.setattr(from_input, "create_and_link", fake_create_and_link)
 
     result = await from_input.from_manual(
         supabase,
@@ -610,9 +610,9 @@ async def test_from_suggestion_new_creates_without_normalize_call(
         target = created.model_copy(
             update={"activation_status": activation_status or created.activation_status}
         )
-        return target, _user_target(target_id=target.id)
+        return target, _user_target(target_id=target.id), True
 
-    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+    monkeypatch.setattr(from_input, "create_and_link", fake_create_and_link)
 
     result = await from_input.from_suggestion(
         supabase,
@@ -652,7 +652,7 @@ async def test_from_suggestion_matched_dedups_to_existing_row(
     matched = _target(id="existing")
     monkeypatch.setattr(from_input, "find_matching_target", AsyncMock(return_value=matched))
     create_spy = AsyncMock()
-    monkeypatch.setattr(from_input, "_create_and_link", create_spy)
+    monkeypatch.setattr(from_input, "create_and_link", create_spy)
 
     result = await from_input.from_suggestion(
         supabase,
@@ -806,9 +806,9 @@ async def test_from_url_new_creates_deriving_and_schedules(
         target = created.model_copy(
             update={"activation_status": activation_status or created.activation_status}
         )
-        return target, _user_target(target_id=target.id)
+        return target, _user_target(target_id=target.id), True
 
-    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+    monkeypatch.setattr(from_input, "create_and_link", fake_create_and_link)
 
     result = await from_input.from_url(
         supabase,
@@ -865,9 +865,9 @@ async def test_from_url_label_resolution(
 
     async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
         target = _target(id="new", label=expected)
-        return target, _user_target(target_id=target.id)
+        return target, _user_target(target_id=target.id), True
 
-    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+    monkeypatch.setattr(from_input, "create_and_link", fake_create_and_link)
 
     await from_input.from_url(
         supabase,
@@ -1205,9 +1205,9 @@ async def test_from_url_matches_on_the_canonical_label_not_the_raw_title(
     async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
         created_labels.append(payload.label)
         target = _target(id="new", label=payload.label)
-        return target, _user_target(target_id=target.id)
+        return target, _user_target(target_id=target.id), True
 
-    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+    monkeypatch.setattr(from_input, "create_and_link", fake_create_and_link)
 
     await from_input.from_url(
         MagicMock(),
@@ -1254,7 +1254,7 @@ async def test_from_url_links_an_existing_target_when_canonicalization_collides(
     async def _no_create(*_a, **_k):  # type: ignore[no-untyped-def]
         raise AssertionError("must link the existing target, not mint a new row")
 
-    monkeypatch.setattr(from_input, "_create_and_link", _no_create)
+    monkeypatch.setattr(from_input, "create_and_link", _no_create)
 
     result = await from_input.from_url(
         MagicMock(),
@@ -1324,7 +1324,7 @@ async def test_from_url_propagates_every_normalizer_failure_before_matching_or_c
     )
     monkeypatch.setattr(
         from_input,
-        "_create_and_link",
+        "create_and_link",
         AsyncMock(side_effect=AssertionError("must not create on a failed normalization")),
     )
 
@@ -1375,9 +1375,9 @@ async def test_from_url_uses_the_stripped_canonical_label_and_never_the_raw_titl
     async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
         created.append(payload.label)
         target = _target(id="new", label=payload.label)
-        return target, _user_target(target_id=target.id)
+        return target, _user_target(target_id=target.id), True
 
-    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+    monkeypatch.setattr(from_input, "create_and_link", fake_create_and_link)
 
     await from_input.from_url(
         MagicMock(),
@@ -1425,9 +1425,9 @@ async def test_from_url_normalizes_the_untitled_placeholder_for_a_missing_title(
 
     async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
         target = _target(id="new", label=payload.label)
-        return target, _user_target(target_id=target.id)
+        return target, _user_target(target_id=target.id), True
 
-    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+    monkeypatch.setattr(from_input, "create_and_link", fake_create_and_link)
 
     await from_input.from_url(
         MagicMock(),
@@ -1463,9 +1463,9 @@ async def test_from_url_records_the_canonicalization_cost(
 
     async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
         target = _target(id="new", label=payload.label)
-        return target, _user_target(target_id=target.id)
+        return target, _user_target(target_id=target.id), True
 
-    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+    monkeypatch.setattr(from_input, "create_and_link", fake_create_and_link)
 
     await from_input.from_url(
         MagicMock(),
@@ -1514,9 +1514,9 @@ async def test_from_url_survives_a_cost_ledger_failure(
 
     async def fake_create_and_link(_s, *, user_id, payload, activation_status=None):  # type: ignore[no-untyped-def]
         target = _target(id="new", label=payload.label)
-        return target, _user_target(target_id=target.id)
+        return target, _user_target(target_id=target.id), True
 
-    monkeypatch.setattr(from_input, "_create_and_link", fake_create_and_link)
+    monkeypatch.setattr(from_input, "create_and_link", fake_create_and_link)
 
     result = await from_input.from_url(
         MagicMock(),
@@ -1566,3 +1566,52 @@ async def test_apply_fit_score_logs_when_there_is_no_payload_at_all(
     assert stub_crud.by_name("link") == []  # nothing written
     messages = [r.getMessage() for r in caplog.records]
     assert any("t-unscored" in m for m in messages), messages
+
+
+# ---- #1084 review: an active create must carry a limit -----------------------
+
+
+@pytest.mark.asyncio
+async def test_create_and_link_active_without_a_limit_is_refused_before_any_call() -> None:
+    """The database refuses the shape too (PT400 LIMIT_REQUIRED); refusing here
+    keeps the uncapped active create inexpressible from application code."""
+    supabase = MagicMock()
+    supabase.rpc.return_value.execute = AsyncMock()
+
+    with pytest.raises(ValueError, match="active_limit is required"):
+        await from_input.create_and_link(
+            supabase,
+            user_id="u-1",
+            payload=TargetCreate(label="Product Manager"),
+            is_active=True,
+        )
+
+    supabase.rpc.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_and_link_active_sends_both_the_flag_and_the_limit() -> None:
+    supabase = MagicMock()
+    supabase.rpc.return_value.execute = AsyncMock(
+        return_value=MagicMock(
+            data={
+                "target": _target().model_dump(mode="json"),
+                "user_target": _user_target(target_id="t-1").model_dump(mode="json"),
+                "was_created": True,
+            }
+        )
+    )
+
+    target, link, was_created = await from_input.create_and_link(
+        supabase,
+        user_id="u-1",
+        payload=TargetCreate(label="Product Manager"),
+        is_active=True,
+        active_limit=2,
+    )
+
+    _, params = supabase.rpc.call_args.args
+    assert params["p_is_active"] is True
+    assert params["p_active_limit"] == 2
+    assert was_created is True
+    assert link.target_id == "t-1"

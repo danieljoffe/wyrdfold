@@ -715,11 +715,13 @@ def test_dev_default_normalize_posting_title_respects_the_length_cap() -> None:
     ],
 )
 def test_normalized_title_rejects_malformed_llm_output(payload: str) -> None:
-    """The schema is the guard the ``from_url`` fallback depends on.
+    """The schema is the guard the catalog identity depends on.
 
-    Every one of these must raise rather than yield a label, so the non-fatal
-    wrapper in ``from_input._canonical_url_label`` degrades to the raw posting
-    title instead of writing junk into the catalog.
+    Every one of these must raise rather than yield a label. Since #1066 the
+    failure propagates out of ``from_input.canonical_posting_label`` as
+    ``LLMMalformedOutputError`` (no raw-title fallback exists any more), so
+    junk never becomes ``targets.normalized_label`` on either the from-url or
+    the from-posting path (#1071).
     """
     from app.services.targets.normalize_posting_title import NormalizedTitle
 

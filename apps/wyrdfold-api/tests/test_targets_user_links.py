@@ -386,72 +386,62 @@ class TestActiveLimitPickerPayload:
 
 
 class TestActivateWithSwap:
-    """`POST /targets/{id}/activate` with `deactivate_target_id`.
+    """``_activate_link_with_optional_swap``: one database transaction (#1080 review).
 
-    The active-target cap (1 free / 2 starter / 5 pro) otherwise makes
-    activation a dead end once a user is at their limit. The swap frees a slot
-    they choose and takes it in ONE request, so the window where neither target
-    is active is server-side rather than spanning two client calls.
+    The swap used to be three writes (deactivate, activate, restore on
+    failure) and the restore ran uncapped, so a concurrent activation between
+    the first two could leave the user over the cap. Now the helper makes ONE
+    call to the activation path with ``swap_out`` set; the database function
+    deactivates, counts and activates under one lock, and a rejection unwinds
+    the deactivation with it. These tests pin that there is exactly one write
+    call and no restore logic left in the router.
     """
 
     @staticmethod
-    def _spy() -> tuple[Any, list[tuple[str, bool]]]:
-        """Records every is_active flip, in order."""
-        flips: list[tuple[str, bool]] = []
-
-        async def set_active(_sb: Any, *, user_id: str, target_id: str, active: bool) -> None:
-            flips.append((target_id, active))
-
-        return set_active, flips
+    def _choices(*ids: str) -> AsyncMock:
+        return AsyncMock(return_value=[{"id": i, "label": i.title()} for i in ids])
 
     @pytest.mark.asyncio
-    async def test_deactivates_the_chosen_target_before_activating(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Order is load-bearing: the cap counts ACTIVE links, so activating
-        first would just hit the same 409 the swap exists to get past."""
+    async def test_swap_is_one_call_with_both_ids(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from app.routers import targets as mod
 
-        set_active, flips = self._spy()
-        monkeypatch.setattr(mod, "_set_link_active", set_active)
-        monkeypatch.setattr(
-            mod,
-            "_active_target_choices",
-            AsyncMock(return_value=[{"id": "old", "label": "Old"}]),
-        )
-        linked = AsyncMock()
-        monkeypatch.setattr(mod, "_link_user_to_target_async", linked)
+        monkeypatch.setattr(mod, "_active_target_choices", self._choices("old"))
+        activate = AsyncMock()
+        monkeypatch.setattr(mod, "_activate_user_target_async", activate)
 
         await mod._activate_link_with_optional_swap(
             MagicMock(), user_id="u1", target_id="new", swap_out="old"
         )
 
-        assert flips == [("old", False)]
-        linked.assert_awaited_once()
-        assert linked.await_args.kwargs["target_id"] == "new"
+        activate.assert_awaited_once()
+        assert activate.await_args.kwargs["target_id"] == "new"
+        assert activate.await_args.kwargs["swap_out"] == "old"
 
     @pytest.mark.asyncio
-    async def test_restores_the_swapped_out_target_when_activation_fails(
+    async def test_plain_activation_passes_no_swap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.routers import targets as mod
+
+        activate = AsyncMock()
+        monkeypatch.setattr(mod, "_activate_user_target_async", activate)
+
+        await mod._activate_link_with_optional_swap(
+            MagicMock(), user_id="u1", target_id="new", swap_out=None
+        )
+
+        assert activate.await_args.kwargs["swap_out"] is None
+
+    @pytest.mark.asyncio
+    async def test_cap_rejection_is_a_409_with_the_swap_picker_and_no_restore(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The failure that matters. Without the rollback a failed swap leaves
-        the user with FEWER active targets than they started with — worse than
-        the refusal they were trying to get past."""
+        """The database unwound the deactivation; the router has nothing to
+        put back, so the only write is the one rejected call."""
         from app.routers import targets as mod
         from app.services.targets import crud
 
-        set_active, flips = self._spy()
-        monkeypatch.setattr(mod, "_set_link_active", set_active)
-        monkeypatch.setattr(
-            mod,
-            "_active_target_choices",
-            AsyncMock(return_value=[{"id": "old", "label": "Old"}]),
-        )
-        monkeypatch.setattr(
-            mod,
-            "_link_user_to_target_async",
-            AsyncMock(side_effect=crud.ActiveTargetLimitError(current_count=1, limit=1)),
-        )
+        monkeypatch.setattr(mod, "_active_target_choices", self._choices("old"))
+        activate = AsyncMock(side_effect=crud.ActiveTargetLimitError(current_count=1, limit=1))
+        monkeypatch.setattr(mod, "_activate_user_target_async", activate)
 
         with pytest.raises(HTTPException) as caught:
             await mod._activate_link_with_optional_swap(
@@ -459,101 +449,61 @@ class TestActivateWithSwap:
             )
 
         assert caught.value.status_code == 409
-        # Deactivated, then put back.
-        assert flips == [("old", False), ("old", True)]
+        assert caught.value.detail["active_targets"] == [{"id": "old", "label": "Old"}]
+        activate.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_rolls_back_on_an_unexpected_error_too(
+    async def test_swapping_out_a_target_that_is_not_active_is_a_400_before_any_write(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Not just the cap — any failure past the deactivation must restore
-        it, or a transient DB blip silently costs the user their active target."""
         from app.routers import targets as mod
 
-        set_active, flips = self._spy()
-        monkeypatch.setattr(mod, "_set_link_active", set_active)
-        monkeypatch.setattr(
-            mod,
-            "_active_target_choices",
-            AsyncMock(return_value=[{"id": "old", "label": "Old"}]),
-        )
-        monkeypatch.setattr(
-            mod, "_link_user_to_target_async", AsyncMock(side_effect=RuntimeError("boom"))
-        )
-
-        with pytest.raises(RuntimeError):
-            await mod._activate_link_with_optional_swap(
-                MagicMock(), user_id="u1", target_id="new", swap_out="old"
-            )
-        assert flips == [("old", False), ("old", True)]
-
-    @pytest.mark.asyncio
-    async def test_refuses_to_deactivate_a_target_that_is_not_active(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Otherwise activating one target is a way to deactivate ANY target
-        by id — a write the caller never asked for."""
-        from app.routers import targets as mod
-
-        set_active, flips = self._spy()
-        monkeypatch.setattr(mod, "_set_link_active", set_active)
-        monkeypatch.setattr(
-            mod,
-            "_active_target_choices",
-            AsyncMock(return_value=[{"id": "actually-active", "label": "A"}]),
-        )
-        linked = AsyncMock()
-        monkeypatch.setattr(mod, "_link_user_to_target_async", linked)
+        monkeypatch.setattr(mod, "_active_target_choices", self._choices("other"))
+        activate = AsyncMock()
+        monkeypatch.setattr(mod, "_activate_user_target_async", activate)
 
         with pytest.raises(HTTPException) as caught:
             await mod._activate_link_with_optional_swap(
-                MagicMock(), user_id="u1", target_id="new", swap_out="someone-elses"
+                MagicMock(), user_id="u1", target_id="new", swap_out="old"
             )
 
         assert caught.value.status_code == 400
-        assert flips == []  # nothing was touched
-        linked.assert_not_awaited()
+        assert caught.value.detail == "That target is not currently active."
+        activate.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_refuses_to_swap_a_target_against_itself(
+    async def test_swapping_a_target_for_itself_is_a_400_before_any_write(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from app.routers import targets as mod
 
-        set_active, flips = self._spy()
-        monkeypatch.setattr(mod, "_set_link_active", set_active)
-        linked = AsyncMock()
-        monkeypatch.setattr(mod, "_link_user_to_target_async", linked)
+        activate = AsyncMock()
+        monkeypatch.setattr(mod, "_activate_user_target_async", activate)
 
         with pytest.raises(HTTPException) as caught:
             await mod._activate_link_with_optional_swap(
                 MagicMock(), user_id="u1", target_id="same", swap_out="same"
             )
+
         assert caught.value.status_code == 400
-        assert flips == []
-        linked.assert_not_awaited()
+        activate.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_without_a_swap_it_behaves_exactly_as_before(
+    async def test_unexpected_errors_propagate_with_no_restore_attempt(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The body is optional; every existing caller passes nothing."""
         from app.routers import targets as mod
 
-        set_active, flips = self._spy()
-        monkeypatch.setattr(mod, "_set_link_active", set_active)
-        linked = AsyncMock()
-        monkeypatch.setattr(mod, "_link_user_to_target_async", linked)
+        monkeypatch.setattr(mod, "_active_target_choices", self._choices("old"))
+        activate = AsyncMock(side_effect=RuntimeError("db blip"))
+        monkeypatch.setattr(mod, "_activate_user_target_async", activate)
 
-        await mod._activate_link_with_optional_swap(
-            MagicMock(), user_id="u1", target_id="new", swap_out=None
-        )
+        with pytest.raises(RuntimeError, match="db blip"):
+            await mod._activate_link_with_optional_swap(
+                MagicMock(), user_id="u1", target_id="new", swap_out="old"
+            )
 
-        assert flips == []  # no deactivation at all
-        linked.assert_awaited_once()
-
-
-# ---- the cap is checked BEFORE the fit score is billed (#865) ---------------
+        activate.assert_awaited_once()
 
 
 async def test_link_route_refuses_at_cap_without_deriving_a_fit_score() -> None:
