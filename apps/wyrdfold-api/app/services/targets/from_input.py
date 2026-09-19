@@ -178,9 +178,10 @@ async def create_and_link(
     """Find-or-create a target and link the caller to it, ATOMICALLY (#667).
 
     ``is_active=True`` links ACTIVE and enforces the caller's active-target cap
-    (``active_limit``, plan-derived and resolved by the caller) inside the same
-    transaction, raising ``crud.ActiveTargetLimitError`` and leaving no target
-    row behind on rejection (#1071). The third element, ``was_created``, is
+    (``active_limit``, plan-derived and resolved by the caller, and REQUIRED
+    whenever ``is_active`` is set) inside the same transaction, raising
+    ``crud.ActiveTargetLimitError`` and leaving no target row behind on
+    rejection (#1071). The third element, ``was_created``, is
     insert vs conflict: a caller that lost the exact-key race to a concurrent
     request gets ``False`` and must treat the row as shared, never as its own
     to derive over.
@@ -199,6 +200,11 @@ async def create_and_link(
     Semantics are unchanged — see the RPC's own comment for how the
     find-or-create idempotence and the activation-status update are preserved.
     """
+    if is_active and active_limit is None:
+        # The database function refuses this shape too (PT400 LIMIT_REQUIRED,
+        # before any write); refusing here as well keeps the unsafe call
+        # inexpressible from application code (#1084 review).
+        raise ValueError("create_and_link: active_limit is required when is_active=True")
     params: dict[str, Any] = {
         "p_user_id": user_id,
         "p_label": payload.label,
