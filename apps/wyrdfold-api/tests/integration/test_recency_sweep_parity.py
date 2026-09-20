@@ -171,7 +171,7 @@ async def test_sweep_matches_python_and_respects_scope(
     # whatever their uuids are.
     monkeypatch.setattr(recency_mod, "_SWEEP_BATCH_SIZE", 3)
 
-    written = await refresh_all_recency_scores(async_service_client)
+    written = (await refresh_all_recency_scores(async_service_client)).written
     assert written > 0
 
     corpus, jobs = _corpus, _corpus["jobs"]
@@ -196,7 +196,7 @@ async def test_sweep_matches_python_and_respects_scope(
     # FROM`` arm is what stops the nightly rewrite-everything churn (#604).
     # ``written`` is the observable: values alone can't tell "skipped" from
     # "rewrote the same number".
-    assert await refresh_all_recency_scores(async_service_client) == 0
+    assert (await refresh_all_recency_scores(async_service_client)).written == 0
 
 
 async def test_sweep_flag_off_is_the_identity(
@@ -219,7 +219,7 @@ async def test_sweep_flag_off_is_the_identity(
     ).eq("target_id", corpus["target_id"]).execute()
     assert _stored(service_client, jobs["mid-decay"]["id"], corpus["target_id"]) == 63
 
-    written = await refresh_all_recency_scores(async_service_client)
+    written = (await refresh_all_recency_scores(async_service_client)).written
 
     assert written >= 1  # at least the staled row was repaired
     for key, score, _age, archived in corpus["spec"]:

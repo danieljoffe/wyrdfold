@@ -18,6 +18,7 @@ from app.scheduler import (
     build_scheduler,
     start_scheduler_if_enabled,
 )
+from app.services.recency import SweepReport
 from app.services.source_discovery import run_discovery_all_targets_locked
 
 
@@ -514,7 +515,7 @@ async def test_run_scheduled_recency_refresh_invokes_sweep_and_invalidates_cache
         patch("app.scheduler.refresh_all_recency_scores", autospec=True) as mock_sweep,
         patch("app.scheduler.job_list_cache") as mock_cache,
     ):
-        mock_sweep.return_value = 12
+        mock_sweep.return_value = SweepReport(written=12, batches=2, exhausted=True)
         await _run_scheduled_recency_refresh()
 
     mock_sweep.assert_called_once_with(fake_client)
@@ -527,7 +528,10 @@ async def test_run_scheduled_recency_refresh_skips_cache_invalidate_when_nothing
 
     with (
         patch("app.scheduler.get_async_supabase", return_value=object()),
-        patch("app.scheduler.refresh_all_recency_scores", return_value=0),
+        patch(
+            "app.scheduler.refresh_all_recency_scores",
+            return_value=SweepReport(written=0, batches=1, exhausted=True),
+        ),
         patch("app.scheduler.job_list_cache") as mock_cache,
     ):
         await _run_scheduled_recency_refresh()
@@ -1081,3 +1085,67 @@ class TestLedgerHelpers:
         monkeypatch.setattr("app.scheduler.get_async_supabase", lambda: None)
 
         assert await _last_scheduler_run("retention_purge") is None
+
+
+# ---- #1088: an incomplete sweep must be loud -------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_incomplete_recency_sweep_logs_at_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The defect this fixes: a sweep that died on its first batch was logged
+    at INFO as "rewrote 0 score rows", indistinguishable from a quiet night.
+    Downgrading this line to INFO must turn the test red."""
+    from app.scheduler import _run_scheduled_recency_refresh
+
+    with (
+        patch("app.scheduler.get_async_supabase", return_value=object()),
+        patch(
+            "app.scheduler.refresh_all_recency_scores",
+            return_value=SweepReport(
+                written=0,
+                batches=0,
+                exhausted=False,
+                failed_with="APIError",
+                timed_out=True,
+                last_cursor="00000000-0000-0000-0000-000000000000",
+            ),
+        ),
+        patch("app.scheduler.job_list_cache"),
+        caplog.at_level(logging.INFO, logger="app.scheduler"),
+    ):
+        await _run_scheduled_recency_refresh()
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "an incomplete sweep must log at ERROR, not INFO"
+    message = errors[0].getMessage()
+    assert "INCOMPLETE" in message
+    assert "statement_timeout=True" in message
+    # And it must NOT also claim success.
+    assert not [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO and "rewrote 0 score rows across" in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_completed_recency_sweep_still_logs_at_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from app.scheduler import _run_scheduled_recency_refresh
+
+    with (
+        patch("app.scheduler.get_async_supabase", return_value=object()),
+        patch(
+            "app.scheduler.refresh_all_recency_scores",
+            return_value=SweepReport(written=7, batches=3, exhausted=True),
+        ),
+        patch("app.scheduler.job_list_cache"),
+        caplog.at_level(logging.INFO, logger="app.scheduler"),
+    ):
+        await _run_scheduled_recency_refresh()
+
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("rewrote 7 score rows across 3 batch(es)" in r.getMessage() for r in caplog.records)
