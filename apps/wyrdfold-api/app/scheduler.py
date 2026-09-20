@@ -383,12 +383,33 @@ async def _run_scheduled_recency_refresh() -> None:
             )
             return
         await _record_scheduler_run("recency_refresh")
-        written = await refresh_all_recency_scores(client)
-        if written > 0:
+        report = await refresh_all_recency_scores(client)
+        if report.written > 0:
             # Cached list pages were sorted by the previous recency_score;
             # drop them so the refreshed ordering surfaces on next load.
             job_list_cache.invalidate()
-        logger.info("scheduled recency refresh: rewrote %d score rows", written)
+        if report.ok:
+            logger.info(
+                "scheduled recency refresh: rewrote %d score rows across %d batch(es)",
+                report.written,
+                report.batches,
+            )
+        else:
+            # A sweep that did not reach the end of the id range is a FAILURE,
+            # not a quiet night. Reporting both as INFO "rewrote 0 score rows"
+            # is how a sweep that had never once completed stayed invisible
+            # for weeks (#1088).
+            logger.error(
+                "scheduled recency refresh INCOMPLETE: rewrote %d score rows across "
+                "%d batch(es) before stopping (failed_with=%s statement_timeout=%s "
+                "cursor=%s) — the freshness sort key is now stale for rows the "
+                "poller does not re-touch",
+                report.written,
+                report.batches,
+                report.failed_with,
+                report.timed_out,
+                report.last_cursor,
+            )
     except Exception:
         logger.exception("scheduled recency refresh raised")
 
