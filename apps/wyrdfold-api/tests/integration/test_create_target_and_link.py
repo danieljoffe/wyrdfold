@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -628,3 +628,110 @@ def test_active_create_without_a_limit_is_refused_before_any_write(
     assert _rows_for(service_client, label.strip().lower()) == []
     assert _active_count(service_client, uid) == 0
     assert service_client.table("user_targets").select("id").eq("user_id", uid).execute().data == []
+
+
+# --- #1083: only the API's service role may call the membership functions ---
+
+
+_MEMBERSHIP_FUNCTIONS = (
+    "create_target_and_link",
+    "activate_user_target",
+    "swap_user_target_active",
+)
+
+
+def _membership_call(
+    client: Client, fn_name: str, *, user_id: str, held_id: str, other_id: str, label: str
+) -> dict[str, Any]:
+    """One call per function, shaped so that a caller who IS let in would grow
+    the user's active set past a cap of one: activate the second target, swap
+    the held one for it, or create-and-activate a new one, each at a cap of 999
+    (the number the release-gate check used on staging)."""
+    if fn_name == "create_target_and_link":
+        return _call(client, user_id=user_id, label=label, is_active=True, active_limit=999)
+    if fn_name == "activate_user_target":
+        return _activate(client, user_id=user_id, target_id=other_id, active_limit=999)
+    return _swap(client, user_id=user_id, swap_out=held_id, target_id=other_id, active_limit=999)
+
+
+def _memberships(client: Client, user_id: str) -> set[tuple[str, bool]]:
+    rows = (
+        client.table("user_targets")
+        .select("target_id, is_active")
+        .eq("user_id", user_id)
+        .execute()
+        .data
+    )
+    return {(r["target_id"], r["is_active"]) for r in rows}
+
+
+@pytest.mark.parametrize("caller", ["own_jwt", "anon"])
+@pytest.mark.parametrize("fn_name", _MEMBERSHIP_FUNCTIONS)
+def test_only_the_service_role_may_execute_the_membership_functions(
+    service_client: Client,
+    two_seeded_users: tuple[str, str],
+    cleanup_targets: list[str],
+    user_client_factory: Callable[[str], Client],
+    anon_client: Client,
+    fn_name: str,
+    caller: str,
+) -> None:
+    """#1083: the plan cap is a number the API passes in, so a user calling
+    these functions with their own login token could pass any cap and hold
+    more active targets than their plan allows. EXECUTE is now revoked from
+    anon and authenticated; only the service role may call them.
+
+    The refusal must be the FUNCTION privilege (42501 "permission denied for
+    function ..."), not row-level security on a table further in: before the
+    revoke, create_target_and_link was already refused, but by the targets
+    insert policy, while activate_user_target went straight through."""
+    uid, _ = two_seeded_users
+    held = _call(service_client, user_id=uid, label=f"Held {uuid.uuid4()}")
+    other = _call(service_client, user_id=uid, label=f"Other {uuid.uuid4()}")
+    held_id, other_id = held["target"]["id"], other["target"]["id"]
+    cleanup_targets += [held_id, other_id]
+    _activate(service_client, user_id=uid, target_id=held_id, active_limit=1)
+    before = _memberships(service_client, uid)
+    assert before == {(held_id, True), (other_id, False)}
+    label = f"Bypass {uuid.uuid4()}"
+
+    client = user_client_factory(uid) if caller == "own_jwt" else anon_client
+    with pytest.raises(APIError) as exc:
+        _membership_call(
+            client, fn_name, user_id=uid, held_id=held_id, other_id=other_id, label=label
+        )
+
+    assert exc.value.code == "42501"
+    assert f"permission denied for function {fn_name}" in exc.value.message
+    # Nothing was written: the active set is untouched and no target was minted.
+    assert _memberships(service_client, uid) == before
+    assert _rows_for(service_client, label.strip().lower()) == []
+
+
+def test_the_service_role_still_executes_every_membership_function(
+    service_client: Client, two_seeded_users: tuple[str, str], cleanup_targets: list[str]
+) -> None:
+    """The revoke must not reach the API's own role: the same three calls, made
+    as the service role, keep working. swap calls activate internally, so this
+    also proves the inner call survives under SECURITY INVOKER."""
+    uid, _ = two_seeded_users
+    held = _call(service_client, user_id=uid, label=f"SvcHeld {uuid.uuid4()}")
+    other = _call(service_client, user_id=uid, label=f"SvcOther {uuid.uuid4()}")
+    held_id, other_id = held["target"]["id"], other["target"]["id"]
+    cleanup_targets += [held_id, other_id]
+
+    activated = _activate(service_client, user_id=uid, target_id=held_id, active_limit=1)
+    assert activated["is_active"] is True
+    swapped = _swap(
+        service_client, user_id=uid, swap_out=held_id, target_id=other_id, active_limit=1
+    )
+    assert swapped["target_id"] == other_id and swapped["is_active"] is True
+    label = f"SvcNew {uuid.uuid4()}"
+    created = _call(service_client, user_id=uid, label=label, is_active=True, active_limit=2)
+    cleanup_targets.append(created["target"]["id"])
+    assert created["was_created"] is True and created["user_target"]["is_active"] is True
+    assert _memberships(service_client, uid) == {
+        (held_id, False),
+        (other_id, True),
+        (created["target"]["id"], True),
+    }

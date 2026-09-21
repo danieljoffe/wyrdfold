@@ -28,6 +28,7 @@ flipping the flag on is a pure sort change with no backfill gap.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -35,6 +36,7 @@ from supabase import AsyncClient
 
 from app.config import settings
 from app.services.db_write import poll_db_read, poll_db_write
+from app.services.supabase_retry import is_statement_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +61,26 @@ _RECENCY_READ_CHUNK_SIZE = 150
 
 # Batch size for the set-based sweep RPC (#604): bounds each UPDATE's
 # transaction/lock window, nothing else — the response is a single summary
-# row regardless. 10k keeps a batch in the low hundreds of ms on the prod
-# instance while finishing the full corpus in a few dozen calls.
-_SWEEP_BATCH_SIZE = 10_000
+# row regardless.
+#
+# In plain terms: this number is how much work one call asks the database to
+# do, and it was set five times too high. Every scheduled sweep since 2026-09-04
+# asked for 10,000 and was killed by the database's 8-second statement timeout
+# before finishing even its first batch, so the sweep never ran at all (#1088).
+#
+# 500 is measured, not guessed. Against the production corpus (~60,758 live
+# score rows): warm, a batch of 500 runs in 1.1-1.8s and a batch of 2,000 in
+# 2.9s; cold — which is the real condition, since this runs twice a day and
+# nothing else keeps these pages resident — a batch of 200 already costs 3.2s
+# and batches of 1,000-3,000 land at 7.4-7.9s, i.e. at the ceiling. 10,000
+# extrapolates to roughly 14s. 500 leaves room for the cold case and still
+# finishes the corpus in ~122 calls, a couple of minutes twice a day.
+#
+# The earlier note here claimed 10k kept a batch "in the low hundreds of ms".
+# That was measured when far more of the catalog was live; the live share has
+# since fallen to about a ninth of the table, so each batch walks many more
+# rows to find its quota. Re-measure before changing this number.
+_SWEEP_BATCH_SIZE = 500
 
 # Keyset start for the sweep's uuid cursor.
 _SWEEP_CURSOR_START = "00000000-0000-0000-0000-000000000000"
@@ -217,7 +236,37 @@ async def refresh_recency_scores_poll(supabase: AsyncClient, job_posting_ids: li
     return written
 
 
-async def refresh_all_recency_scores(supabase: AsyncClient) -> int:
+@dataclass(frozen=True)
+class SweepReport:
+    """What one recency sweep actually did — success and failure are different values.
+
+    In plain terms: the sweep used to answer with a single number, so "the
+    sweep failed on its first batch" and "there was nothing to update" both
+    came back as 0 and the scheduler logged both as a normal quiet night. That
+    is how a sweep that had never once completed went unnoticed (#1088). The
+    caller now gets the outcome as well as the count, and logs accordingly.
+    """
+
+    written: int = 0
+    batches: int = 0
+    #: True only when the loop walked the id range to its end.
+    exhausted: bool = False
+    #: Exception class name of the batch that ended the sweep early, if any.
+    failed_with: str | None = None
+    #: The failure was Postgres 57014, i.e. the batch exceeded the statement
+    #: timeout. Recorded separately because it is the one failure that says
+    #: "the batch is too big", which is what sizing the fix needs (#1088).
+    timed_out: bool = False
+    #: Cursor the sweep died on, so the next investigation starts there.
+    last_cursor: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """The sweep reached the end of the id range without a failed batch."""
+        return self.exhausted and self.failed_with is None
+
+
+async def refresh_all_recency_scores(supabase: AsyncClient) -> SweepReport:
     """Rewrite ``recency_score`` for every live (non-excluded) scores row from
     the current date — set-based, in the database (#604).
 
@@ -242,12 +291,21 @@ async def refresh_all_recency_scores(supabase: AsyncClient) -> int:
 
     Idempotent and safe to run on a schedule; a failed batch is logged and
     ends the sweep early (partial progress is kept — the next tick finishes
-    the rest). Returns the number of rows whose stored value actually
-    CHANGED — the no-op writes the old walk counted are no longer performed,
-    so the scheduler's cache invalidation only fires when ordering moved.
+    the rest). Returns a :class:`SweepReport`: ``written`` counts rows whose
+    stored value actually CHANGED (the no-op writes the old walk counted are
+    no longer performed, so the scheduler's cache invalidation only fires
+    when ordering moved), and ``ok`` says whether the sweep reached the end
+    of the id range at all. Those are different questions and used to share
+    one return value (#1088).
+
+    NOTE: the cursor is still loop-local, so a sweep that dies part-way
+    re-walks from the start on the next tick. That is deliberate here — the
+    fix for it needs the batch-size measurement tracked in #1088, and this
+    change is the no-risk half: make the failure impossible to miss.
     """
     enabled = settings.recency_decay_enabled
     written = 0
+    batches = 0
     cursor = _SWEEP_CURSOR_START
     while True:
         try:
@@ -262,13 +320,34 @@ async def refresh_all_recency_scores(supabase: AsyncClient) -> int:
                     "p_floor": RECENCY_FLOOR,
                 },
             ).execute()
-        except Exception:
-            logger.exception("refresh_all_recency_scores: sweep batch failed")
-            break
+        except Exception as exc:
+            # Classify rather than swallow. A 57014 means "this batch is too
+            # big for the statement timeout" — a sizing problem — and it is
+            # the failure production actually hits (#1088). Anything else is
+            # reported as itself. Either way the sweep ends here and the
+            # caller is told it did NOT finish.
+            timed_out = is_statement_timeout(exc)
+            logger.exception(
+                "refresh_all_recency_scores: sweep batch failed after %d batch(es) "
+                "(cursor=%s batch_size=%d statement_timeout=%s) — sweep INCOMPLETE",
+                batches,
+                cursor,
+                _SWEEP_BATCH_SIZE,
+                timed_out,
+            )
+            return SweepReport(
+                written=written,
+                batches=batches,
+                exhausted=False,
+                failed_with=type(exc).__name__,
+                timed_out=timed_out,
+                last_cursor=cursor,
+            )
         rows = cast(list[dict[str, Any]], resp.data or [])
         if not rows:
-            break
+            return SweepReport(written=written, batches=batches, exhausted=True, last_cursor=cursor)
         batch = rows[0]
+        batches += 1
         written += int(batch.get("written") or 0)
         scanned = int(batch.get("scanned") or 0)
         last_id = batch.get("last_id")
@@ -276,6 +355,5 @@ async def refresh_all_recency_scores(supabase: AsyncClient) -> int:
         # batch means the id range is exhausted, not that dead rows thinned
         # this page.
         if scanned < _SWEEP_BATCH_SIZE or not last_id:
-            break
+            return SweepReport(written=written, batches=batches, exhausted=True, last_cursor=cursor)
         cursor = str(last_id)
-    return written

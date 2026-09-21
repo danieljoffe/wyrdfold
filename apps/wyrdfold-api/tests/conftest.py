@@ -186,3 +186,30 @@ def _reset_spend_memo():
     _poller_mod._spend_memo.update(at=0.0, midnight=None, value=0.0)
     yield
     _poller_mod._spend_memo.update(at=0.0, midnight=None, value=0.0)
+
+
+@pytest.fixture(autouse=True)
+def _restore_dependency_overrides():
+    """Every test hands ``app.dependency_overrides`` back exactly as it found it.
+
+    In plain terms: many endpoint tests swap the app's dependencies (the
+    database client, the signed-in user, the budget gate, the LLM client) by
+    writing into one process-global map, and most of them clean up once per
+    module rather than once per test. A test that forgot, or that failed
+    before its cleanup line, left its stand-ins in place for every test that
+    ran afterwards: those later tests could pass against the wrong database
+    client or a bypassed auth check without exercising their own dependencies
+    at all (the #1076 review). This fixture snapshots the map before each test
+    and restores it afterwards, so a leak can no longer cross a test boundary.
+    Module-scoped fixtures that install overrides for a whole module still
+    work: they run before this snapshot, so their entries are part of what is
+    restored.
+    """
+    from app.main import app
+
+    saved = dict(app.dependency_overrides)
+    try:
+        yield
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(saved)

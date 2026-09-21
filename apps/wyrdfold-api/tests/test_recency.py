@@ -14,6 +14,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from postgrest.exceptions import APIError
 
 import app.services.recency as recency_mod
 from app.config import settings
@@ -26,6 +27,7 @@ from app.routers.jobs import (
 from app.services import db_write
 from app.services.recency import (
     RECENCY_FLOOR,
+    SweepReport,
     compute_recency_multiplier,
     compute_recency_score,
     display_recency_score,
@@ -711,7 +713,7 @@ async def test_refresh_all_pages_the_sweep_rpc_with_a_keyset_cursor(
         rpc_calls,
     )
 
-    written = await refresh_all_recency_scores(sb)
+    written = (await refresh_all_recency_scores(sb)).written
 
     assert written == 3  # only CHANGED rows count — no-op writes are gone
     assert [name for name, _ in rpc_calls] == ["sweep_recency_scores"] * 3
@@ -757,7 +759,8 @@ async def test_refresh_all_keeps_partial_progress_on_a_failed_batch(
     rpc_calls: list[tuple[str, dict[str, Any]]] = []
     sb = _sweep_supabase([_batch(2, 5, "id-a"), RuntimeError("57014")], rpc_calls)
 
-    assert await refresh_all_recency_scores(sb) == 5
+    report = await refresh_all_recency_scores(sb)
+    assert report.written == 5
     assert len(rpc_calls) == 2
 
 
@@ -766,7 +769,7 @@ async def test_refresh_all_handles_an_empty_response() -> None:
     rpc_calls: list[tuple[str, dict[str, Any]]] = []
     sb = _sweep_supabase([[]], rpc_calls)
 
-    assert await refresh_all_recency_scores(sb) == 0
+    assert (await refresh_all_recency_scores(sb)).written == 0
     assert len(rpc_calls) == 1
 
 
@@ -819,3 +822,78 @@ async def test_refresh_poll_read_chunks_stay_url_safe(
     assert max(read_chunks) == recency_mod._RECENCY_READ_CHUNK_SIZE
     # Empty score reads → no updates → no rpc chunks in this run.
     assert rpc_chunks == []
+
+
+# ---- #1088: a failed sweep must be distinguishable from a quiet one --------
+#
+# The sweep returned a bare int, so "died on batch 1" and "nothing needed
+# rewriting" were both 0 and the scheduler logged both at INFO. A sweep that
+# had never once completed in production therefore stayed invisible for over
+# two weeks. These tests pin the distinction.
+
+
+def _api_error(code: str) -> APIError:
+    return APIError({"message": "canceling statement due to statement timeout", "code": code})
+
+
+@pytest.mark.asyncio
+async def test_a_statement_timeout_is_reported_as_an_incomplete_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure production actually hits: Postgres 57014 on a batch."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    monkeypatch.setattr(recency_mod, "_SWEEP_BATCH_SIZE", 2)
+    rpc_calls: list[tuple[str, dict[str, Any]]] = []
+    sb = _sweep_supabase([_batch(2, 5, "id-a"), _api_error("57014")], rpc_calls)
+
+    report = await refresh_all_recency_scores(sb)
+
+    assert report.ok is False
+    assert report.timed_out is True
+    assert report.failed_with == "APIError"
+    assert report.exhausted is False
+    # Partial progress is still reported, and the cursor names where it died.
+    assert report.written == 5
+    assert report.batches == 1
+    assert report.last_cursor == "id-a"
+
+
+@pytest.mark.asyncio
+async def test_a_non_timeout_failure_is_incomplete_but_not_flagged_as_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only 57014 means "the batch is too big" — the distinction is what
+    sizing the real fix depends on, so it must not be blurred."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    monkeypatch.setattr(recency_mod, "_SWEEP_BATCH_SIZE", 2)
+    sb = _sweep_supabase([_api_error("42501")], [])
+
+    report = await refresh_all_recency_scores(sb)
+
+    assert report.ok is False
+    assert report.timed_out is False
+    assert report.failed_with == "APIError"
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_that_reaches_the_end_is_ok_even_when_it_wrote_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legitimate quiet night: everything is inside the grace window or
+    already at the floor. Zero written, but the sweep DID finish."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    monkeypatch.setattr(recency_mod, "_SWEEP_BATCH_SIZE", 2)
+    sb = _sweep_supabase([_batch(0, 0, None)], [])
+
+    report = await refresh_all_recency_scores(sb)
+
+    assert report.ok is True
+    assert report.exhausted is True
+    assert report.written == 0
+
+
+def test_the_report_cannot_call_an_unfinished_sweep_ok() -> None:
+    """``ok`` is the property the scheduler branches on; pin its definition."""
+    assert SweepReport(written=9, batches=3, exhausted=False).ok is False
+    assert SweepReport(exhausted=True, failed_with="APIError").ok is False
+    assert SweepReport(written=0, exhausted=True).ok is True
