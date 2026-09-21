@@ -246,22 +246,31 @@ async def _link(
     *,
     user_id: str,
     target_id: str,
-    is_active: bool = False,
     fit_score: int | None = None,
     fit_score_reasoning: str | None = None,
     fit_score_prose_doc_id: str | None = None,
 ) -> UserTarget:
-    """Async inline of ``crud.link_user_to_target`` for the create-or-link path.
+    """Attach a user to a target without ever deciding whether it is ACTIVE.
 
-    Every from-input link is ``is_active=False`` (following a target never trips
-    the active-target cap — activation is a separate step), so the cap-check
-    branch of ``crud.link_user_to_target`` never runs here and this is a plain
-    upsert. The active-cap read path stays in sync crud for the activate route.
+    In plain terms: following a target, and the background step that stores a
+    fit score, must never switch a target off. This helper used to write the
+    active flag on every call, always as False, so a background write that
+    landed after the user activated the target silently switched it back off
+    and nothing told them (#1089).
+
+    It no longer writes that column at all. On a new row the database default
+    (``is_active NOT NULL DEFAULT false``) makes a follow inactive, which is
+    what every caller here wants; on an existing row the column is absent from
+    the upsert payload, so PostgREST leaves it out of the ``DO UPDATE SET``
+    list and whatever the user chose survives. Activation has exactly one
+    path, ``activate_user_target`` in the database (#1071), and this is not it.
+
+    The fit-score columns keep their conditional shape: written only when
+    supplied, so a bare follow never blanks a stored score.
     """
     row: dict[str, Any] = {
         "user_id": user_id,
         "target_id": target_id,
-        "is_active": is_active,
         "updated_at": datetime.now(UTC).isoformat(),
     }
     if fit_score is not None:
@@ -410,7 +419,6 @@ async def _apply_fit_score(
         supabase,
         user_id=user_id,
         target_id=target.id,
-        is_active=False,
         fit_score=fit_result.fit_score,
         fit_score_reasoning=fit_result.reasoning,
         fit_score_prose_doc_id=prose_doc_id,
@@ -708,7 +716,7 @@ async def _create_or_link_from_suggestion(
     """
     matched = await find_matching_target(supabase, suggestion.label)
     if matched is not None:
-        link = await _link(supabase, user_id=user_id, target_id=matched.id, is_active=False)
+        link = await _link(supabase, user_id=user_id, target_id=matched.id)
         spawn_detached(
             _apply_fit_score(supabase, llm, user_id=user_id, target=matched, payload=payload),
             name=f"fit-score-{matched.id}",
@@ -980,7 +988,7 @@ async def from_url(
 
     matched = await find_matching_target(supabase, label)
     if matched is not None:
-        link = await _link(supabase, user_id=user_id, target_id=matched.id, is_active=False)
+        link = await _link(supabase, user_id=user_id, target_id=matched.id)
         _schedule_url_bg_tasks(
             supabase,
             llm,
