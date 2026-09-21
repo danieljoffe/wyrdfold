@@ -27,6 +27,7 @@ the focus stays on orchestration.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -266,7 +267,15 @@ def stub_crud(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _Recorder
     # cap-specific test overrides this. Only derive_url_target_bg reads it.
     monkeypatch.setattr(from_input, "_count_user_reference_jds", AsyncMock(return_value=0))
 
+    async def fake_store_fit_score(supabase, **kwargs):  # type: ignore[no-untyped-def]
+        # #1097: the deferred score write is an UPDATE on an existing
+        # membership, not an upsert. Recorded separately from "link" so tests
+        # can tell a follow apart from a score write.
+        recorder.record("store_fit_score", **kwargs)
+        return True
+
     monkeypatch.setattr(from_input, "_link", fake_link)
+    monkeypatch.setattr(from_input, "_store_fit_score", fake_store_fit_score)
     monkeypatch.setattr(from_input, "_update", fake_update)
     return recorder
 
@@ -509,7 +518,7 @@ async def test_derive_manual_target_bg_derives_profile_and_fit(
     assert update_body.search_keywords == ["frontend engineer"]
     assert update_body.activation_status == "idle"
     # Fit score upserted onto the link.
-    link_kwargs = stub_crud.by_name("link")[0]
+    link_kwargs = stub_crud.by_name("store_fit_score")[0]
     assert link_kwargs["fit_score"] == 82
     assert "is_active" not in link_kwargs  # a link write never sets it (#1089)
     # Cost logged for both deferred calls.
@@ -733,7 +742,7 @@ async def test_derive_manual_target_bg_fit_scores_from_the_fresh_payload(
     update_body: TargetUpdate = stub_crud.by_name("update")[0]["body"]
     assert update_body.activation_status == "idle"
     # ...and the score is written onto the link.
-    link = stub_crud.by_name("link")[0]
+    link = stub_crud.by_name("store_fit_score")[0]
     assert link["fit_score"] == 82
 
 
@@ -945,7 +954,7 @@ async def test_derive_url_target_bg_new_attributes_and_rpc_merges(
     # Status flip (non-shared column) + fit score still happen.
     update_body: TargetUpdate = stub_crud.by_name("update")[0]["body"]
     assert update_body.activation_status == "idle"
-    assert stub_crud.by_name("link")[0]["fit_score"] == 82
+    assert stub_crud.by_name("store_fit_score")[0]["fit_score"] == 82
 
 
 @pytest.mark.asyncio
@@ -1095,7 +1104,7 @@ async def test_derive_url_target_bg_over_cap_skips_shared_write(
     assert add_ref_calls == []
     assert rpc_calls == []
     # But the user still gets their fit score.
-    assert stub_crud.by_name("link")[0]["fit_score"] == 82
+    assert stub_crud.by_name("store_fit_score")[0]["fit_score"] == 82
 
 
 @pytest.mark.asyncio
@@ -1689,11 +1698,11 @@ async def test_the_deferred_fit_score_write_does_not_carry_the_active_flag(
     the background after a create, so it can land after the user activates."""
     captured: dict[str, Any] = {}
 
-    async def fake_link(_s: Any, **kwargs: Any) -> Any:
+    async def fake_store(_s: Any, **kwargs: Any) -> bool:
         captured.update(kwargs)
-        return _user_target(target_id=kwargs["target_id"])
+        return True
 
-    monkeypatch.setattr(from_input, "_link", fake_link)
+    monkeypatch.setattr(from_input, "_store_fit_score", fake_store)
     monkeypatch.setattr(
         from_input,
         "resolve_current_payload",
@@ -1714,6 +1723,88 @@ async def test_the_deferred_fit_score_write_does_not_carry_the_active_flag(
         payload=OptimizedPayload(),
     )
 
-    assert captured, "expected the fit-score write to link"
+    assert captured, "expected the fit-score write"
     assert "is_active" not in captured
     assert captured["fit_score"] == 71
+
+
+# ---- #1097: a deferred score must never resurrect a removed membership ------
+
+
+@pytest.mark.asyncio
+async def test_the_deferred_write_updates_and_never_upserts() -> None:
+    """An upsert would recreate a membership the user deleted while the
+    background scoring was still running. The write must be an UPDATE
+    filtered on the membership, so it no-ops when the row is gone."""
+    supabase = MagicMock()
+    chain = MagicMock()
+    chain.eq.return_value = chain
+    chain.execute = AsyncMock(return_value=MagicMock(data=[{"user_id": "u-1"}]))
+    supabase.table.return_value.update.return_value = chain
+
+    stored = await from_input._store_fit_score(
+        supabase,
+        user_id="u-1",
+        target_id="t-1",
+        fit_score=71,
+        fit_score_reasoning="ok",
+        fit_score_prose_doc_id="prose-1",
+    )
+
+    assert stored is True
+    supabase.table.return_value.upsert.assert_not_called()
+    payload = supabase.table.return_value.update.call_args.args[0]
+    assert payload["fit_score"] == 71
+    assert "is_active" not in payload
+    # Filtered on BOTH keys, or it would scribble on another user's row.
+    assert [c.args for c in chain.eq.call_args_list] == [("user_id", "u-1"), ("target_id", "t-1")]
+
+
+@pytest.mark.asyncio
+async def test_a_removed_membership_makes_the_deferred_write_a_no_op() -> None:
+    supabase = MagicMock()
+    chain = MagicMock()
+    chain.eq.return_value = chain
+    chain.execute = AsyncMock(return_value=MagicMock(data=[]))
+    supabase.table.return_value.update.return_value = chain
+
+    stored = await from_input._store_fit_score(
+        supabase,
+        user_id="u-1",
+        target_id="gone",
+        fit_score=71,
+        fit_score_reasoning="ok",
+        fit_score_prose_doc_id=None,
+    )
+
+    assert stored is False
+
+
+@pytest.mark.asyncio
+async def test_a_discarded_score_is_logged_rather_than_swallowed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Throwing away work that was paid for must leave a trace."""
+    monkeypatch.setattr(from_input, "_store_fit_score", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        from_input,
+        "resolve_current_payload",
+        AsyncMock(return_value=(OptimizedPayload(), "prose-1")),
+    )
+    monkeypatch.setattr(
+        from_input,
+        "derive_fit_score",
+        AsyncMock(return_value=(FitScoreResult(fit_score=71, reasoning="ok"), _llm_result())),
+    )
+    monkeypatch.setattr(cost_log, "record_async", AsyncMock())
+
+    with caplog.at_level(logging.INFO, logger="app.services.targets.from_input"):
+        await from_input._apply_fit_score(
+            MagicMock(),
+            MagicMock(),
+            user_id="u-1",
+            target=_target(id="t-1"),
+            payload=OptimizedPayload(),
+        )
+
+    assert any("Discarded a fit score" in r.getMessage() for r in caplog.records)

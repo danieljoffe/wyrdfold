@@ -290,6 +290,45 @@ async def _link(
     return crud._parse_user_target(rows[0])
 
 
+async def _store_fit_score(
+    supabase: AsyncClient,
+    *,
+    user_id: str,
+    target_id: str,
+    fit_score: int,
+    fit_score_reasoning: str,
+    fit_score_prose_doc_id: str | None,
+) -> bool:
+    """Store a fit score on a membership that still exists. Never create one.
+
+    In plain terms: this runs in the background, long after the request that
+    scheduled it. If the user removed the target in the meantime, the score
+    has nowhere to go and must be discarded — writing it anyway would bring
+    the removed target back into their list (#1097). Removing a target is a
+    hard delete, and the shared ``_link`` helper upserts, so using it here
+    resurrected the row.
+
+    An UPDATE filtered on the membership is the honest shape: it matches what
+    the write means, and it no-ops when the row is gone. Returns whether a row
+    was actually updated so the caller can say so rather than assume success.
+    """
+    resp = await (
+        supabase.table(crud.USER_TARGETS_TABLE)
+        .update(
+            {
+                "fit_score": fit_score,
+                "fit_score_reasoning": fit_score_reasoning,
+                "fit_score_prose_doc_id": fit_score_prose_doc_id,
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+    )
+    return bool(cast(list[dict[str, Any]], resp.data or []))
+
+
 async def _add_reference_jd(
     supabase: AsyncClient,
     *,
@@ -415,7 +454,7 @@ async def _apply_fit_score(
         result=llm_result,
         metadata={"target_id": target.id, "user_id": user_id},
     )
-    await _link(
+    stored = await _store_fit_score(
         supabase,
         user_id=user_id,
         target_id=target.id,
@@ -423,6 +462,16 @@ async def _apply_fit_score(
         fit_score_reasoning=fit_result.reasoning,
         fit_score_prose_doc_id=prose_doc_id,
     )
+    if not stored:
+        # The user removed the target while this was in flight. Discarding the
+        # score is correct — recreating the membership would put a target they
+        # deleted back in their list (#1097) — but say so, because work that
+        # was paid for is being thrown away and silence would hide that.
+        logger.info(
+            "Discarded a fit score for target %s: user %s no longer follows it",
+            target.id,
+            user_id,
+        )
 
 
 # ---- Background derivation tasks --------------------------------------------
