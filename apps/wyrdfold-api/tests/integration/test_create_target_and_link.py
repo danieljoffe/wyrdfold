@@ -811,3 +811,91 @@ async def test_a_link_write_for_a_new_membership_lands_inactive(
     link = await from_input._link(async_service_client, user_id=uid, target_id=tid)
 
     assert link.is_active is False
+
+
+# ---- #1097: a deferred score must not resurrect a removed membership --------
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_score_does_not_recreate_a_membership_the_user_removed(
+    service_client: Client,
+    async_service_client: Any,
+    two_seeded_users: tuple[str, str],
+    cleanup_targets: list[str],
+) -> None:
+    """The production sequence: create a target, change your mind and remove
+    it, and let the background scoring land afterwards.
+
+    Removing a target is a hard DELETE of the membership row, and the write
+    used to be an upsert, so the row came back and the user saw a target they
+    had deleted reappear (#1097). The write is now an UPDATE filtered on the
+    membership, which no-ops when the row is gone. This has to run against
+    real Postgres: the behaviour under test is upsert-versus-update semantics,
+    which a mock cannot honestly reproduce.
+    """
+    from app.services.targets import from_input
+
+    uid, _ = two_seeded_users
+    made = _call(service_client, user_id=uid, label=f"Removed {uuid.uuid4()}")
+    tid = made["target"]["id"]
+    cleanup_targets.append(tid)
+
+    # The user removes the target.
+    service_client.table("user_targets").delete().eq("user_id", uid).eq("target_id", tid).execute()
+    assert _memberships_for(service_client, uid, tid) == []
+
+    # The deferred scoring lands afterwards.
+    stored = await from_input._store_fit_score(
+        async_service_client,
+        user_id=uid,
+        target_id=tid,
+        fit_score=64,
+        fit_score_reasoning="landed after the user removed it",
+        fit_score_prose_doc_id=None,
+    )
+
+    assert stored is False, "the write reported success against a membership that is gone"
+    assert _memberships_for(service_client, uid, tid) == [], (
+        "the deferred write resurrected a membership the user removed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_score_still_lands_on_a_membership_that_exists(
+    service_client: Client,
+    async_service_client: Any,
+    two_seeded_users: tuple[str, str],
+    cleanup_targets: list[str],
+) -> None:
+    """The other half: the normal path must still store the score."""
+    from app.services.targets import from_input
+
+    uid, _ = two_seeded_users
+    made = _call(service_client, user_id=uid, label=f"Kept {uuid.uuid4()}")
+    tid = made["target"]["id"]
+    cleanup_targets.append(tid)
+
+    stored = await from_input._store_fit_score(
+        async_service_client,
+        user_id=uid,
+        target_id=tid,
+        fit_score=64,
+        fit_score_reasoning="normal path",
+        fit_score_prose_doc_id=None,
+    )
+
+    assert stored is True
+    row = _memberships_for(service_client, uid, tid)[0]
+    assert row["fit_score"] == 64
+    assert row["is_active"] is False
+
+
+def _memberships_for(client: Client, user_id: str, target_id: str) -> list[dict[str, Any]]:
+    return (
+        client.table("user_targets")
+        .select("is_active, fit_score")
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+        .data
+    )
