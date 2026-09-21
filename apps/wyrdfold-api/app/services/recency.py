@@ -61,9 +61,26 @@ _RECENCY_READ_CHUNK_SIZE = 150
 
 # Batch size for the set-based sweep RPC (#604): bounds each UPDATE's
 # transaction/lock window, nothing else — the response is a single summary
-# row regardless. 10k keeps a batch in the low hundreds of ms on the prod
-# instance while finishing the full corpus in a few dozen calls.
-_SWEEP_BATCH_SIZE = 10_000
+# row regardless.
+#
+# In plain terms: this number is how much work one call asks the database to
+# do, and it was set five times too high. Every scheduled sweep since 2026-09-04
+# asked for 10,000 and was killed by the database's 8-second statement timeout
+# before finishing even its first batch, so the sweep never ran at all (#1088).
+#
+# 500 is measured, not guessed. Against the production corpus (~60,758 live
+# score rows): warm, a batch of 500 runs in 1.1-1.8s and a batch of 2,000 in
+# 2.9s; cold — which is the real condition, since this runs twice a day and
+# nothing else keeps these pages resident — a batch of 200 already costs 3.2s
+# and batches of 1,000-3,000 land at 7.4-7.9s, i.e. at the ceiling. 10,000
+# extrapolates to roughly 14s. 500 leaves room for the cold case and still
+# finishes the corpus in ~122 calls, a couple of minutes twice a day.
+#
+# The earlier note here claimed 10k kept a batch "in the low hundreds of ms".
+# That was measured when far more of the catalog was live; the live share has
+# since fallen to about a ninth of the table, so each batch walks many more
+# rows to find its quota. Re-measure before changing this number.
+_SWEEP_BATCH_SIZE = 500
 
 # Keyset start for the sweep's uuid cursor.
 _SWEEP_CURSOR_START = "00000000-0000-0000-0000-000000000000"
