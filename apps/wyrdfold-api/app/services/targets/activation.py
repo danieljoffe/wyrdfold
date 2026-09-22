@@ -58,13 +58,6 @@ class ActivationError(StrEnum):
     DERIVE_TIMEOUT = "derive_timeout"
     #: Anything else the pipeline raised (LLM 402, DB blip, network). Transient.
     PIPELINE_FAILED = "pipeline_failed"
-    #: The activation never finished and the sweep reclaimed the row. Written
-    #: with ``activation_status = 'idle'``, NOT ``'error'``, so the user still
-    #: sees a re-activatable target rather than a red card (see the sweep's
-    #: docstring). It exists purely so reclaims leave a durable trace: before
-    #: this, a reclaim logged a warning that aged out and changed nothing on
-    #: the row, so how often deferred work is abandoned was unknowable (#1090).
-    STALLED_RECLAIMED = "stalled_reclaimed"
 
 
 #: Reasons the user can resolve themselves. Everything else is a backend
@@ -75,6 +68,53 @@ USER_ACTIONABLE_ERRORS: frozenset[str] = frozenset({ActivationError.NO_EXPERIENC
 def is_user_actionable(reason: str | None) -> bool:
     """True when the user can fix the cause themselves (vs. retry-and-hope)."""
     return reason in USER_ACTIONABLE_ERRORS
+
+
+async def _record_reclaims(
+    supabase: AsyncClient,
+    *,
+    rows: list[dict[str, Any]],
+    from_status: str,
+    stale_after_hours: int,
+) -> None:
+    """Append one row per reclaimed target to ``activation_reclaims``.
+
+    In plain terms: this is the only durable record that deferred work was
+    abandoned. The reclaim itself resets the target and logs a warning, and
+    both of those disappear — the log ages out and the reset leaves no mark —
+    so without this nobody can say how often it happens, which is the number
+    that decides how much architecture the underlying problem is worth
+    (#1090).
+
+    Append-only on purpose. A marker column would hold one value, be cleared
+    when the user re-activates, and so collapse repeated reclaims into one
+    while losing recovered targets entirely — a survivor-biased count that
+    cannot tell a rare defect from a frequent one with quick recovery.
+
+    Fail-soft: instrumentation must never break the sweep it is measuring.
+    """
+    try:
+        await (
+            supabase.table("activation_reclaims")
+            .insert(
+                [
+                    {
+                        "target_id": row["id"],
+                        "from_status": from_status,
+                        "stale_after_hours": stale_after_hours,
+                    }
+                    for row in rows
+                ]
+            )
+            .execute()
+        )
+    except Exception:
+        logger.warning(
+            "activation sweep: failed to record %d reclaim(s) from %r (non-fatal)",
+            len(rows),
+            from_status,
+            exc_info=True,
+        )
 
 
 async def sweep_stalled_activations(
@@ -102,25 +142,7 @@ async def sweep_stalled_activations(
     for status in IN_FLIGHT_STATUSES:
         resp = await (
             supabase.table(TARGETS_TABLE)
-            .update(
-                {
-                    "activation_status": "idle",
-                    # Durable trace of the reclaim (#1090). The status stays
-                    # ``idle`` so the card is unchanged for the user — the
-                    # frontend gates its failure message on the status, not on
-                    # this column — but the row now says it was abandoned, and
-                    # by when. Counting these is how the frequency of lost
-                    # deferred work gets sized instead of guessed.
-                    #
-                    # Known undercount: re-activating a target clears both
-                    # columns, so this counts targets reclaimed and NOT since
-                    # recovered. That is the population that matters most, but
-                    # it is not the total number of reclaims.
-                    "activation_error": ActivationError.STALLED_RECLAIMED,
-                    "activation_failed_at": datetime.now(UTC).isoformat(),
-                    "updated_at": datetime.now(UTC).isoformat(),
-                }
-            )
+            .update({"activation_status": "idle", "updated_at": datetime.now(UTC).isoformat()})
             .eq("activation_status", status)
             .lt("updated_at", cutoff)
             .execute()
@@ -128,6 +150,12 @@ async def sweep_stalled_activations(
         rows = cast(list[dict[str, Any]], resp.data or [])
         reclaimed[status] = len(rows)
         if rows:
+            await _record_reclaims(
+                supabase,
+                rows=rows,
+                from_status=status,
+                stale_after_hours=stale_after_hours,
+            )
             logger.warning(
                 "activation sweep: reclaimed %d target(s) stalled in %r for >%dh -> idle (%s)",
                 len(rows),
