@@ -5,7 +5,8 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
-from unittest.mock import patch
+from typing import cast
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -871,17 +872,33 @@ class TestDiscoveryCatchup:
 # ---------------------------------------------------------------------------
 
 
+#: Sentinel: "this job succeeds whenever it runs", i.e. last_success mirrors
+#: last_run. The healthy case, and what every pre-#1088 test meant implicitly.
+_MIRRORS_LAST_RUN = object()
+
+
 def _patch_ledger_read(
     monkeypatch: pytest.MonkeyPatch,
     *,
     last_run: "datetime | Exception | None",
+    last_success: "datetime | Exception | object | None" = _MIRRORS_LAST_RUN,
 ) -> None:
+    """Stub both ledger reads. ``last_success`` defaults to mirroring
+    ``last_run``, which is the healthy job every earlier test assumed."""
+    success = last_run if last_success is _MIRRORS_LAST_RUN else last_success
+
     async def fake_last(_job_id: str) -> "datetime | None":
         if isinstance(last_run, Exception):
             raise last_run
         return last_run
 
+    async def fake_success(_job_id: str) -> "datetime | None":
+        if isinstance(success, Exception):
+            raise success
+        return cast("datetime | None", success)
+
     monkeypatch.setattr("app.scheduler._last_scheduler_run", fake_last)
+    monkeypatch.setattr("app.scheduler._last_scheduler_success", fake_success)
 
 
 def _spy_runner() -> tuple[list[int], "Callable[[], Awaitable[None]]"]:
@@ -1149,3 +1166,289 @@ async def test_a_completed_recency_sweep_still_logs_at_info(
 
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert any("rewrote 7 score rows across 3 batch(es)" in r.getMessage() for r in caplog.records)
+
+
+class TestLedgerCatchupUsesSuccess:
+    """#1088: the catch-up asks "when did we last SUCCEED", not "when did we
+    last try" — while keeping the storm guard that stamping attempts bought.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_job_that_keeps_failing_is_recognised_as_starved_and_rerun(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The recency case exactly: attempted recently, never succeeded. The
+        old catch-up called this fresh and did nothing for two weeks."""
+        _patch_ledger_read(
+            monkeypatch,
+            last_run=_CATCHUP_NOW - timedelta(hours=6),
+            last_success=None,
+        )
+        runs, runner = _spy_runner()
+        sched = _RecordingScheduler()
+
+        await _anchor_job_from_ledger(
+            sched,  # type: ignore[arg-type]
+            job_id="recency_refresh",
+            tick_hours=12,
+            runner=runner,
+            now=_CATCHUP_NOW,
+        )
+
+        assert runs == [1], "a job that has never succeeded must not look fresh"
+        assert sched.modified == []
+
+    @pytest.mark.asyncio
+    async def test_a_failing_job_attempted_moments_ago_is_not_rerun(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The storm guard. Keying purely off success would re-fire a
+        crash-looping job on every deploy, which is what stamping attempts was
+        introduced to prevent (#327). It must hold off, and say so loudly."""
+        _patch_ledger_read(
+            monkeypatch,
+            last_run=_CATCHUP_NOW - timedelta(minutes=2),
+            last_success=None,
+        )
+        runs, runner = _spy_runner()
+        sched = _RecordingScheduler()
+
+        with caplog.at_level(logging.INFO, logger="app.scheduler"):
+            await _anchor_job_from_ledger(
+                sched,  # type: ignore[arg-type]
+                job_id="recency_refresh",
+                tick_hours=12,
+                runner=runner,
+                now=_CATCHUP_NOW,
+            )
+
+        assert runs == [], "a job attempted moments ago must not be re-fired"
+        assert sched.modified == []
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "a starved job must be reported at ERROR"
+        assert "STARVED" in errors[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_the_retry_floor_never_exceeds_the_job_tick(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A job whose tick is shorter than the floor must not be held back
+        longer than it would naturally wait."""
+        _patch_ledger_read(
+            monkeypatch,
+            last_run=_CATCHUP_NOW - timedelta(minutes=40),
+            last_success=None,
+        )
+        runs, runner = _spy_runner()
+        sched = _RecordingScheduler()
+
+        await _anchor_job_from_ledger(
+            sched,  # type: ignore[arg-type]
+            job_id="phase1_backfill_resume",
+            tick_hours=0,  # clamps the floor to zero
+            runner=runner,
+            now=_CATCHUP_NOW,
+        )
+
+        assert runs == [1]
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_job_anchors_on_its_last_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The next fire is measured from when the work actually completed,
+        not from when it was attempted."""
+        success = _CATCHUP_NOW - timedelta(hours=2)
+        _patch_ledger_read(
+            monkeypatch,
+            last_run=_CATCHUP_NOW - timedelta(hours=2, minutes=5),
+            last_success=success,
+        )
+        runs, runner = _spy_runner()
+        sched = _RecordingScheduler()
+
+        await _anchor_job_from_ledger(
+            sched,  # type: ignore[arg-type]
+            job_id="retention_purge",
+            tick_hours=24,
+            runner=runner,
+            now=_CATCHUP_NOW,
+        )
+
+        assert runs == []
+        assert sched.modified == [("retention_purge", success + timedelta(hours=24))]
+
+
+class TestSuccessIsStampedOnlyOnRealCompletion:
+    """#1088: the ledger's whole value is that success means success."""
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_sweep_does_not_stamp_success(self) -> None:
+        """The linkage that closes the blind spot: a sweep that stopped
+        part-way must leave the ledger saying it has not succeeded, so the
+        next boot recognises the job as starved instead of fresh."""
+        from app.scheduler import _run_scheduled_recency_refresh
+
+        stamped: list[str] = []
+
+        async def fake_success(job_id: str) -> None:
+            stamped.append(job_id)
+
+        with (
+            patch("app.scheduler.get_async_supabase", return_value=object()),
+            patch("app.scheduler._record_scheduler_run", AsyncMock()),
+            patch("app.scheduler._record_scheduler_success", fake_success),
+            patch("app.scheduler.job_list_cache"),
+            patch(
+                "app.scheduler.refresh_all_recency_scores",
+                return_value=SweepReport(
+                    written=120, batches=3, exhausted=False, failed_with="APIError", timed_out=True
+                ),
+            ),
+        ):
+            await _run_scheduled_recency_refresh()
+
+        assert stamped == [], "a sweep that did not finish must not record success"
+
+    @pytest.mark.asyncio
+    async def test_a_completed_sweep_stamps_success(self) -> None:
+        from app.scheduler import _run_scheduled_recency_refresh
+
+        stamped: list[str] = []
+
+        async def fake_success(job_id: str) -> None:
+            stamped.append(job_id)
+
+        with (
+            patch("app.scheduler.get_async_supabase", return_value=object()),
+            patch("app.scheduler._record_scheduler_run", AsyncMock()),
+            patch("app.scheduler._record_scheduler_success", fake_success),
+            patch("app.scheduler.job_list_cache"),
+            patch(
+                "app.scheduler.refresh_all_recency_scores",
+                return_value=SweepReport(written=9377, batches=121, exhausted=True),
+            ),
+        ):
+            await _run_scheduled_recency_refresh()
+
+        assert stamped == ["recency_refresh"]
+
+
+class TestFailSoftJobsDoNotRecordFalseSuccess:
+    """#1088 review: two of the six services never raise. They log and return
+    a partial report, so the scheduler must read their completion signal
+    rather than treating "it returned" as "it worked" — which would record the
+    same false health this ledger exists to prevent."""
+
+    @staticmethod
+    def _stamps() -> tuple[list[str], "Callable[[str], Awaitable[None]]"]:
+        stamped: list[str] = []
+
+        async def fake_success(job_id: str) -> None:
+            stamped.append(job_id)
+
+        return stamped, fake_success
+
+    @pytest.mark.asyncio
+    async def test_a_partial_url_health_tick_records_no_success(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from app.scheduler import _run_scheduled_url_health
+
+        stamped, fake_success = self._stamps()
+        partial = {
+            "checked": 0,
+            "healthy": 0,
+            "failures": 0,
+            "server_errors": 0,
+            "archived": 0,
+            "completed": 0,
+        }
+        with (
+            patch("app.scheduler.get_async_supabase", return_value=object()),
+            patch("app.scheduler._record_scheduler_run", AsyncMock()),
+            patch("app.scheduler._record_scheduler_success", fake_success),
+            patch("app.scheduler.job_list_cache"),
+            patch("app.scheduler.run_url_health_check", return_value=partial),
+            caplog.at_level(logging.INFO, logger="app.scheduler"),
+        ):
+            await _run_scheduled_url_health()
+
+        assert stamped == [], "a partial tick must not be recorded as a success"
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    @pytest.mark.asyncio
+    async def test_a_completed_url_health_tick_records_success(self) -> None:
+        from app.scheduler import _run_scheduled_url_health
+
+        stamped, fake_success = self._stamps()
+        done = {
+            "checked": 3,
+            "healthy": 3,
+            "failures": 0,
+            "server_errors": 0,
+            "archived": 0,
+            "completed": 1,
+        }
+        with (
+            patch("app.scheduler.get_async_supabase", return_value=object()),
+            patch("app.scheduler._record_scheduler_run", AsyncMock()),
+            patch("app.scheduler._record_scheduler_success", fake_success),
+            patch("app.scheduler.job_list_cache"),
+            patch("app.scheduler.run_url_health_check", return_value=done),
+        ):
+            await _run_scheduled_url_health()
+
+        assert stamped == ["url_health_check"]
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_billing_reconcile_records_no_success(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from app.scheduler import _run_scheduled_billing_reconcile
+
+        stamped, fake_success = self._stamps()
+        incomplete = {
+            "checked": 0,
+            "in_sync": 0,
+            "healed": 0,
+            "underpaid_reported": 0,
+            "unknown_customer": 0,
+            "stale_skipped": 0,
+            "completed": 0,
+        }
+        with (
+            patch("app.scheduler.get_async_supabase", return_value=object()),
+            patch("app.scheduler._record_scheduler_run", AsyncMock()),
+            patch("app.scheduler._record_scheduler_success", fake_success),
+            patch("app.scheduler.reconcile_billing", return_value=incomplete),
+            caplog.at_level(logging.INFO, logger="app.scheduler"),
+        ):
+            await _run_scheduled_billing_reconcile()
+
+        assert stamped == []
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    @pytest.mark.asyncio
+    async def test_a_completed_billing_reconcile_records_success(self) -> None:
+        from app.scheduler import _run_scheduled_billing_reconcile
+
+        stamped, fake_success = self._stamps()
+        done = {
+            "checked": 2,
+            "in_sync": 2,
+            "healed": 0,
+            "underpaid_reported": 0,
+            "unknown_customer": 0,
+            "stale_skipped": 0,
+            "completed": 1,
+        }
+        with (
+            patch("app.scheduler.get_async_supabase", return_value=object()),
+            patch("app.scheduler._record_scheduler_run", AsyncMock()),
+            patch("app.scheduler._record_scheduler_success", fake_success),
+            patch("app.scheduler.reconcile_billing", return_value=done),
+        ):
+            await _run_scheduled_billing_reconcile()
+
+        assert stamped == ["billing_reconcile"]

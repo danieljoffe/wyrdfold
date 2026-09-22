@@ -735,3 +735,167 @@ def test_the_service_role_still_executes_every_membership_function(
         (other_id, True),
         (created["target"]["id"], True),
     }
+
+
+# ---- #1089: a link write must never deactivate a real membership ------------
+
+
+@pytest.mark.asyncio
+async def test_a_link_write_landing_after_activation_leaves_the_target_active(
+    service_client: Client,
+    async_service_client: Any,
+    two_seeded_users: tuple[str, str],
+    cleanup_targets: list[str],
+) -> None:
+    """The production scenario, end to end against real Postgres.
+
+    A user creates a target, activates it, and the deferred fit-score write
+    lands afterwards. Before the fix that write carried ``is_active=False``
+    and switched the target back off with nothing telling the user (#1089).
+    The write must now store the score and leave the activation alone.
+    """
+    from app.services.targets import from_input
+
+    uid, _ = two_seeded_users
+    made = _call(service_client, user_id=uid, label=f"LinkActive {uuid.uuid4()}")
+    tid = made["target"]["id"]
+    cleanup_targets.append(tid)
+    assert made["user_target"]["is_active"] is False
+
+    activated = _activate(service_client, user_id=uid, target_id=tid, active_limit=5)
+    assert activated["is_active"] is True
+
+    # The deferred write, exactly as _apply_fit_score issues it.
+    link = await from_input._link(
+        async_service_client,
+        user_id=uid,
+        target_id=tid,
+        fit_score=55,
+        fit_score_reasoning="deferred write",
+    )
+
+    assert link.is_active is True, "a background link write deactivated the target"
+    assert link.fit_score == 55
+    row = (
+        service_client.table("user_targets")
+        .select("is_active, fit_score")
+        .eq("user_id", uid)
+        .eq("target_id", tid)
+        .execute()
+        .data[0]
+    )
+    assert row["is_active"] is True
+    assert row["fit_score"] == 55
+
+
+@pytest.mark.asyncio
+async def test_a_link_write_for_a_new_membership_lands_inactive(
+    service_client: Client,
+    async_service_client: Any,
+    two_seeded_users: tuple[str, str],
+    cleanup_targets: list[str],
+) -> None:
+    """The other half of the contract: following never ACTIVATES either. With
+    the column absent from the payload, a new row takes the database default."""
+    from app.services.targets import from_input
+
+    uid, _ = two_seeded_users
+    tid = (
+        service_client.table("targets")
+        .insert({"label": f"LinkNew {uuid.uuid4()}"})
+        .execute()
+        .data[0]["id"]
+    )
+    cleanup_targets.append(tid)
+
+    link = await from_input._link(async_service_client, user_id=uid, target_id=tid)
+
+    assert link.is_active is False
+
+
+# ---- #1097: a deferred score must not resurrect a removed membership --------
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_score_does_not_recreate_a_membership_the_user_removed(
+    service_client: Client,
+    async_service_client: Any,
+    two_seeded_users: tuple[str, str],
+    cleanup_targets: list[str],
+) -> None:
+    """The production sequence: create a target, change your mind and remove
+    it, and let the background scoring land afterwards.
+
+    Removing a target is a hard DELETE of the membership row, and the write
+    used to be an upsert, so the row came back and the user saw a target they
+    had deleted reappear (#1097). The write is now an UPDATE filtered on the
+    membership, which no-ops when the row is gone. This has to run against
+    real Postgres: the behaviour under test is upsert-versus-update semantics,
+    which a mock cannot honestly reproduce.
+    """
+    from app.services.targets import from_input
+
+    uid, _ = two_seeded_users
+    made = _call(service_client, user_id=uid, label=f"Removed {uuid.uuid4()}")
+    tid = made["target"]["id"]
+    cleanup_targets.append(tid)
+
+    # The user removes the target.
+    service_client.table("user_targets").delete().eq("user_id", uid).eq("target_id", tid).execute()
+    assert _memberships_for(service_client, uid, tid) == []
+
+    # The deferred scoring lands afterwards.
+    stored = await from_input._store_fit_score(
+        async_service_client,
+        user_id=uid,
+        target_id=tid,
+        fit_score=64,
+        fit_score_reasoning="landed after the user removed it",
+        fit_score_prose_doc_id=None,
+    )
+
+    assert stored is False, "the write reported success against a membership that is gone"
+    assert _memberships_for(service_client, uid, tid) == [], (
+        "the deferred write resurrected a membership the user removed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_score_still_lands_on_a_membership_that_exists(
+    service_client: Client,
+    async_service_client: Any,
+    two_seeded_users: tuple[str, str],
+    cleanup_targets: list[str],
+) -> None:
+    """The other half: the normal path must still store the score."""
+    from app.services.targets import from_input
+
+    uid, _ = two_seeded_users
+    made = _call(service_client, user_id=uid, label=f"Kept {uuid.uuid4()}")
+    tid = made["target"]["id"]
+    cleanup_targets.append(tid)
+
+    stored = await from_input._store_fit_score(
+        async_service_client,
+        user_id=uid,
+        target_id=tid,
+        fit_score=64,
+        fit_score_reasoning="normal path",
+        fit_score_prose_doc_id=None,
+    )
+
+    assert stored is True
+    row = _memberships_for(service_client, uid, tid)[0]
+    assert row["fit_score"] == 64
+    assert row["is_active"] is False
+
+
+def _memberships_for(client: Client, user_id: str, target_id: str) -> list[dict[str, Any]]:
+    return (
+        client.table("user_targets")
+        .select("is_active, fit_score")
+        .eq("user_id", user_id)
+        .eq("target_id", target_id)
+        .execute()
+        .data
+    )

@@ -27,6 +27,7 @@ the focus stays on orchestration.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -266,7 +267,15 @@ def stub_crud(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> _Recorder
     # cap-specific test overrides this. Only derive_url_target_bg reads it.
     monkeypatch.setattr(from_input, "_count_user_reference_jds", AsyncMock(return_value=0))
 
+    async def fake_store_fit_score(supabase, **kwargs):  # type: ignore[no-untyped-def]
+        # #1097: the deferred score write is an UPDATE on an existing
+        # membership, not an upsert. Recorded separately from "link" so tests
+        # can tell a follow apart from a score write.
+        recorder.record("store_fit_score", **kwargs)
+        return True
+
     monkeypatch.setattr(from_input, "_link", fake_link)
+    monkeypatch.setattr(from_input, "_store_fit_score", fake_store_fit_score)
     monkeypatch.setattr(from_input, "_update", fake_update)
     return recorder
 
@@ -352,9 +361,10 @@ async def test_from_manual_matched_links_inline_defers_fit_score(
     assert "derive_from_label" not in stub_llm_helpers.names()
     assert "fit_score" not in stub_llm_helpers.names()
     assert create_calls == []
-    # Linked inactive with no fit score yet.
+    # Linked with no fit score yet, and WITHOUT touching the active flag:
+    # following a target must never switch one off (#1089).
     link_kwargs = stub_crud.by_name("link")[0]
-    assert link_kwargs["is_active"] is False
+    assert "is_active" not in link_kwargs
     assert link_kwargs["target_id"] == "existing"
     assert link_kwargs.get("fit_score") is None
     # Deferred: fit-score task only.
@@ -508,9 +518,9 @@ async def test_derive_manual_target_bg_derives_profile_and_fit(
     assert update_body.search_keywords == ["frontend engineer"]
     assert update_body.activation_status == "idle"
     # Fit score upserted onto the link.
-    link_kwargs = stub_crud.by_name("link")[0]
+    link_kwargs = stub_crud.by_name("store_fit_score")[0]
     assert link_kwargs["fit_score"] == 82
-    assert link_kwargs["is_active"] is False
+    assert "is_active" not in link_kwargs  # a link write never sets it (#1089)
     # Cost logged for both deferred calls.
     purposes = [c["purpose"] for c in stub_llm_helpers.by_name("cost_log")]
     assert "target.derive_from_label" in purposes
@@ -701,7 +711,7 @@ async def test_from_suggestion_still_fit_scores_when_the_inline_payload_is_none(
     )
 
     assert result.was_matched is True
-    assert stub_crud.by_name("link")[0]["is_active"] is False
+    assert "is_active" not in stub_crud.by_name("link")[0]  # never set (#1089)
     # The fit-score task IS scheduled — the fresh resolve is what decides.
     assert any("fit-score" in n for n in sched.names), sched.names
 
@@ -732,7 +742,7 @@ async def test_derive_manual_target_bg_fit_scores_from_the_fresh_payload(
     update_body: TargetUpdate = stub_crud.by_name("update")[0]["body"]
     assert update_body.activation_status == "idle"
     # ...and the score is written onto the link.
-    link = stub_crud.by_name("link")[0]
+    link = stub_crud.by_name("store_fit_score")[0]
     assert link["fit_score"] == 82
 
 
@@ -771,7 +781,7 @@ async def test_from_url_matched_links_inline_defers_derivation(
     assert "fit_score" not in stub_llm_helpers.names()
     link_kwargs = stub_crud.by_name("link")[0]
     assert link_kwargs["target_id"] == "existing"
-    assert link_kwargs["is_active"] is False
+    assert "is_active" not in link_kwargs  # a link write never sets it (#1089)
     # Two bg tasks: the profile derive, then the source registration.
     assert sched.calls["derive_url_target_bg"]["target_id"] == "existing"
     assert sched.calls["derive_url_target_bg"]["jd_text"] == "x" * 200
@@ -944,7 +954,7 @@ async def test_derive_url_target_bg_new_attributes_and_rpc_merges(
     # Status flip (non-shared column) + fit score still happen.
     update_body: TargetUpdate = stub_crud.by_name("update")[0]["body"]
     assert update_body.activation_status == "idle"
-    assert stub_crud.by_name("link")[0]["fit_score"] == 82
+    assert stub_crud.by_name("store_fit_score")[0]["fit_score"] == 82
 
 
 @pytest.mark.asyncio
@@ -1094,7 +1104,7 @@ async def test_derive_url_target_bg_over_cap_skips_shared_write(
     assert add_ref_calls == []
     assert rpc_calls == []
     # But the user still gets their fit score.
-    assert stub_crud.by_name("link")[0]["fit_score"] == 82
+    assert stub_crud.by_name("store_fit_score")[0]["fit_score"] == 82
 
 
 @pytest.mark.asyncio
@@ -1615,3 +1625,186 @@ async def test_create_and_link_active_sends_both_the_flag_and_the_limit() -> Non
     assert params["p_active_limit"] == 2
     assert was_created is True
     assert link.target_id == "t-1"
+
+
+# ---- #1089: a link write must never deactivate a membership -----------------
+#
+# ``_link`` used to put ``is_active`` into every upsert, always False. A
+# background fit-score write landing after the user activated the target
+# therefore switched it back off, silently. The column is now absent from the
+# payload entirely: a new row takes the database default (false) and an
+# existing row keeps whatever the user chose.
+
+
+def _link_supabase() -> tuple[MagicMock, list[dict[str, Any]]]:
+    payloads: list[dict[str, Any]] = []
+    supabase = MagicMock()
+
+    def capture(row: dict[str, Any], **_kw: Any) -> MagicMock:
+        payloads.append(row)
+        chain = MagicMock()
+        chain.execute = AsyncMock(
+            return_value=MagicMock(
+                data=[_user_target(target_id=row["target_id"]).model_dump(mode="json")]
+            )
+        )
+        return chain
+
+    supabase.table.return_value.upsert.side_effect = capture
+    return supabase, payloads
+
+
+@pytest.mark.asyncio
+async def test_link_never_writes_the_active_flag() -> None:
+    """The whole fix: the column must not appear in the upsert payload, so an
+    existing membership's value is left alone by PostgREST's DO UPDATE SET."""
+    supabase, payloads = _link_supabase()
+
+    await from_input._link(supabase, user_id="u-1", target_id="t-1")
+
+    assert payloads, "expected an upsert"
+    assert "is_active" not in payloads[0]
+    assert payloads[0]["user_id"] == "u-1"
+    assert payloads[0]["target_id"] == "t-1"
+
+
+@pytest.mark.asyncio
+async def test_link_still_writes_fit_score_fields_only_when_supplied() -> None:
+    """The conditional shape must survive the change: a bare follow leaves a
+    stored score alone, a scored write carries its columns."""
+    supabase, payloads = _link_supabase()
+
+    await from_input._link(supabase, user_id="u-1", target_id="t-1")
+    assert "fit_score" not in payloads[0]
+    assert "fit_score_reasoning" not in payloads[0]
+
+    await from_input._link(
+        supabase,
+        user_id="u-1",
+        target_id="t-1",
+        fit_score=71,
+        fit_score_reasoning="strong overlap",
+    )
+    assert payloads[1]["fit_score"] == 71
+    assert payloads[1]["fit_score_reasoning"] == "strong overlap"
+    assert "is_active" not in payloads[1]
+
+
+@pytest.mark.asyncio
+async def test_the_deferred_fit_score_write_does_not_carry_the_active_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The call site that actually caused the bug: ``_apply_fit_score`` runs in
+    the background after a create, so it can land after the user activates."""
+    captured: dict[str, Any] = {}
+
+    async def fake_store(_s: Any, **kwargs: Any) -> bool:
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(from_input, "_store_fit_score", fake_store)
+    monkeypatch.setattr(
+        from_input,
+        "resolve_current_payload",
+        AsyncMock(return_value=(OptimizedPayload(), "prose-1")),
+    )
+    monkeypatch.setattr(
+        from_input,
+        "derive_fit_score",
+        AsyncMock(return_value=(FitScoreResult(fit_score=71, reasoning="ok"), _llm_result())),
+    )
+    monkeypatch.setattr(cost_log, "record_async", AsyncMock())
+
+    await from_input._apply_fit_score(
+        MagicMock(),
+        MagicMock(),
+        user_id="u-1",
+        target=_target(id="t-1"),
+        payload=OptimizedPayload(),
+    )
+
+    assert captured, "expected the fit-score write"
+    assert "is_active" not in captured
+    assert captured["fit_score"] == 71
+
+
+# ---- #1097: a deferred score must never resurrect a removed membership ------
+
+
+@pytest.mark.asyncio
+async def test_the_deferred_write_updates_and_never_upserts() -> None:
+    """An upsert would recreate a membership the user deleted while the
+    background scoring was still running. The write must be an UPDATE
+    filtered on the membership, so it no-ops when the row is gone."""
+    supabase = MagicMock()
+    chain = MagicMock()
+    chain.eq.return_value = chain
+    chain.execute = AsyncMock(return_value=MagicMock(data=[{"user_id": "u-1"}]))
+    supabase.table.return_value.update.return_value = chain
+
+    stored = await from_input._store_fit_score(
+        supabase,
+        user_id="u-1",
+        target_id="t-1",
+        fit_score=71,
+        fit_score_reasoning="ok",
+        fit_score_prose_doc_id="prose-1",
+    )
+
+    assert stored is True
+    supabase.table.return_value.upsert.assert_not_called()
+    payload = supabase.table.return_value.update.call_args.args[0]
+    assert payload["fit_score"] == 71
+    assert "is_active" not in payload
+    # Filtered on BOTH keys, or it would scribble on another user's row.
+    assert [c.args for c in chain.eq.call_args_list] == [("user_id", "u-1"), ("target_id", "t-1")]
+
+
+@pytest.mark.asyncio
+async def test_a_removed_membership_makes_the_deferred_write_a_no_op() -> None:
+    supabase = MagicMock()
+    chain = MagicMock()
+    chain.eq.return_value = chain
+    chain.execute = AsyncMock(return_value=MagicMock(data=[]))
+    supabase.table.return_value.update.return_value = chain
+
+    stored = await from_input._store_fit_score(
+        supabase,
+        user_id="u-1",
+        target_id="gone",
+        fit_score=71,
+        fit_score_reasoning="ok",
+        fit_score_prose_doc_id=None,
+    )
+
+    assert stored is False
+
+
+@pytest.mark.asyncio
+async def test_a_discarded_score_is_logged_rather_than_swallowed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Throwing away work that was paid for must leave a trace."""
+    monkeypatch.setattr(from_input, "_store_fit_score", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        from_input,
+        "resolve_current_payload",
+        AsyncMock(return_value=(OptimizedPayload(), "prose-1")),
+    )
+    monkeypatch.setattr(
+        from_input,
+        "derive_fit_score",
+        AsyncMock(return_value=(FitScoreResult(fit_score=71, reasoning="ok"), _llm_result())),
+    )
+    monkeypatch.setattr(cost_log, "record_async", AsyncMock())
+
+    with caplog.at_level(logging.INFO, logger="app.services.targets.from_input"):
+        await from_input._apply_fit_score(
+            MagicMock(),
+            MagicMock(),
+            user_id="u-1",
+            target=_target(id="t-1"),
+            payload=OptimizedPayload(),
+        )
+
+    assert any("Discarded a fit score" in r.getMessage() for r in caplog.records)

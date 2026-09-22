@@ -76,15 +76,23 @@ async def test_user_actionable_classification() -> None:
 
 
 class _FakeQuery:
-    def __init__(self, rows: list[dict[str, Any]], log: list) -> None:
+    def __init__(
+        self, rows: list[dict[str, Any]], log: list, *, insert_raises: bool = False
+    ) -> None:
         self._rows = rows
         self._log = log
+        self._insert_raises = insert_raises
         self._payload: dict[str, Any] = {}
         self._eq: dict[str, Any] = {}
         self._lt: dict[str, Any] = {}
+        self._inserted: list[dict[str, Any]] | None = None
 
     def update(self, payload: dict[str, Any]) -> _FakeQuery:
         self._payload = payload
+        return self
+
+    def insert(self, payload: list[dict[str, Any]]) -> _FakeQuery:
+        self._inserted = payload
         return self
 
     def eq(self, col: str, val: Any) -> _FakeQuery:
@@ -96,6 +104,11 @@ class _FakeQuery:
         return self
 
     async def execute(self) -> Any:
+        if self._inserted is not None:
+            if self._insert_raises:
+                raise RuntimeError("activation_reclaims write failed")
+            self._log.append(("insert", list(self._inserted)))
+            return type("Resp", (), {"data": list(self._inserted)})()
         matched = [
             r
             for r in self._rows
@@ -109,12 +122,13 @@ class _FakeQuery:
 
 
 class _FakeSupabase:
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
+    def __init__(self, rows: list[dict[str, Any]], *, insert_raises: bool = False) -> None:
         self.rows = rows
         self.log: list = []
+        self.insert_raises = insert_raises
 
     def table(self, _name: str) -> _FakeQuery:
-        return _FakeQuery(self.rows, self.log)
+        return _FakeQuery(self.rows, self.log, insert_raises=self.insert_raises)
 
 
 def _row(status: str, *, hours_ago: float, tid: str) -> dict[str, Any]:
@@ -179,3 +193,83 @@ async def test_sweep_is_idempotent() -> None:
 
     assert first == {"deriving": 0, "polling": 1}
     assert second == {"deriving": 0, "polling": 0}
+
+
+# ---- #1090: every reclaim is recorded, append-only -------------------------
+#
+# The reclaim resets the target and logs a warning, and both vanish — logs age
+# out, the reset leaves no mark. Without a record, how often deferred work is
+# abandoned is unknowable, and that number decides how much architecture the
+# underlying problem is worth. A marker column would not do: it holds one
+# value and is cleared on recovery, so repeated reclaims collapse into one and
+# recovered targets disappear from the count entirely.
+
+
+def _inserts(sb: _FakeSupabase) -> list[dict[str, Any]]:
+    return [row for entry in sb.log if len(entry) == 2 and entry[0] == "insert" for row in entry[1]]
+
+
+async def test_every_reclaimed_target_is_recorded_once_with_its_stage() -> None:
+    sb = _FakeSupabase(
+        [
+            _row("deriving", hours_ago=48, tid="a"),
+            _row("deriving", hours_ago=48, tid="b"),
+            _row("polling", hours_ago=48, tid="c"),
+        ]
+    )
+
+    await sweep_stalled_activations(sb, stale_after_hours=6)
+
+    events = _inserts(sb)
+    assert sorted(e["target_id"] for e in events) == ["a", "b", "c"]
+    assert {e["target_id"]: e["from_status"] for e in events} == {
+        "a": "deriving",
+        "b": "deriving",
+        "c": "polling",
+    }
+    # The window is recorded per event, so changing it later cannot make older
+    # rows unreadable.
+    assert {e["stale_after_hours"] for e in events} == {6}
+
+
+async def test_reclaiming_the_same_target_twice_records_two_events() -> None:
+    """The property a marker column cannot have. A target that stalls, gets
+    re-activated by the user, and stalls again is TWO abandonments, and a
+    frequency measurement that collapses them is worthless."""
+    sb = _FakeSupabase([_row("polling", hours_ago=48, tid="repeat")])
+
+    await sweep_stalled_activations(sb, stale_after_hours=6)
+    # The user re-activates: the row goes back in flight, and the sweep
+    # catches it stalled a second time.
+    sb.rows[0]["activation_status"] = "polling"
+    sb.rows[0]["updated_at"] = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+    await sweep_stalled_activations(sb, stale_after_hours=6)
+
+    events = _inserts(sb)
+    assert len(events) == 2, "the second abandonment must not overwrite the first"
+    assert {e["target_id"] for e in events} == {"repeat"}
+
+
+async def test_nothing_is_recorded_when_nothing_is_reclaimed() -> None:
+    """A record that appears without a reclaim would make the count a lie."""
+    sb = _FakeSupabase([_row("idle", hours_ago=48, tid="resting")])
+
+    await sweep_stalled_activations(sb, stale_after_hours=6)
+
+    assert _inserts(sb) == []
+
+
+async def test_a_failure_to_record_does_not_break_the_sweep() -> None:
+    """Instrumentation must never break the thing it measures.
+
+    The INSERT itself fails here, which is the real failure mode (a missing
+    table on a pre-migration deploy, a transient write error). Patching the
+    recorder wholesale would bypass the very guard under test.
+    """
+    sb = _FakeSupabase([_row("deriving", hours_ago=48, tid="x")], insert_raises=True)
+
+    reclaimed = await sweep_stalled_activations(sb, stale_after_hours=6)
+
+    assert reclaimed == {"deriving": 1, "polling": 0}
+    assert sb.rows[0]["activation_status"] == "idle", "the reclaim itself must still happen"
+    assert _inserts(sb) == []

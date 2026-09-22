@@ -81,9 +81,13 @@ class FakeStripe:
         pages: list[list[Any]],
         *,
         explode: bool = False,
+        recheck_explodes: bool = False,
         recheck_pages: list[list[Any]] | None = None,
     ):
         self.pages = pages
+        # Fail ONLY the per-customer re-check, leaving the bulk snapshot
+        # healthy. `explode` fails both, so it can never reach that branch.
+        self.recheck_explodes = recheck_explodes
         # What the per-customer re-check sees, when it differs from the bulk
         # snapshot. Models the real hazard: Stripe's answer changing mid-sweep.
         self.recheck_pages = recheck_pages
@@ -100,6 +104,8 @@ class FakeStripe:
         # too, or the per-customer re-check would read the whole snapshot back
         # and the freshness fix would be testing nothing.
         if params.get("customer"):
+            if self.recheck_explodes:
+                raise RuntimeError("stripe is down for the re-check")
             wanted = params["customer"]
             source = self.recheck_pages if self.recheck_pages is not None else self.pages
             rows = [x for page in source for x in page if x.customer == wanted]
@@ -389,8 +395,12 @@ async def test_one_failed_write_does_not_abort_the_sweep() -> None:
     report = await reconcile_billing(
         db, client=FakeStripe([[sub("cus_1", STARTER), sub("cus_2", PRO, sid="sub_2")]])
     )
-    assert report["healed"] == 0  # both writes failed, but it completed
+    assert report["healed"] == 0
     assert report["checked"] == 2
+    # It kept going — one bad account must not strand the others — but it did
+    # NOT do the work it was given, so it must not be recorded as a success
+    # (#1088). "Reached the end" is not "reconciled everything".
+    assert report["completed"] == 0
 
 
 # --- pagination ----------------------------------------------------------
@@ -403,7 +413,8 @@ def test_pagination_walks_every_page() -> None:
         [sub(f"cus_{i}", STARTER, sid=f"sub_{i}") for i in range(100, 150)],
     ]
     stripe = FakeStripe(pages)
-    got = _list_all_subscriptions(stripe)
+    got, truncated = _list_all_subscriptions(stripe)
+    assert truncated is False
     assert len(got) == 150, "pagination stopped early"
     assert len(stripe.calls) == 2
     assert stripe.calls[1]["starting_after"] == "sub_99"
@@ -495,7 +506,7 @@ def test_sdk_objects_are_converted_before_use() -> None:
     """The bug real staging found: the SDK returns StripeObject, which has no
     `.get()`. The pager must normalise before anything reads fields."""
     stripe = FakeStripe([[sub("cus_1", STARTER)]])
-    rows = _list_all_subscriptions(stripe)
+    rows, _ = _list_all_subscriptions(stripe)
     assert all(isinstance(r, dict) for r in rows), "SDK objects reached the caller"
     assert rows[0]["customer"] == "cus_1"
 
@@ -503,7 +514,7 @@ def test_sdk_objects_are_converted_before_use() -> None:
 def test_nested_fields_survive_conversion() -> None:
     """A shallow to_dict() would leave StripeObjects underneath and move the
     crash one level down, into items.data[0].price.id."""
-    rows = _list_all_subscriptions(FakeStripe([[sub("cus_1", PRO)]]))
+    rows, _ = _list_all_subscriptions(FakeStripe([[sub("cus_1", PRO)]]))
     assert rows[0]["items"]["data"][0]["price"]["id"] == PRO
 
 
@@ -724,6 +735,10 @@ async def test_a_same_value_webhook_write_blocks_the_heal() -> None:
     assert report["healed"] == 0
     assert report["stale_skipped"] == 1
     assert db.rows[0]["plan"] == "free", "the account must be left on free"
+    # An ordinary business outcome, not a failure: the sweep saw the change and
+    # correctly declined to act. The next pass works from fresh data, so this
+    # run DID complete and must still count as a success (#1088).
+    assert report["completed"] == 1
 
 
 @pytest.mark.asyncio
@@ -811,3 +826,72 @@ async def test_a_trial_is_still_upgraded_when_stripe_says_paid() -> None:
     report = await reconcile_billing(db, client=FakeStripe([[sub("cus_1", PRO)]]))
     assert db.writes == [("u1", {"plan": "pro"})]
     assert report["healed"] == 1
+
+
+# ---- #1088: the sweep reports whether it actually finished ------------------
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_that_cannot_reach_stripe_reports_not_completed(
+    _billing_settings: Any,
+) -> None:
+    """This sweep never raises by design, so without an explicit signal the
+    scheduler would record a clean pass for a run that reconciled nothing."""
+    report = await reconcile_billing(FakeDB([]), client=FakeStripe([], explode=True))
+
+    assert report["completed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_clean_sweep_reports_completed(_billing_settings: Any) -> None:
+    report = await reconcile_billing(FakeDB([]), client=FakeStripe([[]]))
+
+    assert report["completed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_stripe_snapshot_is_not_a_completed_run(
+    monkeypatch: pytest.MonkeyPatch, _billing_settings: Any
+) -> None:
+    """The subtlest of the three: pagination hit its cap, so the sweep
+    reconciled against a PARTIAL view of Stripe. It logs that, but the caller
+    could not tell it apart from a complete snapshot and stamped a success —
+    the same blind spot one layer deeper (#1088)."""
+    import app.services.billing_reconcile as mod
+
+    monkeypatch.setattr(mod, "_MAX_PAGES", 1, raising=False)
+    # Two pages available, cap of one: the walk stops short.
+    stripe = FakeStripe([[sub("cus_1", STARTER)], [sub("cus_2", PRO, sid="sub_2")]])
+
+    report = await reconcile_billing(FakeDB([profile("u1", "starter", "cus_1")]), client=stripe)
+
+    assert report["completed"] == 0, "a partial snapshot is not a completed reconciliation"
+
+
+@pytest.mark.asyncio
+async def test_an_untruncated_snapshot_still_completes(
+    monkeypatch: pytest.MonkeyPatch, _billing_settings: Any
+) -> None:
+    """The control: same shape, cap not reached."""
+    import app.services.billing_reconcile as mod
+
+    monkeypatch.setattr(mod, "_MAX_PAGES", 50, raising=False)
+    stripe = FakeStripe([[sub("cus_1", STARTER)]])
+
+    report = await reconcile_billing(FakeDB([profile("u1", "starter", "cus_1")]), client=stripe)
+
+    assert report["completed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_customer_that_cannot_be_re_verified_is_not_a_completed_run(
+    _billing_settings: Any,
+) -> None:
+    """The re-check before a heal is the guard against restoring paid access
+    on stale data. If it cannot run, that account was not reconciled."""
+    stripe = FakeStripe([[sub("cus_1", STARTER)]], recheck_explodes=True)
+
+    report = await reconcile_billing(FakeDB([profile("u1", "free", "cus_1")]), client=stripe)
+
+    assert report["healed"] == 0
+    assert report["completed"] == 0
