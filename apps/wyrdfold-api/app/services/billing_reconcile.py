@@ -135,8 +135,7 @@ def _expected_plans(subscriptions: list[dict[str, Any]]) -> dict[str, str]:
         elif current != plan:
             strongest = plan if rank(plan) > rank(current) else current
             logger.warning(
-                "billing reconcile: customer=%s has multiple entitled plans "
-                "(%s, %s) — taking %s",
+                "billing reconcile: customer=%s has multiple entitled plans (%s, %s) — taking %s",
                 customer,
                 current,
                 plan,
@@ -146,8 +145,15 @@ def _expected_plans(subscriptions: list[dict[str, Any]]) -> dict[str, str]:
     return best
 
 
-def _list_all_subscriptions(client: Any) -> list[dict[str, Any]]:
+def _list_all_subscriptions(client: Any) -> tuple[list[dict[str, Any]], bool]:
     """Every subscription, paginated. Blocking — call via ``asyncio.to_thread``.
+
+    Returns ``(subscriptions, truncated)``. ``truncated`` is True when the page
+    cap was reached, i.e. the snapshot is INCOMPLETE. It used to log that and
+    return the partial list, which the caller could not tell apart from a
+    complete one — so a reconciliation over a truncated snapshot was recorded
+    as a clean pass (#1088). Whether the run finished is the caller's call to
+    make, so it has to be told.
 
     ``status="all"`` on purpose: filtering server-side to active would hide the
     lapsed ones, and a customer whose subscription is `canceled` is exactly the
@@ -163,15 +169,15 @@ def _list_all_subscriptions(client: Any) -> list[dict[str, Any]]:
         rows = [_as_dict(s) for s in (page.data or [])]
         out.extend(rows)
         if not getattr(page, "has_more", False) or not rows:
-            return out
+            return out, False
         starting_after = cast(str, rows[-1].get("id") or "")
         if not starting_after:
-            return out
+            return out, False
     logger.error(
         "billing reconcile: pagination hit the %d-page cap — results are PARTIAL",
         _MAX_PAGES,
     )
-    return out
+    return out, True
 
 
 def _entitled_plan_now(client: Any, customer_id: str) -> str | None:
@@ -198,9 +204,7 @@ def _entitled_plan_now(client: Any, customer_id: str) -> str | None:
     return _expected_plans(rows).get(customer_id)
 
 
-async def reconcile_billing(
-    supabase: AsyncClient, *, client: Any | None = None
-) -> dict[str, int]:
+async def reconcile_billing(supabase: AsyncClient, *, client: Any | None = None) -> dict[str, int]:
     """Compare Stripe's subscriptions against stored plans. Heal up, report down.
 
     Best-effort and never raises: it runs from the scheduler, where an escaping
@@ -231,6 +235,15 @@ async def reconcile_billing(
         # nothing to reconcile IS the finished state.
         report["completed"] = 1
         return report
+    # Set by any operational failure the loop below catches and continues past.
+    # "Reached the final return" is NOT "reconciled everything it was given": a
+    # truncated Stripe snapshot, a customer it could not re-verify, or a heal it
+    # could not write all mean work was left undone, and recording a success for
+    # those recreates the blind spot this flag exists to close (#1088).
+    # Ordinary business outcomes — a customer that changed under the sweep, an
+    # unknown customer — are NOT failures and leave this alone.
+    incomplete = False
+
     if not settings.stripe_secret_key:
         # A saas instance that cannot reach Stripe has NOT done its work. The
         # warning says so, and the ledger should agree rather than record a
@@ -243,7 +256,8 @@ async def reconcile_billing(
             import stripe
 
             client = stripe.StripeClient(settings.stripe_secret_key)
-        subscriptions = await asyncio.to_thread(_list_all_subscriptions, client)
+        subscriptions, truncated = await asyncio.to_thread(_list_all_subscriptions, client)
+        incomplete = incomplete or truncated
     except Exception:
         logger.exception("billing reconcile: could not list subscriptions — skipped")
         return report
@@ -313,14 +327,13 @@ async def reconcile_billing(
             # this write restore paid access PERMANENTLY — the sweep never
             # downgrades, so nothing would ever take it back.
             try:
-                fresh = await asyncio.to_thread(
-                    _entitled_plan_now, client, customer
-                )
+                fresh = await asyncio.to_thread(_entitled_plan_now, client, customer)
             except Exception:
                 logger.exception(
                     "billing reconcile: could not re-verify customer=%s — not healing",
                     customer,
                 )
+                incomplete = True
                 continue
             if fresh != target:
                 report["stale_skipped"] += 1
@@ -349,6 +362,7 @@ async def reconcile_billing(
                     "not healing (the CAS would be unguarded)",
                     row.get("user_id"),
                 )
+                incomplete = True
                 continue
             try:
                 resp = await (
@@ -364,6 +378,7 @@ async def reconcile_billing(
                     row.get("user_id"),
                     target,
                 )
+                incomplete = True
                 continue
             # A conditional update that matched NOTHING is not a heal. Counting
             # it as one would report success for the exact interleaving this
@@ -408,5 +423,5 @@ async def reconcile_billing(
                 customer,
             )
 
-    report["completed"] = 1
+    report["completed"] = 0 if incomplete else 1
     return report
