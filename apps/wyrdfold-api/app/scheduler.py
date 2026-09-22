@@ -483,6 +483,32 @@ async def _record_scheduler_run(job_id: str) -> None:
 #: introduced for (#327), kept intact now that the catch-up keys off success
 #: (#1088). Clamped to the job's own tick so a short-interval job is never
 #: retried more often than it would run anyway.
+#: Boot catch-up delays, per job, in minutes. Staggered so a cold container
+#: does not run every heavy job at once: once the catch-up keys off SUCCESS
+#: (#1088), the first boot after that change finds them all starved, and these
+#: include a purge that deletes and a sweep that walks the whole score table.
+#:
+#: Single source of truth on purpose. These were literals at the registration
+#: sites while two log lines separately announced a fixed three-minute delay,
+#: so staggering them silently made those lines wrong — operational logs that
+#: lie, which is the exact class of defect this release set out to remove
+#: (#1101 review). The trigger and the message now read the same number, so
+#: they cannot drift apart again.
+_CATCHUP_DELAYS_MIN: dict[str, int] = {
+    "url_health_check": 3,
+    "phase1_backfill_resume": 5,
+    "retention_purge": 7,
+    "activation_sweep": 9,
+    "discovery": 11,
+    "recency_refresh": 13,
+}
+
+
+def _catchup_at(job_id: str) -> datetime:
+    """When this job's boot catch-up should fire (see _CATCHUP_DELAYS_MIN)."""
+    return datetime.now(UTC) + timedelta(minutes=_CATCHUP_DELAYS_MIN[job_id])
+
+
 _CATCHUP_RETRY_FLOOR = timedelta(hours=1)
 
 
@@ -782,7 +808,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         # keeps a cold container from running all six together.
         scheduler.add_job(
             _anchor_job_from_ledger,
-            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=3)),
+            DateTrigger(run_date=_catchup_at("url_health_check")),
             kwargs={
                 "job_id": "url_health_check",
                 "tick_hours": settings.url_health_tick_hours,
@@ -819,7 +845,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         # test caught exactly that here.
         scheduler.add_job(
             _anchor_job_from_ledger,
-            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=5)),
+            DateTrigger(run_date=_catchup_at("phase1_backfill_resume")),
             kwargs={
                 "job_id": "phase1_backfill_resume",
                 "tick_hours": settings.phase1_backfill_resume_tick_hours,
@@ -849,7 +875,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         )
         scheduler.add_job(
             _anchor_job_from_ledger,
-            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=7)),
+            DateTrigger(run_date=_catchup_at("retention_purge")),
             kwargs={
                 "job_id": "retention_purge",
                 "tick_hours": settings.retention_purge_tick_hours,
@@ -910,7 +936,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         # overdue and runs immediately, writing the ledger row that proves it.
         scheduler.add_job(
             _anchor_job_from_ledger,
-            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=9)),
+            DateTrigger(run_date=_catchup_at("activation_sweep")),
             kwargs={
                 "job_id": "activation_sweep",
                 "tick_hours": settings.activation_sweep_tick_hours,
@@ -925,9 +951,10 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         )
         logger.info(
             "activation sweep scheduler registered (tick every %d h, stale after %d h, "
-            "catch-up in 3m)",
+            "catch-up in %dm)",
             settings.activation_sweep_tick_hours,
             settings.activation_stale_after_hours,
+            _CATCHUP_DELAYS_MIN["activation_sweep"],
         )
 
     if settings.discovery_scheduler_enabled:
@@ -948,7 +975,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         # settle and means a crash-looping process never reaches Brave at all.
         scheduler.add_job(
             _anchor_discovery_schedule,
-            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=11)),
+            DateTrigger(run_date=_catchup_at("discovery")),
             args=[scheduler],
             id="discovery_catchup",
             max_instances=1,
@@ -962,8 +989,9 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
             misfire_grace_time=3600,
         )
         logger.info(
-            "discovery scheduler registered (tick every %d h, catch-up in 3m)",
+            "discovery scheduler registered (tick every %d h, catch-up in %dm)",
             settings.discovery_tick_hours,
+            _CATCHUP_DELAYS_MIN["discovery"],
         )
 
     if settings.recency_refresh_enabled:
@@ -978,7 +1006,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         )
         scheduler.add_job(
             _anchor_job_from_ledger,
-            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=13)),
+            DateTrigger(run_date=_catchup_at("recency_refresh")),
             kwargs={
                 "job_id": "recency_refresh",
                 "tick_hours": settings.recency_refresh_tick_hours,

@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -1452,3 +1453,63 @@ class TestFailSoftJobsDoNotRecordFalseSuccess:
             await _run_scheduled_billing_reconcile()
 
         assert stamped == ["billing_reconcile"]
+
+
+class TestCatchupDelaysAreOneSourceOfTruth:
+    """#1101 review: staggering the catch-ups silently made two log lines
+    wrong — they still announced "catch-up in 3m" while their jobs had moved
+    to 9 and 11 minutes. Operational logs that lie are the defect class this
+    release set out to remove, so the trigger and the message now read the
+    same number and this pins that they cannot drift apart again."""
+
+    def test_every_catchup_registration_uses_the_shared_delay_table(self) -> None:
+        import inspect
+
+        from app import scheduler as mod
+
+        src = inspect.getsource(mod)
+        # No registration may hardcode its own delay.
+        hardcoded = re.findall(
+            r"DateTrigger\(run_date=datetime\.now\(UTC\) \+ timedelta\(minutes=\d+\)\)", src
+        )
+        assert hardcoded == [], f"catch-up delay hardcoded at a registration site: {hardcoded}"
+        # Every id="<job>_catchup" has an entry in the table.
+        registered = set(re.findall(r'id="([a-z0-9_]+)_catchup"', src))
+        assert registered, "expected catch-up registrations"
+        missing = registered - set(mod._CATCHUP_DELAYS_MIN)
+        assert missing == set(), f"catch-up jobs with no declared delay: {missing}"
+
+    def test_no_registration_message_states_a_literal_delay(self) -> None:
+        """The exact regression: a message that hardcodes minutes cannot follow
+        a change to the schedule."""
+        import inspect
+
+        from app import scheduler as mod
+
+        src = inspect.getsource(mod)
+        # Only string LITERALS matter here. A blunt substring check also hits
+        # the comment explaining this very regression, which is documentation
+        # rather than a lying log line.
+        literals = re.findall(r'"[^"]*catch-up in \d+m[^"]*"', src)
+        assert literals == [], f"a log message hardcodes its delay: {literals}"
+
+    def test_the_delays_are_distinct_so_the_jobs_do_not_collide(self) -> None:
+        """The staggering is the point: these are the heavy jobs, and a cold
+        container must not run them together."""
+        from app import scheduler as mod
+
+        delays = list(mod._CATCHUP_DELAYS_MIN.values())
+        assert len(set(delays)) == len(delays), f"two catch-ups share a slot: {delays}"
+        assert all(d > 0 for d in delays)
+
+    def test_the_helper_returns_the_declared_delay(self) -> None:
+        from app import scheduler as mod
+
+        before = datetime.now(UTC)
+        when = mod._catchup_at("recency_refresh")
+        offset = (when - before).total_seconds() / 60
+        assert (
+            mod._CATCHUP_DELAYS_MIN["recency_refresh"] - 0.5
+            <= offset
+            <= (mod._CATCHUP_DELAYS_MIN["recency_refresh"] + 0.5)
+        )
