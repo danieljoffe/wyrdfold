@@ -58,6 +58,13 @@ class ActivationError(StrEnum):
     DERIVE_TIMEOUT = "derive_timeout"
     #: Anything else the pipeline raised (LLM 402, DB blip, network). Transient.
     PIPELINE_FAILED = "pipeline_failed"
+    #: The activation never finished and the sweep reclaimed the row. Written
+    #: with ``activation_status = 'idle'``, NOT ``'error'``, so the user still
+    #: sees a re-activatable target rather than a red card (see the sweep's
+    #: docstring). It exists purely so reclaims leave a durable trace: before
+    #: this, a reclaim logged a warning that aged out and changed nothing on
+    #: the row, so how often deferred work is abandoned was unknowable (#1090).
+    STALLED_RECLAIMED = "stalled_reclaimed"
 
 
 #: Reasons the user can resolve themselves. Everything else is a backend
@@ -95,7 +102,25 @@ async def sweep_stalled_activations(
     for status in IN_FLIGHT_STATUSES:
         resp = await (
             supabase.table(TARGETS_TABLE)
-            .update({"activation_status": "idle", "updated_at": datetime.now(UTC).isoformat()})
+            .update(
+                {
+                    "activation_status": "idle",
+                    # Durable trace of the reclaim (#1090). The status stays
+                    # ``idle`` so the card is unchanged for the user — the
+                    # frontend gates its failure message on the status, not on
+                    # this column — but the row now says it was abandoned, and
+                    # by when. Counting these is how the frequency of lost
+                    # deferred work gets sized instead of guessed.
+                    #
+                    # Known undercount: re-activating a target clears both
+                    # columns, so this counts targets reclaimed and NOT since
+                    # recovered. That is the population that matters most, but
+                    # it is not the total number of reclaims.
+                    "activation_error": ActivationError.STALLED_RECLAIMED,
+                    "activation_failed_at": datetime.now(UTC).isoformat(),
+                    "updated_at": datetime.now(UTC).isoformat(),
+                }
+            )
             .eq("activation_status", status)
             .lt("updated_at", cutoff)
             .execute()

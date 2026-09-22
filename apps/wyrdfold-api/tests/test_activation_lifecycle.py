@@ -179,3 +179,35 @@ async def test_sweep_is_idempotent() -> None:
 
     assert first == {"deriving": 0, "polling": 1}
     assert second == {"deriving": 0, "polling": 0}
+
+
+# ---- #1090: a reclaim must leave a durable, countable trace -----------------
+
+
+async def test_a_reclaim_stamps_a_durable_marker_without_changing_what_the_user_sees() -> None:
+    """Before this, a reclaim logged a warning that aged out and changed
+    nothing on the row, so how often deferred work is abandoned could not be
+    counted after the fact. The row now records that it was abandoned and
+    when, while the status stays ``idle`` so the card is unchanged for the
+    user (the frontend gates its failure message on the status)."""
+    sb = _FakeSupabase([_row("deriving", hours_ago=48, tid="stuck")])
+
+    reclaimed = await sweep_stalled_activations(sb, stale_after_hours=6)
+
+    assert reclaimed == {"deriving": 1, "polling": 0}
+    row = sb.rows[0]
+    assert row["activation_status"] == "idle", "the user must still see a re-activatable target"
+    assert row["activation_error"] == ActivationError.STALLED_RECLAIMED
+    assert row["activation_failed_at"], "the marker needs a timestamp to be countable"
+
+
+@pytest.mark.parametrize("status", ["idle", "ready", "error"])
+async def test_a_resting_row_is_not_marked(status: str) -> None:
+    """The marker must only ever describe rows the sweep actually reclaimed,
+    or counting it means nothing."""
+    sb = _FakeSupabase([_row(status, hours_ago=48, tid="resting")])
+
+    await sweep_stalled_activations(sb, stale_after_hours=6)
+
+    assert "activation_error" not in sb.rows[0]
+    assert "activation_failed_at" not in sb.rows[0]
