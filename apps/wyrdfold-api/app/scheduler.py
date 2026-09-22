@@ -259,6 +259,7 @@ async def _run_scheduled_url_health() -> None:
         summary = await run_url_health_check(client)
         if summary["archived"] > 0:
             job_list_cache.invalidate()
+        await _record_scheduler_success("url_health_check")
     except Exception:
         logger.exception("scheduled url_health raised")
 
@@ -282,6 +283,7 @@ async def _run_phase1_backfill_resume() -> None:
             return
         await _record_scheduler_run("phase1_backfill_resume")
         await resume_phase1_backfills(client)
+        await _record_scheduler_success("phase1_backfill_resume")
     except Exception:
         logger.exception("phase1 backfill resume tick failed")
 
@@ -310,6 +312,7 @@ async def _run_scheduled_retention_purge() -> None:
             phase1_rejections_days=settings.phase1_rejections_retention_days,
         )
         logger.info("scheduled retention purge: %s", report)
+        await _record_scheduler_success("retention_purge")
     except Exception:
         logger.exception("scheduled retention purge raised")
 
@@ -335,6 +338,7 @@ async def _run_scheduled_billing_reconcile() -> None:
         # is already logged at ERROR inside the sweep so it reaches Sentry.
         if report["healed"] or report["underpaid_reported"] or report["unknown_customer"]:
             logger.info("scheduled billing reconcile: %s", report)
+        await _record_scheduler_success("billing_reconcile")
     except Exception:
         logger.exception("scheduled billing reconcile raised")
 
@@ -358,6 +362,7 @@ async def _run_scheduled_activation_sweep() -> None:
         )
         if any(reclaimed.values()):
             logger.info("scheduled activation sweep: %s", reclaimed)
+        await _record_scheduler_success("activation_sweep")
     except Exception:
         logger.exception("scheduled activation sweep raised")
 
@@ -389,6 +394,11 @@ async def _run_scheduled_recency_refresh() -> None:
             # drop them so the refreshed ordering surfaces on next load.
             job_list_cache.invalidate()
         if report.ok:
+            # The one job with an explicit completion signal, so it is used:
+            # a sweep that stopped part-way has NOT done its work, and
+            # stamping success for it would recreate the exact blind spot
+            # this change exists to close (#1088).
+            await _record_scheduler_success("recency_refresh")
             logger.info(
                 "scheduled recency refresh: rewrote %d score rows across %d batch(es)",
                 report.written,
@@ -447,6 +457,70 @@ async def _record_scheduler_run(job_id: str) -> None:
         logger.warning("scheduler_runs stamp failed for %s (non-fatal)", job_id)
 
 
+#: Never re-attempt a starved job more often than this at boot, however many
+#: times the process restarts. The storm guard the attempt marker was
+#: introduced for (#327), kept intact now that the catch-up keys off success
+#: (#1088). Clamped to the job's own tick so a short-interval job is never
+#: retried more often than it would run anyway.
+_CATCHUP_RETRY_FLOOR = timedelta(hours=1)
+
+
+async def _record_scheduler_success(job_id: str) -> None:
+    """Stamp that the job COMPLETED its work, not merely that it started.
+
+    In plain terms: the ledger used to record only attempts, so a job failing
+    on every tick looked identical to a healthy one and the catch-up could
+    never tell them apart (#1088).
+
+    An UPDATE rather than an upsert, deliberately: the attempt stamp always
+    runs first and creates the row, so there is nothing to insert here, and an
+    update cannot overwrite ``last_run_at`` — which is the storm guard and has
+    to keep meaning "when did we last TRY". Fail-soft like its sibling: a
+    marker write must never break the job it is describing.
+    """
+    try:
+        client = get_async_supabase()
+        if client is None:
+            return
+        await (
+            client.table("scheduler_runs")
+            .update(
+                {
+                    "last_success_at": datetime.now(UTC).isoformat(),
+                    "updated_at": datetime.now(UTC).isoformat(),
+                }
+            )
+            .eq("job_id", job_id)
+            .execute()
+        )
+    except Exception:
+        logger.warning("scheduler_runs success stamp failed for %s (non-fatal)", job_id)
+
+
+async def _last_scheduler_success(job_id: str) -> datetime | None:
+    """When this job last completed its work, or None if never recorded."""
+    client = get_async_supabase()
+    if client is None:
+        return None
+    resp = await (
+        client.table("scheduler_runs")
+        .select("last_success_at")
+        .eq("job_id", job_id)
+        .limit(1)
+        .execute()
+    )
+    rows = cast("list[dict[str, object]]", resp.data or [])
+    if not rows:
+        return None
+    raw = rows[0].get("last_success_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
 async def _last_scheduler_run(job_id: str) -> datetime | None:
     client = get_async_supabase()
     if client is None:
@@ -472,30 +546,67 @@ async def _anchor_job_from_ledger(
     runner: Callable[[], Awaitable[None]],
     now: datetime | None = None,
 ) -> None:
-    """One-shot catch-up for a ledger-stamped job — same contract as
-    ``_anchor_discovery_schedule``: overdue/never → run now (the runner
-    stamps the ledger itself); fresh → pull the interval job's next fire up
-    to ``last_run + tick``. Fail-soft: any error keeps the boot-relative
-    schedule."""
+    """One-shot catch-up for a ledger-stamped job.
+
+    In plain terms: decide, at boot, whether this job is behind and should run
+    now. It used to ask "when did we last TRY?", which made a job that failed
+    on every attempt look perfectly healthy — the recency sweep failed twice a
+    day for over two weeks and this never once fired for it (#1088). It now
+    asks "when did we last SUCCEED?".
+
+    The attempt marker still does its original job (#327). Keying purely off
+    success would re-fire a permanently failing job on every boot, and this
+    app deploys often, so a crash-loop would become a run storm — the exact
+    thing stamping attempts was introduced to prevent. Both are needed:
+
+      * ``last_success_at`` decides whether the job is STARVED,
+      * ``last_run_at`` decides whether trying again right now would be a
+        STORM, via ``_CATCHUP_RETRY_FLOOR``.
+
+    So a failing job retries at a bounded rate instead of either never
+    recovering or hammering, and the case where attempts keep happening
+    without succeeding is logged rather than left silent. Fail-soft: any error
+    keeps the boot-relative schedule.
+    """
     moment = now or datetime.now(UTC)
     try:
-        last = await _last_scheduler_run(job_id)
+        last_run = await _last_scheduler_run(job_id)
+        last_success = await _last_scheduler_success(job_id)
         tick = timedelta(hours=tick_hours)
-        if last is None or moment - last >= tick:
+        retry_floor = min(_CATCHUP_RETRY_FLOOR, tick)
+        starved = last_success is None or moment - last_success >= tick
+        just_tried = last_run is not None and moment - last_run < retry_floor
+
+        if starved and not just_tried:
             logger.info(
-                "%s catch-up: last persisted run %s is overdue (tick %dh) — running now",
+                "%s catch-up: last SUCCESS %s is overdue (tick %dh) — running now "
+                "(last attempt %s)",
                 job_id,
-                last.isoformat() if last else "never",
+                last_success.isoformat() if last_success else "never",
                 tick_hours,
+                last_run.isoformat() if last_run else "never",
             )
             await runner()
-        else:
-            next_fire = last + tick
+        elif starved:
+            # Attempts are happening and not succeeding. Running again right
+            # now would just be the storm; the next scheduled tick will try
+            # again. Loud, because this is the state that hid for two weeks.
+            logger.error(
+                "%s is STARVED: last success %s, last attempt %s (tick %dh). It is "
+                "being attempted and failing — holding off to avoid a retry storm, "
+                "next attempt on its normal tick",
+                job_id,
+                last_success.isoformat() if last_success else "never",
+                last_run.isoformat() if last_run else "never",
+                tick_hours,
+            )
+        elif last_success is not None:  # always true here; `not starved` implies it
+            next_fire = last_success + tick
             scheduler.modify_job(job_id, next_run_time=next_fire)
             logger.info(
-                "%s catch-up: last persisted run %s is fresh — next fire anchored to %s",
+                "%s catch-up: last success %s is fresh — next fire anchored to %s",
                 job_id,
-                last.isoformat(),
+                last_success.isoformat(),
                 next_fire.isoformat(),
             )
     except Exception:
@@ -642,6 +753,12 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
             replace_existing=True,
             misfire_grace_time=_SWEEP_MISFIRE_GRACE_S,
         )
+        # Catch-ups are staggered (3, 5, 7, 9, 11, 13 minutes after boot)
+        # rather than all firing at +3. Since the catch-up keys off the last
+        # SUCCESS (#1088), the first boot after that change finds every job
+        # starved at once, and these are the heavy jobs — a purge that
+        # deletes, a sweep that walks the whole score table. Spreading them
+        # keeps a cold container from running all six together.
         scheduler.add_job(
             _anchor_job_from_ledger,
             DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=3)),
@@ -681,7 +798,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         # test caught exactly that here.
         scheduler.add_job(
             _anchor_job_from_ledger,
-            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=3)),
+            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=5)),
             kwargs={
                 "job_id": "phase1_backfill_resume",
                 "tick_hours": settings.phase1_backfill_resume_tick_hours,
@@ -711,7 +828,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         )
         scheduler.add_job(
             _anchor_job_from_ledger,
-            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=3)),
+            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=7)),
             kwargs={
                 "job_id": "retention_purge",
                 "tick_hours": settings.retention_purge_tick_hours,
@@ -772,7 +889,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         # overdue and runs immediately, writing the ledger row that proves it.
         scheduler.add_job(
             _anchor_job_from_ledger,
-            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=3)),
+            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=9)),
             kwargs={
                 "job_id": "activation_sweep",
                 "tick_hours": settings.activation_sweep_tick_hours,
@@ -810,7 +927,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         # settle and means a crash-looping process never reaches Brave at all.
         scheduler.add_job(
             _anchor_discovery_schedule,
-            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=3)),
+            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=11)),
             args=[scheduler],
             id="discovery_catchup",
             max_instances=1,
@@ -840,7 +957,7 @@ def start_scheduler_if_enabled() -> AsyncIOScheduler | None:
         )
         scheduler.add_job(
             _anchor_job_from_ledger,
-            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=3)),
+            DateTrigger(run_date=datetime.now(UTC) + timedelta(minutes=13)),
             kwargs={
                 "job_id": "recency_refresh",
                 "tick_hours": settings.recency_refresh_tick_hours,
