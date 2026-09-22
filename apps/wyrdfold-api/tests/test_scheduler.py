@@ -1332,3 +1332,123 @@ class TestSuccessIsStampedOnlyOnRealCompletion:
             await _run_scheduled_recency_refresh()
 
         assert stamped == ["recency_refresh"]
+
+
+class TestFailSoftJobsDoNotRecordFalseSuccess:
+    """#1088 review: two of the six services never raise. They log and return
+    a partial report, so the scheduler must read their completion signal
+    rather than treating "it returned" as "it worked" — which would record the
+    same false health this ledger exists to prevent."""
+
+    @staticmethod
+    def _stamps() -> tuple[list[str], "Callable[[str], Awaitable[None]]"]:
+        stamped: list[str] = []
+
+        async def fake_success(job_id: str) -> None:
+            stamped.append(job_id)
+
+        return stamped, fake_success
+
+    @pytest.mark.asyncio
+    async def test_a_partial_url_health_tick_records_no_success(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from app.scheduler import _run_scheduled_url_health
+
+        stamped, fake_success = self._stamps()
+        partial = {
+            "checked": 0,
+            "healthy": 0,
+            "failures": 0,
+            "server_errors": 0,
+            "archived": 0,
+            "completed": 0,
+        }
+        with (
+            patch("app.scheduler.get_async_supabase", return_value=object()),
+            patch("app.scheduler._record_scheduler_run", AsyncMock()),
+            patch("app.scheduler._record_scheduler_success", fake_success),
+            patch("app.scheduler.job_list_cache"),
+            patch("app.scheduler.run_url_health_check", return_value=partial),
+            caplog.at_level(logging.INFO, logger="app.scheduler"),
+        ):
+            await _run_scheduled_url_health()
+
+        assert stamped == [], "a partial tick must not be recorded as a success"
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    @pytest.mark.asyncio
+    async def test_a_completed_url_health_tick_records_success(self) -> None:
+        from app.scheduler import _run_scheduled_url_health
+
+        stamped, fake_success = self._stamps()
+        done = {
+            "checked": 3,
+            "healthy": 3,
+            "failures": 0,
+            "server_errors": 0,
+            "archived": 0,
+            "completed": 1,
+        }
+        with (
+            patch("app.scheduler.get_async_supabase", return_value=object()),
+            patch("app.scheduler._record_scheduler_run", AsyncMock()),
+            patch("app.scheduler._record_scheduler_success", fake_success),
+            patch("app.scheduler.job_list_cache"),
+            patch("app.scheduler.run_url_health_check", return_value=done),
+        ):
+            await _run_scheduled_url_health()
+
+        assert stamped == ["url_health_check"]
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_billing_reconcile_records_no_success(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from app.scheduler import _run_scheduled_billing_reconcile
+
+        stamped, fake_success = self._stamps()
+        incomplete = {
+            "checked": 0,
+            "in_sync": 0,
+            "healed": 0,
+            "underpaid_reported": 0,
+            "unknown_customer": 0,
+            "stale_skipped": 0,
+            "completed": 0,
+        }
+        with (
+            patch("app.scheduler.get_async_supabase", return_value=object()),
+            patch("app.scheduler._record_scheduler_run", AsyncMock()),
+            patch("app.scheduler._record_scheduler_success", fake_success),
+            patch("app.scheduler.reconcile_billing", return_value=incomplete),
+            caplog.at_level(logging.INFO, logger="app.scheduler"),
+        ):
+            await _run_scheduled_billing_reconcile()
+
+        assert stamped == []
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    @pytest.mark.asyncio
+    async def test_a_completed_billing_reconcile_records_success(self) -> None:
+        from app.scheduler import _run_scheduled_billing_reconcile
+
+        stamped, fake_success = self._stamps()
+        done = {
+            "checked": 2,
+            "in_sync": 2,
+            "healed": 0,
+            "underpaid_reported": 0,
+            "unknown_customer": 0,
+            "stale_skipped": 0,
+            "completed": 1,
+        }
+        with (
+            patch("app.scheduler.get_async_supabase", return_value=object()),
+            patch("app.scheduler._record_scheduler_run", AsyncMock()),
+            patch("app.scheduler._record_scheduler_success", fake_success),
+            patch("app.scheduler.reconcile_billing", return_value=done),
+        ):
+            await _run_scheduled_billing_reconcile()
+
+        assert stamped == ["billing_reconcile"]

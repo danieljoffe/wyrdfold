@@ -214,13 +214,27 @@ async def reconcile_billing(
         "underpaid_reported": 0,
         "unknown_customer": 0,
         "stale_skipped": 0,
+        # Did this run reach its intended end? DEFAULTS TO NOT-COMPLETED and is
+        # set only where the run genuinely finished. This function never
+        # raises by design, so the caller cannot otherwise tell a clean pass
+        # from one that gave up after failing to reach Stripe (#1088).
+        #
+        # Defaulting to 0 means a future early return says "did not complete"
+        # by omission, which is the safe direction.
+        "completed": 0,
     }
 
     # Billing is saas-only. A self-hosted instance has no Stripe relationship,
     # and must not make outbound calls on a timer because a flag was left on.
     if settings.deployment_mode != "saas":
+        # Not a failure: this instance does not sell subscriptions, so having
+        # nothing to reconcile IS the finished state.
+        report["completed"] = 1
         return report
     if not settings.stripe_secret_key:
+        # A saas instance that cannot reach Stripe has NOT done its work. The
+        # warning says so, and the ledger should agree rather than record a
+        # success for a run that reconciled nothing it was supposed to.
         logger.warning("billing reconcile: no STRIPE_SECRET_KEY — skipped")
         return report
 
@@ -394,4 +408,5 @@ async def reconcile_billing(
                 customer,
             )
 
+    report["completed"] = 1
     return report

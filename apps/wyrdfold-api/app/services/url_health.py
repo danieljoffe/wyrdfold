@@ -325,6 +325,17 @@ async def run_url_health_check(
         "failures": 0,
         "server_errors": 0,
         "archived": 0,
+        # Did this tick reach its intended end? DEFAULTS TO NOT-COMPLETED and is
+        # set exactly once, at the successful terminal return below. This
+        # function is deliberately fail-soft — it logs and returns a partial
+        # summary rather than raising — so its caller cannot tell a finished
+        # tick from an abandoned one without being told. The scheduler uses
+        # this to decide whether to record a success in its run ledger (#1088).
+        #
+        # Defaulting to 0 is the point: a future early return added anywhere
+        # below reports "did not complete" by omission, which is the safe
+        # direction. Never set this anywhere but the final return.
+        "completed": 0,
     }
 
     try:
@@ -333,7 +344,11 @@ async def run_url_health_check(
         logger.exception("url_health: failed to fetch due jobs")
         return summary
     if not rows:
+        # Nothing due IS the finished state for this tick, not a failure: the
+        # job looked, found no work, and is done. The other early returns
+        # below are genuine give-ups and must NOT set this.
         logger.info("url_health: no jobs due for check")
+        summary["completed"] = 1
         return summary
 
     urls = [(r["id"], r["absolute_url"]) for r in rows if r.get("absolute_url")]
@@ -381,4 +396,5 @@ async def run_url_health_check(
         summary["server_errors"],
         summary["archived"],
     )
+    summary["completed"] = 1
     return summary

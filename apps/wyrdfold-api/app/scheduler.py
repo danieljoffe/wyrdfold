@@ -259,7 +259,18 @@ async def _run_scheduled_url_health() -> None:
         summary = await run_url_health_check(client)
         if summary["archived"] > 0:
             job_list_cache.invalidate()
-        await _record_scheduler_success("url_health_check")
+        if summary["completed"]:
+            await _record_scheduler_success("url_health_check")
+        else:
+            # The service is fail-soft: it logs and returns a partial summary
+            # rather than raising, so without this the ledger would record a
+            # success for a tick that gave up early — the exact blind spot
+            # this ledger exists to close (#1088).
+            logger.error(
+                "scheduled url_health did NOT complete (partial summary: %s); "
+                "not recording a success",
+                summary,
+            )
     except Exception:
         logger.exception("scheduled url_health raised")
 
@@ -338,7 +349,17 @@ async def _run_scheduled_billing_reconcile() -> None:
         # is already logged at ERROR inside the sweep so it reaches Sentry.
         if report["healed"] or report["underpaid_reported"] or report["unknown_customer"]:
             logger.info("scheduled billing reconcile: %s", report)
-        await _record_scheduler_success("billing_reconcile")
+        if report["completed"]:
+            await _record_scheduler_success("billing_reconcile")
+        else:
+            # Same reasoning as url_health: this sweep never raises, so a run
+            # that could not reach Stripe would otherwise be recorded as a
+            # clean pass (#1088).
+            logger.error(
+                "scheduled billing reconcile did NOT complete (report: %s); "
+                "not recording a success",
+                report,
+            )
     except Exception:
         logger.exception("scheduled billing reconcile raised")
 

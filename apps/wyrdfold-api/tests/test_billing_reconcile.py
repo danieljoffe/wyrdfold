@@ -811,3 +811,24 @@ async def test_a_trial_is_still_upgraded_when_stripe_says_paid() -> None:
     report = await reconcile_billing(db, client=FakeStripe([[sub("cus_1", PRO)]]))
     assert db.writes == [("u1", {"plan": "pro"})]
     assert report["healed"] == 1
+
+
+# ---- #1088: the sweep reports whether it actually finished ------------------
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_that_cannot_reach_stripe_reports_not_completed(
+    _billing_settings: Any,
+) -> None:
+    """This sweep never raises by design, so without an explicit signal the
+    scheduler would record a clean pass for a run that reconciled nothing."""
+    report = await reconcile_billing(FakeDB([]), client=FakeStripe([], explode=True))
+
+    assert report["completed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_clean_sweep_reports_completed(_billing_settings: Any) -> None:
+    report = await reconcile_billing(FakeDB([]), client=FakeStripe([[]]))
+
+    assert report["completed"] == 1
