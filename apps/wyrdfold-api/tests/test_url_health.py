@@ -307,6 +307,8 @@ async def test_run_url_health_check_empty_input_returns_zero_summary() -> None:
         "failures": 0,
         "server_errors": 0,
         "archived": 0,
+        # Nothing due is a finished tick, not an abandoned one (#1088).
+        "completed": 1,
     }
 
 
@@ -441,3 +443,37 @@ async def test_escalate_is_best_effort() -> None:
     sb.table.return_value = _Boom()
 
     assert await url_health.escalate_source_listings(sb, "src-dead") == 0
+
+
+# ---- #1088: the tick reports whether it actually finished -------------------
+#
+# This service is deliberately fail-soft: it logs and returns a partial summary
+# rather than raising, so its caller cannot otherwise tell a finished tick from
+# one that gave up. The scheduler records a success in its run ledger only when
+# this says the tick completed.
+
+
+@pytest.mark.asyncio
+async def test_a_tick_that_gives_up_fetching_due_jobs_reports_not_completed() -> None:
+    sb = MagicMock()
+    sb.rpc.return_value.execute = AsyncMock(side_effect=RuntimeError("db down"))
+
+    summary = await run_url_health_check(
+        sb, batch_size=10, concurrency=2, age_threshold_hours=24, failure_threshold=3
+    )
+
+    assert summary["completed"] == 0, "a tick that gave up must not claim completion"
+
+
+@pytest.mark.asyncio
+async def test_a_tick_with_nothing_due_reports_completed() -> None:
+    """Nothing due is the finished state, not a failure — otherwise a quiet
+    day would look like a starved job to the scheduler."""
+    sb = MagicMock()
+    sb.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=[]))
+
+    summary = await run_url_health_check(
+        sb, batch_size=10, concurrency=2, age_threshold_hours=24, failure_threshold=3
+    )
+
+    assert summary["completed"] == 1
