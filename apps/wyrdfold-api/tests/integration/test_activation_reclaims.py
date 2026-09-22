@@ -129,3 +129,46 @@ async def test_a_healthy_target_is_never_recorded(
         assert _reclaims(service_client, tid) == []
     finally:
         service_client.table("targets").delete().eq("id", tid).execute()
+
+
+@pytest.mark.asyncio
+async def test_the_record_survives_the_target_being_deleted(
+    service_client: Client, async_service_client: AsyncClient, stalled_target: str
+) -> None:
+    """The subtlest survivor bias, and the one most likely to bite.
+
+    A user whose target sat stuck for hours is more likely than average to
+    delete it. If deleting the target took its reclaim history with it, the
+    deletions would correlate with the very failure being measured and the
+    count would drift back toward "reclaims for targets that still exist".
+    The event survives with its target reference severed: the measurement
+    needs the stage, the window and the time, not the identifier.
+    """
+    await sweep_stalled_activations(async_service_client, stale_after_hours=6)
+    events = _reclaims(service_client, stalled_target)
+    assert len(events) == 1
+    event_id = (
+        service_client.table("activation_reclaims")
+        .select("id")
+        .eq("target_id", stalled_target)
+        .execute()
+        .data[0]["id"]
+    )
+
+    service_client.table("targets").delete().eq("id", stalled_target).execute()
+
+    survivor = (
+        service_client.table("activation_reclaims")
+        .select("id, target_id, from_status, stale_after_hours, reclaimed_at")
+        .eq("id", event_id)
+        .execute()
+        .data
+    )
+    assert len(survivor) == 1, "deleting a target must not erase that it was abandoned"
+    assert survivor[0]["target_id"] is None, "the user-linked identifier is severed"
+    # Everything the measurement actually reads is intact.
+    assert survivor[0]["from_status"] == "polling"
+    assert survivor[0]["stale_after_hours"] == 6
+    assert survivor[0]["reclaimed_at"]
+
+    service_client.table("activation_reclaims").delete().eq("id", event_id).execute()

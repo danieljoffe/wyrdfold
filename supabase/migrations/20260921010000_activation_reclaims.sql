@@ -6,6 +6,10 @@
 -- work is abandoned — and that number is exactly what decides how much
 -- architecture #1090 is worth.
 --
+-- Append-only in the sense that matters for a metric: nothing in the normal
+-- lifecycle removes a row. Recovering a target does not, and neither does
+-- deleting one — the row survives with its target reference severed.
+--
 -- Why a table rather than a column on `targets`: a column holds ONE value and
 -- gets cleared when the user re-activates, so repeated reclaims of the same
 -- target collapse into one and a target that recovers vanishes from the count
@@ -20,7 +24,14 @@
 
 CREATE TABLE IF NOT EXISTS public.activation_reclaims (
     id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    target_id    uuid NOT NULL REFERENCES public.targets(id) ON DELETE CASCADE,
+    -- Nullable, and severed rather than deleted when the target goes away.
+    -- ON DELETE CASCADE would have destroyed exactly the events most likely to
+    -- matter: a user whose target sat stuck is more likely than average to
+    -- delete it, so the deletions correlate with the failure being measured
+    -- and the count would quietly drift back to "reclaims for targets that
+    -- still exist". The event itself — which stage, which window, when — is
+    -- what the measurement needs; the target reference is not.
+    target_id    uuid REFERENCES public.targets(id) ON DELETE SET NULL,
     -- The in-flight status the row was stuck in ('deriving' / 'polling'):
     -- which stage was abandoned is part of the question.
     from_status  text NOT NULL,
