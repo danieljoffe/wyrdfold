@@ -3166,15 +3166,35 @@ async def _global_budget_exhausted(supabase: AsyncClient, *, reserve_usd: float 
 # fresh read trips the breaker. Cache keys on the midnight boundary so the
 # UTC-day rollover naturally invalidates.
 _SPEND_MEMO_TTL_S = 60.0
-_spend_memo: dict[str, Any] = {"at": 0.0, "midnight": None, "value": 0.0}
+_spend_memo: dict[str, Any] = {"at": 0.0, "midnight": None, "value": 0.0, "error": None}
 
 
 async def _memoized_total_spend(supabase: AsyncClient, midnight: datetime) -> float:
     now = time.monotonic()
     if _spend_memo["midnight"] == midnight and now - _spend_memo["at"] < _SPEND_MEMO_TTL_S:
+        if _spend_memo["error"] is not None:
+            raise SpendTotalUnavailableError(cast(str, _spend_memo["error"]))
         return cast(float, _spend_memo["value"])
-    value = await total_llm_spend_all_async(supabase, since=midnight)
-    _spend_memo.update(at=now, midnight=midnight, value=value)
+    try:
+        value = await total_llm_spend_all_async(supabase, since=midnight)
+    except SpendTotalUnavailableError as exc:
+        # Memoize the FAILURE, not just the success.
+        #
+        # In plain terms: when this read fails, don't keep asking. The caller
+        # is called once per job inside the triage loops, and the thing that
+        # makes this read fail is a database slow enough to blow the statement
+        # timeout — so re-asking per job would aim a burst of 8-second queries
+        # at exactly the database that is already struggling, turning a blip
+        # into a sustained one. One attempt per TTL; in between, the breaker
+        # holds closed on the remembered answer.
+        #
+        # Caching only successes was harmless while a failed read fell back to
+        # a (wrong) number instead of raising. #1105 made it raise, which is
+        # correct — and turned this into an amplifier. Found by the release
+        # gate: 25 breaker calls produced 25 failing queries.
+        _spend_memo.update(at=now, midnight=midnight, error=str(exc) or "spend total unavailable")
+        raise
+    _spend_memo.update(at=now, midnight=midnight, value=value, error=None)
     return value
 
 
