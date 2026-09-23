@@ -226,3 +226,58 @@ async def test_sweep_flag_off_is_the_identity(
         if archived:
             continue
         assert _stored(service_client, jobs[key]["id"], corpus["target_id"]) == score, key
+
+
+async def test_re_issuing_the_same_batch_is_a_no_op(
+    _corpus: dict[str, Any],
+    service_client: Client,
+    async_service_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1088's retry rests entirely on this: re-running a batch at the SAME
+    cursor must not decay a row twice.
+
+    A retry fires when the client did not get an answer — which includes the
+    case where the server already committed the UPDATE and only the response
+    was lost. So the second call has to be a genuine no-op, not merely
+    "usually harmless". It is, because the function computes
+    ``round(score * multiplier)`` from the base match score rather than from
+    the previous ``recency_score``, and its UPDATE is guarded by
+    ``IS DISTINCT FROM``. If anyone ever makes that arithmetic incremental,
+    the retry silently starts compounding decay — and this test fails.
+
+    Non-vacuous: the first call must actually write, or "wrote nothing twice"
+    would prove nothing.
+    """
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    corpus, jobs = _corpus, _corpus["jobs"]
+
+    # The same arguments the sweep loop sends, at the starting cursor, with a
+    # batch big enough to take the whole local table in one page — so both
+    # calls are unambiguously the SAME batch.
+    params = {
+        "p_enabled": True,
+        "p_after_id": recency_mod._SWEEP_CURSOR_START,
+        "p_batch_size": 10_000,
+        "p_grace_days": float(recency_mod.RECENCY_GRACE_DAYS),
+        "p_daily_decay": recency_mod.RECENCY_DAILY_DECAY,
+        "p_floor": recency_mod.RECENCY_FLOOR,
+    }
+
+    first = (await async_service_client.rpc("sweep_recency_scores", params).execute()).data[0]
+    assert int(first["written"]) > 0, "precondition: the first call must have work to do"
+
+    second = (await async_service_client.rpc("sweep_recency_scores", params).execute()).data[0]
+
+    assert int(second["written"]) == 0, "a re-issued batch rewrote rows — decay is compounding"
+    # Same page, so the zero above is "nothing left to change", not "looked
+    # somewhere else".
+    assert int(second["scanned"]) == int(first["scanned"])
+    assert second["last_id"] == first["last_id"]
+
+    # And the stored values are the once-decayed ones, not twice-decayed.
+    for key, score, age, archived in corpus["spec"]:
+        if archived:
+            continue
+        expected = compute_recency_score(score, age or 0.0, enabled=True)
+        assert _stored(service_client, jobs[key]["id"], corpus["target_id"]) == expected, key

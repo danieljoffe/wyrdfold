@@ -421,9 +421,11 @@ async def _run_scheduled_recency_refresh() -> None:
             # this change exists to close (#1088).
             await _record_scheduler_success("recency_refresh")
             logger.info(
-                "scheduled recency refresh: rewrote %d score rows across %d batch(es)",
+                "scheduled recency refresh: rewrote %d score rows across %d batch(es) "
+                "(%d retried batch call(s))",
                 report.written,
                 report.batches,
+                report.retries_used,
             )
         else:
             # A sweep that did not reach the end of the id range is a FAILURE,
@@ -433,13 +435,14 @@ async def _run_scheduled_recency_refresh() -> None:
             logger.error(
                 "scheduled recency refresh INCOMPLETE: rewrote %d score rows across "
                 "%d batch(es) before stopping (failed_with=%s statement_timeout=%s "
-                "cursor=%s) — the freshness sort key is now stale for rows the "
-                "poller does not re-touch",
+                "cursor=%s retries=%d) — the freshness sort key is now stale for rows "
+                "the poller does not re-touch",
                 report.written,
                 report.batches,
                 report.failed_with,
                 report.timed_out,
                 report.last_cursor,
+                report.retries_used,
             )
     except Exception:
         logger.exception("scheduled recency refresh raised")
