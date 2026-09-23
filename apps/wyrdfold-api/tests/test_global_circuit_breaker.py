@@ -13,6 +13,7 @@ import pytest
 from app.config import settings as live_settings
 from app.services import poller as poller_mod
 from app.services.llm import cost_log
+from tests.test_llm_cost_log import _fake_client
 
 
 class _Resp:
@@ -55,21 +56,15 @@ def test_total_spend_all_zero_when_rpc_returns_none() -> None:
 
 
 def test_total_spend_all_falls_back_to_python_when_rpc_unavailable() -> None:
-    sb = MagicMock()
-    sb.rpc.side_effect = Exception("function does not exist")
-
-    sel = sb.table.return_value.select.return_value
-    sel.gte.return_value.execute.return_value = _Resp(
-        [{"cost_usd": 0.50}, {"cost_usd": 0.25}, {"cost_usd": 0.10}]
-    )
+    sb, rec = _fake_client([{"cost_usd": 0.50}, {"cost_usd": 0.25}, {"cost_usd": 0.10}])
 
     result = cost_log.total_spend_all(sb, since=datetime.now(UTC))
 
     assert result == pytest.approx(0.85)
     sb.table.assert_called_once_with("llm_costs")
     # Fallback still sums across ALL users — no per-user partition.
-    sel.eq.assert_not_called()
-    sel.is_.assert_not_called()
+    assert rec["eq"] == []
+    assert rec["is_"] == []
 
 
 # ---- _cycle_budget_gate breaker integration ---------------------------------

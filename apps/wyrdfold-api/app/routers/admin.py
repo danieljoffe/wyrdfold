@@ -19,6 +19,7 @@ from supabase import AsyncClient
 from app.config import settings
 from app.dependencies import get_async_service_supabase, verify_api_key
 from app.services.llm import cost_log
+from app.services.llm.cost_log import SpendTotalUnavailableError
 from app.services.qualification.skill_growth import (
     backfill_dictionary_skills,
     vocabulary_candidates,
@@ -125,24 +126,34 @@ async def get_cost_summary(
     now = datetime.now(UTC)
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    today_usd = await cost_log.total_spend_all_async(supabase, since=midnight)
-    last_24h = await cost_log.total_spend_all_async(supabase, since=now - timedelta(hours=24))
-    last_7d = await cost_log.total_spend_all_async(supabase, since=now - timedelta(days=7))
-    last_30d = await cost_log.total_spend_all_async(supabase, since=now - timedelta(days=30))
+    try:
+        today_usd = await cost_log.total_spend_all_async(supabase, since=midnight)
+        last_24h = await cost_log.total_spend_all_async(supabase, since=now - timedelta(hours=24))
+        last_7d = await cost_log.total_spend_all_async(supabase, since=now - timedelta(days=7))
+        last_30d = await cost_log.total_spend_all_async(supabase, since=now - timedelta(days=30))
 
-    by_purpose_today: dict[str, float] = await cost_log.spend_by_purpose_all_async(
-        supabase, since=midnight
-    )
-    by_purpose_30d: dict[str, float] = await cost_log.spend_by_purpose_all_async(
-        supabase, since=now - timedelta(days=30)
-    )
+        by_purpose_today: dict[str, float] = await cost_log.spend_by_purpose_all_async(
+            supabase, since=midnight
+        )
+        by_purpose_30d: dict[str, float] = await cost_log.spend_by_purpose_all_async(
+            supabase, since=now - timedelta(days=30)
+        )
 
-    cache_today = CacheStats.from_buckets(
-        await cost_log.cache_metrics_all_async(supabase, since=midnight)
-    )
-    cache_30d = CacheStats.from_buckets(
-        await cost_log.cache_metrics_all_async(supabase, since=now - timedelta(days=30))
-    )
+        cache_today = CacheStats.from_buckets(
+            await cost_log.cache_metrics_all_async(supabase, since=midnight)
+        )
+        cache_30d = CacheStats.from_buckets(
+            await cost_log.cache_metrics_all_async(supabase, since=now - timedelta(days=30))
+        )
+    except SpendTotalUnavailableError as exc:
+        # The operator summary exists to SPOT a runaway. A silently short
+        # total is the one answer that defeats that purpose, so say the
+        # figures are unavailable rather than render a low one (#1105).
+        logger.error("admin cost summary: spend totals unavailable: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Cost figures are temporarily unavailable. Please retry shortly.",
+        ) from exc
 
     cap = settings.global_llm_daily_budget_usd
     usage_pct: float | None

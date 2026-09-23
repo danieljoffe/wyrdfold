@@ -21,6 +21,7 @@ those paths key off ``user_targets`` links.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
@@ -30,6 +31,9 @@ from supabase import AsyncClient
 from app.config import settings
 from app.services.llm import cost_log
 from app.services.llm.budget import MONTHLY_WINDOW_DAYS
+from app.services.llm.cost_log import SpendTotalUnavailableError
+
+logger = logging.getLogger(__name__)
 
 # Why LLM work was skipped, as a stable token the defer logs interpolate.
 # These are log/diagnostic values, not a wire contract — but keep them stable,
@@ -343,7 +347,21 @@ async def build_budget_gate(supabase: AsyncClient, target_ids: list[str]) -> Pay
         raw = overrides.get(uid)
         cap = float(raw) if raw is not None else settings.user_llm_monthly_budget_usd
         if cap > 0:
-            spent = await cost_log.total_spend_async(supabase, user_id=uid, since=since)
+            try:
+                spent = await cost_log.total_spend_async(supabase, user_id=uid, since=since)
+            except SpendTotalUnavailableError:
+                # Fail CLOSED for this payer: an unknown total must not read as
+                # "under the cap". Blocking pauses their background grading
+                # until the next gate build; permitting would spend against a
+                # ceiling nobody can see (#1105).
+                logger.error(
+                    "payer gate: monthly spend total unavailable for user=%s — "
+                    "treating as OVER budget (#1105)",
+                    uid,
+                    exc_info=True,
+                )
+                over.add(uid)
+                continue
             if spent >= cap:
                 over.add(uid)
                 # Monthly already blocks — skip the daily query. Mirrors the
@@ -363,7 +381,19 @@ async def build_budget_gate(supabase: AsyncClient, target_ids: list[str]) -> Pay
             # ``user_llm_daily_budget_usd``, so one afternoon of tailoring
             # would silently stop that user's grading for a day. The two
             # ceilings meter disjoint sets of purposes and cannot fight.
-            spent_day = await cost_log.total_background_spend_async(supabase, uid, since=day_since)
+            try:
+                spent_day = await cost_log.total_background_spend_async(
+                    supabase, uid, since=day_since
+                )
+            except SpendTotalUnavailableError:
+                logger.error(
+                    "payer gate: daily background spend total unavailable for user=%s — "
+                    "treating as OVER the daily ceiling (#1105)",
+                    uid,
+                    exc_info=True,
+                )
+                over_daily.add(uid)
+                continue
             if spent_day >= daily_cap:
                 over_daily.add(uid)
 

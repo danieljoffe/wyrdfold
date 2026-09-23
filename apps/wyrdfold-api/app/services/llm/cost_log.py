@@ -10,6 +10,7 @@ by the caller, opaque at the read layer.
 """
 
 import logging
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any, cast
 
@@ -18,10 +19,106 @@ from supabase import AsyncClient, Client
 from app.constants import resolve_owner
 from app.models.embeddings import EmbeddingResult
 from app.models.llm import LLMCallRecord, LLMResult
+from app.services.supabase_retry import is_statement_timeout
 
 TABLE = "llm_costs"
 
 _log = logging.getLogger(__name__)
+
+# PostgREST caps a single response at 1,000 rows on this deployment (verified
+# against production: a request for 5,000 returned ``content-range: 0-999``).
+# Every read in this module that sums or groups rows MUST page to exhaustion,
+# because a capped page produces a total that is too SMALL — and the budget
+# guards that consume these totals treat "too small" as "there is room left"
+# (#1105).
+_READ_PAGE = 1000
+# A read this large means something is wrong with the window, not that we
+# should spend minutes paging. Refuse to answer rather than answer slowly.
+_MAX_READ_PAGES = 250
+
+
+class SpendTotalUnavailableError(RuntimeError):
+    """A spend total could not be established, so no number is returned.
+
+    In plain terms: it is better to say "I do not know what has been spent"
+    than to hand a budget guard a number that is too small. A guard given a
+    too-small total concludes there is room left and permits work it should
+    have blocked, which is strictly worse than pausing (#1105).
+
+    Callers that GATE on spend must treat this as "blocked". Callers that
+    merely DISPLAY spend must surface the gap rather than render a plausible
+    wrong number.
+    """
+
+
+def _rpc_fallback_or_raise(exc: BaseException, rpc: str) -> None:
+    """Decide whether an RPC failure may fall back to the client-side sum.
+
+    The client-side fallback was written for exactly one situation: a deploy
+    where the migration creating the RPC has not landed yet. That is a real
+    transient and falling back is right for it.
+
+    A statement timeout is NOT that situation. The function exists and the
+    database is healthy; the query merely ran out of time. Substituting a
+    client-side sum there swaps an exact answer for a paged walk of the same
+    rows under the same clock — and historically for a silently capped one.
+    So a timeout raises instead (#1105).
+    """
+    if is_statement_timeout(exc):
+        _log.error(
+            "%s hit the statement timeout — refusing to substitute a client-side sum, "
+            "because an under-reported total makes a budget guard permit work it "
+            "should block (#1105)",
+            rpc,
+        )
+        raise SpendTotalUnavailableError(f"{rpc} exceeded the statement timeout") from exc
+    # Genuinely unexpected, but survivable: log where it can be SEEN. This used
+    # to be DEBUG, which production does not emit, so the degradation was
+    # invisible for as long as it lasted.
+    _log.warning(
+        "%s failed (%s); falling back to the paginated client-side sum",
+        rpc,
+        type(exc).__name__,
+        exc_info=True,
+    )
+
+
+def _read_pages(build: Callable[[], Any], *, label: str) -> list[dict[str, Any]]:
+    """Read a select to exhaustion, one ``_READ_PAGE`` window at a time.
+
+    ``build`` must return a FRESH query each call — postgrest builders carry
+    their own state, so reusing one across pages does not re-range cleanly.
+
+    Raises :class:`SpendTotalUnavailableError` rather than returning a partial set:
+    a caller that wanted every row and got some of them has no way to tell.
+    """
+    rows: list[dict[str, Any]] = []
+    for page in range(_MAX_READ_PAGES):
+        offset = page * _READ_PAGE
+        resp = build().range(offset, offset + _READ_PAGE - 1).execute()
+        got = cast(list[dict[str, Any]], resp.data or [])
+        rows.extend(got)
+        if len(got) < _READ_PAGE:
+            return rows
+    raise SpendTotalUnavailableError(
+        f"{label}: more than {_MAX_READ_PAGES * _READ_PAGE} rows in the window"
+    )
+
+
+async def _read_pages_async(build: Callable[[], Any], *, label: str) -> list[dict[str, Any]]:
+    """Async mirror of :func:`_read_pages`. Same exhaustion rule, same refusal
+    to return a partial set."""
+    rows: list[dict[str, Any]] = []
+    for page in range(_MAX_READ_PAGES):
+        offset = page * _READ_PAGE
+        resp = await build().range(offset, offset + _READ_PAGE - 1).execute()
+        got = cast(list[dict[str, Any]], resp.data or [])
+        rows.extend(got)
+        if len(got) < _READ_PAGE:
+            return rows
+    raise SpendTotalUnavailableError(
+        f"{label}: more than {_MAX_READ_PAGES * _READ_PAGE} rows in the window"
+    )
 
 
 def _insert_row(supabase: Client, row: dict[str, Any]) -> LLMCallRecord:
@@ -217,12 +314,15 @@ def _total_spend_python(
     """Fallback used when the Postgres RPC is unavailable (e.g. mid-deploy
     before the migration lands). Selects every row in the window and sums
     in Python — O(rows) on the wire and in memory."""
-    query = supabase.table(TABLE).select("cost_usd")
-    query = query.eq("user_id", resolve_owner(user_id))
-    if since is not None:
-        query = query.gte("created_at", since.isoformat())
-    resp = query.execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
+
+    def build() -> Any:
+        q = supabase.table(TABLE).select("cost_usd")
+        q = q.eq("user_id", resolve_owner(user_id))
+        if since is not None:
+            q = q.gte("created_at", since.isoformat())
+        return q
+
+    rows = _read_pages(build, label="total_spend")
     return round(sum(float(r["cost_usd"]) for r in rows), 6)
 
 
@@ -246,8 +346,8 @@ def total_spend(
                 "p_since": since.isoformat() if since is not None else None,
             },
         ).execute()
-    except Exception:
-        _log.debug("total_spend_since RPC unavailable, falling back to client-side sum")
+    except Exception as exc:
+        _rpc_fallback_or_raise(exc, "total_spend_since")
         return _total_spend_python(supabase, user_id, since)
 
     # PostgREST returns scalar function results as the bare value (or in
@@ -265,12 +365,15 @@ async def _total_spend_python_async(
 ) -> float:
     """Async mirror of :func:`_total_spend_python` (#57 PR-F). Same select+sum
     fallback, awaited on the pooled async user client."""
-    query = supabase.table(TABLE).select("cost_usd")
-    query = query.eq("user_id", resolve_owner(user_id))
-    if since is not None:
-        query = query.gte("created_at", since.isoformat())
-    resp = await query.execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
+
+    def build() -> Any:
+        q = supabase.table(TABLE).select("cost_usd")
+        q = q.eq("user_id", resolve_owner(user_id))
+        if since is not None:
+            q = q.gte("created_at", since.isoformat())
+        return q
+
+    rows = await _read_pages_async(build, label="total_spend")
     return round(sum(float(r["cost_usd"]) for r in rows), 6)
 
 
@@ -294,8 +397,8 @@ async def total_spend_async(
                 "p_since": since.isoformat() if since is not None else None,
             },
         ).execute()
-    except Exception:
-        _log.debug("total_spend_since RPC unavailable, falling back to client-side sum")
+    except Exception as exc:
+        _rpc_fallback_or_raise(exc, "total_spend_since")
         return await _total_spend_python_async(supabase, user_id, since)
 
     raw = resp.data
@@ -313,12 +416,15 @@ def _total_billable_spend_python(
     """Fallback for :func:`total_billable_spend` when the RPC is
     unavailable (mid-deploy). Selects (cost_usd, purpose) rows in the
     window and filters/sums in Python."""
-    query = supabase.table(TABLE).select("cost_usd,purpose")
-    query = query.eq("user_id", resolve_owner(user_id))
-    if since is not None:
-        query = query.gte("created_at", since.isoformat())
-    resp = query.execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
+
+    def build() -> Any:
+        q = supabase.table(TABLE).select("cost_usd,purpose")
+        q = q.eq("user_id", resolve_owner(user_id))
+        if since is not None:
+            q = q.gte("created_at", since.isoformat())
+        return q
+
+    rows = _read_pages(build, label="total_billable_spend")
     excluded = set(excluded_purposes)
     return round(
         sum(float(r["cost_usd"]) for r in rows if r.get("purpose") not in excluded),
@@ -350,8 +456,8 @@ def total_billable_spend(
                 "p_excluded_purposes": list(excluded_purposes),
             },
         ).execute()
-    except Exception:
-        _log.debug("total_billable_spend_since RPC unavailable, falling back to client-side sum")
+    except Exception as exc:
+        _rpc_fallback_or_raise(exc, "total_billable_spend_since")
         return _total_billable_spend_python(supabase, user_id, since, excluded_purposes)
 
     raw = resp.data
@@ -368,12 +474,15 @@ async def _total_billable_spend_python_async(
 ) -> float:
     """Async mirror of :func:`_total_billable_spend_python` (#57 PR-F). Same
     select + purpose-filter + sum fallback, awaited on the async user client."""
-    query = supabase.table(TABLE).select("cost_usd,purpose")
-    query = query.eq("user_id", resolve_owner(user_id))
-    if since is not None:
-        query = query.gte("created_at", since.isoformat())
-    resp = await query.execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
+
+    def build() -> Any:
+        q = supabase.table(TABLE).select("cost_usd,purpose")
+        q = q.eq("user_id", resolve_owner(user_id))
+        if since is not None:
+            q = q.gte("created_at", since.isoformat())
+        return q
+
+    rows = await _read_pages_async(build, label="total_billable_spend")
     excluded = set(excluded_purposes)
     return round(
         sum(float(r["cost_usd"]) for r in rows if r.get("purpose") not in excluded),
@@ -437,8 +546,8 @@ async def total_billable_spend_async(
                 "p_excluded_purposes": list(excluded_purposes),
             },
         ).execute()
-    except Exception:
-        _log.debug("total_billable_spend_since RPC unavailable, falling back to client-side sum")
+    except Exception as exc:
+        _rpc_fallback_or_raise(exc, "total_billable_spend_since")
         return await _total_billable_spend_python_async(supabase, user_id, since, excluded_purposes)
 
     raw = resp.data
@@ -454,11 +563,14 @@ def _total_spend_all_python(
     """Fallback for ``total_spend_all`` when the RPC is unavailable (e.g.
     mid-deploy before the migration lands). Selects every row in the window
     and sums in Python — O(rows) on the wire."""
-    query = supabase.table(TABLE).select("cost_usd")
-    if since is not None:
-        query = query.gte("created_at", since.isoformat())
-    resp = query.execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
+
+    def build() -> Any:
+        q = supabase.table(TABLE).select("cost_usd")
+        if since is not None:
+            q = q.gte("created_at", since.isoformat())
+        return q
+
+    rows = _read_pages(build, label="total_spend_all")
     return round(sum(float(r["cost_usd"]) for r in rows), 6)
 
 
@@ -480,8 +592,8 @@ def total_spend_all(
             "total_spend_all_since",
             {"p_since": since.isoformat() if since is not None else None},
         ).execute()
-    except Exception:
-        _log.debug("total_spend_all_since RPC unavailable, falling back to client-side sum")
+    except Exception as exc:
+        _rpc_fallback_or_raise(exc, "total_spend_all_since")
         return _total_spend_all_python(supabase, since)
 
     raw = resp.data
@@ -496,11 +608,14 @@ async def _total_spend_all_python_async(
 ) -> float:
     """Async mirror of :func:`_total_spend_all_python` (#57 PR-G2c). Same
     all-users select+sum fallback, awaited on the pooled async service client."""
-    query = supabase.table(TABLE).select("cost_usd")
-    if since is not None:
-        query = query.gte("created_at", since.isoformat())
-    resp = await query.execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
+
+    def build() -> Any:
+        q = supabase.table(TABLE).select("cost_usd")
+        if since is not None:
+            q = q.gte("created_at", since.isoformat())
+        return q
+
+    rows = await _read_pages_async(build, label="total_spend_all")
     return round(sum(float(r["cost_usd"]) for r in rows), 6)
 
 
@@ -520,8 +635,8 @@ async def total_spend_all_async(
             "total_spend_all_since",
             {"p_since": since.isoformat() if since is not None else None},
         ).execute()
-    except Exception:
-        _log.debug("total_spend_all_since RPC unavailable, falling back to client-side sum")
+    except Exception as exc:
+        _rpc_fallback_or_raise(exc, "total_spend_all_since")
         return await _total_spend_all_python_async(supabase, since)
 
     raw = resp.data
@@ -535,12 +650,14 @@ def _spend_by_purpose_python(
     user_id: str | None,
     since: datetime | None,
 ) -> dict[str, float]:
-    query = supabase.table(TABLE).select("purpose, cost_usd")
-    query = query.eq("user_id", resolve_owner(user_id))
-    if since is not None:
-        query = query.gte("created_at", since.isoformat())
-    resp = query.execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
+    def build() -> Any:
+        q = supabase.table(TABLE).select("purpose, cost_usd")
+        q = q.eq("user_id", resolve_owner(user_id))
+        if since is not None:
+            q = q.gte("created_at", since.isoformat())
+        return q
+
+    rows = _read_pages(build, label="spend_by_purpose")
     totals: dict[str, float] = {}
     for r in rows:
         totals[r["purpose"]] = totals.get(r["purpose"], 0.0) + float(r["cost_usd"])
@@ -553,15 +670,22 @@ def spend_by_purpose_all(
 ) -> dict[str, float]:
     """Per-purpose spend across ALL users over the window.
 
-    Powers the operator cost-summary endpoint (#26 F4). No RPC variant
-    — the operator surface is queried infrequently, and the table is
-    bounded by retention, so a client-side group is fine.
+    Powers the operator cost-summary endpoint (#26 F4). No RPC variant: the
+    operator surface is queried infrequently, so a client-side group is fine
+    — but it must PAGE. The earlier note here said the table is "bounded by
+    retention, so a client-side group is fine"; that was wrong. PostgREST
+    caps one response at 1,000 rows and the windows this is called with
+    exceed that, so the breakdown was computed from a fraction of the
+    matching rows on EVERY call — not only when something failed (#1105).
     """
-    query = supabase.table(TABLE).select("purpose, cost_usd")
-    if since is not None:
-        query = query.gte("created_at", since.isoformat())
-    resp = query.execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
+
+    def build() -> Any:
+        q = supabase.table(TABLE).select("purpose, cost_usd")
+        if since is not None:
+            q = q.gte("created_at", since.isoformat())
+        return q
+
+    rows = _read_pages(build, label="spend_by_purpose_all")
     totals: dict[str, float] = {}
     for r in rows:
         totals[r["purpose"]] = totals.get(r["purpose"], 0.0) + float(r["cost_usd"])
@@ -576,12 +700,16 @@ async def spend_by_purpose_all_async(
 
     Per-purpose spend across ALL users, awaited on the async service client for
     the operator cost-summary handler. No RPC variant — same client-side group
-    as the sync version (the operator surface is queried infrequently)."""
-    query = supabase.table(TABLE).select("purpose, cost_usd")
-    if since is not None:
-        query = query.gte("created_at", since.isoformat())
-    resp = await query.execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
+    as the sync version, paged to exhaustion so the breakdown is not computed
+    from a capped page (#1105)."""
+
+    def build() -> Any:
+        q = supabase.table(TABLE).select("purpose, cost_usd")
+        if since is not None:
+            q = q.gte("created_at", since.isoformat())
+        return q
+
+    rows = await _read_pages_async(build, label="spend_by_purpose_all")
     totals: dict[str, float] = {}
     for r in rows:
         totals[r["purpose"]] = totals.get(r["purpose"], 0.0) + float(r["cost_usd"])
@@ -598,16 +726,19 @@ def cache_metrics_all(
     three Anthropic input-token buckets (``input_tokens`` is the
     non-cached portion). Powers the cache hit-rate line on the operator
     cost-summary (#73). No RPC variant: the operator surface is queried
-    infrequently and the table is bounded by retention, so a client-side
-    sum is fine — same posture as ``spend_by_purpose_all``.
+    infrequently, so a client-side sum is fine — paged to exhaustion, same
+    posture as ``spend_by_purpose_all`` and for the same reason (#1105).
     """
-    query = supabase.table(TABLE).select(
-        "input_tokens, cache_read_input_tokens, cache_creation_input_tokens"
-    )
-    if since is not None:
-        query = query.gte("created_at", since.isoformat())
-    resp = query.execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
+
+    def build() -> Any:
+        q = supabase.table(TABLE).select(
+            "input_tokens, cache_read_input_tokens, cache_creation_input_tokens"
+        )
+        if since is not None:
+            q = q.gte("created_at", since.isoformat())
+        return q
+
+    rows = _read_pages(build, label="cache_metrics_all")
     return {
         "cache_read": sum(int(r["cache_read_input_tokens"]) for r in rows),
         "cache_creation": sum(int(r["cache_creation_input_tokens"]) for r in rows),
@@ -623,14 +754,17 @@ async def cache_metrics_all_async(
 
     Prompt-cache token buckets across ALL users, awaited on the async service
     client for the operator cost-summary handler. No RPC variant — same
-    client-side sum as the sync version."""
-    query = supabase.table(TABLE).select(
-        "input_tokens, cache_read_input_tokens, cache_creation_input_tokens"
-    )
-    if since is not None:
-        query = query.gte("created_at", since.isoformat())
-    resp = await query.execute()
-    rows = cast(list[dict[str, Any]], resp.data or [])
+    client-side sum as the sync version, paged to exhaustion (#1105)."""
+
+    def build() -> Any:
+        q = supabase.table(TABLE).select(
+            "input_tokens, cache_read_input_tokens, cache_creation_input_tokens"
+        )
+        if since is not None:
+            q = q.gte("created_at", since.isoformat())
+        return q
+
+    rows = await _read_pages_async(build, label="cache_metrics_all")
     return {
         "cache_read": sum(int(r["cache_read_input_tokens"]) for r in rows),
         "cache_creation": sum(int(r["cache_creation_input_tokens"]) for r in rows),
@@ -655,8 +789,8 @@ def spend_by_purpose(
                 "p_since": since.isoformat() if since is not None else None,
             },
         ).execute()
-    except Exception:
-        _log.debug("spend_by_purpose_since RPC unavailable, falling back to client-side group")
+    except Exception as exc:
+        _rpc_fallback_or_raise(exc, "spend_by_purpose_since")
         return _spend_by_purpose_python(supabase, user_id, since)
 
     raw = resp.data
