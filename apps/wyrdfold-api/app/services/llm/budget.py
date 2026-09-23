@@ -19,6 +19,7 @@ from fastapi import HTTPException
 from supabase import AsyncClient, Client
 
 from app.services.llm import cost_log
+from app.services.llm.cost_log import SpendTotalUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +260,33 @@ def _raise_budget_429(scope: str, limit_usd: float, spent_usd: float, *, user_id
     )
 
 
+def _raise_budget_indeterminate_503(exc: BaseException, *, user_id: str) -> None:
+    """Block the request because we could not establish what has been spent.
+
+    In plain terms: the guard is supposed to answer "is this user under their
+    cap?". When the spend total cannot be read, the honest answer is "I do not
+    know" — and a guard that does not know must not wave the request through.
+    Permitting here is how an uncapped spend happens (#1105).
+
+    Deliberately NOT a 429: that would tell the user they have hit a limit,
+    which may be false and is not something they can act on. A 503 says the
+    check itself is temporarily unavailable, which is what actually happened.
+    """
+    logger.error(
+        "llm_budget_indeterminate user=%s — spend total unavailable, BLOCKING the "
+        "request rather than permitting an unchecked LLM call (#1105): %s",
+        user_id,
+        exc,
+    )
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "code": "llm_budget_check_unavailable",
+            "message": "Could not verify remaining budget. Please retry shortly.",
+        },
+    ) from exc
+
+
 # Per-process dedup so a chatty user doesn't fire a Sentry warning on
 # every request once they cross 80% — first crossing per (user, scope)
 # per process restart is enough signal.
@@ -338,14 +366,18 @@ def check_user_budget(
     now = datetime.now(UTC)
 
     def _window_spend(since: datetime) -> float:
-        if rail_excluded_purposes:
-            return cost_log.total_billable_spend(
-                supabase,
-                user_id=user_id,
-                since=since,
-                excluded_purposes=rail_excluded_purposes,
-            )
-        return cost_log.total_spend(supabase, user_id=user_id, since=since)
+        try:
+            if rail_excluded_purposes:
+                return cost_log.total_billable_spend(
+                    supabase,
+                    user_id=user_id,
+                    since=since,
+                    excluded_purposes=rail_excluded_purposes,
+                )
+            return cost_log.total_spend(supabase, user_id=user_id, since=since)
+        except SpendTotalUnavailableError as exc:
+            _raise_budget_indeterminate_503(exc, user_id=user_id)
+            raise  # unreachable; keeps the return type honest
 
     if hourly_limit_usd > 0:
         spent_hour = _window_spend(now - timedelta(hours=1))
@@ -371,15 +403,18 @@ def check_user_budget(
 
     if monthly_limit_usd > 0:
         month_since = now - timedelta(days=MONTHLY_WINDOW_DAYS)
-        if monthly_excluded_purposes:
-            spent_month = cost_log.total_billable_spend(
-                supabase,
-                user_id=user_id,
-                since=month_since,
-                excluded_purposes=monthly_excluded_purposes,
-            )
-        else:
-            spent_month = cost_log.total_spend(supabase, user_id=user_id, since=month_since)
+        try:
+            if monthly_excluded_purposes:
+                spent_month = cost_log.total_billable_spend(
+                    supabase,
+                    user_id=user_id,
+                    since=month_since,
+                    excluded_purposes=monthly_excluded_purposes,
+                )
+            else:
+                spent_month = cost_log.total_spend(supabase, user_id=user_id, since=month_since)
+        except SpendTotalUnavailableError as exc:
+            _raise_budget_indeterminate_503(exc, user_id=user_id)
         if spent_month >= monthly_limit_usd:
             _raise_budget_429("monthly", monthly_limit_usd, spent_month, user_id=user_id)
         _maybe_warn_approaching(
@@ -414,14 +449,18 @@ async def check_user_budget_async(
     now = datetime.now(UTC)
 
     async def _window_spend(since: datetime) -> float:
-        if rail_excluded_purposes:
-            return await cost_log.total_billable_spend_async(
-                supabase,
-                user_id=user_id,
-                since=since,
-                excluded_purposes=rail_excluded_purposes,
-            )
-        return await cost_log.total_spend_async(supabase, user_id=user_id, since=since)
+        try:
+            if rail_excluded_purposes:
+                return await cost_log.total_billable_spend_async(
+                    supabase,
+                    user_id=user_id,
+                    since=since,
+                    excluded_purposes=rail_excluded_purposes,
+                )
+            return await cost_log.total_spend_async(supabase, user_id=user_id, since=since)
+        except SpendTotalUnavailableError as exc:
+            _raise_budget_indeterminate_503(exc, user_id=user_id)
+            raise  # unreachable; keeps the return type honest
 
     if hourly_limit_usd > 0:
         spent_hour = await _window_spend(now - timedelta(hours=1))
@@ -447,17 +486,20 @@ async def check_user_budget_async(
 
     if monthly_limit_usd > 0:
         month_since = now - timedelta(days=MONTHLY_WINDOW_DAYS)
-        if monthly_excluded_purposes:
-            spent_month = await cost_log.total_billable_spend_async(
-                supabase,
-                user_id=user_id,
-                since=month_since,
-                excluded_purposes=monthly_excluded_purposes,
-            )
-        else:
-            spent_month = await cost_log.total_spend_async(
-                supabase, user_id=user_id, since=month_since
-            )
+        try:
+            if monthly_excluded_purposes:
+                spent_month = await cost_log.total_billable_spend_async(
+                    supabase,
+                    user_id=user_id,
+                    since=month_since,
+                    excluded_purposes=monthly_excluded_purposes,
+                )
+            else:
+                spent_month = await cost_log.total_spend_async(
+                    supabase, user_id=user_id, since=month_since
+                )
+        except SpendTotalUnavailableError as exc:
+            _raise_budget_indeterminate_503(exc, user_id=user_id)
         if spent_month >= monthly_limit_usd:
             _raise_budget_429("monthly", monthly_limit_usd, spent_month, user_id=user_id)
         _maybe_warn_approaching(

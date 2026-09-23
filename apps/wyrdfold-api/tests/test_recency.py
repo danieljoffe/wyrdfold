@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from postgrest.exceptions import APIError
 
@@ -685,13 +686,24 @@ def _sweep_supabase(
     rpc_calls: list[tuple[str, dict[str, Any]]],
 ) -> MagicMock:
     """Fake AsyncClient whose ``sweep_recency_scores`` RPC serves ``batches``
-    in order — each entry a response ``data`` list, or an Exception to raise."""
+    in order — each entry a response ``data`` list, or an Exception to raise.
+    One entry per CALL, retries included.
+
+    Running off the end of the script raises. It used to serve an empty batch
+    forever, which reads as "the id range is exhausted" — so a sweep making
+    more calls than the test scripted would have been scored as a clean
+    success. A fixture that cannot fail proves nothing."""
     sb = MagicMock()
     remaining = list(batches)
 
     def _rpc(name: str, params: dict[str, Any]) -> _SweepRpcChain:
         rpc_calls.append((name, params))
-        return _SweepRpcChain(remaining.pop(0) if remaining else [])
+        if not remaining:
+            raise AssertionError(
+                f"sweep made an unscripted call #{len(rpc_calls)} (after_id="
+                f"{params.get('p_after_id')}) — the script has {len(batches)} entries"
+            )
+        return _SweepRpcChain(remaining.pop(0))
 
     sb.rpc.side_effect = _rpc
     return sb
@@ -840,11 +852,19 @@ def _api_error(code: str) -> APIError:
 async def test_a_statement_timeout_is_reported_as_an_incomplete_sweep(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The failure production actually hits: Postgres 57014 on a batch."""
+    """The failure production actually hits: Postgres 57014 on a batch.
+
+    The batch is retried first (see the retry tests below), so the script has
+    to serve the failure once per attempt; surviving all of them is what makes
+    it a real failure rather than a blip."""
     monkeypatch.setattr(settings, "recency_decay_enabled", True)
     monkeypatch.setattr(recency_mod, "_SWEEP_BATCH_SIZE", 2)
+    monkeypatch.setattr(recency_mod, "_SWEEP_BATCH_RETRIES", 2)
     rpc_calls: list[tuple[str, dict[str, Any]]] = []
-    sb = _sweep_supabase([_batch(2, 5, "id-a"), _api_error("57014")], rpc_calls)
+    sb = _sweep_supabase(
+        [_batch(2, 5, "id-a"), _api_error("57014"), _api_error("57014"), _api_error("57014")],
+        rpc_calls,
+    )
 
     report = await refresh_all_recency_scores(sb)
 
@@ -856,6 +876,7 @@ async def test_a_statement_timeout_is_reported_as_an_incomplete_sweep(
     assert report.written == 5
     assert report.batches == 1
     assert report.last_cursor == "id-a"
+    assert report.retries_used == 2
 
 
 @pytest.mark.asyncio
@@ -890,6 +911,126 @@ async def test_a_sweep_that_reaches_the_end_is_ok_even_when_it_wrote_nothing(
     assert report.ok is True
     assert report.exhausted is True
     assert report.written == 0
+
+
+# ---- #1088: one unlucky batch must not throw away the whole tick ----------
+#
+# At 500 rows a batch the sweep is ~120 calls, so it is ~120x more exposed to a
+# one-off blip than the single-call version it replaced. A transient failure
+# used to abandon every remaining batch and leave the freshness sort key stale
+# for twelve hours. These pin that a blip is retried, that a real failure still
+# stops, and that a systematically failing sweep cannot spin.
+
+
+@pytest.mark.asyncio
+async def test_a_transient_batch_failure_is_retried_and_the_sweep_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The case the retry exists for: batch 2 blips, the sweep carries on and
+    reaches the end of the id range instead of abandoning batches 3 and 4."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    monkeypatch.setattr(recency_mod, "_SWEEP_BATCH_SIZE", 2)
+    rpc_calls: list[tuple[str, dict[str, Any]]] = []
+    sb = _sweep_supabase(
+        [
+            _batch(2, 1, "id-a"),
+            httpx.RemoteProtocolError("Server disconnected"),
+            _batch(2, 2, "id-b"),
+            _batch(1, 3, "id-c"),
+        ],
+        rpc_calls,
+    )
+
+    report = await refresh_all_recency_scores(sb)
+
+    assert report.ok is True
+    assert report.exhausted is True
+    assert report.written == 6  # nothing lost to the blip
+    assert report.batches == 3
+    assert report.retries_used == 1
+    # The retry re-issues the SAME cursor — re-issuing the next one would skip
+    # a page of rows silently.
+    assert [p["p_after_id"] for _, p in rpc_calls] == [
+        "00000000-0000-0000-0000-000000000000",
+        "id-a",
+        "id-a",
+        "id-b",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_statement_timeout_is_retried_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """57014 is retried here even though the shared helper leaves it off by
+    default. At a measured-safe batch size a timeout means contention, and this
+    is a twice-daily background job — the extra seconds cost nothing."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    monkeypatch.setattr(recency_mod, "_SWEEP_BATCH_SIZE", 2)
+    rpc_calls: list[tuple[str, dict[str, Any]]] = []
+    sb = _sweep_supabase([_api_error("57014"), _batch(1, 4, "id-a")], rpc_calls)
+
+    report = await refresh_all_recency_scores(sb)
+
+    assert report.ok is True
+    assert report.written == 4
+    assert report.retries_used == 1
+    assert len(rpc_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_failure_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A revoked grant will not heal in 400ms. Retrying it would turn one
+    clear failure into three, and delay the ERROR that has to be seen."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    monkeypatch.setattr(recency_mod, "_SWEEP_BATCH_SIZE", 2)
+    rpc_calls: list[tuple[str, dict[str, Any]]] = []
+    sb = _sweep_supabase([_api_error("42501")], rpc_calls)
+
+    report = await refresh_all_recency_scores(sb)
+
+    assert report.ok is False
+    assert report.retries_used == 0
+    assert len(rpc_calls) == 1  # one attempt, no re-issue
+
+
+@pytest.mark.asyncio
+async def test_the_retry_budget_is_spent_across_the_whole_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sweep failing SYSTEMATICALLY must cost a handful of extra calls, not
+    two retries on each of ~120 cursors. With a budget of 2 and 1 retry per
+    batch: batch 1 blips (1 spent), batch 2 blips (2 spent), and the third
+    failure gets no retry at all — the sweep stops.
+
+    Scripted as exactly 5 calls; the fixture raises on a 6th, so a budget that
+    silently failed to apply would fail this test rather than pass it."""
+    monkeypatch.setattr(settings, "recency_decay_enabled", True)
+    monkeypatch.setattr(recency_mod, "_SWEEP_BATCH_SIZE", 2)
+    monkeypatch.setattr(recency_mod, "_SWEEP_BATCH_RETRIES", 1)
+    monkeypatch.setattr(recency_mod, "_SWEEP_RETRY_BUDGET", 2)
+    rpc_calls: list[tuple[str, dict[str, Any]]] = []
+    blip = httpx.RemoteProtocolError("Server disconnected")
+    sb = _sweep_supabase(
+        [
+            blip,  # batch 1, attempt 1 — retry 1 of the budget
+            _batch(2, 1, "id-a"),
+            blip,  # batch 2, attempt 1 — retry 2 of the budget
+            _batch(2, 1, "id-b"),
+            blip,  # budget spent: no retry, the sweep ends here
+        ],
+        rpc_calls,
+    )
+
+    report = await refresh_all_recency_scores(sb)
+
+    assert report.ok is False
+    assert report.retries_used == 2
+    assert report.batches == 2
+    assert report.written == 2  # both completed batches kept
+    assert len(rpc_calls) == 5
 
 
 def test_the_report_cannot_call_an_unfinished_sweep_ok() -> None:

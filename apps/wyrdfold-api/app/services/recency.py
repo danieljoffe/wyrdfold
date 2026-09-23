@@ -30,13 +30,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any, cast
 
 from supabase import AsyncClient
 
 from app.config import settings
 from app.services.db_write import poll_db_read, poll_db_write
-from app.services.supabase_retry import is_statement_timeout
+from app.services.supabase_retry import execute_with_retry, is_statement_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,28 @@ _SWEEP_BATCH_SIZE = 500
 
 # Keyset start for the sweep's uuid cursor.
 _SWEEP_CURSOR_START = "00000000-0000-0000-0000-000000000000"
+
+# In plain terms: one unlucky call must not throw away the whole night's work.
+#
+# At 500 rows a batch the sweep is ~120 calls, so it is ~120 times more exposed
+# to a one-off database blip than the single-call version it replaced. Without
+# a retry, one dropped connection or one batch that happened to land during a
+# contention spike abandons the other ~119 batches and the freshness sort key
+# stays stale for twelve hours (#1088).
+#
+# ``execute_with_retry`` already knows how to re-issue a supabase-py call with
+# backoff. The sweep opts IN to also retrying Postgres 57014 (statement
+# timeout), which that helper leaves off by default because a retry re-burns
+# the full statement budget and a hot write path must not silently double its
+# load. The opt-in is right here and wrong there: this is a twice-daily
+# background job where a few extra seconds cost nothing, and a 57014 at a
+# measured-safe batch size means transient contention, not a batch that is
+# permanently too big.
+_SWEEP_BATCH_RETRIES = 2
+# ...and a ceiling across the whole sweep, so a run failing SYSTEMATICALLY (a
+# revoked grant, a plan regression, the timeout tightened) spends a handful of
+# extra calls and then stops, rather than 2 retries on each of ~120 cursors.
+_SWEEP_RETRY_BUDGET = 6
 
 
 def compute_recency_multiplier(age_days: float) -> float:
@@ -259,11 +282,40 @@ class SweepReport:
     timed_out: bool = False
     #: Cursor the sweep died on, so the next investigation starts there.
     last_cursor: str = ""
+    #: Batch calls that had to be re-issued after a transient failure. Non-zero
+    #: on an otherwise healthy sweep is the early warning that the batch size
+    #: is drifting back towards the statement timeout.
+    retries_used: int = 0
 
     @property
     def ok(self) -> bool:
         """The sweep reached the end of the id range without a failed batch."""
         return self.exhausted and self.failed_with is None
+
+
+async def _sweep_one_batch(
+    supabase: AsyncClient,
+    *,
+    enabled: bool,
+    cursor: str,
+    attempts: list[int],
+) -> Any:
+    """One ``sweep_recency_scores`` call, appending to *attempts* each time it
+    runs. Lives at module level (rather than inline in the loop) so the retry
+    wrapper re-issues the SAME cursor without closing over the loop variable,
+    and so the caller can tell a first attempt from a re-issue."""
+    attempts.append(1)
+    return await supabase.rpc(
+        "sweep_recency_scores",
+        {
+            "p_enabled": enabled,
+            "p_after_id": cursor,
+            "p_batch_size": _SWEEP_BATCH_SIZE,
+            "p_grace_days": float(RECENCY_GRACE_DAYS),
+            "p_daily_decay": RECENCY_DAILY_DECAY,
+            "p_floor": RECENCY_FLOOR,
+        },
+    ).execute()
 
 
 async def refresh_all_recency_scores(supabase: AsyncClient) -> SweepReport:
@@ -289,48 +341,64 @@ async def refresh_all_recency_scores(supabase: AsyncClient) -> SweepReport:
     with :func:`compute_recency_score` is pinned by
     ``tests/integration/test_recency_sweep_parity.py``.
 
-    Idempotent and safe to run on a schedule; a failed batch is logged and
-    ends the sweep early (partial progress is kept — the next tick finishes
-    the rest). Returns a :class:`SweepReport`: ``written`` counts rows whose
+    Idempotent and safe to run on a schedule. A failed batch is retried a
+    bounded number of times at the same cursor (so one transient blip does not
+    throw away the other ~120 batches of the tick); only once those are spent
+    is it logged and the sweep ended early, with partial progress kept — the
+    next tick finishes the rest.
+
+    Returns a :class:`SweepReport`: ``written`` counts rows whose
     stored value actually CHANGED (the no-op writes the old walk counted are
     no longer performed, so the scheduler's cache invalidation only fires
     when ordering moved), and ``ok`` says whether the sweep reached the end
     of the id range at all. Those are different questions and used to share
     one return value (#1088).
 
-    NOTE: the cursor is still loop-local, so a sweep that dies part-way
-    re-walks from the start on the next tick. That is deliberate here — the
-    fix for it needs the batch-size measurement tracked in #1088, and this
-    change is the no-risk half: make the failure impossible to miss.
+    The cursor is deliberately loop-local: a sweep that dies part-way re-walks
+    from the start next tick rather than resuming from a persisted cursor. That
+    was measured rather than assumed — re-walking the rows a previous tick
+    already corrected costs about 0.1s a batch (they are skipped in SQL as
+    no-op writes) against ~1.3s for a batch that actually writes, so persisting
+    a cursor would add moving parts to save a fraction of one run. Revisit only
+    if the corpus grows enough to change that ratio (#1088).
     """
     enabled = settings.recency_decay_enabled
     written = 0
     batches = 0
+    retries_used = 0
     cursor = _SWEEP_CURSOR_START
     while True:
+        attempts: list[int] = []
         try:
-            resp = await supabase.rpc(
-                "sweep_recency_scores",
-                {
-                    "p_enabled": enabled,
-                    "p_after_id": cursor,
-                    "p_batch_size": _SWEEP_BATCH_SIZE,
-                    "p_grace_days": float(RECENCY_GRACE_DAYS),
-                    "p_daily_decay": RECENCY_DAILY_DECAY,
-                    "p_floor": RECENCY_FLOOR,
-                },
-            ).execute()
+            resp = await execute_with_retry(
+                partial(
+                    _sweep_one_batch,
+                    supabase,
+                    enabled=enabled,
+                    cursor=cursor,
+                    attempts=attempts,
+                ),
+                label="sweep_recency_scores",
+                # Never more than the sweep has left to spend, so a run that is
+                # failing systematically stops instead of retrying every cursor.
+                retries=max(0, min(_SWEEP_BATCH_RETRIES, _SWEEP_RETRY_BUDGET - retries_used)),
+                retry_statement_timeout=True,
+            )
         except Exception as exc:
-            # Classify rather than swallow. A 57014 means "this batch is too
-            # big for the statement timeout" — a sizing problem — and it is
-            # the failure production actually hits (#1088). Anything else is
-            # reported as itself. Either way the sweep ends here and the
-            # caller is told it did NOT finish.
+            # Classify rather than swallow. A 57014 means the batch exceeded the
+            # statement timeout — at a measured-safe batch size that is
+            # contention, which is why it was retried above; surviving the
+            # retries means it is the sizing problem production hit (#1088).
+            # Anything else is reported as itself. Either way the sweep ends
+            # here and the caller is told it did NOT finish.
+            retries_used += max(0, len(attempts) - 1)
             timed_out = is_statement_timeout(exc)
             logger.exception(
-                "refresh_all_recency_scores: sweep batch failed after %d batch(es) "
-                "(cursor=%s batch_size=%d statement_timeout=%s) — sweep INCOMPLETE",
+                "refresh_all_recency_scores: sweep batch failed after %d batch(es) and "
+                "%d retry(ies) (cursor=%s batch_size=%d statement_timeout=%s) — "
+                "sweep INCOMPLETE",
                 batches,
+                retries_used,
                 cursor,
                 _SWEEP_BATCH_SIZE,
                 timed_out,
@@ -342,10 +410,18 @@ async def refresh_all_recency_scores(supabase: AsyncClient) -> SweepReport:
                 failed_with=type(exc).__name__,
                 timed_out=timed_out,
                 last_cursor=cursor,
+                retries_used=retries_used,
             )
+        retries_used += max(0, len(attempts) - 1)
         rows = cast(list[dict[str, Any]], resp.data or [])
         if not rows:
-            return SweepReport(written=written, batches=batches, exhausted=True, last_cursor=cursor)
+            return SweepReport(
+                written=written,
+                batches=batches,
+                exhausted=True,
+                last_cursor=cursor,
+                retries_used=retries_used,
+            )
         batch = rows[0]
         batches += 1
         written += int(batch.get("written") or 0)
@@ -355,5 +431,11 @@ async def refresh_all_recency_scores(supabase: AsyncClient) -> SweepReport:
         # batch means the id range is exhausted, not that dead rows thinned
         # this page.
         if scanned < _SWEEP_BATCH_SIZE or not last_id:
-            return SweepReport(written=written, batches=batches, exhausted=True, last_cursor=cursor)
+            return SweepReport(
+                written=written,
+                batches=batches,
+                exhausted=True,
+                last_cursor=cursor,
+                retries_used=retries_used,
+            )
         cursor = str(last_id)
