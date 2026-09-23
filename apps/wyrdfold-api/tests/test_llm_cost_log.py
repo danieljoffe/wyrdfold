@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from postgrest.exceptions import APIError
 
 from app.constants import SYSTEM_USER_ID
 from app.models.embeddings import EmbeddingResult, EmbeddingUsage
@@ -18,6 +19,93 @@ from app.services.llm.cost_log_buffer import buffer
 class _Resp:
     def __init__(self, data: Any) -> None:
         self.data = data
+
+
+# ---- a fake that behaves like the real PostgREST, cap included -------------
+#
+# The old fakes here were plain MagicMock chains, so they answered whatever
+# was asked and had no row cap. That is why nothing caught #1105: production
+# PostgREST clamps one response at 1,000 rows, the aggregates read without
+# paging, and every total was quietly computed from the first page. A fake
+# that cannot truncate cannot fail the way the dependency really fails.
+#
+# This one enforces the cap and honours .range(), so a reader that forgets to
+# page returns a SHORT total here exactly as it did in production.
+_POSTGREST_MAX_ROWS = 1000
+
+
+class _FakeQuery:
+    """Minimal postgrest query builder: filters are recorded, not applied
+    (the tests choose the row set), but RANGE and the row cap are real."""
+
+    def __init__(self, rows: list[dict[str, Any]], rec: dict[str, list[Any]]) -> None:
+        self._rows = rows
+        self._rec = rec
+        self._start = 0
+        self._end: int | None = None
+
+    def eq(self, *a: Any, **_k: Any) -> _FakeQuery:
+        self._rec["eq"].append(a)
+        return self
+
+    def gte(self, *a: Any, **_k: Any) -> _FakeQuery:
+        self._rec["gte"].append(a)
+        return self
+
+    def is_(self, *a: Any, **_k: Any) -> _FakeQuery:
+        self._rec["is_"].append(a)
+        return self
+
+    def order(self, *_a: Any, **_k: Any) -> _FakeQuery:
+        return self
+
+    def limit(self, n: int) -> _FakeQuery:
+        self._end = self._start + n - 1
+        return self
+
+    def range(self, start: int, end: int) -> _FakeQuery:
+        self._start, self._end = start, end
+        return self
+
+    def _page(self) -> list[dict[str, Any]]:
+        end = len(self._rows) - 1 if self._end is None else self._end
+        window = self._rows[self._start : end + 1]
+        self._rec["ranges"].append((self._start, end))
+        # The real server will not return more than this however wide the
+        # requested range is.
+        return window[:_POSTGREST_MAX_ROWS]
+
+    def execute(self) -> _Resp:
+        return _Resp(self._page())
+
+
+class _FakeAsyncQuery(_FakeQuery):
+    async def execute(self) -> _Resp:  # type: ignore[override]
+        return _Resp(self._page())
+
+
+class _FakeTable:
+    def __init__(self, rows: list[dict[str, Any]], rec: dict[str, list[Any]], *, is_async: bool):
+        self._rows, self._rec, self._async = rows, rec, is_async
+
+    def select(self, *_a: Any, **_k: Any) -> _FakeQuery:
+        cls = _FakeAsyncQuery if self._async else _FakeQuery
+        return cls(self._rows, self._rec)
+
+
+def _fake_client(
+    rows: list[dict[str, Any]], *, is_async: bool = False, rpc_error: Exception | None = None
+) -> tuple[Any, dict[str, list[Any]]]:
+    """Client whose RPC fails (forcing the fallback) and whose table reads
+    behave like PostgREST, row cap included.
+
+    Returns the client plus a record of what was asked: ``ranges`` (so a test
+    can prove the reader paged) and the ``eq`` / ``gte`` / ``is_`` filters."""
+    rec: dict[str, list[Any]] = {"ranges": [], "eq": [], "gte": [], "is_": []}
+    sb = MagicMock()
+    sb.rpc.side_effect = rpc_error or Exception("function does not exist")
+    sb.table.return_value = _FakeTable(rows, rec, is_async=is_async)
+    return sb, rec
 
 
 def _llm_result(cost: float = 0.01) -> LLMResult:
@@ -74,14 +162,7 @@ def test_total_spend_zero_when_rpc_returns_none() -> None:
 
 
 def test_total_spend_falls_back_to_python_when_rpc_unavailable() -> None:
-    sb = MagicMock()
-    sb.rpc.side_effect = Exception("function does not exist")
-
-    # Fallback path: select cost_usd, sum in Python.
-    sel = sb.table.return_value.select.return_value
-    sel.eq.return_value.gte.return_value.execute.return_value = _Resp(
-        [{"cost_usd": 0.10}, {"cost_usd": 0.25}, {"cost_usd": 0.05}]
-    )
+    sb, _ = _fake_client([{"cost_usd": 0.10}, {"cost_usd": 0.25}, {"cost_usd": 0.05}])
 
     result = cost_log.total_spend(sb, user_id="u1", since=datetime.now(UTC) - timedelta(hours=1))
     assert result == pytest.approx(0.40)
@@ -90,16 +171,13 @@ def test_total_spend_falls_back_to_python_when_rpc_unavailable() -> None:
 def test_total_spend_fallback_reads_system_partition_for_none_user() -> None:
     # RPC unavailable + no user (cron) → the Python fallback filters on the
     # SYSTEM partition via eq, NOT the retired is_("user_id","null") branch.
-    sb = MagicMock()
-    sb.rpc.side_effect = Exception("not deployed")
-    sel = sb.table.return_value.select.return_value
-    sel.eq.return_value.gte.return_value.execute.return_value = _Resp([{"cost_usd": 0.5}])
+    sb, rec = _fake_client([{"cost_usd": 0.5}], rpc_error=Exception("not deployed"))
 
     result = cost_log.total_spend(sb, user_id=None, since=datetime.now(UTC) - timedelta(hours=1))
 
     assert result == pytest.approx(0.5)
-    sel.eq.assert_called_once_with("user_id", SYSTEM_USER_ID)
-    sel.is_.assert_not_called()
+    assert rec["eq"] == [("user_id", SYSTEM_USER_ID)]
+    assert rec["is_"] == []
 
 
 def test_total_spend_rounds_to_six_decimals() -> None:
@@ -129,16 +207,13 @@ def test_spend_by_purpose_empty_when_rpc_returns_empty_object() -> None:
 
 
 def test_spend_by_purpose_falls_back_when_rpc_unavailable() -> None:
-    sb = MagicMock()
-    sb.rpc.side_effect = Exception("not deployed")
-
-    sel = sb.table.return_value.select.return_value
-    sel.eq.return_value.execute.return_value = _Resp(
+    sb, _ = _fake_client(
         [
             {"purpose": "job_analysis", "cost_usd": 0.10},
             {"purpose": "job_analysis", "cost_usd": 0.20},
             {"purpose": "tailor", "cost_usd": 0.05},
-        ]
+        ],
+        rpc_error=Exception("not deployed"),
     )
 
     result = cost_log.spend_by_purpose(sb, user_id="u1")
@@ -149,9 +224,7 @@ def test_spend_by_purpose_falls_back_when_rpc_unavailable() -> None:
 
 
 def test_cache_metrics_all_sums_token_buckets() -> None:
-    sb = MagicMock()
-    sel = sb.table.return_value.select.return_value
-    sel.execute.return_value = _Resp(
+    sb, _ = _fake_client(
         [
             {
                 "input_tokens": 100,
@@ -366,13 +439,8 @@ async def test_total_spend_async_zero_when_rpc_returns_none() -> None:
 
 @pytest.mark.asyncio
 async def test_total_spend_async_falls_back_to_python_when_rpc_unavailable() -> None:
-    sb = MagicMock()
-    sb.rpc.side_effect = Exception("function does not exist")
-
-    # Fallback path: select cost_usd, sum in Python — awaited on the async client.
-    sel = sb.table.return_value.select.return_value
-    sel.eq.return_value.gte.return_value.execute = AsyncMock(
-        return_value=_Resp([{"cost_usd": 0.10}, {"cost_usd": 0.25}, {"cost_usd": 0.05}])
+    sb, _ = _fake_client(
+        [{"cost_usd": 0.10}, {"cost_usd": 0.25}, {"cost_usd": 0.05}], is_async=True
     )
 
     result = await cost_log.total_spend_async(
@@ -399,19 +467,14 @@ async def test_total_billable_spend_async_uses_rpc_when_available() -> None:
 
 @pytest.mark.asyncio
 async def test_total_billable_spend_async_falls_back_when_rpc_unavailable() -> None:
-    sb = MagicMock()
-    sb.rpc.side_effect = Exception("not deployed")
-
-    # Fallback: select (cost_usd, purpose), filter out excluded purposes, sum.
-    sel = sb.table.return_value.select.return_value
-    sel.eq.return_value.gte.return_value.execute = AsyncMock(
-        return_value=_Resp(
-            [
-                {"cost_usd": 0.10, "purpose": "job_analysis"},
-                {"cost_usd": 0.20, "purpose": "poll_scoring"},  # excluded
-                {"cost_usd": 0.05, "purpose": "tailor"},
-            ]
-        )
+    sb, _ = _fake_client(
+        [
+            {"cost_usd": 0.10, "purpose": "job_analysis"},
+            {"cost_usd": 0.20, "purpose": "poll_scoring"},  # excluded
+            {"cost_usd": 0.05, "purpose": "tailor"},
+        ],
+        is_async=True,
+        rpc_error=Exception("not deployed"),
     )
 
     result = await cost_log.total_billable_spend_async(
@@ -455,13 +518,8 @@ async def test_total_spend_all_async_zero_when_rpc_returns_none() -> None:
 
 @pytest.mark.asyncio
 async def test_total_spend_all_async_falls_back_to_python_when_rpc_unavailable() -> None:
-    sb = MagicMock()
-    sb.rpc.side_effect = Exception("function does not exist")
-
-    # Fallback: select cost_usd across ALL users (no user filter), sum in Python.
-    sel = sb.table.return_value.select.return_value
-    sel.gte.return_value.execute = AsyncMock(
-        return_value=_Resp([{"cost_usd": 1.00}, {"cost_usd": 0.50}, {"cost_usd": 0.25}])
+    sb, _ = _fake_client(
+        [{"cost_usd": 1.00}, {"cost_usd": 0.50}, {"cost_usd": 0.25}], is_async=True
     )
 
     result = await cost_log.total_spend_all_async(sb, since=datetime.now(UTC) - timedelta(days=1))
@@ -471,16 +529,13 @@ async def test_total_spend_all_async_falls_back_to_python_when_rpc_unavailable()
 @pytest.mark.asyncio
 async def test_spend_by_purpose_all_async_groups_client_side() -> None:
     # No RPC variant — the async twin awaits the select and groups in Python.
-    sb = MagicMock()
-    sel = sb.table.return_value.select.return_value
-    sel.gte.return_value.execute = AsyncMock(
-        return_value=_Resp(
-            [
-                {"purpose": "phase1_triage", "cost_usd": 1.0},
-                {"purpose": "phase1_triage", "cost_usd": 0.5},
-                {"purpose": "fit.job", "cost_usd": 2.0},
-            ]
-        )
+    sb, _ = _fake_client(
+        [
+            {"purpose": "phase1_triage", "cost_usd": 1.0},
+            {"purpose": "phase1_triage", "cost_usd": 0.5},
+            {"purpose": "fit.job", "cost_usd": 2.0},
+        ],
+        is_async=True,
     )
 
     result = await cost_log.spend_by_purpose_all_async(sb, since=datetime.now(UTC))
@@ -490,23 +545,20 @@ async def test_spend_by_purpose_all_async_groups_client_side() -> None:
 
 @pytest.mark.asyncio
 async def test_cache_metrics_all_async_sums_token_buckets() -> None:
-    sb = MagicMock()
-    sel = sb.table.return_value.select.return_value
-    sel.gte.return_value.execute = AsyncMock(
-        return_value=_Resp(
-            [
-                {
-                    "input_tokens": 100,
-                    "cache_read_input_tokens": 800,
-                    "cache_creation_input_tokens": 100,
-                },
-                {
-                    "input_tokens": 0,
-                    "cache_read_input_tokens": 200,
-                    "cache_creation_input_tokens": 0,
-                },
-            ]
-        )
+    sb, _ = _fake_client(
+        [
+            {
+                "input_tokens": 100,
+                "cache_read_input_tokens": 800,
+                "cache_creation_input_tokens": 100,
+            },
+            {
+                "input_tokens": 0,
+                "cache_read_input_tokens": 200,
+                "cache_creation_input_tokens": 0,
+            },
+        ],
+        is_async=True,
     )
 
     result = await cost_log.cache_metrics_all_async(sb, since=datetime.now(UTC))
@@ -554,3 +606,111 @@ async def test_record_async_stamps_the_cost_provenance() -> None:
 
     inserted = sb.table.return_value.insert.call_args[0][0]
     assert inserted["metadata"] == {"cost_source": "reported", "transport": "unknown"}
+
+
+# ---- #1105: a spend total is never allowed to be quietly short -------------
+#
+# PostgREST caps one response at 1,000 rows. Every aggregate here used to read
+# without paging, so any window bigger than the cap produced a total that was
+# too SMALL — and the budget guards read "too small" as "there is room left".
+# These pin the three things that keep that from coming back: the readers page,
+# a timeout is not swallowed, and an indeterminate total is never returned as a
+# number.
+
+
+def _rows(n: int, each: float = 0.001) -> list[dict[str, Any]]:
+    return [{"cost_usd": each, "purpose": "tailor"} for _ in range(n)]
+
+
+def _timeout() -> APIError:
+    return APIError({"message": "canceling statement due to statement timeout", "code": "57014"})
+
+
+def test_a_window_larger_than_the_row_cap_is_summed_in_full() -> None:
+    """The bug itself. 2,500 rows against a 1,000-row cap: unpaged this
+    returned a third of the real total and no error."""
+    sb, rec = _fake_client(_rows(2500))
+
+    result = cost_log.total_spend_all(sb, since=datetime.now(UTC) - timedelta(days=30))
+
+    assert result == pytest.approx(2.5)  # not 1.0, which is what one page gives
+    assert rec["ranges"] == [(0, 999), (1000, 1999), (2000, 2999)]
+
+
+def test_the_operator_breakdown_also_pages() -> None:
+    """``spend_by_purpose_all`` has no RPC behind it, so its read is the
+    PRIMARY path — it was truncating on every call, not just on failure."""
+    sb, rec = _fake_client(
+        [{"purpose": "phase1_triage", "cost_usd": 0.001} for _ in range(1500)]
+    )
+
+    result = cost_log.spend_by_purpose_all(sb, since=datetime.now(UTC) - timedelta(days=30))
+
+    assert result == {"phase1_triage": pytest.approx(1.5)}
+    assert len(rec["ranges"]) == 2
+
+
+def test_cache_metrics_also_page() -> None:
+    sb, rec = _fake_client(
+        [
+            {"input_tokens": 1, "cache_read_input_tokens": 2, "cache_creation_input_tokens": 3}
+            for _ in range(1200)
+        ]
+    )
+
+    result = cost_log.cache_metrics_all(sb, since=datetime.now(UTC))
+
+    assert result == {"cache_read": 2400, "cache_creation": 3600, "uncached_input": 1200}
+    assert len(rec["ranges"]) == 2
+
+
+def test_an_exactly_full_page_still_asks_for_the_next_one() -> None:
+    """Off-by-one guard: at exactly the cap the reader cannot tell "that was
+    everything" from "there is more", so it must ask again."""
+    sb, rec = _fake_client(_rows(1000))
+
+    assert cost_log.total_spend_all(sb) == pytest.approx(1.0)
+    assert rec["ranges"] == [(0, 999), (1000, 1999)]
+
+
+def test_a_statement_timeout_does_not_fall_back_to_the_client_side_sum() -> None:
+    """A timeout means the exact answer timed out — not that the function is
+    missing. Substituting a paged walk of the same rows under the same clock
+    is not a fix, and historically it substituted a TRUNCATED one."""
+    sb, rec = _fake_client(_rows(5), rpc_error=_timeout())
+
+    with pytest.raises(cost_log.SpendTotalUnavailableError):
+        cost_log.total_spend_all(sb, since=datetime.now(UTC))
+
+    assert rec["ranges"] == []  # the fallback was not attempted
+
+
+def test_a_missing_rpc_still_falls_back() -> None:
+    """The case the fallback was actually written for — a deploy where the
+    migration has not landed — must keep working."""
+    sb, _ = _fake_client(_rows(5), rpc_error=Exception("function does not exist"))
+
+    assert cost_log.total_spend_all(sb, since=datetime.now(UTC)) == pytest.approx(0.005)
+
+
+def test_a_read_too_large_to_page_refuses_rather_than_returning_a_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pagination itself has a ceiling. Hitting it must raise, not hand
+    back the rows gathered so far — a caller that asked for every row and got
+    some of them has no way to tell."""
+    monkeypatch.setattr(cost_log, "_MAX_READ_PAGES", 2)
+    sb, _ = _fake_client(_rows(5000))
+
+    with pytest.raises(cost_log.SpendTotalUnavailableError):
+        cost_log.total_spend_all(sb, since=datetime.now(UTC))
+
+
+@pytest.mark.asyncio
+async def test_the_async_readers_page_too() -> None:
+    sb, rec = _fake_client(_rows(2500), is_async=True)
+
+    result = await cost_log.total_spend_all_async(sb, since=datetime.now(UTC))
+
+    assert result == pytest.approx(2.5)
+    assert rec["ranges"] == [(0, 999), (1000, 1999), (2000, 2999)]

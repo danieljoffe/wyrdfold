@@ -47,6 +47,7 @@ from app.models.user_profile import (
     ResumeStyleSettings,
     ResumeStyleSettingsUpdate,
 )
+from app.services.llm.cost_log import SpendTotalUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -654,13 +655,24 @@ async def get_llm_usage(
     # concurrently on the event loop (the async twins / awaited queries) —
     # sequentially they were the endpoint's bottleneck (~7-8 round-trips,
     # ~2-3s on a heavy account). All five are read-only. #260
-    spent_month, resets_at, analysis_used, hourly_spent, daily_spent = await asyncio.gather(
-        _month_spend(),
-        _resets_at(),
-        _analysis_used(),
-        _hourly_spend(),
-        _daily_spend(),
-    )
+    try:
+        spent_month, resets_at, analysis_used, hourly_spent, daily_spent = await asyncio.gather(
+            _month_spend(),
+            _resets_at(),
+            _analysis_used(),
+            _hourly_spend(),
+            _daily_spend(),
+        )
+    except SpendTotalUnavailableError as exc:
+        # This is a usage METER, so the failure mode matters: a spend total
+        # that cannot be read used to come back silently short, which showed
+        # the user MORE headroom than they actually had. Saying "unavailable"
+        # is the honest answer; a plausible wrong number is not (#1105).
+        logger.error("llm-usage: spend total unavailable for user=%s: %s", user_id, exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Usage figures are temporarily unavailable. Please retry shortly.",
+        ) from exc
 
     return LlmUsageResponse(
         hourly=LlmUsageWindow(

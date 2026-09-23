@@ -41,6 +41,7 @@ from app.services.lever import fetch_lever_jobs
 from app.services.llm import MissingUserKeyError, TrialExpiredError
 from app.services.llm import get_client_async as get_llm_client_async
 from app.services.llm.client import LLMClient
+from app.services.llm.cost_log import SpendTotalUnavailableError
 from app.services.llm.cost_log import record_async as record_llm_cost_async
 from app.services.llm.cost_log import total_spend_all_async as total_llm_spend_all_async
 from app.services.llm.provider_breaker import (
@@ -3139,7 +3140,22 @@ async def _global_budget_exhausted(supabase: AsyncClient, *, reserve_usd: float 
         # spender yields entirely, leaving the budget for grading.
         return True
     midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    return await _memoized_total_spend(supabase, midnight) >= effective_cap
+    try:
+        spent = await _memoized_total_spend(supabase, midnight)
+    except SpendTotalUnavailableError:
+        # Fail CLOSED. The breaker's whole job is to stop LLM work once the
+        # day's cap is reached; if it cannot find out what has been spent, the
+        # safe answer is "exhausted". Treating an unknown total as "there is
+        # room left" is how spending runs past a cap unnoticed (#1105).
+        # Ingestion is unaffected — only LLM work defers.
+        logger.error(
+            "global LLM circuit breaker: today's spend total is UNAVAILABLE — "
+            "treating the budget as exhausted and deferring LLM work this cycle "
+            "(jobs still ingest) (#1105)",
+            exc_info=True,
+        )
+        return True
+    return spent >= effective_cap
 
 
 # #642: TTL memo for the day-spend aggregate. The mid-loop budget re-checks
