@@ -190,3 +190,68 @@ async def test_the_payer_gate_still_admits_a_payer_under_their_cap(
 
     assert "u-1" not in gate.over_budget_users
     assert gate.target_blocked("t-1") is False
+
+
+# ---- the amplifier the release gate caught ---------------------------------
+
+
+async def test_a_failing_spend_read_is_not_re_issued_on_every_breaker_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Found by the #1088+#1105 release gate, not by either PR alone.
+
+    ``_global_budget_exhausted`` is called once per job inside the triage
+    loops. Its 60s memo used to cache only SUCCESS, which was harmless while a
+    failed spend read fell back to a number. #1105 made it raise — correctly —
+    and that turned the memo into an amplifier: 25 breaker calls produced 25
+    failing queries, each running until the 8-second statement timeout killed
+    it, against the database that was already too slow to answer.
+
+    The breaker must still hold closed throughout; the point is that it does
+    so from the remembered answer instead of re-asking.
+    """
+    from app.services import poller
+
+    calls = 0
+
+    async def failing(*_a: Any, **_k: Any) -> float:
+        nonlocal calls
+        calls += 1
+        raise SpendTotalUnavailableError("exceeded the statement timeout")
+
+    monkeypatch.setattr(settings, "global_llm_daily_budget_usd", 10.0)
+    monkeypatch.setattr(poller, "total_llm_spend_all_async", failing)
+    monkeypatch.setitem(poller._spend_memo, "at", 0.0)
+    monkeypatch.setitem(poller._spend_memo, "midnight", None)
+    monkeypatch.setitem(poller._spend_memo, "error", None)
+
+    results = [await poller._global_budget_exhausted(MagicMock()) for _ in range(25)]
+
+    assert all(results), "the breaker must stay closed for every call"
+    assert calls == 1, f"the failing read was re-issued {calls} times; the memo must hold it"
+
+
+async def test_the_memo_still_re_reads_once_the_ttl_lapses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half: remembering a failure must not wedge the breaker shut
+    forever. Once the TTL lapses it tries again, and a recovered database
+    re-opens it."""
+    from app.services import poller
+
+    monkeypatch.setattr(settings, "global_llm_daily_budget_usd", 10.0)
+    monkeypatch.setitem(poller._spend_memo, "at", 0.0)
+    monkeypatch.setitem(poller._spend_memo, "midnight", None)
+    monkeypatch.setitem(poller._spend_memo, "error", None)
+
+    monkeypatch.setattr(poller, "total_llm_spend_all_async", _unavailable_async)
+    assert await poller._global_budget_exhausted(MagicMock()) is True
+
+    # The database recovers; expire the memo the way the clock would.
+    async def _cheap(*_a: Any, **_k: Any) -> float:
+        return 1.0
+
+    monkeypatch.setattr(poller, "total_llm_spend_all_async", _cheap)
+    monkeypatch.setitem(poller._spend_memo, "at", 0.0)
+
+    assert await poller._global_budget_exhausted(MagicMock()) is False
