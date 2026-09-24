@@ -45,7 +45,7 @@ from typing import Any, cast
 from supabase import AsyncClient
 
 from app.config import settings
-from app.services.db_write import poll_db_read, poll_db_write
+from app.services.db_write import archive_job_ids, poll_db_read, poll_db_write
 
 logger = logging.getLogger(__name__)
 
@@ -126,14 +126,13 @@ async def _archive_stale(supabase: AsyncClient, *, batch: int) -> int:
 
     engaged = await _engaged_ids(supabase, ids)
     to_archive = [i for i in ids if i not in engaged]
+    # One pinned timestamp for the whole sweep, and batches sized by
+    # ``archive_job_ids`` rather than this module's generic ``_WRITE_CHUNK``:
+    # an archive write costs far more per row than the reads and deletes that
+    # constant also sizes, because of the per-row denormalisation trigger
+    # (#1107).
     now = datetime.now(UTC).isoformat()
-    for i in range(0, len(to_archive), _WRITE_CHUNK):
-        chunk = to_archive[i : i + _WRITE_CHUNK]
-        await poll_db_write(
-            supabase,
-            lambda c, _chunk=chunk: c.table("jobs").update({"archived_at": now}).in_("id", _chunk),
-            label="archival stamp archived_at",
-        )
+    await archive_job_ids(supabase, to_archive, archived_at=now, label="archival stamp archived_at")
     if engaged:
         logger.info(
             "Archival sweep: left %d engaged job(s) live past the %dd cutoff",
