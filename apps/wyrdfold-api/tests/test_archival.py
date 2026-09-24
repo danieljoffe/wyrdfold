@@ -103,6 +103,35 @@ class TestArchiveStale:
         assert sorted(in_args[1]) == ["old-1", "old-3"]  # old-2 protected
 
     @pytest.mark.asyncio
+    async def test_archive_write_is_split_into_bounded_statements(self) -> None:
+        """The sweep's archive write is sized by ``ARCHIVE_WRITE_CHUNK``, not by
+        this module's generic ``_WRITE_CHUNK`` of 200 (#1107).
+
+        Stamping ``archived_at`` costs far more per row than the reads and
+        deletes that constant also sizes, because a FOR EACH ROW trigger
+        rewrites each job's scores rows. At 200 this statement was measured on
+        production at 7,647 ms against an 8-second timeout, and a killed one
+        leaves dead listings on every serving surface.
+        """
+        candidates = [{"id": f"old-{n}"} for n in range(120)]
+        sb = _FakeSupabase({"jobs": [candidates], "user_jobs": [[]]})
+
+        archived = await archival._archive_stale(sb, batch=500)
+
+        assert archived == 120
+        updates = sb.ops("jobs", "update")
+        assert len(updates) == 3  # 50 + 50 + 20, not one statement of 120
+        assert [len(q.called("in_")[0][1]) for q in updates] == [50, 50, 20]
+
+        # One timestamp across every batch — jobs that aged out together must
+        # still read as archived together.
+        stamps = {q.called("update")[0][0]["archived_at"] for q in updates}
+        assert len(stamps) == 1
+        # This path has never moved updated_at; splitting the write must not
+        # start it doing so.
+        assert all("updated_at" not in q.called("update")[0][0] for q in updates)
+
+    @pytest.mark.asyncio
     async def test_no_candidates_is_a_noop(self) -> None:
         sb = _FakeSupabase({"jobs": [[]]})
         assert await archival._archive_stale(sb, batch=500) == 0

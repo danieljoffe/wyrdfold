@@ -26,6 +26,7 @@ from app.services.board_metadata import board_columns, board_us_verdict
 from app.services.date_normalize import normalize_posted_at
 from app.services.db_write import (
     DB_WRITE_CONCURRENCY,
+    archive_job_ids,
     poll_db_read,
     poll_db_upsert,
     poll_db_write,
@@ -1439,13 +1440,13 @@ async def _backfill_qualify_stale(supabase: AsyncClient, limit: int) -> None:
     if dead:
         logger.info("Qualification backfill: archiving %d dead listing(s)", len(dead))
         with contextlib.suppress(Exception):
-            await poll_db_write(
+            # ``dead`` is as large as ``qualification_backfill_batch`` allows,
+            # which an operator can set to 1,000 — so the write is batched
+            # rather than issued as one statement (#1107).
+            await archive_job_ids(
                 supabase,
-                lambda c: (
-                    c.table("jobs")
-                    .update({"archived_at": datetime.now(UTC).isoformat()})
-                    .in_("id", dead)
-                ),
+                dead,
+                archived_at=datetime.now(UTC).isoformat(),
                 label="poll qualify-backfill archive",
             )
 
@@ -2702,21 +2703,29 @@ async def _poll_one_source(
         if stale_ids:
             # Flag stale/delisted jobs globally-dead via archived_at (#75 C3
             # — global liveness, distinct from per-user jobs.status).
-            # ``stale_ids`` scales with a source's active-row count, so they
-            # ride in the ``archive_jobs_by_ids`` RPC's ``p_ids`` jsonb body
-            # rather than an ``id=in.(...)`` URL filter — no URL-length limit,
-            # one set-based UPDATE instead of N chunks (#93). The RPC stamps a
-            # single ``now()`` across every id (matching the single big-UPDATE
-            # semantics: one shared timestamp for all archived rows) and writes
-            # the same ``archived_at`` + ``updated_at`` the chunked path wrote.
+            #
+            # ``stale_ids`` scales with a source's active-row count and nothing
+            # bounds it: a board that goes dark archives everything it held in
+            # one go. This used to be a single ``archive_jobs_by_ids`` RPC
+            # call, chosen under #93 to send one set-based UPDATE instead of N
+            # chunks. #1107 inverted that reasoning — an archive statement's
+            # cost is per ROW, not per statement, because a FOR EACH ROW
+            # trigger rewrites each job's scores rows, so the one big UPDATE
+            # was the exposure rather than the saving. ``archive_job_ids``
+            # keeps what the RPC was actually needed for: one pinned timestamp
+            # across every batch, so a board's listings still all carry the
+            # same archived_at. At 50 ids a batch the ``id=in.(...)`` filter is
+            # ~2 KB of URL, far short of the length limit the RPC avoided.
             #
             # Both writes are idempotent (UPDATE with stable WHERE), so a
             # retry after a stream drop is safe.
             await asyncio.gather(
-                poll_db_write(
+                archive_job_ids(
                     supabase,
-                    lambda c: c.rpc("archive_jobs_by_ids", {"p_ids": stale_ids}),
+                    stale_ids,
+                    archived_at=datetime.now(UTC).isoformat(),
                     label=f"poll archive {company_name}",
+                    stamp_updated_at=True,
                 ),
                 poll_db_write(
                     supabase,

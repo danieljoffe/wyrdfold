@@ -25,11 +25,14 @@ module that issues poll queries can share them without importing the poller.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 from app.services.supabase_retry import execute_with_retry, execute_with_retry_sync
 from app.supabase_pool import get_async_supabase
+
+logger = logging.getLogger(__name__)
 
 # Hard ceiling on concurrent supabase writes across the WHOLE poll cycle. The
 # Stage-1/Stage-2 scoring loops ``asyncio.gather`` one write per (row x
@@ -244,3 +247,105 @@ async def poll_db_read(
             lambda: execute_with_retry_sync(build(supabase).execute, label=label)
         )
     return await asyncio.to_thread(build(supabase).execute)
+
+
+# Rows per archive-write statement.
+#
+# In plain terms: stamping ``jobs.archived_at`` is the most expensive per-row
+# write the catalog has, so the number of rows allowed into one statement is
+# what keeps it under the database's 8-second limit.
+#
+# It is expensive because it is not really a one-column write.
+# ``jobs_sync_scores_denorm_au`` is an AFTER UPDATE trigger that runs FOR EACH
+# ROW, so a statement pays its cost once per id: it rewrites that job's
+# ``scores`` rows, and because it flips ``scores.job_is_live`` those rewrites
+# also maintain three partial indexes. Measured on production, the trigger is
+# 85-88% of the statement's total time.
+#
+# 50 is measured, not guessed. Cold, on disjoint id sets so no run warmed the
+# next: 50 rows twice at 311 and 320 ms, 100 rows at 551 ms, 200 rows twice at
+# 996 and 860 ms — i.e. 4.6-6.3 ms per row, linear in the row count. Because
+# the cost is linear, so is the exposure: production's worst case runs about
+# 8x its mean (contention, not a different plan), and at the 200 this replaced
+# that put the observed maximum at 7,647 ms — 94% of the ceiling, on a
+# statement whose failure silently leaves dead listings on every serving
+# surface (#1107). 50 models to roughly 1.9 s, about a quarter of the ceiling.
+#
+# Re-measure before raising it. The per-row cost tracks how many targets a job
+# is scored against, so it grows with the catalog rather than staying put.
+ARCHIVE_WRITE_CHUNK = 50
+
+
+async def archive_job_ids(
+    supabase: Any,
+    ids: Sequence[str],
+    *,
+    archived_at: str,
+    label: str,
+    stamp_updated_at: bool = False,
+) -> int:
+    """Stamp ``jobs.archived_at`` = *archived_at* on *ids*, in statements of at
+    most :data:`ARCHIVE_WRITE_CHUNK` rows. Returns the number of rows the
+    database reports it actually changed — not the number of ids handed in.
+
+    Shared by every path that archives a set of listings (the stale-listing
+    sweep, the archival sweep, the liveness backfill) so none of them can hand
+    the database an id list whose size nothing bounds — which is what each of
+    them did before #1107, in three different ways: one had no bound at all,
+    one was capped by an operator setting that allows 1,000, and one chunked at
+    200 and was measured at 94% of the statement timeout.
+
+    *archived_at* is passed in, never read from the clock here, so a set of
+    listings that went dead together is stamped with ONE timestamp across every
+    batch. That is the semantic the single-statement writes this replaces got
+    for free, and dropping it would make "archived in the same sweep" stop
+    meaning "archived at the same instant".
+
+    Batches run in sequence rather than gathered. This is background catalog
+    maintenance sharing a write semaphore with the poll cycle, and the whole
+    point of the change is to stop archiving arriving as one lump.
+
+    A failed batch propagates — each caller already has its own handling — but
+    logs what DID land first. A partial archive is otherwise indistinguishable
+    from a complete one, which is the failure shape #1088 went unnoticed in.
+
+    The count comes off each response's ``RETURNING`` rows rather than off
+    ``len(chunk)``, for the reason :func:`app.services.poller._update_jobs_chunked`
+    gives: a count of what we INTENDED to write reports writes that never
+    happened. That is not hypothetical here — it is what the integration test
+    for this helper hit first time, reporting every id stamped while the
+    database had archived nothing.
+
+    *stamp_updated_at* writes ``jobs.updated_at`` alongside, to the same
+    timestamp. Only the stale-listing sweep asks for it, because only that path
+    ever wrote it — the column has no trigger behind it, so whether it moves is
+    decided entirely by the payload, and the three callers have always
+    disagreed. Preserved per-caller rather than unified: making them agree
+    changes what a reader of that column sees, which is a separate decision
+    from how large a statement may be.
+    """
+    if not ids:
+        return 0
+    payload: dict[str, Any] = {"archived_at": archived_at}
+    if stamp_updated_at:
+        payload["updated_at"] = archived_at
+    stamped = 0
+    for start in range(0, len(ids), ARCHIVE_WRITE_CHUNK):
+        chunk = list(ids[start : start + ARCHIVE_WRITE_CHUNK])
+
+        def _build(client: Any, _chunk: list[str] = chunk) -> Any:
+            return client.table("jobs").update(payload).in_("id", _chunk)
+
+        try:
+            resp = await poll_db_write(supabase, _build, label=label)
+        except Exception:
+            logger.warning(
+                "%s: archive INCOMPLETE — %d of %d id(s) stamped before the failure",
+                label,
+                stamped,
+                len(ids),
+            )
+            raise
+        rows = getattr(resp, "data", None)
+        stamped += len(rows) if isinstance(rows, list) else 0
+    return stamped

@@ -230,8 +230,12 @@ async def _run_cycle_with(monkeypatch, jobs_returned: list[StandardJob]):
     from tests.test_poller import _GUARD_SOURCE, _make_poll_supabase
 
     existing = [
-        {"id": "job-1", "external_id": "known-1", "title": "Senior Engineer",
-         "company_name": "Acme"}
+        {
+            "id": "job-1",
+            "external_id": "known-1",
+            "title": "Senior Engineer",
+            "company_name": "Acme",
+        }
     ]
     supabase, jobs_table, _sources = _make_poll_supabase(existing)
     jobs_table.select.return_value.eq.return_value.execute.return_value.data = [
@@ -300,7 +304,10 @@ async def test_detail_skipped_posting_is_not_archived_as_stale(monkeypatch) -> N
         return StandardJob(**base)  # type: ignore[arg-type]
 
     def _archive_calls(supabase: MagicMock) -> list[Any]:
-        return [c for c in supabase.rpc.call_args_list if c[0][0] == "archive_jobs_by_ids"]
+        # Stale listings are archived by bounded ``jobs.update({archived_at})``
+        # statements now, not the ``archive_jobs_by_ids`` RPC (#1107).
+        jobs_table = supabase.table("jobs")
+        return [c for c in jobs_table.update.call_args_list if "archived_at" in c.args[0]]
 
     # PRECONDITION: a posting that really is gone from the board DOES archive,
     # so this harness can observe archiving at all.
