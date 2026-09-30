@@ -262,6 +262,10 @@ _INERT_SOURCE_STATE: dict[str, Any] = {
     # debugging an outage that happened in another database.
     "last_error": None,
     "last_error_at": None,
+    # Retirement verdict (20260930000000). Production's verdict about its own
+    # polling history; staging never polls these rows, so it inherits none.
+    "retired_at": None,
+    "retired_reason": None,
     # Denormalised counter the poller maintains. Production's value describes
     # production's catalog, not the subset copied here, so it would be wrong
     # either way; 0 is at least CONSISTENT with last_polled_at being NULL —

@@ -2803,7 +2803,7 @@ async def _poll_one_source(
         # board was re-polled forever.
         logger.warning("Poll failed for %s: %s", company_name, exc)
         summary["error"] = f"{company_name}: board fetch failed"
-        await _record_source_failure(supabase, source, error=str(exc))
+        await _record_source_failure(supabase, source, error=str(exc), status=exc.status)
     except Exception as exc:
         logger.exception("Poll failed for %s", company_name)
         summary["error"] = f"{company_name}: poll failed"
@@ -2815,6 +2815,12 @@ async def _poll_one_source(
 # Truncate stored failure text so a giant traceback/HTML body can't bloat
 # the row (the column is queryable signal, not a log store).
 _SOURCE_LAST_ERROR_MAX_LEN = 500
+
+# What the pre-disable re-detection tells the backoff to do. See
+# _redetect_before_disabling for each value.
+RedetectVerdict = Literal["repointed", "suppress", "disable", "retire_duplicate", "retire_dead"]
+# Mirrors the sources_retired_reason_check constraint (20260930000000).
+SourceRetireReason = Literal["dead_board", "duplicate"]
 
 # #962: re-detection outcomes accumulated across a cycle. Per-event log lines
 # exist (RE-POINTED / still-live / collision), but spotting drift -- a new ATS
@@ -2836,7 +2842,11 @@ def _log_redetect_cycle_summary() -> None:
 
 
 async def _record_source_failure(
-    supabase: AsyncClient, source: dict[str, Any], *, error: str | None = None
+    supabase: AsyncClient,
+    source: dict[str, Any],
+    *,
+    error: str | None = None,
+    status: int | None = None,
 ) -> None:
     """Failure backoff: count consecutive fetch failures per source, persist
     the failure cause, and auto-disable at the threshold (a dead board
@@ -2863,6 +2873,13 @@ async def _record_source_failure(
     rather than died, and it may not even be dead. That can re-point this row
     onto the company's live board (in which case nothing else is written) or
     veto the disable, but it can never manufacture one.
+
+    It can also upgrade the disable to a RETIREMENT when it has proof rather
+    than just failures: the row is a duplicate of another source, or the
+    board answered ``status`` 404 and nothing live exists for the company.
+    Auto-recovery never revives a retired row, which is what stops a dead
+    board cycling off-and-on (and alerting) forever. ``status`` is the HTTP
+    status of the failed fetch, None when there was no HTTP answer.
     """
     threshold = settings.source_failure_disable_threshold
     if threshold <= 0:
@@ -2883,25 +2900,36 @@ async def _record_source_failure(
         if error:
             updates["last_error"] = error[:_SOURCE_LAST_ERROR_MAX_LEN]
         disabling = failures >= threshold
+        retire_reason: SourceRetireReason | None = None
         if disabling and settings.source_redetect_on_disable_enabled:
             # #912: the threshold says "this board stopped answering", which is
             # not the same claim as "this company stopped hiring". Ask the ATSs
             # before acting on the identifier. Gated on the threshold, not on
             # every failure, so the probing is bounded to the handful of
             # sources that would otherwise be disabled this cycle.
-            verdict = await _redetect_before_disabling(supabase, source, failures=failures)
+            verdict = await _redetect_before_disabling(
+                supabase, source, failures=failures, status=status
+            )
             _redetect_cycle_counts[verdict] += 1
             if verdict == "repointed":
                 # The row now points at the live board and the failure is
                 # resolved — the failure/disable write below would undo it.
                 return
-            disabling = verdict == "disable"
+            if verdict == "retire_duplicate":
+                retire_reason = "duplicate"
+            elif verdict == "retire_dead":
+                retire_reason = "dead_board"
+            disabling = verdict != "suppress"
         if disabling:
             updates["enabled"] = False
             updates["disabled_at"] = now_iso
+            if retire_reason is not None:
+                updates["retired_at"] = now_iso
+                updates["retired_reason"] = retire_reason
             logger.warning(
-                "Source %s disabled after %d consecutive failures",
+                "Source %s %s after %d consecutive failures",
                 company,
+                f"RETIRED ({retire_reason})" if retire_reason else "disabled",
                 failures,
             )
         await poll_db_write(
@@ -2923,15 +2951,31 @@ async def _record_source_failure(
                     company,
                 )
         if disabling and settings.sentry_dsn:
+            level: Literal["warning", "error"]
+            # One Sentry issue per KIND of event, not per source: each company
+            # used to open its own issue (and its own email), and a dead board
+            # re-opened it on every recovery round. The per-source detail rides
+            # in the message; the fingerprint does the grouping.
+            if retire_reason is not None:
+                message = (
+                    f"source retired ({retire_reason}) after {failures} consecutive "
+                    f"failures: {company} ({source_id}). "
+                    f"last_error={updates.get('last_error') or 'n/a'}"
+                )
+                fingerprint = ["source-retired", retire_reason]
+                level = "warning"
+            else:
+                message = (
+                    f"source auto-disabled after {failures} consecutive "
+                    f"failures: {company} ({source_id}). "
+                    f"last_error={updates.get('last_error') or 'n/a'}"
+                )
+                fingerprint = ["source-auto-disabled"]
+                level = "error"
             try:
                 import sentry_sdk
 
-                sentry_sdk.capture_message(
-                    f"source auto-disabled after {failures} consecutive "
-                    f"failures: {company} ({source_id}). "
-                    f"last_error={updates.get('last_error') or 'n/a'}",
-                    level="error",
-                )
+                sentry_sdk.capture_message(message, level=level, fingerprint=fingerprint)
             except Exception:
                 logger.exception("Failed to report source auto-disable to Sentry")
     except Exception:
@@ -2939,8 +2983,12 @@ async def _record_source_failure(
 
 
 async def _redetect_before_disabling(
-    supabase: AsyncClient, source: dict[str, Any], *, failures: int
-) -> Literal["repointed", "suppress", "disable"]:
+    supabase: AsyncClient,
+    source: dict[str, Any],
+    *,
+    failures: int,
+    status: int | None = None,
+) -> RedetectVerdict:
     """Re-detect a source the backoff is about to disable (#912).
 
     Returns what the caller should do:
@@ -2955,9 +3003,19 @@ async def _redetect_before_disabling(
         disabling would be wrong. The caller still records the failure (the
         counter keeps climbing and stays queryable) but leaves ``enabled``
         alone.
+    ``retire_duplicate``
+        The company's live board is already owned by another source, so this
+        row is a duplicate: disable it AND mark it retired so auto-recovery
+        never revives it. The company is still polled through the other row.
+    ``retire_dead``
+        The failed fetch was an HTTP 404 (``status``) and a complete
+        re-detection found no board at all for the company. Disable and
+        retire. Only a 404 counts: a 422 can mean OUR request is malformed,
+        and timeouts/5xx are exactly the outage case auto-recovery exists for.
     ``disable``
-        Nothing found, or the live board is already owned by another source.
-        Today's behaviour, unchanged.
+        Anything short of proof — nothing found after a non-404 failure, or a
+        re-detection that errored, timed out, or saw only an empty board.
+        Disabled as before, and auto-recovery retries it later.
 
     Best-effort throughout: any unexpected failure degrades to ``disable``.
     """
@@ -2995,18 +3053,19 @@ async def _redetect_before_disabling(
         logger.warning(
             "Source %s moved to %s/%s but source %s already owns that "
             "board_token — skipping the re-point (duplicate company); "
-            "disabling after %d consecutive failures",
+            "retiring after %d consecutive failures",
             company,
             outcome.provider,
             outcome.board_token,
             outcome.blocked_by,
             failures,
         )
-        return "disable"
+        return "retire_duplicate"
 
-    if outcome.action != "repoint":
-        return "disable"
+    if outcome.action == "not_found":
+        return "retire_dead" if outcome.conclusive and status == 404 else "disable"
 
+    # Only ``repoint`` is left (mypy checks the Literal is exhausted).
     # Re-point the EXISTING row rather than registering a new source: jobs
     # carry ``source_id`` as an FK, so a new row would orphan every listing we
     # already hold for this company. ``company_name`` is deliberately left
@@ -3069,7 +3128,9 @@ async def recover_stale_sources(supabase: AsyncClient, *, now: datetime | None =
 
     Only touches rows we auto-disabled (``disabled_at IS NOT NULL``), so an
     operator who manually disables a source (leaving ``disabled_at`` NULL) is
-    never overridden.
+    never overridden. Never touches a RETIRED row (``retired_at``): the
+    backoff retired it on proof the board is dead or duplicated, and reviving
+    it only restarts a fail-disable-alert loop that can never succeed.
     """
     cooldown_hours = settings.source_recovery_after_hours
     if cooldown_hours <= 0:
@@ -3091,6 +3152,7 @@ async def recover_stale_sources(supabase: AsyncClient, *, now: datetime | None =
                 .eq("enabled", False)
                 .not_.is_("disabled_at", "null")
                 .lt("disabled_at", cutoff)
+                .is_("retired_at", "null")
             ),
             label="poll source auto-recovery",
         )

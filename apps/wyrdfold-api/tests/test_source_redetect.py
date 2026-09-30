@@ -347,6 +347,9 @@ async def test_nothing_found_is_not_a_recovery(fleet: _BoardFleet) -> None:
     outcome = await redetect_source(sb, _ACME)
 
     assert outcome.action == "not_found"
+    # Every probe ran and none found a board: the one miss that counts as
+    # proof, and the only one the poller may retire on.
+    assert outcome.conclusive is True
     # ...and it really did look: all three rungs of the ladder plus the
     # current-board probe.
     assert fleet.probed(f"{ASHBY_BASE}/acme")
@@ -371,6 +374,9 @@ async def test_live_board_with_zero_postings_is_not_a_repoint(fleet: _BoardFleet
 
     outcome = await redetect_source(sb, source)
     assert outcome.action == "not_found"
+    # The company HAS a board, just an empty one — not proof it has nowhere to
+    # be found, so it must not be retired on this miss.
+    assert outcome.conclusive is False
 
 
 async def test_collision_with_an_existing_source_is_reported(fleet: _BoardFleet) -> None:
@@ -605,6 +611,7 @@ async def test_a_broken_probe_degrades_to_todays_behaviour(
 
     outcome = await redetect_source(sb, _ACME)
     assert outcome.action == "not_found"
+    assert outcome.conclusive is False, "a probe that could not run proves nothing"
 
 
 async def test_unreadable_ownership_check_blocks_the_repoint(fleet: _BoardFleet) -> None:
@@ -618,6 +625,8 @@ async def test_unreadable_ownership_check_blocks_the_repoint(fleet: _BoardFleet)
 
     outcome = await redetect_source(sb, _ACME)
     assert outcome.action == "not_found"
+    # A live board WAS found — this miss is the opposite of "nowhere to be found".
+    assert outcome.conclusive is False
 
 
 # ---- what the poller persists ----------------------------------------------
@@ -627,11 +636,12 @@ async def _record(
     source: dict[str, Any],
     owners: dict[str, str] | None = None,
     error: str = "greenhouse acme returned 404",
+    status: int | None = 404,
 ) -> tuple[dict[str, Any] | None, _SourcesTable]:
     from app.services import poller
 
     sb, table = _supabase(owners)
-    await poller._record_source_failure(sb, source, error=error)
+    await poller._record_source_failure(sb, source, error=error, status=status)
     return (table.updates[-1] if table.updates else None), table
 
 
@@ -689,25 +699,84 @@ async def test_still_live_suppresses_the_disable_but_keeps_counting(
     assert "board_token" not in payload
 
 
-async def test_nothing_found_disables_exactly_as_before(fleet: _BoardFleet) -> None:
-    payload, _table = await _record(_ACME)
+async def test_a_404_with_nothing_found_retires_the_source(fleet: _BoardFleet) -> None:
+    """The loop this exists to stop: the board answers 404, and the company
+    has no live board anywhere. Disable AND retire, so auto-recovery never
+    re-enables it into another 10 failures and another alert."""
+    payload, _table = await _record(_ACME, status=404)
 
     assert payload is not None
     assert payload["enabled"] is False
     assert payload["disabled_at"] is not None
+    assert payload["retired_at"] == payload["disabled_at"]
+    assert payload["retired_reason"] == "dead_board"
     assert payload["consecutive_failures"] == 10
     assert "board_token" not in payload
 
 
-async def test_collision_disables_and_never_writes_the_duplicate_token(
+@pytest.mark.parametrize(
+    ("status", "why"),
+    [
+        (422, "Workday 422 can mean OUR request is malformed, not a dead board"),
+        (503, "a 5xx is the ATS-outage case auto-recovery exists for"),
+        (None, "no HTTP answer at all (transport failure) proves nothing"),
+    ],
+)
+async def test_nothing_found_without_a_404_only_disables(
+    fleet: _BoardFleet, status: int | None, why: str
+) -> None:
+    """Same fake, same empty fleet as the retirement above — only the status
+    differs, so the status is what decides."""
+    payload, _table = await _record(_ACME, status=status, error=f"greenhouse acme {status}")
+
+    assert payload is not None
+    assert payload["enabled"] is False
+    assert payload["disabled_at"] is not None, "still recoverable"
+    assert "retired_at" not in payload, why
+    assert "retired_reason" not in payload
+
+
+async def test_a_404_with_only_an_empty_board_found_only_disables(
+    fleet: _BoardFleet,
+) -> None:
+    """The company has a live board with no postings yet: it may start hiring
+    there, so the row stays recoverable."""
+    fleet.add("greenhouse", "acmeco", jobs=0)
+
+    payload, _table = await _record({**_ACME, "company_name": "AcmeCo"}, status=404)
+
+    assert payload is not None
+    assert payload["enabled"] is False
+    assert "retired_at" not in payload
+
+
+async def test_a_404_with_a_broken_redetection_only_disables(
+    mock_http_client: MagicMock,
+) -> None:
+    """A re-detection that could not run is not proof the company is gone."""
+    mock_http_client.get = AsyncMock(side_effect=RuntimeError("boom"))
+    mock_http_client.post = AsyncMock(side_effect=RuntimeError("boom"))
+
+    payload, _table = await _record(_ACME, status=404)
+
+    assert payload is not None
+    assert payload["enabled"] is False
+    assert "retired_at" not in payload
+
+
+async def test_collision_retires_as_a_duplicate_and_never_writes_its_token(
     fleet: _BoardFleet,
 ) -> None:
     fleet.add("ashby", "acme", jobs=7)
 
-    payload, _table = await _record(_ACME, owners={"acme": "src-other"})
+    # A 422, deliberately: a duplicate is proven by the other row owning the
+    # live board, whatever this row's own fetch answered.
+    payload, _table = await _record(_ACME, owners={"acme": "src-other"}, status=422)
 
     assert payload is not None
     assert payload["enabled"] is False
+    assert payload["retired_reason"] == "duplicate"
+    assert payload["retired_at"] is not None
     assert "board_token" not in payload, "would violate UNIQUE(board_token)"
     assert "provider" not in payload
 
@@ -751,9 +820,37 @@ async def test_the_off_switch_restores_the_pre_912_behaviour(
     # it rather than a missing board.
     fleet.add("ashby", "acme", jobs=7)
 
-    payload, _table = await _record(_ACME)
+    payload, _table = await _record(_ACME, status=404)
 
     assert payload is not None
     assert payload["enabled"] is False
     assert "board_token" not in payload
+    # No re-detection, no proof: a 404 alone never retires.
+    assert "retired_at" not in payload
     assert fleet.requested == []
+
+
+async def test_retirement_alerts_under_one_grouped_sentry_issue(
+    fleet: _BoardFleet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retirements share one Sentry issue per reason. Each company used to
+    open its own issue — ~110 of them in a month, one email each."""
+    import sentry_sdk
+
+    from app.services import poller
+
+    monkeypatch.setattr(poller.settings, "sentry_dsn", "https://x@sentry/1")
+    sent: list[tuple[str, str | None, list[str] | None]] = []
+    monkeypatch.setattr(
+        sentry_sdk,
+        "capture_message",
+        lambda msg, level=None, fingerprint=None: sent.append((msg, level, fingerprint)),
+    )
+
+    await _record(_ACME, status=404)
+
+    assert len(sent) == 1
+    message, level, fingerprint = sent[0]
+    assert fingerprint == ["source-retired", "dead_board"]
+    assert level == "warning"
+    assert "Acme" in message and "src-1" in message, "per-source detail rides in the message"

@@ -132,6 +132,12 @@ class RedetectOutcome:
     # rather than a probe issued just now. The caller must not claim to have
     # observed something it only remembered.
     from_cooldown: bool = False
+    # For ``not_found``: True only when every probe ran to completion and none
+    # found a board at all. False when the ladder errored, timed out, could not
+    # interpret the provider, or saw a live board it declined (zero postings,
+    # or an unreadable ownership check). The poller retires a source only on a
+    # conclusive miss — an ambiguous one keeps the recoverable disable.
+    conclusive: bool = False
 
 
 def _plain_slug(name: str) -> str:
@@ -247,6 +253,7 @@ async def redetect_source(
         )
 
     found = None
+    saw_empty_board = False
     try:
         async with asyncio.timeout(timeout_s):
             # 1. Is the board we hold actually dead? One request, and it is the
@@ -283,6 +290,7 @@ async def redetect_source(
                     # A live board with zero postings is not enough evidence to
                     # move a company onto it — the same bar ``source_registration``
                     # applies when it refuses a ``dead_board``. Keep looking.
+                    saw_empty_board = True
                     continue
                 found = detected
                 break
@@ -297,7 +305,9 @@ async def redetect_source(
         return RedetectOutcome(action="not_found")
 
     if found is None:
-        return RedetectOutcome(action="not_found")
+        # An empty board is still a board: the company may start posting there,
+        # so it is not proof the company has nowhere to be found.
+        return RedetectOutcome(action="not_found", conclusive=not saw_empty_board)
 
     try:
         owner = await _token_owner(supabase, found.board_token, exclude_id=source_id)
