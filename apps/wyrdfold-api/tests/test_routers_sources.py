@@ -111,6 +111,24 @@ def test_sources_toggle_flips_enabled(client_factory):
     sb.table.return_value.update.assert_called_with({"enabled": False})
 
 
+def test_sources_toggle_on_clears_a_retirement(client_factory):
+    """An operator re-enabling a retired source overrides the retirement, so
+    the row stops reading as retired. Turning a source OFF leaves it alone
+    (asserted exactly by the test above)."""
+    sb = MagicMock()
+    (
+        sb.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value
+    ) = _Resp([{"enabled": False}])
+    sb.table.return_value.update.return_value.eq.return_value.execute.return_value = _Resp(None)
+    client = client_factory(sb)
+    r = client.post("/sources", json={"action": "toggle", "board_token": "foo"})
+    assert r.status_code == 200
+    assert r.json()["enabled"] is True
+    sb.table.return_value.update.assert_called_with(
+        {"enabled": True, "retired_at": None, "retired_reason": None}
+    )
+
+
 def test_sources_seed_inserts_all(client_factory):
     sb = MagicMock()
     sb.table.return_value.select.return_value.execute.return_value = _Resp([])
