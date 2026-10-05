@@ -105,3 +105,36 @@ enters a production bundle.
 Re-check 2026-12-09, or sooner if the nx toolchain moves: drop this the moment
 @nx/vitest resolves a patched vitest on its own.
 """
+
+[[IgnoredVulns]]
+id = "GHSA-vfj7-8cjw-p6xm"
+ignoreUntil = 2027-01-04
+reason = """
+braces stack-exhaustion DoS from deeply nested brace patterns.
+
+NO FIXED VERSION EXISTS: OSV's range is {introduced: 0, last_affected: 3.0.3}
+and 3.0.3 is the latest release (checked 2026-10-04).
+
+Unreachable here: braces arrives only through dev tooling (micromatch under
+eslint-config-next / @next/eslint-plugin-next / @nx). `pnpm why --prod`
+finds no production path. Its inputs are glob patterns written in this repo's
+own configs; an attacker would need to commit a malicious lint/build config.
+Drop this the moment a patched release lands.
+"""
+
+[[IgnoredVulns]]
+id = "GHSA-ch52-4w7c-c8xp"
+ignoreUntil = 2027-01-04
+reason = """
+http-cache-semantics max-stale handling can serve one user's cached response
+to another from a SHARED cache.
+
+NO FIXED VERSION EXISTS: OSV's range is {introduced: 0, last_affected: 4.2.0}
+and 4.2.0 is the latest release (checked 2026-10-04).
+
+Unreachable here: it arrives only through the @nx toolchain (registry/HTTP
+fetch caching during installs and builds). `pnpm why --prod` finds no
+production path, and nothing we ship runs a shared HTTP cache built on it —
+the exploit needs a multi-user server cache, which a developer CLI is not.
+Drop this the moment a patched release lands.
+"""
