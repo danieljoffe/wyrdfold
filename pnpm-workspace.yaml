@@ -13,7 +13,7 @@ overrides:
   form-data: ^4.0.6
   js-yaml: ^4.3.2 # GHSA-52cp-r559-cp3m, then GHSA-2883-xcg3-v3hh (was ^4.3.0, which still allowed the flagged 4.3.1)
   body-parser: '>=1.20.6' # GHSA-v422-hmwv-36x6 DoS
-  brace-expansion: 5.0.9 # GHSA-mh99-v99m-4gvg + GHSA-3jxr-9vmj-r5cp + GHSA-rgw5-rvv9-x895 ReDoS. Broad (all majors) — 1.x/2.x shipped NO in-line fix (latest 1.1.16/2.1.2 are the flagged versions), so the 5.0.x line is the only patched track; bumped 5.0.8→5.0.9 for the new GHSA-rgw5-rvv9-x895 advisory. Live-DB OSV gate moving target, independent of any single PR.
+  brace-expansion: 5.0.12 # bumped 5.0.9→5.0.12 for three 2026-10 advisories (fixes 5.0.10/.11/.12). Earlier: GHSA-mh99-v99m-4gvg + GHSA-3jxr-9vmj-r5cp + GHSA-rgw5-rvv9-x895 ReDoS. Broad (all majors) — 1.x/2.x shipped NO in-line fix (latest 1.1.16/2.1.2 are the flagged versions), so the 5.0.x line is the only patched track; bumped 5.0.8→5.0.9 for the new GHSA-rgw5-rvv9-x895 advisory. Live-DB OSV gate moving target, independent of any single PR.
   # image-size: intentionally NOT pinned — every version through the latest
   # (2.0.2) is flagged with no fix published. Suppressed in osv-scanner.toml
   # with justification instead. See GHSA-5p2g-fcmc-qvqq.
@@ -35,14 +35,19 @@ overrides:
   vite: 7.3.5
   '@vitest/browser': '>=4.1.6'
   esbuild: ^0.28.1
-  undici: ^7.29.0 # GHSA-4cwx-7wf7-3272 + GHSA-8xcm-r25x-g524 + GHSA-jr45-8vmc-qm54 + GHSA-m8rv-5g2x-5cg5 + GHSA-v3r7-h72x-cjcm (7.28.0 flagged; fix 7.29.0). Live-DB OSV moving target.
+  undici: ^7.29.1 # GHSA-4cwx-7wf7-3272 + GHSA-8xcm-r25x-g524 + GHSA-jr45-8vmc-qm54 + GHSA-m8rv-5g2x-5cg5 + GHSA-v3r7-h72x-cjcm (7.28.0 flagged; fix 7.29.0) + GHSA-3xpg-4rpp-hhhm, GHSA-8436-99hf-9mmv, GHSA-pmjh-fq2x-6v4x, GHSA-r53p-7pc4-xj5r, GHSA-rfgv-xxqx-mfg5, GHSA-rx4f-c7p8-82vq, GHSA-w293-vg96-wgc3 (7.29.0 flagged 2026-10; fix 7.29.1). Live-DB OSV moving target.
   fast-uri: ^3.1.5 # GHSA-7p8r-x3mc-p8w7 ReDoS (3.1.4 flagged; fix 3.1.5). Pinned to the 3.x patched line — a bare >=3.1.5 pulls the 4.x major (breaking for the ajv consumers). Live-DB OSV moving target.
-  ip-address: ^10.2.1 # GHSA-22jq-vg5j-6vgg (10.2.0 flagged; fix 10.2.1). ^ to stay on the 10.x line. Live-DB OSV moving target.
-  dompurify: ^3.4.11 # GHSA ALLOWED_ATTR pollution (<3.4.11; 0504c8ce). Reached transitively via isomorphic-dompurify, AND declared directly in devDependencies because the sanitize specs import it (they bind DOMPurify to jsdom's window rather than pull isomorphic-dompurify's Node-only ESM). This override is the version's single source of truth — keep the devDependency range identical so the two don't read as disagreeing.
-  piscina: 4.9.3
+  ip-address: ^10.7.1 # 2026-10: two new advisories on 10.4.0 (fixes 10.5.1 / 10.7.1). Earlier: GHSA-22jq-vg5j-6vgg (10.2.0 flagged; fix 10.2.1). ^ to stay on the 10.x line. Live-DB OSV moving target.
+  dompurify: ^3.4.16 # 2026-10 advisory on 3.4.15 (fix 3.4.16). Earlier: GHSA ALLOWED_ATTR pollution (<3.4.11; 0504c8ce). Reached transitively via isomorphic-dompurify, AND declared directly in devDependencies because the sanitize specs import it (they bind DOMPurify to jsdom's window rather than pull isomorphic-dompurify's Node-only ESM). This override is the version's single source of truth — keep the devDependency range identical so the two don't read as disagreeing.
+  piscina: 4.9.4 # 2026-10 advisory on 4.9.3 (fix 4.9.4)
   qs: '>=6.16.0' # GHSA-4mjr-xmp4-gh2g + GHSA-x5fp-wj9c-mxmx (6.15.x flagged; fix 6.16.0). Dev transitive via express (@lhci/cli + @nx toolchain); body-parser pins it exactly, so the override is the only lever. Live-DB OSV moving target.
   webpack-dev-server: 5.2.5
   linkify-it: '^5.0.2' # GHSA-v245-v573-v5vm ReDoS (transitive via markdown-it, which wants ^5; stay on 5.x — bare >=5.0.2 pulled an untested 6.0.0 major)
+  # 2026-10 advisory wave (all dev/tooling transitives; fixes from OSV):
+  serialize-javascript: ^7.1.2 # 7.1.1 flagged; fix 7.1.2
+  markdown-it: ^14.3.1 # 14.2.0 flagged; fix 14.3.1
+  '@xhmikosr/decompress': ^11.1.4 # 11.1.3 flagged; fix 11.1.4
+  basic-ftp: ^6.2.1 # GHSA-c475-qrg2-pj4r (5.3.1 flagged; fix only on 6.x). Dev-only via @lhci/cli > proxy-agent > get-uri; Lighthouse CI never speaks FTP
   sharp: '>=0.35.0' # GHSA-f88m-g3jw-g9cj (transitive 0.34.5 pinned by next; direct dep is already ^0.35.3)
 
 onlyBuiltDependencies:
