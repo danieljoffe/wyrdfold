@@ -12,18 +12,18 @@
   "dependencies": {
     "@danieljoffe/shared-ui": "^0.12.1",
     "@supabase/ssr": "^0.12.7",
-    "@tiptap/core": "^3.31.3",
-    "@tiptap/extension-link": "^3.31.3",
-    "@tiptap/pm": "^3.31.3",
-    "@tiptap/react": "^3.31.3",
-    "@tiptap/starter-kit": "^3.31.3",
-    "isomorphic-dompurify": "4.2.0",
-    "lucide-react": "1.45.0",
-    "next": "16.3.6",
+    "@tiptap/core": "^3.31.4",
+    "@tiptap/extension-link": "^3.31.4",
+    "@tiptap/pm": "^3.31.4",
+    "@tiptap/react": "^3.31.4",
+    "@tiptap/starter-kit": "^3.31.4",
+    "isomorphic-dompurify": "4.4.0",
+    "lucide-react": "1.49.0",
+    "next": "16.3.8",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "recharts": "^3.10.1",
-    "sharp": "^0.35.4",
+    "sharp": "^0.35.5",
     "tiptap-markdown": "^0.9.0"
   }
 }
