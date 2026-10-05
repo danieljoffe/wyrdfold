@@ -66,6 +66,17 @@ class ProbeOutcome:
 
 _INDETERMINATE = ProbeOutcome()
 _ABSENT = ProbeOutcome(absent=True)
+# A board that exists but lists nothing right now. Not proof of absence — the
+# company may post there tomorrow — and kept result-less so detect_ats callers
+# see exactly what they always did (None) for an empty Lever/SmartRecruiters
+# board. Identical to _INDETERMINATE by value; named for what it means.
+_EXISTS_EMPTY = ProbeOutcome()
+
+# SmartRecruiters' careers site answers a real company with 200 and redirects
+# an unknown one to the site root (measured 2026-10-04: visa -> 200,
+# a nonsense slug -> 302 https://jobs.smartrecruiters.com/). Its postings API
+# cannot make that distinction — it answers both with 200 and an empty list.
+SMARTRECRUITERS_CAREERS_BASE = "https://careers.smartrecruiters.com"
 
 
 def _non_200(status: int) -> ProbeOutcome:
@@ -258,8 +269,9 @@ async def _probe_lever(slug: str, client: httpx.AsyncClient) -> ProbeOutcome:
     if not isinstance(data, list):
         return _INDETERMINATE
     if len(data) == 0:
-        # A well-formed empty listing: nothing to poll here, said plainly.
-        return _ABSENT
+        # Lever 404s an unknown company, so a 200 with an empty list is a
+        # live board with no openings today.
+        return _EXISTS_EMPTY
     # Lever doesn't expose board-level company name; use slug title-cased
     return ProbeOutcome(
         DetectResult(
@@ -310,9 +322,9 @@ async def _probe_smartrecruiters(slug: str, client: httpx.AsyncClient) -> ProbeO
     if not isinstance(content, list):
         return _INDETERMINATE
     if len(content) == 0:
-        # SmartRecruiters answers 200 with an empty listing for a company that
-        # does not exist (measured 2026-10-04), so this is its "no board".
-        return _ABSENT
+        # The postings API answers an unknown company and a real-but-empty one
+        # identically, so ask the careers site which this is.
+        return await _smartrecruiters_company_exists(slug, client)
     total = data.get("totalFound", len(content))
     return ProbeOutcome(
         DetectResult(
@@ -322,6 +334,21 @@ async def _probe_smartrecruiters(slug: str, client: httpx.AsyncClient) -> ProbeO
             job_count=total,
         )
     )
+
+
+async def _smartrecruiters_company_exists(slug: str, client: httpx.AsyncClient) -> ProbeOutcome:
+    """Settle an empty SmartRecruiters listing: real-but-empty, absent, or unknown."""
+    try:
+        resp = await client.get(f"{SMARTRECRUITERS_CAREERS_BASE}/{slug}", follow_redirects=False)
+    except httpx.HTTPError:
+        return _INDETERMINATE
+    if resp.status_code == 200:
+        return _EXISTS_EMPTY
+    if resp.status_code in (301, 302, 303, 307, 308):
+        location = (resp.headers.get("location") or "").rstrip("/")
+        if location in ("https://jobs.smartrecruiters.com", SMARTRECRUITERS_CAREERS_BASE):
+            return _ABSENT
+    return _non_200(resp.status_code)
 
 
 _PROBERS = {

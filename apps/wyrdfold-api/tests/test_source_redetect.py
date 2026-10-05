@@ -35,6 +35,7 @@ import httpx
 import pytest
 
 from app.services.ashby import ASHBY_BASE
+from app.services.ats_detect import SMARTRECRUITERS_CAREERS_BASE
 from app.services.greenhouse import GREENHOUSE_BASE
 from app.services.lever import LEVER_BASE
 from app.services.smartrecruiters import SMARTRECRUITERS_BASE
@@ -46,9 +47,12 @@ pytestmark = pytest.mark.asyncio
 
 
 class _Resp:
-    def __init__(self, status_code: int, payload: Any = None) -> None:
+    def __init__(
+        self, status_code: int, payload: Any = None, headers: dict[str, str] | None = None
+    ) -> None:
         self.status_code = status_code
         self._payload = payload
+        self.headers = headers or {}
 
     def json(self) -> Any:
         if self._payload is None:
@@ -112,8 +116,10 @@ class _BoardFleet:
         if url.startswith(LEVER_BASE):
             slug = url[len(LEVER_BASE) :].lstrip("/").split("?")[0]
             n = self.boards.get(("lever", slug))
-            if not n:
-                return _Resp(404)
+            if n is None:
+                return _Resp(404)  # Lever 404s an unknown company
+            if n == 0:
+                return _Resp(200, [])  # ...and lists [] for a real, empty board
             return _Resp(200, [{"id": i} for i in range(n)])
 
         if url.startswith(ASHBY_BASE):
@@ -122,6 +128,14 @@ class _BoardFleet:
             if n is None:
                 return _Resp(404)
             return _Resp(200, {"organizationName": slug.title(), "jobs": [{"id": i} for i in range(n)]})
+
+        if url.startswith(SMARTRECRUITERS_CAREERS_BASE):
+            # Measured 2026-10-04: a real company's careers page answers 200;
+            # an unknown slug redirects to the site root.
+            slug = url[len(SMARTRECRUITERS_CAREERS_BASE) :].lstrip("/")
+            if ("smartrecruiters", slug) in self.boards:
+                return _Resp(200, None)
+            return _Resp(302, None, {"location": "https://jobs.smartrecruiters.com/"})
 
         if url.startswith(SMARTRECRUITERS_BASE):
             slug = url[len(SMARTRECRUITERS_BASE) :].lstrip("/").split("/")[0]
@@ -938,18 +952,69 @@ async def test_an_ambiguous_probe_never_retires(
     assert "retired_at" not in payload
 
 
-async def test_smartrecruiters_empty_listing_counts_as_absent(fleet: _BoardFleet) -> None:
-    """SmartRecruiters never 404s an unknown company — it answers 200 with an
-    empty listing. If that were indeterminate, every re-detection would be
-    inconclusive and no dead board could ever retire. Precondition: the fake
-    really serves that shape for the slug probed."""
+async def test_an_unknown_smartrecruiters_company_is_absent(fleet: _BoardFleet) -> None:
+    """SmartRecruiters' postings API never 404s an unknown company — it lists
+    nothing. The careers site settles it: an unknown slug redirects to the
+    site root. Without this, every re-detection would be inconclusive (the
+    ladder always asks SmartRecruiters) and no dead board could ever retire."""
     from app.services.ats_detect import probe_board_outcome
     from app.services.source_redetect import redetect_source
 
     sr = await probe_board_outcome("smartrecruiters", "acme")
     assert sr.result is None and sr.absent is True
     assert fleet.probed(f"{SMARTRECRUITERS_BASE}/acme")
+    assert fleet.probed(f"{SMARTRECRUITERS_CAREERS_BASE}/acme")
 
     sb, _table = _supabase()
     outcome = await redetect_source(sb, _ACME)
     assert outcome.conclusive is True
+
+
+@pytest.mark.parametrize(
+    ("provider", "why"),
+    [
+        ("lever", "Lever lists [] for a real board with no openings"),
+        ("smartrecruiters", "its careers page answers 200 for a real company"),
+    ],
+)
+async def test_a_404_plus_a_live_but_empty_board_only_disables(
+    fleet: _BoardFleet, provider: str, why: str
+) -> None:
+    """End to end, per provider (ChatGPT review on #1113): the fetch got a 404,
+    and re-detection finds the company's board on another ATS — live, but with
+    zero openings today. That is a company that exists, not proof it is gone."""
+    from app.services.ats_detect import probe_board_outcome
+
+    fleet.add(provider, "acme", jobs=0)
+    # Precondition: the fake really serves a live-but-empty board here, so the
+    # verdict below is the classification, not a missing board.
+    empty = await probe_board_outcome(provider, "acme")
+    assert empty.result is None and empty.absent is False, why
+
+    payload, _table = await _record(_ACME, status=404)
+
+    assert payload is not None
+    assert payload["enabled"] is False
+    assert payload["disabled_at"] is not None, "still recoverable"
+    assert "retired_at" not in payload, why
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param(_Resp(503), id="careers-5xx"),
+        pytest.param(httpx.ConnectError("reset"), id="careers-transport"),
+        pytest.param(_Resp(302, None, {"location": "https://example.com/elsewhere"}), id="odd-redirect"),
+    ],
+)
+async def test_an_unreadable_smartrecruiters_careers_check_is_indeterminate(
+    fleet: _BoardFleet, answer: _Resp | Exception
+) -> None:
+    from app.services.ats_detect import probe_board_outcome
+
+    fleet.fault(f"{SMARTRECRUITERS_CAREERS_BASE}/acme", answer)
+
+    sr = await probe_board_outcome("smartrecruiters", "acme")
+
+    assert fleet.probed(f"{SMARTRECRUITERS_CAREERS_BASE}/acme")
+    assert sr.result is None and sr.absent is False
