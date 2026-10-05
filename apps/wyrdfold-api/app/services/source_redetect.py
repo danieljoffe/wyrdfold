@@ -54,8 +54,8 @@ from app.config import settings
 from app.services.ats_detect import (
     PROBEABLE_PROVIDERS,
     clean_company_name,
-    detect_ats,
-    probe_board,
+    detect_ats_outcome,
+    probe_board_outcome,
 )
 from app.services.db_write import poll_db_read
 
@@ -132,11 +132,12 @@ class RedetectOutcome:
     # rather than a probe issued just now. The caller must not claim to have
     # observed something it only remembered.
     from_cooldown: bool = False
-    # For ``not_found``: True only when every probe ran to completion and none
-    # found a board at all. False when the ladder errored, timed out, could not
-    # interpret the provider, or saw a live board it declined (zero postings,
-    # or an unreadable ownership check). The poller retires a source only on a
-    # conclusive miss — an ambiguous one keeps the recoverable disable.
+    # For ``not_found``: True only when EVERY probe got an authoritative "no
+    # board here" (see ats_detect.ProbeOutcome). False when any probe was
+    # indeterminate (429, 5xx, transport error, unreadable body), the ladder
+    # errored or timed out, the provider can't be interpreted, or a live board
+    # was declined (zero postings, or an unreadable ownership check). The
+    # poller retires a source only on a conclusive miss.
     conclusive: bool = False
 
 
@@ -253,13 +254,18 @@ async def redetect_source(
         )
 
     found = None
-    saw_empty_board = False
+    # Conclusive only while every probe so far was an AUTHORITATIVE miss. One
+    # rate-limited, erroring or unreadable answer — or an empty-but-live board —
+    # and the company may be right there, so the miss is not proof.
+    all_absent = True
     try:
         async with asyncio.timeout(timeout_s):
             # 1. Is the board we hold actually dead? One request, and it is the
             #    question the backoff got wrong: a transient failure looks
             #    identical to a stale token from the poller's side.
-            live = await probe_board(provider, board_token)
+            held = await probe_board_outcome(provider, board_token)
+            live = held.result
+            all_absent = held.absent
             if live is not None:
                 _mark_still_live(source_id, now=now)
                 return RedetectOutcome(
@@ -272,8 +278,10 @@ async def redetect_source(
 
             # 2. It is dead. Has the company moved?
             for slug in slug_candidates(source):
-                detected = await detect_ats(slug)
+                probed = await detect_ats_outcome(slug)
+                detected = probed.result
                 if detected is None:
+                    all_absent = all_absent and probed.absent
                     continue
                 if (detected.provider, detected.board_token) == current:
                     # The direct probe said dead and the ladder says live —
@@ -290,7 +298,7 @@ async def redetect_source(
                     # A live board with zero postings is not enough evidence to
                     # move a company onto it — the same bar ``source_registration``
                     # applies when it refuses a ``dead_board``. Keep looking.
-                    saw_empty_board = True
+                    all_absent = False
                     continue
                 found = detected
                 break
@@ -305,9 +313,7 @@ async def redetect_source(
         return RedetectOutcome(action="not_found")
 
     if found is None:
-        # An empty board is still a board: the company may start posting there,
-        # so it is not proof the company has nowhere to be found.
-        return RedetectOutcome(action="not_found", conclusive=not saw_empty_board)
+        return RedetectOutcome(action="not_found", conclusive=all_absent)
 
     try:
         owner = await _token_owner(supabase, found.board_token, exclude_id=source_id)

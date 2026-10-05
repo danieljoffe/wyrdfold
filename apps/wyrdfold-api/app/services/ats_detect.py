@@ -44,6 +44,34 @@ class DetectResult:
         self.company_name = clean_company_name(self.company_name)
 
 
+# Statuses that mean "the provider says this board does not exist".
+_ABSENT_STATUSES = frozenset({404, 410})
+
+
+@dataclass(frozen=True)
+class ProbeOutcome:
+    """What one probe established — three answers, not two.
+
+    ``result`` set: the provider served a board. ``absent``: the provider gave
+    an authoritative "no board here" (a 404/410, or a well-formed listing with
+    zero postings from a provider that cannot tell missing from empty). Neither:
+    INDETERMINATE — a 429, a 5xx or other status, a transport failure, a non-JSON
+    or wrongly-shaped body. Callers that must not act on ambiguity (source
+    retirement) treat only ``absent`` as proof.
+    """
+
+    result: DetectResult | None = None
+    absent: bool = False
+
+
+_INDETERMINATE = ProbeOutcome()
+_ABSENT = ProbeOutcome(absent=True)
+
+
+def _non_200(status: int) -> ProbeOutcome:
+    return _ABSENT if status in _ABSENT_STATUSES else _INDETERMINATE
+
+
 # URL patterns that let us skip probing and go straight to a provider.
 _URL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"boards\.greenhouse\.io/([a-z0-9][a-z0-9-]+)", re.I), "greenhouse"),
@@ -98,7 +126,7 @@ def _parse_workday_url(raw: str) -> tuple[str, str, str] | None:
 
 async def _probe_workday(
     base_url: str, tenant: str, site: str, client: httpx.AsyncClient
-) -> DetectResult | None:
+) -> ProbeOutcome:
     """Probe Workday's CXS list endpoint for the board's total job count."""
     url = f"{base_url}/wday/cxs/{tenant}/{site}/jobs"
     try:
@@ -107,20 +135,24 @@ async def _probe_workday(
             json={"appliedFacets": {}, "limit": 1, "offset": 0, "searchText": ""},
         )
         if resp.status_code != 200:
-            return None
+            # A 422 stays indeterminate: Workday answers it for a malformed
+            # request as well as for a retired site.
+            return _non_200(resp.status_code)
         data = resp.json()
     except (httpx.HTTPError, ValueError):
-        return None
+        return _INDETERMINATE
     if not isinstance(data, dict):
-        return None
+        return _INDETERMINATE
     total = data.get("total")
     if not isinstance(total, int):
-        return None
-    return DetectResult(
-        provider="workday",
-        board_token=f"{base_url}|{tenant}|{site}",
-        company_name=tenant.replace("-", " ").title(),
-        job_count=total,
+        return _INDETERMINATE
+    return ProbeOutcome(
+        DetectResult(
+            provider="workday",
+            board_token=f"{base_url}|{tenant}|{site}",
+            company_name=tenant.replace("-", " ").title(),
+            job_count=total,
+        )
     )
 
 
@@ -171,7 +203,7 @@ def is_ats_url(raw: str) -> bool:
     return any(pattern.search(raw) for pattern, _ in _URL_PATTERNS)
 
 
-async def _probe_greenhouse(slug: str, client: httpx.AsyncClient) -> DetectResult | None:
+async def _probe_greenhouse(slug: str, client: httpx.AsyncClient) -> ProbeOutcome:
     # Probe the jobs list, not the board root. The root endpoint
     # (``/v1/boards/{slug}``) returns only ``{name, content}`` — the old
     # ``len(data.get("departments", []))`` count was always 0, which made
@@ -180,17 +212,17 @@ async def _probe_greenhouse(slug: str, client: httpx.AsyncClient) -> DetectResul
     try:
         resp = await client.get(url)
         if resp.status_code != 200:
-            return None
+            return _non_200(resp.status_code)
         data = resp.json()
     except (httpx.HTTPError, ValueError):
         # ValueError covers a 200 with a non-JSON body (rate-limit HTML,
         # Cloudflare interstitial, a marketing page sharing the host).
-        return None
+        return _INDETERMINATE
     if not isinstance(data, dict):
-        return None
+        return _INDETERMINATE
     jobs = data.get("jobs")
     if not isinstance(jobs, list):
-        return None
+        return _INDETERMINATE
 
     # The display name lives on the board root; fetch it best-effort and
     # fall back to the slug if it's unavailable.
@@ -204,76 +236,91 @@ async def _probe_greenhouse(slug: str, client: httpx.AsyncClient) -> DetectResul
     except (httpx.HTTPError, ValueError):
         pass
 
-    return DetectResult(
-        provider="greenhouse",
-        board_token=slug,
-        company_name=company_name,
-        job_count=len(jobs),
+    return ProbeOutcome(
+        DetectResult(
+            provider="greenhouse",
+            board_token=slug,
+            company_name=company_name,
+            job_count=len(jobs),
+        )
     )
 
 
-async def _probe_lever(slug: str, client: httpx.AsyncClient) -> DetectResult | None:
+async def _probe_lever(slug: str, client: httpx.AsyncClient) -> ProbeOutcome:
     url = f"{LEVER_BASE}/{slug}?mode=json&limit=1"
     try:
         resp = await client.get(url)
         if resp.status_code != 200:
-            return None
+            return _non_200(resp.status_code)
         data = resp.json()
     except (httpx.HTTPError, ValueError):
-        return None
-    if not isinstance(data, list) or len(data) == 0:
-        return None
+        return _INDETERMINATE
+    if not isinstance(data, list):
+        return _INDETERMINATE
+    if len(data) == 0:
+        # A well-formed empty listing: nothing to poll here, said plainly.
+        return _ABSENT
     # Lever doesn't expose board-level company name; use slug title-cased
-    return DetectResult(
-        provider="lever",
-        board_token=slug,
-        company_name=slug.replace("-", " ").title(),
-        job_count=len(data),
+    return ProbeOutcome(
+        DetectResult(
+            provider="lever",
+            board_token=slug,
+            company_name=slug.replace("-", " ").title(),
+            job_count=len(data),
+        )
     )
 
 
-async def _probe_ashby(slug: str, client: httpx.AsyncClient) -> DetectResult | None:
+async def _probe_ashby(slug: str, client: httpx.AsyncClient) -> ProbeOutcome:
     url = f"{ASHBY_BASE}/{slug}"
     try:
         resp = await client.get(url)
         if resp.status_code != 200:
-            return None
+            return _non_200(resp.status_code)
         data = resp.json()
     except (httpx.HTTPError, ValueError):
-        return None
+        return _INDETERMINATE
     if not isinstance(data, dict):
-        return None
+        return _INDETERMINATE
     jobs = data.get("jobs", [])
     if not isinstance(jobs, list):
-        return None
-    return DetectResult(
-        provider="ashby",
-        board_token=slug,
-        company_name=data.get("organizationName", slug),
-        job_count=len(jobs),
+        return _INDETERMINATE
+    return ProbeOutcome(
+        DetectResult(
+            provider="ashby",
+            board_token=slug,
+            company_name=data.get("organizationName", slug),
+            job_count=len(jobs),
+        )
     )
 
 
-async def _probe_smartrecruiters(slug: str, client: httpx.AsyncClient) -> DetectResult | None:
+async def _probe_smartrecruiters(slug: str, client: httpx.AsyncClient) -> ProbeOutcome:
     url = f"{SMARTRECRUITERS_BASE}/{slug}/postings?limit=1"
     try:
         resp = await client.get(url)
         if resp.status_code != 200:
-            return None
+            return _non_200(resp.status_code)
         data = resp.json()
     except (httpx.HTTPError, ValueError):
-        return None
+        return _INDETERMINATE
     if not isinstance(data, dict):
-        return None
+        return _INDETERMINATE
     content = data.get("content", [])
-    if not isinstance(content, list) or len(content) == 0:
-        return None
+    if not isinstance(content, list):
+        return _INDETERMINATE
+    if len(content) == 0:
+        # SmartRecruiters answers 200 with an empty listing for a company that
+        # does not exist (measured 2026-10-04), so this is its "no board".
+        return _ABSENT
     total = data.get("totalFound", len(content))
-    return DetectResult(
-        provider="smartrecruiters",
-        board_token=slug,
-        company_name=slug.replace("-", " ").title(),
-        job_count=total,
+    return ProbeOutcome(
+        DetectResult(
+            provider="smartrecruiters",
+            board_token=slug,
+            company_name=slug.replace("-", " ").title(),
+            job_count=total,
+        )
     )
 
 
@@ -304,22 +351,38 @@ async def probe_board(provider: str, board_token: str) -> DetectResult | None:
     Returns the ``DetectResult`` when the board answers with a listing, None
     when it doesn't (or when ``provider`` isn't one we can probe). A Workday
     ``board_token`` is the composite ``{base_url}|{tenant}|{site}`` the
-    fetchers use; anything else is a plain slug.
+    fetchers use; anything else is a plain slug. :func:`probe_board_outcome`
+    says WHY it is None.
     """
+    return (await probe_board_outcome(provider, board_token)).result
+
+
+async def probe_board_outcome(provider: str, board_token: str) -> ProbeOutcome:
+    """:func:`probe_board`, keeping the absent-vs-indeterminate distinction."""
     client = get_http_client()
     if provider == "workday":
         parts = board_token.split("|")
         if len(parts) != 3:
-            return None
+            return _INDETERMINATE
         return await _probe_workday(parts[0], parts[1], parts[2], client)
     prober = _PROBERS.get(provider)
     if prober is None:
-        return None
+        return _INDETERMINATE
     return await prober(board_token, client)
 
 
 async def detect_ats(raw_input: str) -> DetectResult | None:
     """Parse input (URL or company name), probe ATS providers, return first match."""
+    return (await detect_ats_outcome(raw_input)).result
+
+
+async def detect_ats_outcome(raw_input: str) -> ProbeOutcome:
+    """:func:`detect_ats`, keeping the absent-vs-indeterminate distinction.
+
+    When several providers are probed, the miss is ``absent`` only if EVERY one
+    of them answered authoritatively; one rate-limited or erroring provider
+    makes the whole miss indeterminate, because the company may be right there.
+    """
     client = get_http_client()
 
     # Workday URLs carry the site in the path, which the slug-based probers
@@ -333,22 +396,24 @@ async def detect_ats(raw_input: str) -> DetectResult | None:
     provider_hint, slug = _parse_input(raw_input)
 
     if not slug:
-        return None
+        return _INDETERMINATE
 
     if provider_hint == "workday":
         # Workday URL without a site segment — unpollable, and probing the
         # tenant slug against the other ATSs would just waste four requests.
-        return None
+        return _INDETERMINATE
 
     # If we know the provider from the URL, just probe that one
     if provider_hint and provider_hint in _PROBERS:
         return await _PROBERS[provider_hint](slug, client)
 
     # Otherwise probe all sequentially with a small delay
+    all_absent = True
     for provider in _PROBE_ORDER:
-        result = await _PROBERS[provider](slug, client)
-        if result:
-            return result
+        outcome = await _PROBERS[provider](slug, client)
+        if outcome.result:
+            return outcome
+        all_absent = all_absent and outcome.absent
         await asyncio.sleep(PROBE_DELAY)
 
-    return None
+    return _ABSENT if all_absent else _INDETERMINATE

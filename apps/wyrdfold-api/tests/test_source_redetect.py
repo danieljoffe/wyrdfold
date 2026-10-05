@@ -31,6 +31,7 @@ import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from app.services.ashby import ASHBY_BASE
@@ -67,6 +68,22 @@ class _BoardFleet:
         # (provider, slug) -> job count
         self.boards: dict[tuple[str, str], int] = {}
         self.requested: list[str] = []
+        # URL substring -> what that request gets instead (a response, or an
+        # exception to raise). The indeterminate answers retirement must never
+        # mistake for a dead board.
+        self.faults: dict[str, _Resp | Exception] = {}
+
+    def fault(self, needle: str, answer: _Resp | Exception) -> _BoardFleet:
+        self.faults[needle] = answer
+        return self
+
+    def _fault_for(self, url: str) -> _Resp | None:
+        for needle, answer in self.faults.items():
+            if needle in url:
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+        return None
 
     def add(self, provider: str, slug: str, jobs: int = 3) -> _BoardFleet:
         self.boards[(provider, slug)] = jobs
@@ -76,6 +93,8 @@ class _BoardFleet:
 
     async def get(self, url: str, **_kwargs: Any) -> _Resp:
         self.requested.append(url)
+        if (faulted := self._fault_for(url)) is not None:
+            return faulted
 
         if url.startswith(GREENHOUSE_BASE):
             rest = url[len(GREENHOUSE_BASE) :].lstrip("/")
@@ -108,13 +127,17 @@ class _BoardFleet:
             slug = url[len(SMARTRECRUITERS_BASE) :].lstrip("/").split("/")[0]
             n = self.boards.get(("smartrecruiters", slug))
             if not n:
-                return _Resp(404)
+                # Measured 2026-10-04: SmartRecruiters answers an unknown
+                # company with 200 and an empty listing, never a 404.
+                return _Resp(200, {"offset": 0, "limit": 1, "totalFound": 0, "content": []})
             return _Resp(200, {"content": [{"id": i} for i in range(n)], "totalFound": n})
 
         return _Resp(404)
 
     async def post(self, url: str, **_kwargs: Any) -> _Resp:
         self.requested.append(url)
+        if (faulted := self._fault_for(url)) is not None:
+            return faulted
         # https://{tenant}.wdN.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs
         if "/wday/cxs/" in url:
             tail = url.split("/wday/cxs/", 1)[1]
@@ -854,3 +877,79 @@ async def test_retirement_alerts_under_one_grouped_sentry_issue(
     assert fingerprint == ["source-retired", "dead_board"]
     assert level == "warning"
     assert "Acme" in message and "src-1" in message, "per-source detail rides in the message"
+
+
+
+# ---- ambiguous probes are never proof (ChatGPT review on #1113) -------------
+#
+# The probers swallow 429s, 5xx, transport errors and unreadable bodies and
+# used to report them as "no board", the same answer as a genuine 404. A
+# re-detection that hit an ATS outage then looked conclusive and would have
+# RETIRED a source permanently. Each case below breaks ONE probe of an
+# otherwise-empty fleet (which on its own retires — see
+# test_a_404_with_nothing_found_retires_the_source).
+
+_AMBIGUOUS = [
+    pytest.param(_Resp(429), id="429-rate-limited"),
+    pytest.param(_Resp(503), id="503-server-error"),
+    pytest.param(httpx.ConnectError("connection reset"), id="transport-failure"),
+    pytest.param(_Resp(200, None), id="200-non-json"),
+    pytest.param(_Resp(200, "<html>interstitial</html>"), id="200-wrong-shape"),
+]
+
+
+@pytest.mark.parametrize("answer", _AMBIGUOUS)
+@pytest.mark.parametrize(
+    "needle",
+    [
+        pytest.param(f"{GREENHOUSE_BASE}/acme/jobs", id="held-board-probe"),
+        pytest.param(f"{ASHBY_BASE}/acme", id="ladder-probe"),
+    ],
+)
+async def test_an_ambiguous_probe_makes_the_miss_inconclusive(
+    fleet: _BoardFleet, needle: str, answer: _Resp | Exception
+) -> None:
+    from app.services.source_redetect import redetect_source
+
+    fleet.fault(needle, answer)
+    sb, _table = _supabase()
+
+    outcome = await redetect_source(sb, _ACME)
+
+    assert fleet.probed(needle), "the fault must actually have been hit"
+    assert outcome.action == "not_found"
+    assert outcome.conclusive is False
+
+
+@pytest.mark.parametrize("answer", _AMBIGUOUS)
+async def test_an_ambiguous_probe_never_retires(
+    fleet: _BoardFleet, answer: _Resp | Exception
+) -> None:
+    """End to end through the poller: the fetch got a 404, but one
+    re-detection probe was ambiguous, so the source is only disabled."""
+    fleet.fault(f"{LEVER_BASE}/acme", answer)
+
+    payload, _table = await _record(_ACME, status=404)
+
+    assert fleet.probed(f"{LEVER_BASE}/acme")
+    assert payload is not None
+    assert payload["enabled"] is False
+    assert payload["disabled_at"] is not None, "still recoverable"
+    assert "retired_at" not in payload
+
+
+async def test_smartrecruiters_empty_listing_counts_as_absent(fleet: _BoardFleet) -> None:
+    """SmartRecruiters never 404s an unknown company — it answers 200 with an
+    empty listing. If that were indeterminate, every re-detection would be
+    inconclusive and no dead board could ever retire. Precondition: the fake
+    really serves that shape for the slug probed."""
+    from app.services.ats_detect import probe_board_outcome
+    from app.services.source_redetect import redetect_source
+
+    sr = await probe_board_outcome("smartrecruiters", "acme")
+    assert sr.result is None and sr.absent is True
+    assert fleet.probed(f"{SMARTRECRUITERS_BASE}/acme")
+
+    sb, _table = _supabase()
+    outcome = await redetect_source(sb, _ACME)
+    assert outcome.conclusive is True
