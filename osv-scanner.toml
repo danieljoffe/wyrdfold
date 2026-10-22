@@ -76,37 +76,6 @@ Re-check 2026-12-09.
 """
 
 [[IgnoredVulns]]
-id = "GHSA-82fw-gwwq-j7x9"
-ignoreUntil = 2026-12-09
-reason = """
-vitest / @vitest/mocker: the dev server serves files outside the project root.
-
-A FIXED VERSION EXISTS (4.1.11), and the rule at the top of this file says pin
-rather than suppress — so this entry needs the extra justification for why the
-pin is the wrong tool HERE.
-
-Pinning drops the package instead of upgrading it. @vitest/browser-playwright
-declares an EXACT peer (`vitest: 4.1.4`), and vitest itself is an undeclared
-transitive reached only through @nx/vitest@23.1.2 (a peer of the nx toolchain).
-Forcing vitest >= 4.1.11 makes that exact peer unsatisfiable, so pnpm resolves
-by REMOVING vitest and its 44-package subtree from the lockfile rather than
-failing loudly: the audit goes green because the package is gone, not because
-it is patched. Verified by reading the lockfile diff (-492 lines) — pinning the
-whole @vitest/* family together does not help, because @nx/vitest is what
-decides the version and it is not ours to pin. Upgrading nx is the real fix and
-is far outside a Phase-1 packing PR.
-
-Unreachable here regardless: this repo's frontend test runner is JEST
-(`nx test wyrdfold`). Nothing in this workspace declares or runs vitest, so its
-dev server is never started, and the advisory requires a running vitest dev
-server to reach a file outside the project root. devDependencies-only; never
-enters a production bundle.
-
-Re-check 2026-12-09, or sooner if the nx toolchain moves: drop this the moment
-@nx/vitest resolves a patched vitest on its own.
-"""
-
-[[IgnoredVulns]]
 id = "GHSA-vfj7-8cjw-p6xm"
 ignoreUntil = 2027-01-04
 reason = """
