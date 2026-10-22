@@ -18,7 +18,6 @@ const config: KnipConfig = {
       ignoreDependencies: [
         // Tailwind v4 uses @import in CSS, not JS imports
         'tailwindcss',
-        '@tailwindcss/typography',
         // caniuse-lite is required by browserslist (package.json config)
         'caniuse-lite',
         // ts-node is referenced in tsconfig.json "ts-node" block
