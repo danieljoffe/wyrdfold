@@ -163,7 +163,9 @@ const nextConfig = {
 
 const plugins = [withNx];
 
-const { withSentryConfig } = await import('@sentry/nextjs');
+// The build-config helper lives at the `/config` subpath since @sentry/nextjs
+// 10.75; the root export is deprecated and stops working in v11.
+const { withSentryConfig } = await import('@sentry/nextjs/config');
 
 const nextConfigWithPlugins = composePlugins(...plugins)(nextConfig);
 

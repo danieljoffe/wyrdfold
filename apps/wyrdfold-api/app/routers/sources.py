@@ -84,12 +84,14 @@ async def _source_enabled(supabase: AsyncClient, *, board_token: str) -> dict[st
 
 
 async def _set_source_enabled(supabase: AsyncClient, *, board_token: str, enabled: bool) -> None:
-    await (
-        supabase.table("sources")
-        .update({"enabled": enabled})
-        .eq("board_token", board_token)
-        .execute()
-    )
+    payload: dict[str, Any] = {"enabled": enabled}
+    if enabled:
+        # An operator turning a source back on overrides a retirement: the
+        # row must stop reading as retired, or the next failure streak would
+        # be reported against a stale verdict.
+        payload["retired_at"] = None
+        payload["retired_reason"] = None
+    await supabase.table("sources").update(payload).eq("board_token", board_token).execute()
 
 
 async def _seed_source_catalog(supabase: AsyncClient) -> tuple[int, list[str]]:

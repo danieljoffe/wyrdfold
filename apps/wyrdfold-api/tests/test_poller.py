@@ -11,6 +11,7 @@ from app.models.targets import (
     ScoringProfile,
     SeniorityProfile,
 )
+from app.services import db_write
 from app.services.poller import (
     _is_us_location,
     _passes_free_gates,
@@ -434,6 +435,23 @@ def test_poll_sources_for_target_skips_inactive_target(
 # ---- mass-archive guard -----------------------------------------------------
 
 
+def _archive_writes(jobs_table: MagicMock) -> list[tuple[dict, list[str]]]:
+    """Every archive statement the cycle issued, as ``(payload, ids)``.
+
+    Stale listings are archived by ``archive_job_ids``, which issues
+    ``jobs.update({archived_at,...}).in_("id", chunk)`` once per bounded batch
+    (#1107). It used to be a single ``archive_jobs_by_ids`` RPC carrying every
+    id, so tests that want to see archiving look at the jobs table now.
+    """
+    payloads = [c.args[0] for c in jobs_table.update.call_args_list]
+    chunks = [c.args[1] for c in jobs_table.update.return_value.in_.call_args_list]
+    return [
+        (payload, ids)
+        for payload, ids in zip(payloads, chunks, strict=True)
+        if "archived_at" in payload
+    ]
+
+
 def _make_poll_supabase(existing_rows: list[dict]) -> tuple[MagicMock, MagicMock, MagicMock]:
     """Mock Supabase for a ``_poll_one_source`` run with no upserts.
 
@@ -577,21 +595,29 @@ async def test_nonzero_fetch_still_archives_stale_rows(monkeypatch):
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
 
     assert summary["archived"] == 1
-    # #75 C3 / #93: stale jobs are flagged globally-dead via the
-    # ``archive_jobs_by_ids`` RPC (ids in the jsonb body, archived_at stamped
-    # server-side), not a per-user jobs.status UPDATE.
-    jobs_table.update.assert_not_called()
-    archive_calls = [c for c in supabase.rpc.call_args_list if c.args[0] == "archive_jobs_by_ids"]
-    assert len(archive_calls) == 1
-    assert archive_calls[0].args[1] == {"p_ids": ["job-1"]}
+    # #75 C3: stale jobs are flagged globally-dead via ``archived_at``, not a
+    # per-user jobs.status UPDATE.
+    writes = _archive_writes(jobs_table)
+    assert len(writes) == 1
+    payload, ids = writes[0]
+    assert ids == ["job-1"]
+    assert payload["archived_at"] and payload["updated_at"] == payload["archived_at"]
 
 
 @pytest.mark.asyncio
-async def test_stale_archive_uses_single_rpc_with_all_ids(monkeypatch):
-    """A large stale-archive set is ONE ``archive_jobs_by_ids`` RPC carrying
-    every id in the jsonb body — no ``id=in.(...)`` URL filter to overflow,
-    no chunking — covering every stale id exactly once (#93). The RPC stamps
-    one shared archived_at server-side, so single-UPDATE semantics hold."""
+async def test_stale_archive_is_split_into_bounded_statements(monkeypatch):
+    """A large stale-archive set is split into statements of at most
+    ``ARCHIVE_WRITE_CHUNK`` rows, covering every stale id exactly once and
+    carrying ONE shared ``archived_at`` across all of them (#1107).
+
+    This inverts #93, deliberately. That issue sent every id in one RPC to
+    avoid N chunked statements and a URL filter long enough to overflow. The
+    measurement behind #1107 showed the cost of an archive statement is per
+    ROW — a FOR EACH ROW trigger rewrites each job's scores rows — so the one
+    big statement was the exposure, not the saving: production measured it at
+    7,647 ms against an 8-second timeout. Bounded batches keep what the RPC was
+    genuinely needed for (one timestamp for the whole set) and, at 50 ids,
+    stay far short of the URL length that motivated it."""
     from app.services import poller as poller_mod
 
     # 250 existing rows, all delisted (none appears in the live fetch).
@@ -627,13 +653,27 @@ async def test_stale_archive_uses_single_rpc_with_all_ids(monkeypatch):
     summary = await poller_mod._poll_one_source(dict(_GUARD_SOURCE), supabase)
 
     assert summary["archived"] == 250
-    # No client-side jobs UPDATE at all — the archive is the RPC.
-    jobs_table.update.assert_not_called()
-    archive_calls = [c for c in supabase.rpc.call_args_list if c.args[0] == "archive_jobs_by_ids"]
-    # Exactly one RPC carrying every stale id in the body, no duplicates.
-    assert len(archive_calls) == 1
-    archived_ids = archive_calls[0].args[1]["p_ids"]
+    writes = _archive_writes(jobs_table)
+
+    # 250 ids at 50 a statement — never one statement of 250.
+    assert len(writes) == 5
+    assert [len(ids) for _, ids in writes] == [50, 50, 50, 50, 50]
+    assert all(len(ids) <= db_write.ARCHIVE_WRITE_CHUNK for _, ids in writes)
+
+    # Every stale id exactly once, none invented.
+    archived_ids = [i for _, ids in writes for i in ids]
     assert sorted(archived_ids) == sorted(r["id"] for r in existing)
+    assert len(archived_ids) == len(set(archived_ids))
+
+    # One timestamp for the whole board, not one per batch: these listings
+    # went dead together and must still read that way.
+    stamps = {payload["archived_at"] for payload, _ in writes}
+    assert len(stamps) == 1
+    # The stale sweep is the one archive path that also moves updated_at.
+    assert all(payload["updated_at"] == payload["archived_at"] for payload, _ in writes)
+
+    # The old single-RPC path is gone.
+    assert not [c for c in supabase.rpc.call_args_list if c.args[0] == "archive_jobs_by_ids"]
 
 
 # ---- Phase 1 triage: known jobs are not re-triaged --------------------------
@@ -2405,9 +2445,7 @@ async def test_withheld_persistent_skip_still_logs_at_info(
     OFF the same reason genuinely WITHHOLDS the listing, so it stays at INFO —
     the split is by whether work is lost, not by which reason it is."""
     with caplog.at_level(logging.DEBUG, logger="app.services.poller"):
-        await _run_poll_with_blocked_gate(
-            monkeypatch, reason="catalog_ungraded", admits=False
-        )
+        await _run_poll_with_blocked_gate(monkeypatch, reason="catalog_ungraded", admits=False)
 
     per_target = [r for r in caplog.records if "Phase 1 deferred for target" in r.getMessage()]
     assert per_target

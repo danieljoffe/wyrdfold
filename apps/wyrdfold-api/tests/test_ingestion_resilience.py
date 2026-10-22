@@ -95,11 +95,11 @@ async def test_record_failure_alerts_on_disable(monkeypatch) -> None:
 
     import sentry_sdk
 
-    captured_msgs: list[tuple[str, str]] = []
+    captured_msgs: list[tuple[str, str, list[str]]] = []
     monkeypatch.setattr(
         sentry_sdk,
         "capture_message",
-        lambda msg, level=None: captured_msgs.append((msg, level)),
+        lambda msg, level=None, fingerprint=None: captured_msgs.append((msg, level, fingerprint)),
     )
 
     source = {"id": "s1", "company_name": "Acme", "consecutive_failures": 2}
@@ -108,6 +108,9 @@ async def test_record_failure_alerts_on_disable(monkeypatch) -> None:
     assert len(captured_msgs) == 1
     assert "auto-disabled" in captured_msgs[0][0]
     assert captured_msgs[0][1] == "error"
+    # One Sentry issue for every auto-disable, not one per source: the
+    # per-source detail is in the message, the grouping in the fingerprint.
+    assert captured_msgs[0][2] == ["source-auto-disabled"]
 
 
 @pytest.mark.asyncio
@@ -149,11 +152,17 @@ def _recovery_supabase(recovered_rows: list[dict[str, Any]]) -> tuple[MagicMock,
 
     def _lt(col: str, val: str) -> MagicMock:
         seen["lt"] = (col, val)
+        handle = MagicMock()
+        handle.is_.side_effect = _is
+        return handle
+
+    def _is(col: str, val: str) -> MagicMock:
+        seen["is_"] = (col, val)
         leaf = MagicMock()
         leaf.execute.return_value = _Resp(data=recovered_rows)
         return leaf
 
-    # update().eq(...) -> .not_.is_(...) -> .lt(...) -> .execute()
+    # update().eq(...) -> .not_.is_(...) -> .lt(...) -> .is_(...) -> .execute()
     update_handle.eq.return_value.not_.is_.return_value.lt.side_effect = _lt
 
     sources_table = MagicMock()
@@ -182,6 +191,8 @@ async def test_recovery_reenables_sources_past_cooldown(monkeypatch) -> None:
     # Cutoff is exactly cooldown hours before `now`.
     expected_cutoff = (now - timedelta(hours=24)).isoformat()
     assert seen["lt"] == ("disabled_at", expected_cutoff)
+    # A retired source is never revived — that revival is the loop.
+    assert seen["is_"] == ("retired_at", "null")
 
 
 @pytest.mark.asyncio

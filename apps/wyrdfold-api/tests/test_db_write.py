@@ -523,3 +523,127 @@ async def test_upsert_of_nothing_issues_no_statement(_sync_only: None) -> None:
         == []
     )
     assert client.calls == []
+
+
+# ---- bounded archive writes (#1107) ----------------------------------------
+
+
+class _RecordingUpdateClient:
+    """Records each ``.table(t).update(payload).in_(col, ids).execute()``.
+
+    ``fail_on`` makes the Nth statement (0-based) raise, so a partial archive
+    can be asserted rather than assumed.
+    """
+
+    def __init__(self, fail_on: int | None = None) -> None:
+        self.calls: list[tuple[str, dict[str, Any], list[str]]] = []
+        self.fail_on = fail_on
+        self._table = ""
+        self._payload: dict[str, Any] = {}
+        self._ids: list[str] = []
+
+    def table(self, name: str) -> _RecordingUpdateClient:
+        self._table = name
+        return self
+
+    def update(self, payload: dict[str, Any]) -> _RecordingUpdateClient:
+        self._payload = dict(payload)
+        return self
+
+    def in_(self, column: str, ids: list[str]) -> _RecordingUpdateClient:
+        assert column == "id"
+        self._ids = list(ids)
+        return self
+
+    def execute(self) -> Any:
+        if self.fail_on is not None and len(self.calls) == self.fail_on:
+            raise RuntimeError("statement timeout")
+        self.calls.append((self._table, dict(self._payload), list(self._ids)))
+        return MagicMock(data=[{"id": i} for i in self._ids])
+
+
+@pytest.mark.asyncio
+async def test_archive_splits_into_bounded_statements(_sync_only: None) -> None:
+    """The whole point of #1107: no archive statement carries more rows than
+    the measured batch size, however many ids the caller hands over.
+
+    Before this, the three archive paths bounded their id lists at 200, at an
+    operator setting that allows 1,000, and not at all — and the 200 one was
+    measured on production at 7,647 ms against an 8-second statement timeout.
+    """
+    client = _RecordingUpdateClient()
+    ids = [f"job-{n}" for n in range(120)]
+
+    stamped = await db_write.archive_job_ids(
+        client, ids, archived_at="2026-09-24T00:00:00+00:00", label="t"
+    )
+
+    assert stamped == 120
+    assert len(client.calls) == 3  # 50 + 50 + 20, not one statement of 120
+    assert [len(c[2]) for c in client.calls] == [50, 50, 20]
+    assert db_write.ARCHIVE_WRITE_CHUNK == 50
+    # Every id written exactly once, none invented.
+    written = [i for _, _, chunk in client.calls for i in chunk]
+    assert written == ids
+
+
+@pytest.mark.asyncio
+async def test_archive_pins_one_timestamp_across_every_batch(_sync_only: None) -> None:
+    """Listings that went dead together must still read as archived together.
+
+    Splitting one statement into several is only safe if the timestamp does not
+    split with it — a per-batch ``now()`` would make "archived in this sweep"
+    stop meaning "archived at the same instant".
+    """
+    client = _RecordingUpdateClient()
+
+    await db_write.archive_job_ids(
+        client,
+        [f"job-{n}" for n in range(101)],
+        archived_at="2026-09-24T12:00:00+00:00",
+        label="t",
+    )
+
+    stamps = {payload["archived_at"] for _, payload, _ in client.calls}
+    assert len(client.calls) == 3
+    assert stamps == {"2026-09-24T12:00:00+00:00"}
+
+
+@pytest.mark.asyncio
+async def test_archive_stamps_updated_at_only_when_asked(_sync_only: None) -> None:
+    """``jobs.updated_at`` has no trigger behind it, so whether it moves is
+    decided entirely by the payload. Only the stale-listing sweep ever wrote
+    it; the other two archive paths never did. Preserved per-caller."""
+    default = _RecordingUpdateClient()
+    await db_write.archive_job_ids(default, ["a"], archived_at="T", label="t")
+    assert default.calls[0][1] == {"archived_at": "T"}
+
+    sweep = _RecordingUpdateClient()
+    await db_write.archive_job_ids(sweep, ["a"], archived_at="T", label="t", stamp_updated_at=True)
+    assert sweep.calls[0][1] == {"archived_at": "T", "updated_at": "T"}
+
+
+@pytest.mark.asyncio
+async def test_archive_of_nothing_issues_no_statement(_sync_only: None) -> None:
+    client = _RecordingUpdateClient()
+    assert await db_write.archive_job_ids(client, [], archived_at="T", label="t") == 0
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_partial_archive_is_reported_not_swallowed(
+    _sync_only: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A batch that dies mid-way leaves SOME rows archived. That has to reach
+    the log as an incomplete archive — a partial run that reads as a clean one
+    is the shape #1088 hid in for weeks."""
+    client = _RecordingUpdateClient(fail_on=2)  # third statement raises
+    ids = [f"job-{n}" for n in range(120)]
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError):
+            await db_write.archive_job_ids(client, ids, archived_at="T", label="poll archive X")
+
+    assert len(client.calls) == 2  # the first two landed and STAY landed
+    assert "archive INCOMPLETE" in caplog.text
+    assert "100 of 120" in caplog.text

@@ -31,9 +31,11 @@ import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from app.services.ashby import ASHBY_BASE
+from app.services.ats_detect import SMARTRECRUITERS_CAREERS_BASE
 from app.services.greenhouse import GREENHOUSE_BASE
 from app.services.lever import LEVER_BASE
 from app.services.smartrecruiters import SMARTRECRUITERS_BASE
@@ -45,9 +47,12 @@ pytestmark = pytest.mark.asyncio
 
 
 class _Resp:
-    def __init__(self, status_code: int, payload: Any = None) -> None:
+    def __init__(
+        self, status_code: int, payload: Any = None, headers: dict[str, str] | None = None
+    ) -> None:
         self.status_code = status_code
         self._payload = payload
+        self.headers = headers or {}
 
     def json(self) -> Any:
         if self._payload is None:
@@ -67,6 +72,22 @@ class _BoardFleet:
         # (provider, slug) -> job count
         self.boards: dict[tuple[str, str], int] = {}
         self.requested: list[str] = []
+        # URL substring -> what that request gets instead (a response, or an
+        # exception to raise). The indeterminate answers retirement must never
+        # mistake for a dead board.
+        self.faults: dict[str, _Resp | Exception] = {}
+
+    def fault(self, needle: str, answer: _Resp | Exception) -> _BoardFleet:
+        self.faults[needle] = answer
+        return self
+
+    def _fault_for(self, url: str) -> _Resp | None:
+        for needle, answer in self.faults.items():
+            if needle in url:
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+        return None
 
     def add(self, provider: str, slug: str, jobs: int = 3) -> _BoardFleet:
         self.boards[(provider, slug)] = jobs
@@ -76,6 +97,8 @@ class _BoardFleet:
 
     async def get(self, url: str, **_kwargs: Any) -> _Resp:
         self.requested.append(url)
+        if (faulted := self._fault_for(url)) is not None:
+            return faulted
 
         if url.startswith(GREENHOUSE_BASE):
             rest = url[len(GREENHOUSE_BASE) :].lstrip("/")
@@ -93,8 +116,10 @@ class _BoardFleet:
         if url.startswith(LEVER_BASE):
             slug = url[len(LEVER_BASE) :].lstrip("/").split("?")[0]
             n = self.boards.get(("lever", slug))
-            if not n:
-                return _Resp(404)
+            if n is None:
+                return _Resp(404)  # Lever 404s an unknown company
+            if n == 0:
+                return _Resp(200, [])  # ...and lists [] for a real, empty board
             return _Resp(200, [{"id": i} for i in range(n)])
 
         if url.startswith(ASHBY_BASE):
@@ -104,17 +129,29 @@ class _BoardFleet:
                 return _Resp(404)
             return _Resp(200, {"organizationName": slug.title(), "jobs": [{"id": i} for i in range(n)]})
 
+        if url.startswith(SMARTRECRUITERS_CAREERS_BASE):
+            # Measured 2026-10-04: a real company's careers page answers 200;
+            # an unknown slug redirects to the site root.
+            slug = url[len(SMARTRECRUITERS_CAREERS_BASE) :].lstrip("/")
+            if ("smartrecruiters", slug) in self.boards:
+                return _Resp(200, None)
+            return _Resp(302, None, {"location": "https://jobs.smartrecruiters.com/"})
+
         if url.startswith(SMARTRECRUITERS_BASE):
             slug = url[len(SMARTRECRUITERS_BASE) :].lstrip("/").split("/")[0]
             n = self.boards.get(("smartrecruiters", slug))
             if not n:
-                return _Resp(404)
+                # Measured 2026-10-04: SmartRecruiters answers an unknown
+                # company with 200 and an empty listing, never a 404.
+                return _Resp(200, {"offset": 0, "limit": 1, "totalFound": 0, "content": []})
             return _Resp(200, {"content": [{"id": i} for i in range(n)], "totalFound": n})
 
         return _Resp(404)
 
     async def post(self, url: str, **_kwargs: Any) -> _Resp:
         self.requested.append(url)
+        if (faulted := self._fault_for(url)) is not None:
+            return faulted
         # https://{tenant}.wdN.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs
         if "/wday/cxs/" in url:
             tail = url.split("/wday/cxs/", 1)[1]
@@ -347,6 +384,9 @@ async def test_nothing_found_is_not_a_recovery(fleet: _BoardFleet) -> None:
     outcome = await redetect_source(sb, _ACME)
 
     assert outcome.action == "not_found"
+    # Every probe ran and none found a board: the one miss that counts as
+    # proof, and the only one the poller may retire on.
+    assert outcome.conclusive is True
     # ...and it really did look: all three rungs of the ladder plus the
     # current-board probe.
     assert fleet.probed(f"{ASHBY_BASE}/acme")
@@ -371,6 +411,9 @@ async def test_live_board_with_zero_postings_is_not_a_repoint(fleet: _BoardFleet
 
     outcome = await redetect_source(sb, source)
     assert outcome.action == "not_found"
+    # The company HAS a board, just an empty one — not proof it has nowhere to
+    # be found, so it must not be retired on this miss.
+    assert outcome.conclusive is False
 
 
 async def test_collision_with_an_existing_source_is_reported(fleet: _BoardFleet) -> None:
@@ -605,6 +648,7 @@ async def test_a_broken_probe_degrades_to_todays_behaviour(
 
     outcome = await redetect_source(sb, _ACME)
     assert outcome.action == "not_found"
+    assert outcome.conclusive is False, "a probe that could not run proves nothing"
 
 
 async def test_unreadable_ownership_check_blocks_the_repoint(fleet: _BoardFleet) -> None:
@@ -618,6 +662,8 @@ async def test_unreadable_ownership_check_blocks_the_repoint(fleet: _BoardFleet)
 
     outcome = await redetect_source(sb, _ACME)
     assert outcome.action == "not_found"
+    # A live board WAS found — this miss is the opposite of "nowhere to be found".
+    assert outcome.conclusive is False
 
 
 # ---- what the poller persists ----------------------------------------------
@@ -627,11 +673,12 @@ async def _record(
     source: dict[str, Any],
     owners: dict[str, str] | None = None,
     error: str = "greenhouse acme returned 404",
+    status: int | None = 404,
 ) -> tuple[dict[str, Any] | None, _SourcesTable]:
     from app.services import poller
 
     sb, table = _supabase(owners)
-    await poller._record_source_failure(sb, source, error=error)
+    await poller._record_source_failure(sb, source, error=error, status=status)
     return (table.updates[-1] if table.updates else None), table
 
 
@@ -689,25 +736,84 @@ async def test_still_live_suppresses_the_disable_but_keeps_counting(
     assert "board_token" not in payload
 
 
-async def test_nothing_found_disables_exactly_as_before(fleet: _BoardFleet) -> None:
-    payload, _table = await _record(_ACME)
+async def test_a_404_with_nothing_found_retires_the_source(fleet: _BoardFleet) -> None:
+    """The loop this exists to stop: the board answers 404, and the company
+    has no live board anywhere. Disable AND retire, so auto-recovery never
+    re-enables it into another 10 failures and another alert."""
+    payload, _table = await _record(_ACME, status=404)
 
     assert payload is not None
     assert payload["enabled"] is False
     assert payload["disabled_at"] is not None
+    assert payload["retired_at"] == payload["disabled_at"]
+    assert payload["retired_reason"] == "dead_board"
     assert payload["consecutive_failures"] == 10
     assert "board_token" not in payload
 
 
-async def test_collision_disables_and_never_writes_the_duplicate_token(
+@pytest.mark.parametrize(
+    ("status", "why"),
+    [
+        (422, "Workday 422 can mean OUR request is malformed, not a dead board"),
+        (503, "a 5xx is the ATS-outage case auto-recovery exists for"),
+        (None, "no HTTP answer at all (transport failure) proves nothing"),
+    ],
+)
+async def test_nothing_found_without_a_404_only_disables(
+    fleet: _BoardFleet, status: int | None, why: str
+) -> None:
+    """Same fake, same empty fleet as the retirement above — only the status
+    differs, so the status is what decides."""
+    payload, _table = await _record(_ACME, status=status, error=f"greenhouse acme {status}")
+
+    assert payload is not None
+    assert payload["enabled"] is False
+    assert payload["disabled_at"] is not None, "still recoverable"
+    assert "retired_at" not in payload, why
+    assert "retired_reason" not in payload
+
+
+async def test_a_404_with_only_an_empty_board_found_only_disables(
+    fleet: _BoardFleet,
+) -> None:
+    """The company has a live board with no postings yet: it may start hiring
+    there, so the row stays recoverable."""
+    fleet.add("greenhouse", "acmeco", jobs=0)
+
+    payload, _table = await _record({**_ACME, "company_name": "AcmeCo"}, status=404)
+
+    assert payload is not None
+    assert payload["enabled"] is False
+    assert "retired_at" not in payload
+
+
+async def test_a_404_with_a_broken_redetection_only_disables(
+    mock_http_client: MagicMock,
+) -> None:
+    """A re-detection that could not run is not proof the company is gone."""
+    mock_http_client.get = AsyncMock(side_effect=RuntimeError("boom"))
+    mock_http_client.post = AsyncMock(side_effect=RuntimeError("boom"))
+
+    payload, _table = await _record(_ACME, status=404)
+
+    assert payload is not None
+    assert payload["enabled"] is False
+    assert "retired_at" not in payload
+
+
+async def test_collision_retires_as_a_duplicate_and_never_writes_its_token(
     fleet: _BoardFleet,
 ) -> None:
     fleet.add("ashby", "acme", jobs=7)
 
-    payload, _table = await _record(_ACME, owners={"acme": "src-other"})
+    # A 422, deliberately: a duplicate is proven by the other row owning the
+    # live board, whatever this row's own fetch answered.
+    payload, _table = await _record(_ACME, owners={"acme": "src-other"}, status=422)
 
     assert payload is not None
     assert payload["enabled"] is False
+    assert payload["retired_reason"] == "duplicate"
+    assert payload["retired_at"] is not None
     assert "board_token" not in payload, "would violate UNIQUE(board_token)"
     assert "provider" not in payload
 
@@ -751,9 +857,164 @@ async def test_the_off_switch_restores_the_pre_912_behaviour(
     # it rather than a missing board.
     fleet.add("ashby", "acme", jobs=7)
 
-    payload, _table = await _record(_ACME)
+    payload, _table = await _record(_ACME, status=404)
 
     assert payload is not None
     assert payload["enabled"] is False
     assert "board_token" not in payload
+    # No re-detection, no proof: a 404 alone never retires.
+    assert "retired_at" not in payload
     assert fleet.requested == []
+
+
+async def test_retirement_alerts_under_one_grouped_sentry_issue(
+    fleet: _BoardFleet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retirements share one Sentry issue per reason. Each company used to
+    open its own issue — ~110 of them in a month, one email each."""
+    import sentry_sdk
+
+    from app.services import poller
+
+    monkeypatch.setattr(poller.settings, "sentry_dsn", "https://x@sentry/1")
+    sent: list[tuple[str, str | None, list[str] | None]] = []
+    monkeypatch.setattr(
+        sentry_sdk,
+        "capture_message",
+        lambda msg, level=None, fingerprint=None: sent.append((msg, level, fingerprint)),
+    )
+
+    await _record(_ACME, status=404)
+
+    assert len(sent) == 1
+    message, level, fingerprint = sent[0]
+    assert fingerprint == ["source-retired", "dead_board"]
+    assert level == "warning"
+    assert "Acme" in message and "src-1" in message, "per-source detail rides in the message"
+
+
+
+# ---- ambiguous probes are never proof (ChatGPT review on #1113) -------------
+#
+# The probers swallow 429s, 5xx, transport errors and unreadable bodies and
+# used to report them as "no board", the same answer as a genuine 404. A
+# re-detection that hit an ATS outage then looked conclusive and would have
+# RETIRED a source permanently. Each case below breaks ONE probe of an
+# otherwise-empty fleet (which on its own retires — see
+# test_a_404_with_nothing_found_retires_the_source).
+
+_AMBIGUOUS = [
+    pytest.param(_Resp(429), id="429-rate-limited"),
+    pytest.param(_Resp(503), id="503-server-error"),
+    pytest.param(httpx.ConnectError("connection reset"), id="transport-failure"),
+    pytest.param(_Resp(200, None), id="200-non-json"),
+    pytest.param(_Resp(200, "<html>interstitial</html>"), id="200-wrong-shape"),
+]
+
+
+@pytest.mark.parametrize("answer", _AMBIGUOUS)
+@pytest.mark.parametrize(
+    "needle",
+    [
+        pytest.param(f"{GREENHOUSE_BASE}/acme/jobs", id="held-board-probe"),
+        pytest.param(f"{ASHBY_BASE}/acme", id="ladder-probe"),
+    ],
+)
+async def test_an_ambiguous_probe_makes_the_miss_inconclusive(
+    fleet: _BoardFleet, needle: str, answer: _Resp | Exception
+) -> None:
+    from app.services.source_redetect import redetect_source
+
+    fleet.fault(needle, answer)
+    sb, _table = _supabase()
+
+    outcome = await redetect_source(sb, _ACME)
+
+    assert fleet.probed(needle), "the fault must actually have been hit"
+    assert outcome.action == "not_found"
+    assert outcome.conclusive is False
+
+
+@pytest.mark.parametrize("answer", _AMBIGUOUS)
+async def test_an_ambiguous_probe_never_retires(
+    fleet: _BoardFleet, answer: _Resp | Exception
+) -> None:
+    """End to end through the poller: the fetch got a 404, but one
+    re-detection probe was ambiguous, so the source is only disabled."""
+    fleet.fault(f"{LEVER_BASE}/acme", answer)
+
+    payload, _table = await _record(_ACME, status=404)
+
+    assert fleet.probed(f"{LEVER_BASE}/acme")
+    assert payload is not None
+    assert payload["enabled"] is False
+    assert payload["disabled_at"] is not None, "still recoverable"
+    assert "retired_at" not in payload
+
+
+async def test_an_unknown_smartrecruiters_company_is_absent(fleet: _BoardFleet) -> None:
+    """SmartRecruiters' postings API never 404s an unknown company — it lists
+    nothing. The careers site settles it: an unknown slug redirects to the
+    site root. Without this, every re-detection would be inconclusive (the
+    ladder always asks SmartRecruiters) and no dead board could ever retire."""
+    from app.services.ats_detect import probe_board_outcome
+    from app.services.source_redetect import redetect_source
+
+    sr = await probe_board_outcome("smartrecruiters", "acme")
+    assert sr.result is None and sr.absent is True
+    assert fleet.probed(f"{SMARTRECRUITERS_BASE}/acme")
+    assert fleet.probed(f"{SMARTRECRUITERS_CAREERS_BASE}/acme")
+
+    sb, _table = _supabase()
+    outcome = await redetect_source(sb, _ACME)
+    assert outcome.conclusive is True
+
+
+@pytest.mark.parametrize(
+    ("provider", "why"),
+    [
+        ("lever", "Lever lists [] for a real board with no openings"),
+        ("smartrecruiters", "its careers page answers 200 for a real company"),
+    ],
+)
+async def test_a_404_plus_a_live_but_empty_board_only_disables(
+    fleet: _BoardFleet, provider: str, why: str
+) -> None:
+    """End to end, per provider (ChatGPT review on #1113): the fetch got a 404,
+    and re-detection finds the company's board on another ATS — live, but with
+    zero openings today. That is a company that exists, not proof it is gone."""
+    from app.services.ats_detect import probe_board_outcome
+
+    fleet.add(provider, "acme", jobs=0)
+    # Precondition: the fake really serves a live-but-empty board here, so the
+    # verdict below is the classification, not a missing board.
+    empty = await probe_board_outcome(provider, "acme")
+    assert empty.result is None and empty.absent is False, why
+
+    payload, _table = await _record(_ACME, status=404)
+
+    assert payload is not None
+    assert payload["enabled"] is False
+    assert payload["disabled_at"] is not None, "still recoverable"
+    assert "retired_at" not in payload, why
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param(_Resp(503), id="careers-5xx"),
+        pytest.param(httpx.ConnectError("reset"), id="careers-transport"),
+        pytest.param(_Resp(302, None, {"location": "https://example.com/elsewhere"}), id="odd-redirect"),
+    ],
+)
+async def test_an_unreadable_smartrecruiters_careers_check_is_indeterminate(
+    fleet: _BoardFleet, answer: _Resp | Exception
+) -> None:
+    from app.services.ats_detect import probe_board_outcome
+
+    fleet.fault(f"{SMARTRECRUITERS_CAREERS_BASE}/acme", answer)
+
+    sr = await probe_board_outcome("smartrecruiters", "acme")
+
+    assert fleet.probed(f"{SMARTRECRUITERS_CAREERS_BASE}/acme")
+    assert sr.result is None and sr.absent is False
