@@ -53,11 +53,12 @@ class ProbeOutcome:
     """What one probe established — three answers, not two.
 
     ``result`` set: the provider served a board. ``absent``: the provider gave
-    an authoritative "no board here" (a 404/410, or a well-formed listing with
-    zero postings from a provider that cannot tell missing from empty). Neither:
-    INDETERMINATE — a 429, a 5xx or other status, a transport failure, a non-JSON
-    or wrongly-shaped body. Callers that must not act on ambiguity (source
-    retirement) treat only ``absent`` as proof.
+    an authoritative "no board here" — a 404/410, or (SmartRecruiters only) an
+    empty listing whose careers page redirects to the site root. Neither: NOT
+    PROOF — either indeterminate (a 429, a 5xx or other status, a transport
+    failure, a non-JSON or wrongly-shaped body) or a board that exists but lists
+    nothing today (``_EXISTS_EMPTY``). Callers that must not act on ambiguity
+    (source retirement) treat only ``absent`` as proof.
     """
 
     result: DetectResult | None = None

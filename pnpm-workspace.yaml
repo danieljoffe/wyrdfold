@@ -47,7 +47,8 @@ overrides:
   markdown-it: ^14.3.3 # 2026-10-22 wave: two advisories on 14.3.2 (fix 14.3.3). Earlier: 14.2.0 flagged; fix 14.3.1
   '@xhmikosr/decompress': ^11.1.4 # 11.1.3 flagged; fix 11.1.4
   basic-ftp: ^6.2.1 # GHSA-c475-qrg2-pj4r (5.3.1 flagged; fix only on 6.x). Dev-only via @lhci/cli > proxy-agent > get-uri; Lighthouse CI never speaks FTP
-  # 2026-10-22 wave (fixes from OSV; all dev/tooling transitives unless noted):
+  # 2026-10-22 wave (fixes from OSV). Dev/tooling-only except source-map-js,
+  # which also reaches production through @sentry/nextjs:
   follow-redirects: ^1.16.1 # GHSA-8r9p-f939-6h3c + GHSA-q3jh-wrc6-jgq8 (1.16.0 flagged; fix 1.16.1)
   handlebars: ^4.7.10 # GHSA-8r5x-fm3f-whwj (9.8) + GHSA-p8wg-vrv2-v86f + GHSA-xw65-4hp5-5hc7 (4.7.9 flagged; fix 4.7.10)
   proxy-addr: ^2.0.8 # GHSA-jqcg-44mw-7w3h (2.0.7 flagged; fix 2.0.8)
