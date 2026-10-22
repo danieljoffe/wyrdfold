@@ -49,7 +49,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          filter: tree:0
+          # Full clone, no partial-clone `filter`. A treeless clone fetches
+          # history lazily, and those later fetches carry no credentials
+          # (persist-credentials: false) — fine while the repo was public, a
+          # hard failure once it went private (2026-10-22: every PR's
+          # change detection died, skipping all checks). History is ~13 MiB.
           fetch-depth: 0
           persist-credentials: false
       - name: Detect non-docs changes
@@ -63,7 +67,13 @@ jobs:
             echo "Non-PR event ($EVENT) → run full CI."
             echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          changed="$(git diff --name-only "$BASE...$HEAD")"
+          # Fail SAFE: if git cannot produce the diff, run everything. A crash
+          # here would skip every dependent job, and skipped jobs read as
+          # "not failed" — the opposite of safe.
+          if ! changed="$(git diff --name-only "$BASE...$HEAD")"; then
+            echo "git diff failed → running full CI (fail-safe)."
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
           echo "Changed files:"; echo "$changed"
           # Docs-only ⇒ EVERY changed file is *.md / docs/ / .claude/. Any other
           # file ⇒ code=true (run the full suite). Pure-shell case match (no grep)
@@ -98,7 +108,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          filter: tree:0
           fetch-depth: 0
           persist-credentials: false
 
@@ -154,7 +163,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          filter: tree:0
           fetch-depth: 0
           persist-credentials: false
 
@@ -352,7 +360,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          filter: tree:0
           fetch-depth: 0
           persist-credentials: false
 
@@ -398,7 +405,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          filter: tree:0
           fetch-depth: 0
           persist-credentials: false
 
@@ -487,7 +493,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          filter: tree:0
           fetch-depth: 0
           persist-credentials: false
 
@@ -572,7 +577,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          filter: tree:0
           fetch-depth: 0
           persist-credentials: false
 
