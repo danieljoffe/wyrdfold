@@ -94,6 +94,18 @@ const LINK_ERROR_CODES: ReadonlySet<string> = new Set([
   'validation_failed',
 ]);
 
+// The params this route reads. Names are written by the link's author too,
+// so any other name is reported as `other`.
+const CALLBACK_PARAMS: ReadonlySet<string> = new Set([
+  'code',
+  'error',
+  'error_code',
+  'error_description',
+  'next',
+  'token_hash',
+  'type',
+]);
+
 function knownCode(
   allowed: ReadonlySet<string>,
   value: string | null
@@ -198,7 +210,15 @@ export async function GET(request: Request) {
     // type lands here too, and its value is a live credential.
     Sentry.captureMessage('auth/callback: no code or token_hash', {
       level: 'warning',
-      extra: { params: [...new Set(searchParams.keys())].sort() },
+      extra: {
+        params: [
+          ...new Set(
+            [...searchParams.keys()].map(name =>
+              CALLBACK_PARAMS.has(name) ? name : 'other'
+            )
+          ),
+        ].sort(),
+      },
     });
     return bounceToLogin(origin, 'missing_code');
   }

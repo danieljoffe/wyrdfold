@@ -107,14 +107,21 @@ describe('auth/callback GET', () => {
     });
 
     it('reports only param names to Sentry, never the token_hash', async () => {
-      await GET(makeRequest('token_hash=SECRET-TOKEN-HASH&type=bogus'));
+      await GET(
+        makeRequest(
+          'token_hash=SECRET-TOKEN-HASH&type=bogus&PLANTED-jane%40example.com=1'
+        )
+      );
 
       expect(mockCaptureMessage).toHaveBeenCalledTimes(1);
       const [, options] = mockCaptureMessage.mock.calls[0];
-      expect(options.extra).toEqual({ params: ['token_hash', 'type'] });
-      expect(JSON.stringify(mockCaptureMessage.mock.calls)).not.toContain(
-        'SECRET-TOKEN-HASH'
-      );
+      // Names the route doesn't read are caller-written too: `other`.
+      expect(options.extra).toEqual({
+        params: ['other', 'token_hash', 'type'],
+      });
+      const sent = JSON.stringify(mockCaptureMessage.mock.calls);
+      expect(sent).not.toContain('SECRET-TOKEN-HASH');
+      expect(sent).not.toContain('PLANTED');
     });
   });
 
