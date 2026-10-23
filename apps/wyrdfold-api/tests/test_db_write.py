@@ -5,10 +5,11 @@ Covers the two things #57 leans on:
 - ``db_to_thread`` bounds the poll's write fan-out at ``DB_WRITE_CONCURRENCY``
   no matter how wide the ``asyncio.gather`` is (the prod pooler-drop bug), and
   the semaphore is per-event-loop (safe under pytest's per-test loops).
-- ``poll_db_write`` picks the backend by ``POLLER_ASYNC_DB``: async client on
-  the loop when the flag is on and the client is up, else the sync client in a
-  thread — the latter also being the fail-safe when the async client is absent.
-  Both paths retry transient transport blips.
+- ``poll_db_write`` / ``poll_db_read`` pick the backend: the pooled async
+  client on the loop when it is up, else the caller's own client — awaited when
+  it is async, in a thread when it is sync. Writes retry transient transport
+  blips on every path; reads do too, except on the sync path, where
+  ``retry_sync`` opts in.
 """
 
 from __future__ import annotations
@@ -318,6 +319,117 @@ async def test_read_does_not_hold_the_write_semaphore(
     finally:
         for _ in holds:
             sem.release()
+
+
+# ---- no pool, and the caller passed an ASYNC client (PYTHON-FASTAPI-4H) ------
+#
+# In plain terms: the pooled client is missing before startup and after
+# shutdown, and a detached task (target activation) can still be running when a
+# deploy shuts the old instance down. That task holds an async client. Handing
+# its query to a thread returns an unawaited coroutine instead of a response, so
+# a read crashes on ``.data`` and a write silently never happens. The fallback
+# must await an async client and only thread a sync one.
+
+
+class _ClosedAsyncClient(_Recorder):
+    """An async client whose HTTP pool is already closed — what a detached task
+    is left holding once the lifespan's shutdown has run."""
+
+    async def execute(self) -> Any:
+        self.executed += 1
+        raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+
+@pytest.mark.asyncio
+async def test_write_without_pool_awaits_an_async_caller_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)
+    caller = _AsyncClient()
+
+    resp = await db_write.poll_db_write(caller, _scores_update, label="t")
+
+    assert caller.executed == 1  # the write ran — not a coroutine left unawaited
+    assert resp.data == [{"ok": True}]
+    assert ("eq", "job_posting_id", "j") in caller.ops
+
+
+@pytest.mark.asyncio
+async def test_write_without_pool_retries_an_async_caller_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)
+    caller = _AsyncClient(fail_times=1)
+
+    resp = await db_write.poll_db_write(caller, _scores_update, label="t")
+
+    assert resp.data == [{"ok": True}]
+    assert caller.executed == 2  # one blip, one retry — like the other two paths
+
+
+@pytest.mark.asyncio
+async def test_write_without_pool_still_waits_for_the_write_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The herd cap holds on this path too: with every write slot taken, the
+    write waits instead of adding to the burst."""
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)
+    sem = db_write._db_write_semaphore()
+    holds = [await sem.acquire() for _ in range(db_write.DB_WRITE_CONCURRENCY)]
+    caller = _AsyncClient()
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                db_write.poll_db_write(caller, _scores_update, label="t"), timeout=0.2
+            )
+        assert caller.executed == 0  # queued behind the cap, never issued
+    finally:
+        for _ in holds:
+            sem.release()
+
+
+@pytest.mark.asyncio
+async def test_write_without_pool_on_a_closed_client_raises_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shutdown case itself: the write cannot happen, so it must fail
+    visibly instead of returning as if it had reached the database."""
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)
+    caller = _ClosedAsyncClient()
+
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        await db_write.poll_db_write(caller, _scores_update, label="t")
+    assert caller.executed == 1  # not retried: a closed client is not a blip
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_sync", [False, True])
+async def test_read_without_pool_awaits_an_async_caller_client(
+    monkeypatch: pytest.MonkeyPatch, retry_sync: bool
+) -> None:
+    """The production crash: ``'coroutine' object has no attribute 'data'``."""
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)
+    caller = _AsyncClient()
+
+    resp = await db_write.poll_db_read(caller, _sources_select, label="r", retry_sync=retry_sync)
+
+    assert resp.data == [{"ok": True}]
+    assert caller.executed == 1
+
+
+@pytest.mark.asyncio
+async def test_read_without_pool_retries_an_async_caller_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An async read always retries, as on the pooled path; ``retry_sync`` only
+    preserves the old sync call sites' behavior."""
+    monkeypatch.setattr(db_write, "get_async_supabase", lambda: None)
+    caller = _AsyncClient(fail_times=1)
+
+    resp = await db_write.poll_db_read(caller, _sources_select, label="r")
+
+    assert resp.data == [{"ok": True}]
+    assert caller.executed == 2
 
 
 # ---- key-set-grouped bulk upsert (#928) ------------------------------------
