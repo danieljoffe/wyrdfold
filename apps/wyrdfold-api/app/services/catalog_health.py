@@ -80,9 +80,7 @@ def tv_distance(current: Counter[str], baseline: Counter[str]) -> float:
     if cur_total == 0 or base_total == 0:
         return 1.0
     tokens = set(current) | set(baseline)
-    return 0.5 * sum(
-        abs(current[t] / cur_total - baseline[t] / base_total) for t in tokens
-    )
+    return 0.5 * sum(abs(current[t] / cur_total - baseline[t] / base_total) for t in tokens)
 
 
 def evaluate_tripwire(
@@ -303,9 +301,7 @@ async def record_cycle_health(supabase: AsyncClient) -> dict[str, Any] | None:
             # min(actual, backstop) as though it were the real intake.
             "new_jobs": exact_count,
             "window_truncated": truncated,
-            "relevant_jobs": await _relevant_count(
-                supabase, [str(r["id"]) for r in window_rows]
-            ),
+            "relevant_jobs": await _relevant_count(supabase, [str(r["id"]) for r in window_rows]),
             "live_total": live_total,
             "pct_ungraded": _pct(snapshot.get("ungraded")),
             "pct_location_unknown": _pct(snapshot.get("location_unknown")),

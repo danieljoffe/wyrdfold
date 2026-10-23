@@ -64,10 +64,7 @@ def test_an_unpaged_read_really_is_capped(_seeded_user: str, service_client: Cli
     """The premise. If this ever stops being true the fix can be simplified,
     so assert it rather than trusting the note."""
     resp = (
-        service_client.table("llm_costs")
-        .select("cost_usd")
-        .eq("user_id", _seeded_user)
-        .execute()
+        service_client.table("llm_costs").select("cost_usd").eq("user_id", _seeded_user).execute()
     )
     assert len(resp.data) == 1000, "PostgREST no longer caps at 1,000 — revisit #1105"
     assert len(resp.data) < _ROWS

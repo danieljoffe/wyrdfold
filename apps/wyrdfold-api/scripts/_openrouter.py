@@ -65,11 +65,7 @@ def get_api_key() -> str:
     app itself reads, so harness and prod agree by construction), then ~/.zshrc.
     """
     for name in (_KEY_ENV, _LEGACY_KEY_ENV):
-        key = (
-            os.environ.get(name)
-            or _from_env_file(ENV_LOCAL, name)
-            or _from_env_file(ZSHRC, name)
-        )
+        key = os.environ.get(name) or _from_env_file(ENV_LOCAL, name) or _from_env_file(ZSHRC, name)
         if key:
             return key
     raise RuntimeError(

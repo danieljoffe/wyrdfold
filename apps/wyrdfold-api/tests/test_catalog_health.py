@@ -91,7 +91,9 @@ class _FakeSupabase:
         return queue.pop(0) if queue else []
 
 
-def _job(jid: str, title: str, *, hours_ago: int = 1, posted_hours_ago: int | None = 5) -> dict[str, Any]:
+def _job(
+    jid: str, title: str, *, hours_ago: int = 1, posted_hours_ago: int | None = 5
+) -> dict[str, Any]:
     now = datetime.now(UTC)
     return {
         "id": jid,
@@ -382,8 +384,7 @@ async def test_recorder_baseline_truncates_across_rotating_tails(
     baseline_rows = [
         {
             "top_title_tokens": (
-                [[t, c] for t, c in dominant.items()]
-                + [[f"noise{r}x{i}", 12] for i in range(10)]
+                [[t, c] for t, c in dominant.items()] + [[f"noise{r}x{i}", 12] for i in range(10)]
             ),
             "new_jobs": 140,
         }

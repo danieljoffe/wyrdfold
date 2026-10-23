@@ -127,7 +127,9 @@ class _BoardFleet:
             n = self.boards.get(("ashby", slug))
             if n is None:
                 return _Resp(404)
-            return _Resp(200, {"organizationName": slug.title(), "jobs": [{"id": i} for i in range(n)]})
+            return _Resp(
+                200, {"organizationName": slug.title(), "jobs": [{"id": i} for i in range(n)]}
+            )
 
         if url.startswith(SMARTRECRUITERS_CAREERS_BASE):
             # Measured 2026-10-04: a real company's careers page answers 200;
@@ -210,7 +212,9 @@ class _Chain:
                 raise RuntimeError("duplicate key value violates unique constraint")
             self._table.updates.append(dict(self._payload or {}))
             return MagicMock(data=[])
-        rows = [{"id": self._table.owners[self._token]}] if self._token in self._table.owners else []
+        rows = (
+            [{"id": self._table.owners[self._token]}] if self._token in self._table.owners else []
+        )
         return MagicMock(data=rows)
 
 
@@ -295,7 +299,9 @@ def test_slug_candidates_cleans_dedups_and_unpacks_workday() -> None:
 
     # A one-character slug is a coin flip against every board on four
     # providers, not an identifier.
-    assert slug_candidates({"provider": "greenhouse", "board_token": "x", "company_name": "X"}) == []
+    assert (
+        slug_candidates({"provider": "greenhouse", "board_token": "x", "company_name": "X"}) == []
+    )
 
 
 # ---- redetect_source verdicts ----------------------------------------------
@@ -534,17 +540,19 @@ async def test_the_cooldown_is_per_source_and_switchable(
     before = len(fleet.requested)
     other = await source_redetect.redetect_source(
         sb,
-        {"id": "src-ud", "provider": "greenhouse", "board_token": "underdogfantasy",
-         "company_name": "Underdog"},
+        {
+            "id": "src-ud",
+            "provider": "greenhouse",
+            "board_token": "underdogfantasy",
+            "company_name": "Underdog",
+        },
     )
     assert other.action == "still_live"
     assert other.from_cooldown is False
     assert len(fleet.requested) > before
 
     # Window of 0 disables the memo entirely.
-    monkeypatch.setattr(
-        source_redetect.settings, "source_redetect_still_live_cooldown_hours", 0
-    )
+    monkeypatch.setattr(source_redetect.settings, "source_redetect_still_live_cooldown_hours", 0)
     source_redetect._STILL_LIVE_UNTIL.clear()
     await source_redetect.redetect_source(sb, _TRICON)
     mark = len(fleet.requested)
@@ -629,9 +637,7 @@ async def test_a_hanging_board_cannot_wedge_the_poll_cycle(
     mock_http_client.post = AsyncMock(side_effect=_hang)
     sb, _table = _supabase()
 
-    outcome = await asyncio.wait_for(
-        redetect_source(sb, _ACME, timeout_s=0.05), timeout=5
-    )
+    outcome = await asyncio.wait_for(redetect_source(sb, _ACME, timeout_s=0.05), timeout=5)
     assert outcome.action == "not_found"
 
 
@@ -893,7 +899,6 @@ async def test_retirement_alerts_under_one_grouped_sentry_issue(
     assert "Acme" in message and "src-1" in message, "per-source detail rides in the message"
 
 
-
 # ---- ambiguous probes are never proof (ChatGPT review on #1113) -------------
 #
 # The probers swallow 429s, 5xx, transport errors and unreadable bodies and
@@ -1004,7 +1009,9 @@ async def test_a_404_plus_a_live_but_empty_board_only_disables(
     [
         pytest.param(_Resp(503), id="careers-5xx"),
         pytest.param(httpx.ConnectError("reset"), id="careers-transport"),
-        pytest.param(_Resp(302, None, {"location": "https://example.com/elsewhere"}), id="odd-redirect"),
+        pytest.param(
+            _Resp(302, None, {"location": "https://example.com/elsewhere"}), id="odd-redirect"
+        ),
     ],
 )
 async def test_an_unreadable_smartrecruiters_careers_check_is_indeterminate(

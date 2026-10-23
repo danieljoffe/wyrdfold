@@ -69,9 +69,7 @@ _TARGET_LABEL = "Customer Experience Leadership (loadtest)"
 def _client() -> Client:
     sb = create_service_client()
     if sb is None:
-        raise SystemExit(
-            "Supabase not configured — set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY"
-        )
+        raise SystemExit("Supabase not configured — set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY")
     return sb
 
 

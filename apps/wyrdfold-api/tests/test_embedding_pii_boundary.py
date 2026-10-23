@@ -98,9 +98,7 @@ def test_chunk_text_carries_experience_not_identity() -> None:
     chunks = chunks_for_optimized(payload)
     assert chunks, "no chunks produced — the assertions below would be vacuous"
 
-    blob = "\n".join(
-        [c.content for c in chunks] + [str(c.metadata or {}) for c in chunks]
-    ).lower()
+    blob = "\n".join([c.content for c in chunks] + [str(c.metadata or {}) for c in chunks]).lower()
 
     # The experience DID make it through — otherwise this test proves nothing
     # about what was filtered, only that the builder returned little.

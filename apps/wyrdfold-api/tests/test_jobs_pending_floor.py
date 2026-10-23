@@ -794,7 +794,10 @@ async def test_explicit_floor_caps_the_pending_tail(monkeypatch: pytest.MonkeyPa
         },
         *_many_pending(30),
     ]
-    postings = {s["job_posting_id"]: {"id": s["job_posting_id"], "title": s["job_posting_id"]} for s in scores}
+    postings = {
+        s["job_posting_id"]: {"id": s["job_posting_id"], "title": s["job_posting_id"]}
+        for s in scores
+    }
     result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
         target_id="t-1",
@@ -821,7 +824,10 @@ async def test_the_prod_shape_no_graded_row_clears_the_bar(
     """Exactly what prod returned: nothing graded qualifies, 30 exempt rows."""
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     scores = _many_pending(30)
-    postings = {s["job_posting_id"]: {"id": s["job_posting_id"], "title": s["job_posting_id"]} for s in scores}
+    postings = {
+        s["job_posting_id"]: {"id": s["job_posting_id"], "title": s["job_posting_id"]}
+        for s in scores
+    }
     result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
         target_id="t-1",
@@ -847,7 +853,10 @@ async def test_the_profile_default_floor_does_not_cap(monkeypatch: pytest.Monkey
     new intake — trimming it there is the harm the exemption exists to prevent."""
     monkeypatch.setattr(settings, "recency_decay_enabled", False)
     scores = _many_pending(30)
-    postings = {s["job_posting_id"]: {"id": s["job_posting_id"], "title": s["job_posting_id"]} for s in scores}
+    postings = {
+        s["job_posting_id"]: {"id": s["job_posting_id"], "title": s["job_posting_id"]}
+        for s in scores
+    }
     result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
         target_id="t-1",

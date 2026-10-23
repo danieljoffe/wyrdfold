@@ -1154,6 +1154,8 @@ async def test_target_existence_check_fails_open(monkeypatch: pytest.MonkeyPatch
     )
     assert n == 1
     assert graded == ["j1"]
+
+
 async def test_run_summary_reports_the_underfill_funnel(
     monkeypatch: pytest.MonkeyPatch, _tagging_on: Any, caplog: pytest.LogCaptureFixture
 ) -> None:

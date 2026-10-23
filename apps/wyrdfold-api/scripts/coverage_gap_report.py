@@ -73,10 +73,38 @@ DEFAULT_THIN = 5
 # {data, scientist} and matches the Data Scientist target.
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _STOP = {
-    "the", "a", "an", "of", "and", "or", "for", "in", "to", "with", "at", "on",
-    "senior", "junior", "staff", "lead", "principal", "sr", "jr",
-    "i", "ii", "iii", "iv", "remote", "role", "roles", "job", "jobs",
-    "position", "positions", "level", "levels",
+    "the",
+    "a",
+    "an",
+    "of",
+    "and",
+    "or",
+    "for",
+    "in",
+    "to",
+    "with",
+    "at",
+    "on",
+    "senior",
+    "junior",
+    "staff",
+    "lead",
+    "principal",
+    "sr",
+    "jr",
+    "i",
+    "ii",
+    "iii",
+    "iv",
+    "remote",
+    "role",
+    "roles",
+    "job",
+    "jobs",
+    "position",
+    "positions",
+    "level",
+    "levels",
 }
 
 
@@ -266,7 +294,12 @@ async def main() -> None:
     )
     targets = get_active(supabase)
 
-    logger.info("Demand window: %dd   searches: %d   active targets: %d", args.days, len(searches), len(targets))
+    logger.info(
+        "Demand window: %dd   searches: %d   active targets: %d",
+        args.days,
+        len(searches),
+        len(targets),
+    )
     logger.info("")
     gaps = analyze_coverage_gaps(searches, targets, thin_threshold=args.thin)
     _print(gaps, thin=args.thin)

@@ -156,7 +156,6 @@ def _patch_backfill(monkeypatch: pytest.MonkeyPatch, verdicts: dict[str, str]) -
     return rec
 
 
-
 def _keyset_supabase(table: list[dict[str, Any]], seen: list[str]) -> MagicMock:
     """Fake supabase backed by a REAL list, honouring the keyset predicate.
 

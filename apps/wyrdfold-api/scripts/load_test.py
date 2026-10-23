@@ -222,8 +222,17 @@ async def _sample_pg(db: DbConn) -> tuple[int, int]:
         "from pg_stat_activity where datname = current_database()"
     )
     out = await _run_cmd(
-        "psql", "-h", db.host, "-p", str(db.port), "-U", db.user, "-d", db.name,
-        "-tAc", sql,
+        "psql",
+        "-h",
+        db.host,
+        "-p",
+        str(db.port),
+        "-U",
+        db.user,
+        "-d",
+        db.name,
+        "-tAc",
+        sql,
         env={**os.environ, "PGPASSWORD": db.password},
     )
     line = out.strip().splitlines()[0] if out.strip() else ""
@@ -309,9 +318,13 @@ def _print_resource_report(samples: list[ResourceSample]) -> None:
     fds = [s.fds for s in samples if s.fds is not None]
     print(f"  RESOURCES  (n={len(samples)} samples)")
     print("-" * 96)
-    print(f"    pg backends       peak={max(pg_totals):>4}  median={int(statistics.median(pg_totals)):>4}")
+    print(
+        f"    pg backends       peak={max(pg_totals):>4}  median={int(statistics.median(pg_totals)):>4}"
+    )
     if any(pg_pgrst):
-        print(f"    postgREST conns   peak={max(pg_pgrst):>4}  median={int(statistics.median(pg_pgrst)):>4}")
+        print(
+            f"    postgREST conns   peak={max(pg_pgrst):>4}  median={int(statistics.median(pg_pgrst)):>4}"
+        )
     if rss:
         span_min = (samples[-1].t - samples[0].t) / 60.0
         slope = (rss[-1] - rss[0]) / span_min if span_min > 0 else 0.0
@@ -354,9 +367,7 @@ async def _run(
                 )
             )
         if sample_cfg is not None:
-            tasks.append(
-                asyncio.create_task(_resource_sampler_loop(sample_cfg, deadline, samples))
-            )
+            tasks.append(asyncio.create_task(_resource_sampler_loop(sample_cfg, deadline, samples)))
         await asyncio.gather(*tasks)
 
     _print_report(stats, time.monotonic() - started, vus, polls[0])
