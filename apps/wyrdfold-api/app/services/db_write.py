@@ -6,9 +6,10 @@ loop via the pooled HTTP/2 ``AsyncClient`` (#225) — async I/O doesn't occupy a
 executor thread, so the poll's DB fan-out stops starving the threads that
 interactive requests need (the #57 regression this targets). The
 ``POLLER_ASYNC_DB`` flag that once gated this was removed in slice 4: the poll
-cycle is unconditionally async now. FAIL-SAFE: when the async client isn't up,
-the call silently falls back to the sync client in a thread (the #107 path), so
-a query is never dropped — in practice prod always has the async client.
+cycle is unconditionally async now. FAIL-SAFE: when the pool isn't up, the call
+runs on the caller's own client — awaited on the loop when that client is async,
+in a thread when it is sync (the #107 path). Prod has the pool except during
+shutdown, which a detached task can outlive (Sentry PYTHON-FASTAPI-4H).
 
 Writes additionally retry transient transport blips (idempotent writes only —
 see :mod:`app.services.supabase_retry`) and are bounded by
@@ -25,6 +26,7 @@ module that issues poll queries can share them without importing the poller.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Callable, Sequence
 from typing import Any, cast
@@ -67,6 +69,18 @@ async def db_to_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any
         return await asyncio.to_thread(fn, *args, **kwargs)
 
 
+def _is_async_query(query: Any) -> bool:
+    """True when *query* came from an async client, so it must be awaited.
+
+    In plain terms: running an async query in a thread does not run it — it
+    hands back a coroutine nobody awaits. A read then crashes on ``.data`` and
+    a write never reaches the database while looking like it did (Sentry
+    PYTHON-FASTAPI-4H: a target-activation task still held an async client
+    after the pool was gone — and only shutdown clears the pool).
+    """
+    return inspect.iscoroutinefunction(query.execute)
+
+
 async def poll_db_write(
     supabase: Any,
     build: Callable[..., Any],
@@ -75,8 +89,8 @@ async def poll_db_write(
 ) -> Any:
     """Execute one poll-cycle write, async-on-loop (sync-in-thread fallback).
 
-    ``build(client)`` receives a supabase client — the sync ``Client`` passed
-    in ``supabase`` or the pooled ``AsyncClient`` — and returns a *built,
+    ``build(client)`` receives a supabase client — the pooled ``AsyncClient``,
+    or the caller's own (sync or async) ``supabase`` — and returns a *built,
     unexecuted* postgrest query. supabase-py's sync and async query builders
     share the same chainable API, so one ``build`` closure works against
     either; this seam owns the only real differences (await vs. thread, and the
@@ -92,10 +106,13 @@ async def poll_db_write(
     if async_sb is not None:
         async with _db_write_semaphore():
             return await execute_with_retry(build(async_sb).execute, label=label)
-    # Fail-safe only: prod always has the async client (the flag was removed in
-    # #57 slice 4 — the poll cycle is unconditionally async now). This sync path
-    # survives for tests/local runs that don't init the async client.
-    return await db_to_thread(lambda: execute_with_retry_sync(build(supabase).execute, label=label))
+    # No pool: tests/local runs that never init it, or a task still running
+    # after shutdown closed it. Use the caller's own client in its own mode.
+    query = build(supabase)
+    if _is_async_query(query):
+        async with _db_write_semaphore():
+            return await execute_with_retry(query.execute, label=label)
+    return await db_to_thread(lambda: execute_with_retry_sync(query.execute, label=label))
 
 
 async def poll_db_upsert(
@@ -242,11 +259,13 @@ async def poll_db_read(
     async_sb = get_async_supabase()
     if async_sb is not None:
         return await execute_with_retry(build(async_sb).execute, label=label)
+    # No pool — same caller's-client fallback as poll_db_write.
+    query = build(supabase)
+    if _is_async_query(query):
+        return await execute_with_retry(query.execute, label=label)
     if retry_sync:
-        return await asyncio.to_thread(
-            lambda: execute_with_retry_sync(build(supabase).execute, label=label)
-        )
-    return await asyncio.to_thread(build(supabase).execute)
+        return await asyncio.to_thread(lambda: execute_with_retry_sync(query.execute, label=label))
+    return await asyncio.to_thread(query.execute)
 
 
 # Rows per archive-write statement.
