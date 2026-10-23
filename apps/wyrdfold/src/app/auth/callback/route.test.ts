@@ -105,6 +105,17 @@ describe('auth/callback GET', () => {
         `${ORIGIN}/login?auth_error=missing_code`
       );
     });
+
+    it('reports only param names to Sentry, never the token_hash', async () => {
+      await GET(makeRequest('token_hash=SECRET-TOKEN-HASH&type=bogus'));
+
+      expect(mockCaptureMessage).toHaveBeenCalledTimes(1);
+      const [, options] = mockCaptureMessage.mock.calls[0];
+      expect(options.extra).toEqual({ params: ['token_hash', 'type'] });
+      expect(JSON.stringify(mockCaptureMessage.mock.calls)).not.toContain(
+        'SECRET-TOKEN-HASH'
+      );
+    });
   });
 
   describe('PKCE code flow (same-browser magic-link sign-in)', () => {
@@ -157,6 +168,15 @@ describe('auth/callback GET', () => {
       expect(res.headers.get('location')).toBe(
         `${ORIGIN}/login?auth_error=otp_expired`
       );
+    });
+
+    it('caps caller-supplied error text before it reaches Sentry', async () => {
+      const longText = 'x'.repeat(5000);
+      await GET(makeRequest(`error=${longText}&error_description=${longText}`));
+
+      const [, options] = mockCaptureMessage.mock.calls[0];
+      expect(options.extra.errorParam).toHaveLength(201);
+      expect(options.extra.errorDescription).toHaveLength(201);
     });
 
     it('bounces with missing_code when neither code nor token_hash is present', async () => {

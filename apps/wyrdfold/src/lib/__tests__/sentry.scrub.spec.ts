@@ -130,7 +130,15 @@ describe('stripQueries', () => {
       'Unexpected token ? in JSON at position 0',
     ],
     ['a/b?c', 'a/b?c'],
-    [FRAME_FILENAME, FRAME_FILENAME],
+    // Frames themselves are skipped by the walk; see 'keeps stack frames verbatim'.
+    [FRAME_FILENAME, 'app:///_next/static/chunks/main.js'],
+    // Query runs with no URL or path in front of them.
+    ['?token_hash=TOKEN-HASH&type=bogus', ''],
+    ['search: ?token_hash=TOKEN-HASH', 'search: '],
+    ['#access_token=JWT-SECRET&refresh_token=SESSION-SECRET', ''],
+    ['wyrdfold.com/auth/callback?code=PKCE-CODE', 'wyrdfold.com/auth/callback'],
+    ['Issue #123 is fixed', 'Issue #123 is fixed'],
+    ['color: #fff', 'color: #fff'],
   ])('%s -> %s', (input, expected) => {
     expect(stripQueries(input)).toBe(expected);
   });
@@ -177,6 +185,18 @@ describe('scrubEvent', () => {
     const frames =
       scrubEvent(serverError()).exception?.values?.[0]?.stacktrace?.frames;
     expect(frames?.[0]?.filename).toBe(FRAME_FILENAME);
+  });
+
+  it('removes a bare query string captured as extra data', () => {
+    // auth/callback used to send `url.search` as-is; with an unrecognised
+    // `type` that is a live token_hash with nothing in front of it.
+    const event = serverError();
+    event.extra = { search: '?token_hash=TOKEN-HASH&type=bogus' };
+
+    const json = JSON.stringify(scrubEvent(event));
+
+    expect(json).not.toContain('TOKEN-HASH');
+    expect(scrubEvent(event).extra).toEqual({ search: '' });
   });
 
   it('drops a user that has no id', () => {

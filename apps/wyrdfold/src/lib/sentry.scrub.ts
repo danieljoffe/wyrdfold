@@ -29,6 +29,10 @@ const UNSAFE_ATTRIBUTE =
 // filters.
 const URL_QUERY = /(https?:\/\/[^\s?#"'<>]*)[?#][^\s"'<>]*/g;
 const PATH_QUERY = /(^|[\s"'(=,])(\/[^\s?#"'<>]*)[?#][^\s"'<>]*/g;
+// Any other `?key=value…` or `#key=value…` run, wherever it sits: a bare
+// `url.search` (`?token_hash=…`), a scheme-less `host/path?…`, an
+// implicit-flow `#access_token=…`. A lone `?` or `#123` is left alone.
+const KEY_VALUE_QUERY = /[?#][^\s"'<>#?&=/]+=[^\s"'<>]*/g;
 
 // Passed through untouched. Stack frames feed grouping and symbolication and
 // hold no request data. `sdkProcessingMetadata` is the SDK's own scratch
@@ -40,9 +44,12 @@ const VERBATIM_KEYS = new Set([
   'sdkProcessingMetadata',
 ]);
 
-/** Drops the query string and fragment from every URL or path in `value`. */
+/** Drops every query string and fragment in `value`, bare `?key=…` runs included. */
 export function stripQueries(value: string): string {
-  return value.replace(URL_QUERY, '$1').replace(PATH_QUERY, '$1$2');
+  return value
+    .replace(URL_QUERY, '$1')
+    .replace(PATH_QUERY, '$1$2')
+    .replace(KEY_VALUE_QUERY, '');
 }
 
 // A copy with every string query-stripped. `seen` maps each object already

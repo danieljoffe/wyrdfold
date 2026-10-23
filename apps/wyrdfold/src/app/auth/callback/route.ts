@@ -51,6 +51,15 @@ function bounceToLogin(origin: string, reason: string): NextResponse {
   return NextResponse.redirect(url);
 }
 
+// Caller-supplied text bound for Sentry: enough to read, never a payload.
+const SENTRY_TEXT_LIMIT = 200;
+
+function clip(value: string): string {
+  return value.length > SENTRY_TEXT_LIMIT
+    ? `${value.slice(0, SENTRY_TEXT_LIMIT)}…`
+    : value;
+}
+
 /**
  * Handles the auth callback from Supabase. Two flows arrive here:
  *
@@ -94,9 +103,14 @@ export async function GET(request: Request) {
   // redirecting back with `?error=...&error_description=...`. Surface
   // those before attempting any exchange.
   if (errorParam) {
+    // Supabase's own error code and description, not secrets. Anyone can
+    // put text in a URL, though, so only a capped amount reaches Sentry.
     Sentry.captureMessage('auth/callback: supabase returned error', {
       level: 'warning',
-      extra: { errorParam, errorDescription },
+      extra: {
+        errorParam: clip(errorParam),
+        errorDescription: errorDescription && clip(errorDescription),
+      },
     });
     return bounceToLogin(origin, errorParam);
   }
@@ -136,13 +150,15 @@ export async function GET(request: Request) {
       return bounceToLogin(origin, error.code ?? 'exchange_failed');
     }
   } else {
-    // Neither flow's params present. Most common cause: Supabase
-    // silently substituted site_url for an unallow-listed redirect, so
-    // the link landed at /auth/callback (or wherever site_url points)
-    // without the params Supabase would have appended.
+    // Neither flow could run: no code, and no token_hash with a recognised
+    // type. Most common cause: Supabase silently substituted site_url for
+    // an unallow-listed redirect, so the link landed at /auth/callback (or
+    // wherever site_url points) without the params Supabase would have
+    // appended. Param NAMES only: a token_hash with a missing or unknown
+    // type lands here too, and its value is a live credential.
     Sentry.captureMessage('auth/callback: no code or token_hash', {
       level: 'warning',
-      extra: { search: url.search },
+      extra: { params: [...new Set(searchParams.keys())].sort() },
     });
     return bounceToLogin(origin, 'missing_code');
   }
