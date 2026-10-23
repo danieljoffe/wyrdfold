@@ -1,0 +1,31 @@
+# Trivy ignore list — explicit, expiring acceptances of known findings.
+# Each entry says why it is safe and when it must be re-evaluated, so it gets
+# looked at again instead of rotting. YAML (not the plain .trivyignore format)
+# because only YAML can scope an entry to specific paths.
+
+vulnerabilities:
+  # wheel / jaraco.context land in /app/.venv because `uv sync` uses them
+  # as build helpers when installing source distributions. The runtime app
+  # never invokes either tool (no setup.py runs, no wheel files processed
+  # inside the container). Real exploit path would require running
+  # `pip install` / `wheel install` against attacker-controlled input
+  # inside the production container — we don't.
+  # They aren't in uv.lock (build-system deps, not project deps), so the
+  # fix has to come from uv pulling in newer versions transitively — track
+  # upstream and remove this entry on next bump.
+  - id: CVE-2026-24049
+    expired_at: 2027-03-31
+  - id: CVE-2026-23949
+    expired_at: 2027-03-31
+
+secrets:
+  # Not a credential. From 1.15 the Anthropic SDK documents its agents-beta
+  # `execution_identity` option with the literal text
+  # `{"type": "service_account"}`, which is the marker Trivy's Google
+  # service-account rule looks for. Scoped to the SDK's own folder and to this
+  # one rule, so a real key anywhere else in the image still fails the scan.
+  - id: gcp-service-account
+    paths:
+      - '/app/.venv/lib/python3.*/site-packages/anthropic/**'
+    expired_at: 2027-04-23
+    statement: Anthropic SDK docstrings, not key material (checked 2026-10-23, anthropic 1.15.0)

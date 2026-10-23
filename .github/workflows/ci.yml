@@ -606,8 +606,9 @@ jobs:
       # `os,library` covers Debian packages from the slim base AND the
       # Python deps resolved into /app/.venv by the builder stage.
       # `ignore-unfixed` keeps the gate firing only on actionable
-      # findings. `.trivyignore` documents the accepted-risk transitive
-      # build-tool CVEs with expiry dates.
+      # findings. Image scans also run Trivy's secret scanner by default;
+      # `.trivyignore.yaml` holds every accepted finding, each with a reason
+      # and an expiry date (YAML so an entry can be scoped to paths).
       #
       # The scanner image is pinned by digest (not just the mutable 0.69.1
       # tag): it runs with the host docker socket mounted, so a re-tagged or
@@ -619,11 +620,11 @@ jobs:
         run: |
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD/.trivyignore:/.trivyignore:ro" \
+            -v "$PWD/.trivyignore.yaml:/.trivyignore.yaml:ro" \
             aquasec/trivy:0.69.1@sha256:1c78ed1ef824ab8bb05b04359d186e4c1229d0b3e67005faacb54a7d71974f73 image \
               --severity HIGH,CRITICAL \
               --vuln-type os,library \
               --ignore-unfixed \
-              --ignorefile /.trivyignore \
+              --ignorefile /.trivyignore.yaml \
               --exit-code 1 \
               wyrdfold-api:ci
