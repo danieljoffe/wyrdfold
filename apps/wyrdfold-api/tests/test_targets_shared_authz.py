@@ -9,7 +9,7 @@ router routes mishandled that:
   A JWT caller must only drop THEIR ``user_targets`` link; operators keep the hard
   delete.
 - **SEC-4 (MED)** ``POST /targets/{id}/deactivate`` was missing the
-  ``_require_user_owns_target`` guard every sibling route has, so any JWT user could
+  ``_require_user_owns_target_async`` guard every sibling route has, so any JWT user could
   read back any target's full metadata.
 - **SEC-2 (HIGH)** ``PATCH /targets/{id}`` let any co-follower overwrite the shared
   scoring profile / label — uncapped, bypassing the #191 merge machinery. Direct
@@ -219,8 +219,9 @@ def test_delete_by_operator_still_hard_deletes(
 ) -> None:
     from app.routers import targets as mod
 
-    # Operator path (user_id is None): _require_user_owns_target early-returns,
-    # and the shared-row hard delete is the intended behavior.
+    # user_id None (in-process only since #192; no HTTP caller arrives with
+    # it): _require_user_owns_target_async early-returns and the shared-row
+    # hard delete runs.
     unlink = AsyncMock(return_value=True)
     hard_delete = AsyncMock(return_value=True)
     monkeypatch.setattr(mod, "_unlink_user_from_target_async", unlink)

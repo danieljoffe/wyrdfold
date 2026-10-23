@@ -1,11 +1,10 @@
 """Sources router — global job-board catalog.
 
 Sources are operator-managed (job boards, ATS providers). Reads are
-available to any authenticated user; mutations (`POST /sources`,
-`POST /sources/seed`) are gated to the cron API key only — a leaked
-operator key is the only way they should be reachable, and even
-authenticated users must not be able to add/remove/toggle the global
-source list.
+available to any signed-in user (JWT). Mutations (`POST /sources`,
+`POST /sources/seed`) also need the operator key, so a caller needs both:
+a signed-in user can't add/remove/toggle the global source list without
+the key, and a leaked key can't do it without a user's JWT.
 """
 
 import logging
@@ -29,8 +28,8 @@ from app.services.greenhouse import GREENHOUSE_BASE
 
 logger = logging.getLogger(__name__)
 
-# Default dependency = read auth (JWT or api-key). Write endpoints below
-# layer on `verify_api_key` to restrict to operator/cron callers.
+# Every route needs a user JWT (the router gate takes no shared key since
+# #192). Write endpoints below add `verify_api_key`, so they need both.
 router = APIRouter(
     prefix="/sources",
     tags=["sources"],

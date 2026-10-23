@@ -14,7 +14,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from postgrest.exceptions import APIError
 from postgrest.types import CountMethod
-from supabase import AsyncClient, Client
+from supabase import AsyncClient
 
 from app.background import spawn_detached
 from app.cache import job_list_cache, jobs_cache_prefix
@@ -129,6 +129,13 @@ from app.services.validate import assert_safe_host, validate_job_url
 
 logger = logging.getLogger(__name__)
 
+# Since #192 every route here needs a user JWT, so over HTTP
+# ``get_current_user_id_optional`` returns that user's id and the
+# ``user_id is None`` branches below, which comments call the operator /
+# api-key / cron path, are unreachable; only in-process callers and tests
+# take them.
+# In effect PATCH /{target_id} refuses every caller and DELETE /{target_id}
+# never takes its operator hard-delete.
 router = APIRouter(
     prefix="/targets",
     tags=["targets"],
@@ -144,33 +151,16 @@ router = APIRouter(
 # uses. It replaced a per-row-upsert N+1 over an unordered OFFSET scan here.
 
 
-def _require_user_owns_target(supabase: Client, *, user_id: str | None, target_id: str) -> None:
-    """Raise 404 if a JWT caller is not linked to ``target_id``.
-
-    Targets are a shared resource keyed only by the explicit ``user_targets``
-    junction — there is no RLS backstop because the API uses the service-role
-    key. Without this guard any authenticated user could mutate any target.
-
-    A ``None`` user_id is the operator/api-key path (``verify_api_key_or_jwt``)
-    and bypasses the check — operators are trusted with full access.
-
-    Returns 404 (not 403) so non-owners cannot enumerate target existence.
-    """
-    if user_id is None:
-        return
-    if target_id not in crud.get_user_target_ids(supabase, user_id):
-        raise HTTPException(status_code=404, detail="Target not found")
-
-
 def _require_operator(user_id: str | None) -> None:
     """Reject a signed-in end user from a shared-catalog mutation.
 
     Targets are a shared row (many users co-follow one target via the global
     ``find_matching_target`` label dedup), so a direct field edit here would
     rewrite the scoring rubric / label every co-follower depends on. Those
-    edits are operator-only: ``user_id is None`` is the operator/api-key path
-    (cron, admin curation) and passes; a real subject is a JWT end user and is
-    refused. End users shape only their own view (axis weights, preferences on
+    edits are operator-only: ``user_id is None`` passes and a real subject (a
+    JWT end user) is refused. Since #192 no HTTP caller arrives with ``None``
+    (see the note above ``router``), so over HTTP this refuses everyone. End
+    users shape only their own view (axis weights, preferences on
     ``user_targets``) and contribute to the shared profile solely through the
     bounded #191 path (reference JDs, learner review). See SEC-2 (#366).
     """
@@ -216,9 +206,14 @@ async def _user_target_ids(supabase: AsyncClient, user_id: str) -> set[str]:
 async def _require_user_owns_target_async(
     supabase: AsyncClient, *, user_id: str | None, target_id: str
 ) -> None:
-    """Async twin of :func:`_require_user_owns_target` (the sync version is kept
-    for the sync / threadpooled handlers). 404s a JWT caller not linked to
-    ``target_id``; the operator/api-key path (``user_id`` None) bypasses."""
+    """404 a caller who isn't linked to ``target_id``.
+
+    Targets are shared rows keyed only by the ``user_targets`` junction, and
+    the service-role client has no RLS backstop, so without this any signed-in
+    user could act on any target. A 404 (not 403) keeps target existence
+    unenumerable. ``user_id`` None skips the check, but since #192 no HTTP
+    caller arrives with ``None`` (see the note above ``router``).
+    """
     if user_id is None:
         return
     if target_id not in await _user_target_ids(supabase, user_id):
@@ -1692,6 +1687,7 @@ async def update_target(
     # Shared-catalog write → operator-only (SEC-2, #366). End users can't edit
     # the shared scoring profile / label; they tune their own view via
     # axis-weights / preferences and contribute via the bounded #191 path.
+    # Since #192 this refuses every HTTP caller (see ``_require_operator``).
     _require_operator(user_id)
     target = await _update_target_async(supabase, target_id, body)
     if target is None:
@@ -2080,9 +2076,10 @@ async def poll_jobs_for_target(
 ) -> PollResult:
     """Poll all job sources, filtering for jobs matching this target's search keywords.
 
-    Admin / operator-only: gated by ``verify_api_key`` so an
-    unauthenticated caller can't trigger a fan-out poll across all
-    configured ATS sources. Not reachable from the wyrdfold FE.
+    Admin / operator-only: needs the operator key (``verify_api_key``) on
+    top of the router's user JWT, so neither a leaked key nor an ordinary
+    signed-in user can trigger a fan-out poll across all configured ATS
+    sources. Not reachable from the wyrdfold FE.
 
     The target read and the poll fan-out both run natively on the async service
     client (#57).
@@ -2135,8 +2132,9 @@ async def get_target_funnel(
 ) -> TargetFunnelResponse:
     """Diagnostic funnel report for one target (#845).
 
-    API-key-only — the response includes per-user list floors and the
-    target's scoring profile, which is operator-facing data, not user
+    Operator-only: needs the operator key (``verify_api_key``) on top of
+    the router's user JWT — the response includes per-user list floors and
+    the target's scoring profile, which is operator-facing data, not user
     surface. Read-only.
     """
     try:

@@ -64,18 +64,21 @@ class Settings(BaseSettings):
     # service-role key (which bypasses RLS). Only required once per-user
     # data access migrates onto the user client; unset is fine until then.
     supabase_anon_key: str = Field(default="", repr=False)
+    # Legacy operator key. ``verify_api_key`` accepts it exactly like
+    # ``wyrdfold_cron_key`` below; the user-data routers stopped accepting it
+    # in #29 R3 H4 / #192. Deployed environments leave it empty; local
+    # harnesses (docker-smoke, load_test, CI's E2E API) still set it.
     wyrdfold_api_key: str = Field(default="", repr=False)
-    # Dedicated cron/automation key (#29 round 3 / H4). OPTIONAL, default
-    # empty. When set, it is accepted by ``verify_api_key`` (the strictly
-    # operator/cron routes: /poll, /discovery, /admin, jobs rescore +
-    # backfill-salary, sources POST/seed, targets funnel) IN ADDITION to
-    # ``wyrdfold_api_key`` — but it is deliberately NOT accepted by
-    # ``verify_api_key_or_jwt`` (the six user-data routers). This gives the
-    # operator a migration path to a narrowly-scoped automation credential:
-    # point cron/poller/batch at WYRDFOLD_CRON_KEY (works only on operator
-    # routes), then the broad WYRDFOLD_API_KEY can be retired so a leak of
-    # the automation key can no longer authenticate against user data. Empty
-    # changes nothing (the legacy key keeps working everywhere it does today).
+    # The operator credential (#29 round 3 / H4), sent as ``x-api-key``.
+    # Accepted only by ``verify_api_key``, never by the user-data routers'
+    # ``verify_api_key_or_jwt``, so a leaked key can't read user data.
+    #   - On its own it opens /poll, /discovery and /admin.
+    #   - Six operator routes sit on JWT-gated routers, so they need a
+    #     signed-in user's JWT as well: jobs rescore + backfill-salary,
+    #     sources POST + seed, targets poll-jobs + funnel. Kept on purpose
+    #     (docs/decisions.md, 2026-10-23); tests/test_apikey_scope.py pins
+    #     the set.
+    # Empty = only the legacy key above (if set) opens the operator routes.
     wyrdfold_cron_key: str = Field(default="", repr=False)
     # Shared secret proving a request came through the trusted Next.js BFF
     # (SEC-5). The BFF injects it as ``X-Wyrdfold-BFF`` on the public,
