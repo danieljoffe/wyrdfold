@@ -31,7 +31,7 @@ résumé tailoring. Live at wyrdfold.com (Vercel FE + Railway API + hosted Supab
 
 ## Key commands
 
-- API tests: `cd apps/wyrdfold-api && uv run pytest -q` (+ `ruff check`, `mypy app`).
+- API tests: `cd apps/wyrdfold-api && uv run pytest -q` (+ `ruff check`, `ruff format --check`, `mypy app`).
   Integration tests need `pytestmark = pytest.mark.integration` (run `-m integration`).
 - FE: `nx test wyrdfold` (jest — run before any FE PR; `nx build` only typechecks),
   `nx lint wyrdfold`. Local FE dev on port 3200; local Supabase on 54321/54322.

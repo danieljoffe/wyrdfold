@@ -56,9 +56,25 @@ def _query(sql: str) -> list[str]:
     env = {**os.environ, "PGPASSWORD": PGPASSWORD}
     try:
         proc = subprocess.run(  # noqa: S603 — resolved binary, constant SQL
-            [_PSQL_BIN, "-h", PGHOST, "-p", PGPORT, "-U", PGUSER, "-d", PGDATABASE,
-             "-At", "-c", sql],
-            capture_output=True, text=True, timeout=30, check=False, env=env,
+            [
+                _PSQL_BIN,
+                "-h",
+                PGHOST,
+                "-p",
+                PGPORT,
+                "-U",
+                PGUSER,
+                "-d",
+                PGDATABASE,
+                "-At",
+                "-c",
+                sql,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:  # pragma: no cover
         pytest.skip(f"local Postgres unreachable: {exc}")

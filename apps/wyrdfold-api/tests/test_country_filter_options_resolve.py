@@ -16,21 +16,15 @@ from pathlib import Path
 
 from app.services.location_parse import canonical_country
 
-_FILTER_TSX = (
-    Path(__file__).resolve().parents[2] / "wyrdfold/src/app/(app)/jobs/JobsFilter.tsx"
-)
+_FILTER_TSX = Path(__file__).resolve().parents[2] / "wyrdfold/src/app/(app)/jobs/JobsFilter.tsx"
 
 
 def _ui_country_options() -> list[tuple[str, str]]:
-    block = re.search(
-        r"const COUNTRY_OPTIONS[^=]*=\s*\[(.*?)\];", _FILTER_TSX.read_text(), re.S
-    )
+    block = re.search(r"const COUNTRY_OPTIONS[^=]*=\s*\[(.*?)\];", _FILTER_TSX.read_text(), re.S)
     assert block, "COUNTRY_OPTIONS not found — did the filter move?"
     return [
         (m.group(1), m.group(2))
-        for m in re.finditer(
-            r"\{\s*value:\s*'([^']*)',\s*label:\s*'([^']*)'\s*\}", block.group(1)
-        )
+        for m in re.finditer(r"\{\s*value:\s*'([^']*)',\s*label:\s*'([^']*)'\s*\}", block.group(1))
     ]
 
 

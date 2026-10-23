@@ -31,7 +31,10 @@ _FE = Path(__file__).resolve().parents[2] / "wyrdfold/src"
 # to this list only with a reason; a new unexplained entry means someone shipped
 # half a feature.
 _ALLOWED_WITHOUT_FE_SENDER: dict[tuple[str, str], str] = {
-    ("TailorRequest", "critique"): "Server-side re-tailor loop passes it; no UI surfaces a critique box.",
+    (
+        "TailorRequest",
+        "critique",
+    ): "Server-side re-tailor loop passes it; no UI surfaces a critique box.",
     ("CoverLetterRequest", "critique"): "Same re-tailor loop; no UI surface.",
 }
 
@@ -55,8 +58,7 @@ def _model_fields() -> dict[str, list[str]]:
                 out[node.name] = [
                     stmt.target.id
                     for stmt in node.body
-                    if isinstance(stmt, ast.AnnAssign)
-                    and isinstance(stmt.target, ast.Name)
+                    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
                 ]
     return out
 

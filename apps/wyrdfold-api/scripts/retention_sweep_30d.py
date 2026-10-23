@@ -87,6 +87,7 @@ async def _write_with_retry(fn: Any, *, what: str, attempts: int = 4) -> Any:
             await asyncio.sleep(wait)
     return None  # unreachable
 
+
 # Tables whose mere reference to a job marks it a user artifact (protected
 # from tombstoning; engagement via user_jobs is checked separately).
 _ARTIFACT_TABLES = ("analyses", "job_feedback", "documents")
@@ -122,10 +123,7 @@ async def _artifact_ids(supabase: Client, job_ids: list[str]) -> set[str]:
         for i in range(0, len(job_ids), IN_CHUNK):
             chunk = job_ids[i : i + IN_CHUNK]
             resp = await asyncio.to_thread(
-                supabase.table(table)
-                .select("job_posting_id")
-                .in_("job_posting_id", chunk)
-                .execute
+                supabase.table(table).select("job_posting_id").in_("job_posting_id", chunk).execute
             )
             out.update(
                 cast(str, r["job_posting_id"])
@@ -332,9 +330,7 @@ async def _phase_c_cascade(
             if done and done % 5000 < EMB_CHUNK * 2:
                 logger.info("  %s progress: %d", table, done)
         counts[key] = done
-        logger.info(
-            "  %s %s: %d", table, "deleted" if execute else "would delete", done
-        )
+        logger.info("  %s %s: %d", table, "deleted" if execute else "would delete", done)
     return counts
 
 
@@ -357,9 +353,7 @@ async def _verify(supabase: Client, *, cutoff: str) -> None:
         "PASS" if live_old == 0 else "CHECK",
         live_old,
     )
-    emb = _count(
-        supabase.table("job_embeddings").select("id", count="exact", head=True)
-    )
+    emb = _count(supabase.table("job_embeddings").select("id", count="exact", head=True))
     logger.info("  job_embeddings rows remaining: %d", emb)
 
 

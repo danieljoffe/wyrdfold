@@ -218,7 +218,8 @@ class ScoresQuery:
                 rows = [
                     r
                     for r in rows
-                    if not _row_is_graded(r) or (r.get("recency_score") or r["score"]) >= self._floor
+                    if not _row_is_graded(r)
+                    or (r.get("recency_score") or r["score"]) >= self._floor
                 ]
             else:
                 rows = [r for r in rows if r["score"] >= self._floor]

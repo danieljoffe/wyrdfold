@@ -165,11 +165,11 @@ def test_57014_maps_to_503_with_retry_after() -> None:
 
 _CF_BLOCK_PAGE = (
     "b'<!DOCTYPE html>\\n<head>\\n<title>Attention Required! | Cloudflare</title>\\n"
-    "</head>\\n<body>\\n<h1 data-translate=\"block_headline\">Sorry, you have been "
+    '</head>\\n<body>\\n<h1 data-translate="block_headline">Sorry, you have been '
     "blocked</h1>\\n<h2><span>You are unable to access</span> supabase.co</h2>\\n"
-    "<span class=\"cf-footer-item\">Cloudflare Ray ID: "
-    "<strong class=\"font-semibold\">a2cb3ab25f9fae43</strong></span>\\n"
-    "<span class=\"hidden\" id=\"cf-footer-ip\">76.93.69.205</span>\\n</body>'"
+    '<span class="cf-footer-item">Cloudflare Ray ID: '
+    '<strong class="font-semibold">a2cb3ab25f9fae43</strong></span>\\n'
+    '<span class="hidden" id="cf-footer-ip">76.93.69.205</span>\\n</body>\''
 )
 
 

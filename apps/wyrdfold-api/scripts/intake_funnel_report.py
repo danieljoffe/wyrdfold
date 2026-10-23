@@ -164,7 +164,9 @@ async def main() -> None:
         {"label": t.label, "role_family": t.role_family}
         for t in get_pipeline_active_targets(supabase)
     ]
-    logger.info("== 3. ADMISSION (pipeline-active targets — titles must prematch these to ingest) ==")
+    logger.info(
+        "== 3. ADMISSION (pipeline-active targets — titles must prematch these to ingest) =="
+    )
     if not targets:
         logger.info("  NONE — nothing can ingest (free gates drop everything)")
     for t in targets:

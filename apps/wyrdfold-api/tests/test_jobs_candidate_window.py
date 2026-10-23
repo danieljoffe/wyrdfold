@@ -138,10 +138,18 @@ async def test_search_narrows_the_window_instead_of_emptying_it(
     """
     monkeypatch.setattr(jobs_mod, "_CANDIDATE_WINDOW", 10)
     rows = [
-        _score_row(f"b{n:02d}", score=90 - n, graded=True, first_seen="2026-07-01", title="Backend Engineer")
+        _score_row(
+            f"b{n:02d}",
+            score=90 - n,
+            graded=True,
+            first_seen="2026-07-01",
+            title="Backend Engineer",
+        )
         for n in range(20)
     ] + [
-        _score_row(f"f{n}", score=5 + n, graded=True, first_seen="2026-07-02", title="Frontend Engineer")
+        _score_row(
+            f"f{n}", score=5 + n, graded=True, first_seen="2026-07-02", title="Frontend Engineer"
+        )
         for n in range(6)
     ]
 
@@ -165,8 +173,7 @@ async def test_graded_rows_get_their_own_window_and_cannot_be_crowded_out(
     """
     monkeypatch.setattr(jobs_mod, "_CANDIDATE_WINDOW", 5)
     graded = [
-        _score_row(f"g{n}", score=20 + n, graded=True, first_seen="2026-07-01")
-        for n in range(3)
+        _score_row(f"g{n}", score=20 + n, graded=True, first_seen="2026-07-01") for n in range(3)
     ]
     pending = [
         _score_row(f"p{n:02d}", score=90, graded=False, first_seen=f"2026-07-{n + 1:02d}")
@@ -230,8 +237,7 @@ async def test_saturated_window_is_logged_not_silent(
     The old behaviour was a silent 1,000-row truncation nothing could observe."""
     monkeypatch.setattr(jobs_mod, "_CANDIDATE_WINDOW", 2)
     rows = [
-        _score_row(f"j{n}", score=50 - n, graded=True, first_seen="2026-07-01")
-        for n in range(5)
+        _score_row(f"j{n}", score=50 - n, graded=True, first_seen="2026-07-01") for n in range(5)
     ]
 
     with caplog.at_level(logging.WARNING):
@@ -276,7 +282,7 @@ async def test_window_ordering_matches_the_python_ranking_it_feeds() -> None:
 def _collation_rows() -> list[dict[str, Any]]:
     """Titles whose Postgres order is NOT any Python sort of the same values."""
     titles = [
-        ".NET & React Full Stack Developer",       # glibc: punctuation ignored
+        ".NET & React Full Stack Developer",  # glibc: punctuation ignored
         "(1508) Senior Fullstack Engineer",
         "abridge Platform Engineer",
         "Accenture Delivery Engineer",
@@ -284,7 +290,7 @@ def _collation_rows() -> list[dict[str, Any]]:
     rows = []
     for i, title in enumerate(titles):
         row = _score_row(f"j{i}", score=50, graded=True, first_seen="2026-07-01", title=title)
-        row["__db_order"] = i          # the DB's collation order
+        row["__db_order"] = i  # the DB's collation order
         rows.append(row)
     return rows
 
@@ -306,9 +312,7 @@ async def test_window_order_survives_a_post_fetch_filter_dropping_rows() -> None
     this is what makes preserving the window index safe."""
     rows = _collation_rows()
     sb = _supabase(rows)
-    result = await _list(
-        sb, sort="title", ascending=True, page_size=10, only_terms=["remote"]
-    )
+    result = await _list(sb, sort="title", ascending=True, page_size=10, only_terms=["remote"])
     kept = [p["title"] for p in result["postings"]]
     expected = [r["jobs"]["title"] for r in rows if r["jobs"]["title"] in kept]
     assert kept == expected
@@ -327,16 +331,33 @@ async def test_archived_view_still_sorts_in_python() -> None:
     # archived view — it overwrites ``status`` from user_jobs, so the flag on
     # the posting is what counts (the 30d sweep's output, UX/IA §5 Stage 1).
     postings = {
-        "j0": {"id": "j0", "title": "a", "company_name": "Zeta",
-               "archived_at": "2026-07-20T00:00:00+00:00"},
-        "j1": {"id": "j1", "title": "b", "company_name": "alpha",
-               "archived_at": "2026-07-21T00:00:00+00:00"},
+        "j0": {
+            "id": "j0",
+            "title": "a",
+            "company_name": "Zeta",
+            "archived_at": "2026-07-20T00:00:00+00:00",
+        },
+        "j1": {
+            "id": "j1",
+            "title": "b",
+            "company_name": "alpha",
+            "archived_at": "2026-07-21T00:00:00+00:00",
+        },
     }
     sb = two_query_supabase(rows, postings)
     result = await _list_jobs_for_target_two_query(
-        sb, target_id="t-1", cursor={}, page_size=10, sort="company_name",
-        ascending=True, min_score=None, status="archived", company=None,
-        search=None, exclude_terms=[], only_terms=[],
+        sb,
+        target_id="t-1",
+        cursor={},
+        page_size=10,
+        sort="company_name",
+        ascending=True,
+        min_score=None,
+        status="archived",
+        company=None,
+        search=None,
+        exclude_terms=[],
+        only_terms=[],
     )
     # casefold order: alpha before Zeta (codepoint order would invert it).
     assert [p["company_name"] for p in result["postings"]] == ["alpha", "Zeta"]
@@ -462,9 +483,7 @@ async def test_other_sorts_do_not_split_on_the_posted_date(
         _posted_row("a", posted="2026-07-01", cataloged="2026-08-01"),
         _posted_row("b", posted=None, cataloged="2026-08-02"),
     ]
-    result = await _list(
-        _posted_supabase(rows), sort="company_name", ascending=True, page_size=20
-    )
+    result = await _list(_posted_supabase(rows), sort="company_name", ascending=True, page_size=20)
     ids = [p["id"] for p in result["postings"]]
     assert sorted(ids) == ["a", "b"], ids
     assert len(ids) == len(set(ids))

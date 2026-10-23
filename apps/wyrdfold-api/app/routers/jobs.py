@@ -916,9 +916,7 @@ def _order_candidate_window(
     desc = not ascending
     if sort == "score":
         column = "recency_score" if tier == "graded" else "job_first_seen_at"
-        return query.order(column, desc=desc, nullsfirst=False).order(
-            "job_posting_id", desc=desc
-        )
+        return query.order(column, desc=desc, nullsfirst=False).order("job_posting_id", desc=desc)
     if archived_view:
         return query.order("job_posting_id", desc=desc)
     # The undated tier has no provider date to order by — fall back to when we
@@ -987,9 +985,7 @@ async def _fetch_candidate_window(
             archived_view=archived_view,
             tier=tier,
         ).range(0, _CANDIDATE_WINDOW - 1)
-        resp = await execute_with_retry(
-            query.execute, label=label, retry_statement_timeout=True
-        )
+        resp = await execute_with_retry(query.execute, label=label, retry_statement_timeout=True)
         rows = cast(list[dict[str, Any]], resp.data or [])
         if len(rows) >= _CANDIDATE_WINDOW:
             logger.warning(
@@ -1980,9 +1976,7 @@ async def _list_jobs_across_user_targets_two_query(
         query = (
             supabase.table("scores")
             .select(
-                _SCORE_ROW_COLS
-                + ", target_id"
-                + ("" if archived_view else _jobs_embed_for(sort))
+                _SCORE_ROW_COLS + ", target_id" + ("" if archived_view else _jobs_embed_for(sort))
             )
             .in_("target_id", list(user_target_ids))
             .eq("excluded", False)
@@ -2015,13 +2009,9 @@ async def _list_jobs_across_user_targets_two_query(
     # collapse would hide a job everywhere the moment the target it was
     # removed from happened to win the dedup — "remove from this target" has
     # to leave it visible under the others.
-    removed = await _removed_pairs(
-        supabase, user_id=user_id, target_ids=list(user_target_ids)
-    )
+    removed = await _removed_pairs(supabase, user_id=user_id, target_ids=list(user_target_ids))
     if removed:
-        score_rows = [
-            r for r in score_rows if (r["target_id"], r["job_posting_id"]) not in removed
-        ]
+        score_rows = [r for r in score_rows if (r["target_id"], r["job_posting_id"]) not in removed]
 
     if not score_rows:
         return {"postings": [], "next_cursor": None, "total": 0}
@@ -2241,9 +2231,7 @@ def _logistics_core(
                 # Surface the contradictions so they can be reviewed rather
                 # than silently dropped — this is the population worth fixing
                 # upstream in the extraction.
-                logger.info(
-                    "remote_filter.disagreement extraction=remote posting_is_remote=False"
-                )
+                logger.info("remote_filter.disagreement extraction=remote posting_is_remote=False")
             return False
     if f.min_salary is not None:
         if salary_currency == "USD" and salary_period == "yearly":
@@ -2324,9 +2312,7 @@ def _apply_logistics_filter(
     return kept
 
 
-def _cap_unknown_country(
-    rows: list[dict[str, Any]], wanted: str
-) -> list[dict[str, Any]]:
+def _cap_unknown_country(rows: list[dict[str, Any]], wanted: str) -> list[dict[str, Any]]:
     """Bound the unknown-country tail behind a country filter (#805).
 
     ``_logistics_core`` keeps a row whose country is unknown, on purpose: a
@@ -2891,9 +2877,7 @@ async def _pipeline_counts_python(
     # can no longer see.
     removed = await _removed_pairs(supabase, user_id=user_id, target_ids=list(target_ids))
     if removed:
-        score_rows = [
-            r for r in score_rows if (r["target_id"], r["job_posting_id"]) not in removed
-        ]
+        score_rows = [r for r in score_rows if (r["target_id"], r["job_posting_id"]) not in removed]
     job_ids = sorted({cast(str, r["job_posting_id"]) for r in score_rows})
     counts: dict[str, int] = {}
     for i in range(0, len(job_ids), _IN_CHUNK_SIZE):

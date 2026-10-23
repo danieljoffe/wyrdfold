@@ -74,17 +74,19 @@ def test_honest_and_fabricated_in_one_letter_still_flags() -> None:
 
 def test_skills_present_in_the_payload_are_never_invented() -> None:
     """React/WCAG are genuinely in the payload; claiming them is not invention."""
-    assert _invented_skills(
-        "I built a React component library and resolved 200 WCAG violations.",
-        _PAYLOAD,
-    ) == []
+    assert (
+        _invented_skills(
+            "I built a React component library and resolved 200 WCAG violations.",
+            _PAYLOAD,
+        )
+        == []
+    )
 
 
 def test_refusal_detector_separates_decline_from_honest_framing() -> None:
     """The two must not be conflated: conceding a gap is the desired behaviour,
     declining to write the letter is the bug this PR fixes."""
-    assert _refuses("I am flagging this mismatch rather than generating a "
-                    "misleading letter.")
+    assert _refuses("I am flagging this mismatch rather than generating a misleading letter.")
     assert _refuses("This role is not a fit for my background.")
     assert not _refuses(
         "I want to be direct: this role is a reach from my background, and I "

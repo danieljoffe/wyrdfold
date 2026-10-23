@@ -29,10 +29,18 @@ from app.services.date_normalize import normalize_posted_at
 from app.services.workday import KnownPosting, _needs_detail, _posting_bucket, _refresh_bucket
 
 _SHALLOW = [
-    {"externalPath": "/job/a", "title": "Engineer", "postedOn": "Posted Today",
-     "locationsText": "Austin, TX"},
-    {"externalPath": "/job/b", "title": "Designer", "postedOn": "Posted Today",
-     "locationsText": "Austin, TX"},
+    {
+        "externalPath": "/job/a",
+        "title": "Engineer",
+        "postedOn": "Posted Today",
+        "locationsText": "Austin, TX",
+    },
+    {
+        "externalPath": "/job/b",
+        "title": "Designer",
+        "postedOn": "Posted Today",
+        "locationsText": "Austin, TX",
+    },
 ]
 
 
@@ -149,7 +157,9 @@ async def test_only_the_changed_posting_is_fetched(
     monkeypatch.setattr(workday, "_fetch_one_posting_detail", _fake_detail)
     monkeypatch.setattr(workday, "_refresh_bucket", lambda *_a, **_k: -1)
 
-    known = _known(**{"/job/b": KnownPosting(title="Designer II", posted_at_stored=_stored_today())})
+    known = _known(
+        **{"/job/b": KnownPosting(title="Designer II", posted_at_stored=_stored_today())}
+    )
     jobs = await workday.fetch_workday_jobs(
         "https://acme.wd1.myworkdayjobs.com|acme|External", known=known
     )
@@ -214,9 +224,7 @@ async def _fetch_with(monkeypatch, **kwargs: Any) -> tuple[list[Any], list[str]]
 async def test_postings_the_free_gates_reject_cost_no_detail_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    jobs, detail_calls = await _fetch_with(
-        monkeypatch, admissible=lambda _title, _loc: False
-    )
+    jobs, detail_calls = await _fetch_with(monkeypatch, admissible=lambda _title, _loc: False)
     assert detail_calls == [], "a rejected posting must not cost a request"
     # Still returned, so the stale-archive pass counts them as seen — the
     # poller drops them at the same gates it always did.
