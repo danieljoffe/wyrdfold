@@ -57,7 +57,7 @@ Run outputs land in `scripts/eval_results/` (also gitignored).
 
 ## Notes
 
-- The Dockerfile uses `ghcr.io/astral-sh/uv:latest` for deps, then `python:3.11-slim` at runtime.
+- The Dockerfile uses `ghcr.io/astral-sh/uv:latest` for deps, then `python:3.14-slim` (pinned by digest) at runtime.
 - Railway supplies `$PORT` at runtime; the `startCommand` in `railway.toml` binds to it.
 - Healthcheck path is `/health`; Railway marks the deploy live once it returns 200.
 - Auth: Supabase JWT for user requests, `WYRDFOLD_API_KEY` for cron / poller / batch. Persistence is scoped per authenticated `user_id` in the service layer; database-level tenant isolation via RLS is tracked in #79.

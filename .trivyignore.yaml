@@ -3,21 +3,6 @@
 # looked at again instead of rotting. YAML (not the plain .trivyignore format)
 # because only YAML can scope an entry to specific paths.
 
-vulnerabilities:
-  # wheel / jaraco.context land in /app/.venv because `uv sync` uses them
-  # as build helpers when installing source distributions. The runtime app
-  # never invokes either tool (no setup.py runs, no wheel files processed
-  # inside the container). Real exploit path would require running
-  # `pip install` / `wheel install` against attacker-controlled input
-  # inside the production container — we don't.
-  # They aren't in uv.lock (build-system deps, not project deps), so the
-  # fix has to come from uv pulling in newer versions transitively — track
-  # upstream and remove this entry on next bump.
-  - id: CVE-2026-24049
-    expired_at: 2027-03-31
-  - id: CVE-2026-23949
-    expired_at: 2027-03-31
-
 secrets:
   # Not a credential. From 1.15 the Anthropic SDK documents its agents-beta
   # `execution_identity` option with the literal text
