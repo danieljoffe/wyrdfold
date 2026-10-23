@@ -474,10 +474,13 @@ jobs:
           fi
           pandoc --version
 
+      # `ruff format --check` keeps layout drift out of develop, so reformatting
+      # never rides along in a feature diff (36 files had drifted before it ran).
       - name: Lint, typecheck, test
         working-directory: apps/wyrdfold-api
         run: |
           uv run --package wyrdfold-api ruff check .
+          uv run --package wyrdfold-api ruff format --check .
           uv run --package wyrdfold-api mypy app/
           uv run --package wyrdfold-api pytest -v
 

@@ -1,0 +1,6 @@
+# Commits `git blame` should skip because they only change layout.
+# GitHub's blame view reads this file automatically. Locally, run once:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# style(api): apply ruff format to the 36 files that had drifted
+2e0e90a7de11c0d6f733ef9d4a273dae0c8b4606
