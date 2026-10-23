@@ -170,13 +170,40 @@ describe('auth/callback GET', () => {
       );
     });
 
-    it('caps caller-supplied error text before it reaches Sentry', async () => {
-      const longText = 'x'.repeat(5000);
-      await GET(makeRequest(`error=${longText}&error_description=${longText}`));
+    it('sends Sentry known error codes only, never the URL text', async () => {
+      // Anyone can write these params, so a credential, an email or a
+      // résumé fragment would otherwise reach Sentry verbatim.
+      const res = await GET(
+        makeRequest(
+          'error=PLANTED-jane%40example.com&error_code=PLANTED-TOKEN' +
+            '&error_description=PLANTED-RESUME-TEXT'
+        )
+      );
 
       const [, options] = mockCaptureMessage.mock.calls[0];
-      expect(options.extra.errorParam).toHaveLength(201);
-      expect(options.extra.errorDescription).toHaveLength(201);
+      expect(options.extra).toEqual({ error: 'other', errorCode: 'other' });
+      expect(JSON.stringify(mockCaptureMessage.mock.calls)).not.toContain(
+        'PLANTED'
+      );
+      // The redirect still tells the user what Supabase said.
+      expect(res.headers.get('location')).toBe(
+        `${ORIGIN}/login?auth_error=PLANTED-jane%40example.com`
+      );
+    });
+
+    it('passes known codes through and never the description', async () => {
+      await GET(
+        makeRequest(
+          'error=access_denied&error_code=otp_expired' +
+            '&error_description=Email+link+is+invalid+or+has+expired'
+        )
+      );
+
+      const [, options] = mockCaptureMessage.mock.calls[0];
+      expect(options.extra).toEqual({
+        error: 'access_denied',
+        errorCode: 'otp_expired',
+      });
     });
 
     it('bounces with missing_code when neither code nor token_hash is present', async () => {

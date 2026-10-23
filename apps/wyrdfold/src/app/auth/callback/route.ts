@@ -51,13 +51,55 @@ function bounceToLogin(origin: string, reason: string): NextResponse {
   return NextResponse.redirect(url);
 }
 
-// Caller-supplied text bound for Sentry: enough to read, never a payload.
-const SENTRY_TEXT_LIMIT = 200;
+// What Sentry may learn from Supabase's error redirect. Every value in the
+// URL is whatever the link's author put there, so only known codes are sent
+// (anything else becomes `other`) and the free-text `error_description`
+// never is. `error` is an OAuth 2.0 code (RFC 6749 §4.1.2.1)…
+const OAUTH_ERRORS: ReadonlySet<string> = new Set([
+  'access_denied',
+  'invalid_request',
+  'invalid_scope',
+  'server_error',
+  'temporarily_unavailable',
+  'unauthorized_client',
+  'unsupported_response_type',
+]);
 
-function clip(value: string): string {
-  return value.length > SENTRY_TEXT_LIMIT
-    ? `${value.slice(0, SENTRY_TEXT_LIMIT)}…`
-    : value;
+// …and `error_code` is Supabase's own: the codes from auth-js's ErrorCode
+// list (lib/error-codes.ts, not exported) that an email link or an OAuth
+// callback can fail with. A code missing here is reported as `other`.
+const LINK_ERROR_CODES: ReadonlySet<string> = new Set([
+  'bad_code_verifier',
+  'bad_oauth_callback',
+  'bad_oauth_state',
+  'email_address_invalid',
+  'email_address_not_authorized',
+  'email_not_confirmed',
+  'email_provider_disabled',
+  'flow_state_expired',
+  'flow_state_not_found',
+  'invite_not_found',
+  'otp_disabled',
+  'otp_expired',
+  'over_email_send_rate_limit',
+  'over_request_rate_limit',
+  'provider_disabled',
+  'request_timeout',
+  'session_expired',
+  'session_not_found',
+  'signup_disabled',
+  'unexpected_failure',
+  'user_banned',
+  'user_not_found',
+  'validation_failed',
+]);
+
+function knownCode(
+  allowed: ReadonlySet<string>,
+  value: string | null
+): string | null {
+  if (value === null) return null;
+  return allowed.has(value) ? value : 'other';
 }
 
 /**
@@ -91,7 +133,7 @@ export async function GET(request: Request) {
   const tokenHash = searchParams.get('token_hash');
   const otpType = asOtpType(searchParams.get('type'));
   const errorParam = searchParams.get('error');
-  const errorDescription = searchParams.get('error_description');
+  const errorCode = searchParams.get('error_code');
 
   const cookieStore = await cookies();
   const cookieNext = cookieStore.get(NEXT_COOKIE)?.value;
@@ -103,13 +145,11 @@ export async function GET(request: Request) {
   // redirecting back with `?error=...&error_description=...`. Surface
   // those before attempting any exchange.
   if (errorParam) {
-    // Supabase's own error code and description, not secrets. Anyone can
-    // put text in a URL, though, so only a capped amount reaches Sentry.
     Sentry.captureMessage('auth/callback: supabase returned error', {
       level: 'warning',
       extra: {
-        errorParam: clip(errorParam),
-        errorDescription: errorDescription && clip(errorDescription),
+        error: knownCode(OAUTH_ERRORS, errorParam),
+        errorCode: knownCode(LINK_ERROR_CODES, errorCode),
       },
     });
     return bounceToLogin(origin, errorParam);
