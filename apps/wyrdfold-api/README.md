@@ -60,4 +60,4 @@ Run outputs land in `scripts/eval_results/` (also gitignored).
 - The Dockerfile uses `ghcr.io/astral-sh/uv:latest` for deps, then `python:3.14-slim` (pinned by digest) at runtime.
 - Railway supplies `$PORT` at runtime; the `startCommand` in `railway.toml` binds to it.
 - Healthcheck path is `/health`; Railway marks the deploy live once it returns 200.
-- Auth: Supabase JWT for user requests, `WYRDFOLD_API_KEY` for cron / poller / batch. Persistence is scoped per authenticated `user_id` in the service layer; database-level tenant isolation via RLS is tracked in #79.
+- Auth: Supabase JWT for user requests. Operator routes take `WYRDFOLD_CRON_KEY` as `x-api-key` (the web app's `/api/jobs/poll` cron sends only this key); `WYRDFOLD_API_KEY` is a legacy key accepted only where the cron key is, and deployed environments leave it unset. `.env.example` lists which operator routes also need a JWT. Persistence is scoped per authenticated `user_id` in the service layer; database-level tenant isolation via RLS is tracked in #79.
