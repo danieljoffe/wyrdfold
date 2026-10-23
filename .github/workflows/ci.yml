@@ -267,8 +267,12 @@ jobs:
           sudo dpkg -i /tmp/supabase.deb
           supabase --version
 
+      # Same stack start as the rls-integration job — see the comment there for
+      # why the images come from ghcr.io and which services are skipped.
       - name: Start Supabase stack
-        run: supabase start
+        env:
+          SUPABASE_INTERNAL_IMAGE_REGISTRY: ghcr.io
+        run: supabase start -x studio,postgres-meta,logflare,vector,imgproxy
 
       # NEXT_PUBLIC_* are inlined into the client bundle at BUILD time, so
       # this export must land before "Build wyrdfold" below.
@@ -534,10 +538,19 @@ jobs:
 
       # ubuntu-latest preinstalls Docker. `supabase start` boots the local stack
       # (Postgres + PostgREST + GoTrue + Storage) and applies every migration,
-      # so the suite exercises real RLS against the current schema. config.toml
-      # already disables the heavy unused services (imgproxy/edge-runtime/pooler).
+      # so the suite exercises real RLS against the current schema.
+      #
+      # The images come from ghcr.io instead of the CLI's default,
+      # public.ecr.aws. ECR caps anonymous downloads per source IP, and GitHub's
+      # shared runner IPs keep hitting that cap ("toomanyrequests: Data limit
+      # exceeded" — 7 of the 14 most recent failed CI runs); Supabase publishes
+      # the same tags to ghcr.io. `-x` skips the services no test uses — the
+      # dashboard (studio + postgres-meta), the logs pipeline (logflare +
+      # vector) and image resizing (imgproxy): 5 of the 12 images.
       - name: Start Supabase stack
-        run: supabase start
+        env:
+          SUPABASE_INTERNAL_IMAGE_REGISTRY: ghcr.io
+        run: supabase start -x studio,postgres-meta,logflare,vector,imgproxy
 
       # Guard against a false green: if the stack weren't reachable the conftest
       # would SKIP the whole suite (pytest still exits 0). Confirm REST answers
