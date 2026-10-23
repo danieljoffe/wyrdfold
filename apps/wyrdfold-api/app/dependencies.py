@@ -194,11 +194,11 @@ def verify_api_key(
     key: str | None = Security(api_key_header),
     s: Settings = Depends(get_settings),
 ) -> str:
-    # Strictly operator/cron routes accept EITHER the legacy
-    # ``WYRDFOLD_API_KEY`` or the narrower ``WYRDFOLD_CRON_KEY`` (#29 R3 /
-    # H4). The broad user-data acceptance in ``verify_api_key_or_jwt`` keeps
-    # accepting only the legacy key, so the cron key can never authenticate
-    # against user data.
+    # Operator routes accept EITHER the legacy ``WYRDFOLD_API_KEY`` or the
+    # narrower ``WYRDFOLD_CRON_KEY`` (#29 R3 / H4). The user-data gate
+    # (``verify_api_key_or_jwt``) accepts neither since #192, so no shared key
+    # can authenticate against user data. Six operator routes sit on JWT-gated
+    # routers and so need a user JWT as well (see ``config.py``).
     if not _operator_key_matches(key, s):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return key or ""

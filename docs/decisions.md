@@ -16,6 +16,13 @@ leaked key alone can't trigger them and neither can an ordinary user. The
 comments now say so, and `tests/test_apikey_scope.py` walks the real app and
 pins the exact set, so a new or moved operator route fails the test.
 
+The same #192 change left every `user_id is None` "operator / api-key" branch in
+the jobs, targets and tailor routers unreachable over HTTP:
+`get_current_user_id_optional` returns the JWT's user once the router gate has
+passed. So `PATCH /targets/{id}` refuses everyone and the operator hard-delete
+never runs. Each router now says so at the top. Removing those branches, or
+re-gating them like the six, is a separate decision.
+
 ## 2026-09-18 — The SDK is a drift surface; OpenRouter Claude calls get a raw Messages transport (#1067)
 
 anthropic 1.0 removed the sampling kwargs (#1065) and swapped httpx for httpx2

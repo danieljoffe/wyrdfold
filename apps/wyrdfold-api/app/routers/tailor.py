@@ -119,6 +119,11 @@ from app.services.tailor.reuse import (
 
 _log = logging.getLogger(__name__)
 
+# Since #192 every route here needs a user JWT, so over HTTP
+# ``get_current_user_id_optional`` returns that user's id and the
+# ``user_id is None`` branches below, which comments call the operator /
+# api-key / cron path, are unreachable; only in-process callers and tests
+# take them.
 router = APIRouter(
     prefix="/tailor",
     tags=["tailor"],
