@@ -3,6 +3,19 @@
 The incidents behind the standing rules. Newest first. Each entry: what
 happened, what we decided, where the rule lives now.
 
+## 2026-10-23 — Six operator routes need a user JWT and the operator key, on purpose
+
+#192 made the user-data routers JWT-only. Six operator routes live on those
+routers and add `verify_api_key` themselves: jobs rescore + backfill-salary,
+sources POST + seed, targets poll-jobs + funnel. Since #192 a caller has needed
+both a signed-in user's JWT and the operator key, while the docstrings and
+`config.py` still said the key alone opened them. Nobody noticed: nothing calls
+these routes (the web app's poll-jobs proxy had been removed as dead), and
+`test_target_scoring.py` overrides both gates. Decided: keep needing both, so a
+leaked key alone can't trigger them and neither can an ordinary user. The
+comments now say so, and `tests/test_apikey_scope.py` walks the real app and
+pins the exact set, so a new or moved operator route fails the test.
+
 ## 2026-09-18 — The SDK is a drift surface; OpenRouter Claude calls get a raw Messages transport (#1067)
 
 anthropic 1.0 removed the sampling kwargs (#1065) and swapped httpx for httpx2

@@ -3425,11 +3425,11 @@ async def rescore_for_target(
 ) -> dict[str, Any]:
     """Re-score all jobs against a target's scoring profile.
 
-    Admin / operator-only: gated by ``verify_api_key`` so an
-    unauthenticated caller can't trigger an O(jobs × scoring_keywords)
-    DB-heavy re-score by hitting the API directly. Not reachable from
-    the wyrdfold FE — only invoked manually from the operator console
-    or from CLI scripts that supply the api key.
+    Admin / operator-only: needs the operator key (``verify_api_key``) on
+    top of the router's user JWT, so neither a leaked key nor an ordinary
+    signed-in user can trigger an O(jobs × scoring_keywords) DB-heavy
+    re-score. Not reachable from the wyrdfold FE; a manual call sends a
+    signed-in user's Bearer token and ``x-api-key``.
 
     Runs ``bulk_score_for_target`` on the pooled async service client, awaited on
     the loop (#57 PR-G2e-4) — the same re-scorer the feedback learner uses.
@@ -3499,9 +3499,10 @@ async def backfill_salary(
     single `bulk_update_salaries` RPC — turns ~N row-by-row UPDATEs
     into one statement per batch.
 
-    Admin-only: gated by ``verify_api_key`` so an unauthenticated
-    caller can't trigger a full-table scan + per-row salary extraction.
-    Not reachable from the wyrdfold FE.
+    Admin-only: needs the operator key (``verify_api_key``) on top of the
+    router's user JWT, so neither a leaked key nor an ordinary signed-in
+    user can trigger a full-table scan + per-row salary extraction. Not
+    reachable from the wyrdfold FE.
     """
     updated = await _run_salary_backfill(supabase)
     job_list_cache.invalidate()

@@ -2080,9 +2080,10 @@ async def poll_jobs_for_target(
 ) -> PollResult:
     """Poll all job sources, filtering for jobs matching this target's search keywords.
 
-    Admin / operator-only: gated by ``verify_api_key`` so an
-    unauthenticated caller can't trigger a fan-out poll across all
-    configured ATS sources. Not reachable from the wyrdfold FE.
+    Admin / operator-only: needs the operator key (``verify_api_key``) on
+    top of the router's user JWT, so neither a leaked key nor an ordinary
+    signed-in user can trigger a fan-out poll across all configured ATS
+    sources. Not reachable from the wyrdfold FE.
 
     The target read and the poll fan-out both run natively on the async service
     client (#57).
@@ -2135,8 +2136,9 @@ async def get_target_funnel(
 ) -> TargetFunnelResponse:
     """Diagnostic funnel report for one target (#845).
 
-    API-key-only — the response includes per-user list floors and the
-    target's scoring profile, which is operator-facing data, not user
+    Operator-only: needs the operator key (``verify_api_key``) on top of
+    the router's user JWT — the response includes per-user list floors and
+    the target's scoring profile, which is operator-facing data, not user
     surface. Read-only.
     """
     try:

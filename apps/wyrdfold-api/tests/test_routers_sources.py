@@ -49,7 +49,7 @@ def test_sources_unauth_returns_401():
 
 def test_sources_jwt_only_caller_cannot_write():
     """JWT-only authenticated users must not mutate the global source list —
-    only the operator/cron API key can. Regression for P0-Sec-1."""
+    a write also needs the operator key. Regression for P0-Sec-1."""
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     # Pass the *or-jwt* check (mimicking a JWT user) but leave verify_api_key
     # un-overridden so it falls through to the real check (no api-key header).
