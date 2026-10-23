@@ -75,8 +75,8 @@ def _is_async_query(query: Any) -> bool:
     In plain terms: running an async query in a thread does not run it — it
     hands back a coroutine nobody awaits. A read then crashes on ``.data`` and
     a write never reaches the database while looking like it did (Sentry
-    PYTHON-FASTAPI-4H: a target-activation task outlived the pool during a
-    deploy's shutdown and was still holding an async client).
+    PYTHON-FASTAPI-4H: a target-activation task still held an async client
+    after the pool was gone — and only shutdown clears the pool).
     """
     return inspect.iscoroutinefunction(query.execute)
 
