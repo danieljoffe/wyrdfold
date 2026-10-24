@@ -425,6 +425,7 @@ async def test_integration_cutoff_drops_low_scores() -> None:
     # Caller folds pref_score_cutoff=60 into min_score before calling.
     result = await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         cursor={},
         page_size=10,
@@ -461,6 +462,7 @@ async def test_integration_null_tags_kept_with_active_pref_filter() -> None:
 
     result = await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         cursor={},
         page_size=10,
@@ -504,6 +506,7 @@ async def test_integration_employment_type_filter_drops_known_mismatch() -> None
 
     result = await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         cursor={},
         page_size=10,

@@ -27,10 +27,10 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings, settings
 from app.dependencies import (
+    enforce_llm_budget,
     get_async_service_supabase,
     get_async_user_supabase,
     get_current_user_id,
-    get_current_user_id_optional,
     get_llm_client,
     get_settings,
     verify_api_key_or_jwt,
@@ -164,8 +164,7 @@ def _client(
 ) -> Iterator[TestClient]:
     """TestClient with the tailor router's deps overridden.
 
-    ``get_current_user_id_optional`` returns None so ``enforce_llm_budget``
-    short-circuits (it bypasses api-key callers) — the budget gate has its own
+    ``enforce_llm_budget`` is overridden away — the budget gate has its own
     tests and isn't what these exercise.
     """
     mock = supabase if supabase is not None else MagicMock()
@@ -173,7 +172,7 @@ def _client(
     app.dependency_overrides[get_async_service_supabase] = lambda: mock
     app.dependency_overrides[get_async_user_supabase] = lambda: mock
     app.dependency_overrides[get_current_user_id] = lambda: _USER
-    app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    app.dependency_overrides[enforce_llm_budget] = lambda: None
     app.dependency_overrides[get_llm_client] = lambda: MagicMock()
     app.dependency_overrides[get_settings] = lambda: settings.model_copy(
         update={"tailor_max_concurrent_runs": max_concurrent}

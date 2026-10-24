@@ -97,7 +97,7 @@ async def _list(sb: Any, **kwargs: Any) -> dict[str, Any]:
         "only_terms": [],
     }
     base.update(kwargs)
-    return await _list_jobs_for_target_two_query(sb, **base)
+    return await _list_jobs_for_target_two_query(sb, user_id="user-1", **base)
 
 
 @pytest.fixture(autouse=True)
@@ -347,6 +347,7 @@ async def test_archived_view_still_sorts_in_python() -> None:
     sb = two_query_supabase(rows, postings)
     result = await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         cursor={},
         page_size=10,

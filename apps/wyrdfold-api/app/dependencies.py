@@ -497,7 +497,7 @@ def verify_api_key_or_jwt(
 async def _try_decode_jwt_sub_async(request: Request, s: Settings) -> str | None:
     """Return the JWT `sub` if a valid Bearer token is present, else None.
 
-    The async auth path (``get_current_user_id`` / ``_optional`` /
+    The async auth path (``get_current_user_id`` /
     ``get_llm_client``, #57 PR-G2e-8). Same result and side effects as the
     retired sync ``_try_decode_jwt_sub``: decode failures logged at WARNING
     (see ``verify_api_key_or_jwt`` for rationale), and the user id stamped onto
@@ -639,41 +639,19 @@ def get_current_user_email(
     return email if isinstance(email, str) and email else None
 
 
-async def get_current_user_id_optional(
-    request: Request,
-    key: str | None = Security(api_key_header),
-    s: Settings = Depends(get_settings),
-) -> str | None:
-    """Return the JWT `sub`, or None for api-key callers (cron/poller/batch).
-
-    Routes accepting both auth modes use this to thread the user identity
-    through the service layer: JWT → real per-user data, api-key → legacy
-    single-tenant rows (where user_id IS NULL). Raises 401 if neither auth
-    mode matches. The JWT verify runs off the event loop
-    (``_try_decode_jwt_sub_async``); the best-effort last-seen stamp is spawned
-    DETACHED so it never sits on the request's critical path (#57 PR-G2e-8).
-    """
-    sub = await _try_decode_jwt_sub_async(request, s)
-    if sub is not None:
-        if _should_stamp_last_seen(sub, s):
-            spawn_detached(_write_last_seen(sub), name="last-seen-stamp")
-        return sub
-    if _api_key_matches(key, s.wyrdfold_api_key):
-        return None
-    raise HTTPException(status_code=401, detail="Unauthorized")
-
-
 async def enforce_llm_budget(
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
     supabase: AsyncClient = Depends(get_async_service_supabase),
     s: Settings = Depends(get_settings),
 ) -> None:
     """Defense-in-depth budget gate for LLM-touching routes.
 
-    JWT users get checked against rolling hourly/daily/monthly cost caps
-    from `llm_costs`. API-key callers (cron/poller/batch) bypass here —
-    background work is charged to the target's activator and gated in
-    the poller. The monthly cap resolves per plan tier in saas mode
+    The caller is checked against rolling hourly/daily/monthly cost caps
+    from `llm_costs`. JWT-required: with no user there is nothing to meter, so
+    the request is refused rather than let through unchecked. Background work
+    (cron/poller/batch) never comes through here — it is charged to the
+    target's activator and gated in the poller. The monthly cap resolves per
+    plan tier in saas mode
     (`budget.resolve_llm_quota_async`: BYOK payers skip it, managed tiers get
     the plan's interactive-only quota, per-user override wins); self_host
     keeps the settings default + override. 0 disables a window.
@@ -683,8 +661,6 @@ async def enforce_llm_budget(
     FastAPI threadpool worker. Same thresholds / tiers / window ordering as the
     sync gate it replaced.
     """
-    if user_id is None:
-        return
     from app.services.entitlements import NON_BILLABLE_PURPOSES
     from app.services.llm import budget
 

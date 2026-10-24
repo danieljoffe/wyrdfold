@@ -7,10 +7,10 @@ needs a design decision, not a cleanup PR.
 
 Two clients exist (`app/dependencies.py`):
 
-| Client                                                   | Dependency                                                                                                        | RLS                     |
-| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ----------------------- |
-| **User client** — per-request, bound to the caller's JWT | `get_user_supabase` (JWT-only) / `get_supabase_for_caller` (dual-auth: JWT → user client, api-key → service-role) | enforced (`auth.uid()`) |
-| **Service-role** — singleton, bypasses RLS               | `get_supabase`                                                                                                    | bypassed                |
+| Client                                                   | Dependency                                                                                           | RLS                     |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------- |
+| **User client** — per-request, bound to the caller's JWT | `get_user_supabase` / `get_supabase_for_caller` (both JWT-only since #192; the latter was dual-auth) | enforced (`auth.uid()`) |
+| **Service-role** — singleton, bypasses RLS               | `get_supabase`                                                                                       | bypassed                |
 
 ## Migrated — runs on the RLS user client
 
@@ -40,6 +40,9 @@ Two clients exist (`app/dependencies.py`):
 | **Background pipeline** (poller, scheduler, batch, learner internals)                                                                                                      | No request context — these run from cron/queue with the service key, charging work to the activating user via explicit `user_id` params.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 ## Dual-auth (JWT → RLS, api-key → service-role): done (#88)
+
+Since #192 these routes take JWT callers only, and the api-key "operator view"
+branches were removed (2026-10-24), so what follows describes the JWT half.
 
 `jobs.py` list/read surfaces (`GET /jobs`, `/pipeline-counts`, `GET /{id}`)
 now run on `get_supabase_for_caller`: JWT callers ride the RLS user client,

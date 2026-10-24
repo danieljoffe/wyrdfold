@@ -13,7 +13,6 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from postgrest.exceptions import APIError
-from postgrest.types import CountMethod
 from supabase import AsyncClient
 
 from app.cache import job_list_cache, jobs_cache_prefix, make_cache_key
@@ -23,7 +22,6 @@ from app.dependencies import (
     get_async_supabase_for_caller,
     get_async_user_supabase,
     get_current_user_id,
-    get_current_user_id_optional,
     verify_api_key,
     verify_api_key_or_jwt,
 )
@@ -100,16 +98,6 @@ class _RpcIneligibleError(RuntimeError):
     ``except RuntimeError`` still catches it."""
 
 
-# Operator location-filter path fetches pre-filter rows into Python (location
-# can't be filtered server-side), so cap the scan to keep it bounded as `jobs`
-# grows (#113). A hit is logged, never silently truncated.
-_OPERATOR_LOCATION_SCAN_CAP = 10_000
-
-# Since #192 every route here needs a user JWT, so over HTTP
-# ``get_current_user_id_optional`` returns that user's id and the
-# ``user_id is None`` branches below, which comments call the operator /
-# api-key / cron path, are unreachable; only in-process callers and tests
-# take them.
 router = APIRouter(
     prefix="/jobs",
     tags=["jobs"],
@@ -282,7 +270,7 @@ async def _fetch_jobs_chunked(
     supabase: AsyncClient,
     page_ids: list[str],
     *,
-    user_id: str | None,
+    user_id: str,
     status: str | None,
     company: str | None,
     search: str | None,
@@ -297,8 +285,8 @@ async def _fetch_jobs_chunked(
     caller's per-user status, not the global ``jobs.status``. For each
     chunk we fetch the ``jobs`` rows WITHOUT a status filter, then look
     up the caller's ``user_jobs`` statuses for the same ids and overlay
-    them (``'new'`` for any job the user hasn't touched, and for every
-    job when ``user_id is None``). The status filter is then applied on
+    them (``'new'`` for any job the user hasn't touched). The status
+    filter is then applied on
     that per-user value, mirroring the old semantics.
 
     **Archived exclusion:** when ``status`` is not explicitly supplied
@@ -334,10 +322,9 @@ async def _fetch_jobs_chunked(
         rows = cast(list[dict[str, Any]], resp.data or [])
 
         # Resolve per-user status: jobs the user hasn't touched (no
-        # user_jobs row) — and every job when there's no user identity —
-        # read as 'new' (#75 "absent = new" rule).
+        # user_jobs row) read as 'new' (#75 "absent = new" rule).
         status_map: dict[str, str] = {}
-        if user_id is not None and rows:
+        if rows:
             uj_resp = (
                 await supabase.table("user_jobs")
                 .select("job_posting_id,status")
@@ -525,7 +512,7 @@ async def _list_jobs_for_target_rpc(
     exclude_terms: list[str],
     only_terms: list[str],
     cursor: dict[str, Any],
-    user_id: str | None = None,
+    user_id: str,
 ) -> dict[str, Any]:
     # Neither RPC knows ``posted_at``: their SQL maps the sort token through a
     # CASE whose ELSE branch is ``score``, so an unrecognised token does not
@@ -1198,7 +1185,7 @@ async def _assemble_jobs_page(
     exclude_terms: list[str],
     only_terms: list[str],
     preferences: TargetPreferences | None,
-    user_id: str | None,
+    user_id: str,
     logistics: _LogisticsFilter | None = None,
     include_unknown_salary_by_target: dict[str, bool] | None = None,
     explicit_floor: bool = False,
@@ -1224,8 +1211,8 @@ async def _assemble_jobs_page(
 
         Single-target path: the one ``preferences`` object. Cross-target: the
         row's winning target's pref from ``include_unknown_salary_by_target``
-        (absent target → the model default, True). api-key/global paths pass
-        neither → strict False, the pre-wiring behavior.
+        (absent target → the model default, True). A caller passing neither
+        gets strict False, the pre-wiring behavior.
         """
         if preferences is not None:
             return preferences.pref_include_unknown_salary
@@ -1247,7 +1234,7 @@ async def _assemble_jobs_page(
         """``_include_unknown_salary`` for a scores row (no hydrated posting
         exists yet at pre-filter time). Same precedence: explicit per-target
         preferences win; the cross-target path falls back to the row's winning
-        target's pref; api-key/global paths stay strict."""
+        target's pref; a caller passing neither stays strict."""
         if preferences is not None:
             return preferences.pref_include_unknown_salary
         if include_unknown_salary_by_target is None:
@@ -1473,7 +1460,7 @@ async def _assemble_jobs_page(
 
 
 async def _removed_pairs(
-    supabase: AsyncClient, *, user_id: str | None, target_ids: list[str]
+    supabase: AsyncClient, *, user_id: str, target_ids: list[str]
 ) -> set[tuple[str, str]]:
     """``(target_id, job_posting_id)`` pairs the caller removed from a target.
 
@@ -1481,10 +1468,8 @@ async def _removed_pairs(
     ``remove_job_from_target``. The pair granularity is load-bearing on the
     cross-target paths: a job removed from target A must stay visible under
     target B, so these paths cannot collapse to a flat set of job ids.
-
-    Anonymous / operator callers (``user_id is None``) have no removals.
     """
-    if user_id is None or not target_ids:
+    if not target_ids:
         return set()
     resp = (
         await supabase.table("user_target_job_removals")
@@ -1500,7 +1485,7 @@ async def _removed_pairs(
 
 
 async def _removed_job_ids(
-    supabase: AsyncClient, *, user_id: str | None, target_ids: list[str]
+    supabase: AsyncClient, *, user_id: str, target_ids: list[str]
 ) -> set[str]:
     """Job ids removed from any of ``target_ids``. Safe to flatten only when
     the caller is scoped to a SINGLE target — see ``_removed_pairs``."""
@@ -1524,7 +1509,7 @@ async def _list_jobs_for_target_two_query(
     cursor: dict[str, Any],
     axis_weights: AxisWeights | None = None,
     preferences: TargetPreferences | None = None,
-    user_id: str | None = None,
+    user_id: str,
     logistics: _LogisticsFilter | None = None,
     explicit_floor: bool = False,
 ) -> dict[str, Any]:
@@ -1618,7 +1603,7 @@ async def _list_jobs_for_target(
     cursor: dict[str, Any],
     axis_weights: AxisWeights | None = None,
     preferences: TargetPreferences | None = None,
-    user_id: str | None = None,
+    user_id: str,
     logistics: _LogisticsFilter | None = None,
     explicit_floor: bool = False,
 ) -> dict[str, Any]:
@@ -1765,7 +1750,7 @@ async def _list_jobs_across_user_targets_rpc(
     search: str | None,
     cursor: dict[str, Any],
     weights_by_target: dict[str, AxisWeights] | None = None,
-    user_id: str | None = None,
+    user_id: str,
 ) -> dict[str, Any]:
     """Untargeted list via the server-side dedup+sort+paginate RPC (#365).
 
@@ -1851,7 +1836,7 @@ async def _list_jobs_across_user_targets(
     only_terms: list[str],
     cursor: dict[str, Any],
     weights_by_target: dict[str, AxisWeights] | None = None,
-    user_id: str | None = None,
+    user_id: str,
     logistics: _LogisticsFilter | None = None,
     include_unknown_salary_by_target: dict[str, bool] | None = None,
     explicit_floor: bool = False,
@@ -1950,7 +1935,7 @@ async def _list_jobs_across_user_targets_two_query(
     only_terms: list[str],
     cursor: dict[str, Any],
     weights_by_target: dict[str, AxisWeights] | None = None,
-    user_id: str | None = None,
+    user_id: str,
     logistics: _LogisticsFilter | None = None,
     include_unknown_salary_by_target: dict[str, bool] | None = None,
     explicit_floor: bool = False,
@@ -2174,7 +2159,7 @@ def _logistics_passes(
       ``include_unknown_salary`` (the per-(user, target)
       ``pref_include_unknown_salary``, wired 2026-07-31) relaxes exactly that
       unknown-drop — a KNOWN salary below the floor is dropped either way. The
-      api-key/global paths keep the strict default. The bound
+      bound
       PREFERS the deterministic jobs-level columns (``salary_max``/``salary_min``
       parsed from the posting's own salary text — present for the whole corpus,
       yearly-USD gated) and falls back to the Phase-2 grader's
@@ -2523,114 +2508,6 @@ def _apply_preferences_filter(
     ]
 
 
-async def _list_jobs_operator(
-    supabase: AsyncClient,
-    *,
-    cursor_data: dict[str, Any],
-    page_size: int,
-    sort: str,
-    ascending: bool,
-    min_score: int | None,
-    status: str | None,
-    company: str | None,
-    search: str | None,
-    exclude_terms: list[str],
-    only_terms: list[str],
-) -> dict[str, Any]:
-    """Operator/global list path (api-key, no JWT): full ``jobs`` table view,
-    no target scoping. The operator/global view only distinguishes live vs
-    archived; per-user statuses (saved/applied/…) don't apply without a user,
-    so it derives a ``status`` of "archived"/"new" from ``archived_at``.
-
-    Extracted from ``list_jobs`` so the async handler holds no literal
-    ``.execute()`` on the loop (#57 slice 3 / #107) — the two reads await here.
-    """
-    query = supabase.table("jobs").select(
-        _JP_SELECT_COLS + ", archived_at",
-        count=CountMethod.exact,
-    )
-    if min_score is not None:
-        query = query.gte("score", min_score)
-    if status == "archived":
-        # Operators wanting an archive audit pass status='archived' to see
-        # globally-dead jobs.
-        query = query.not_.is_("archived_at", "null")
-    else:
-        # Default (status is None or any per-user value, which the operator
-        # has no notion of): show only live jobs.
-        query = query.is_("archived_at", "null")
-    if company:
-        query = query.eq("company_name", company)
-    query = _apply_title_search(query, search)
-
-    # Per-user status isn't sortable on the global view (column gone); fall
-    # back to a safe default if a caller asks to sort by it.
-    operator_sort = "created_at" if sort == "status" else sort
-
-    # Operator view keeps offset pagination under an opaque cursor (it's a
-    # bounded table scan, not the keyset hot path).
-    operator_offset = _offset_from_cursor(cursor_data)
-
-    def _finalize_operator_rows(
-        rows: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        # Derive the response ``status`` from global liveness and drop the
-        # helper column so the response shape is unchanged.
-        for row in rows:
-            row["status"] = "archived" if row.get("archived_at") else "new"
-            row.pop("archived_at", None)
-        return rows
-
-    has_location_filter = bool(exclude_terms or only_terms)
-    if has_location_filter:
-        # Location is post-fetch — server-side ``.range()`` would return
-        # a pre-filter page whose total is wrong and whose contents may
-        # mostly get trimmed. Fetch the full (pre-location) set ordered
-        # server-side, filter in Python, then paginate from the result.
-        query = (
-            query.order(operator_sort, desc=not ascending)
-            .order("id", desc=not ascending)
-            .limit(_OPERATOR_LOCATION_SCAN_CAP)
-        )
-        resp = await query.execute()
-        all_rows = cast(list[dict[str, Any]], list(resp.data or []))
-        if len(all_rows) >= _OPERATOR_LOCATION_SCAN_CAP:
-            logger.warning(
-                "Operator location filter hit the %d-row scan cap; postings "
-                "beyond it were not searched.",
-                _OPERATOR_LOCATION_SCAN_CAP,
-            )
-        filtered = _apply_location_filter(
-            all_rows,
-            exclude_terms=exclude_terms,
-            only_terms=only_terms,
-        )
-        return {
-            "postings": _finalize_operator_rows(
-                filtered[operator_offset : operator_offset + page_size]
-            ),
-            "next_cursor": _offset_next_cursor(operator_offset, page_size, len(filtered)),
-            "total": len(filtered),
-            "applied_min_score": min_score,
-        }
-    # The id tiebreaker is load-bearing, not cosmetic: OFFSET pagination over a
-    # non-unique ORDER BY (``company_name`` has whole blocks of equal values) is
-    # not stable in Postgres — successive pages may repeat and skip rows.
-    query = (
-        query.order(operator_sort, desc=not ascending)
-        .order("id", desc=not ascending)
-        .range(operator_offset, operator_offset + page_size - 1)
-    )
-    resp = await query.execute()
-    operator_total = resp.count or 0
-    return {
-        "postings": _finalize_operator_rows(cast(list[dict[str, Any]], list(resp.data or []))),
-        "next_cursor": _offset_next_cursor(operator_offset, page_size, operator_total),
-        "total": operator_total,
-        "applied_min_score": min_score,
-    }
-
-
 @router.get("")
 async def list_jobs(
     cursor: str | None = Query(None),
@@ -2650,14 +2527,12 @@ async def list_jobs(
     remote_only: bool = Query(False),
     min_salary: int | None = Query(None, ge=0),
     country: str | None = Query(None, max_length=4),
-    # #88 dual-auth: JWT callers ride the RLS user client (jobs/scores/targets
-    # are SELECT-true; user_jobs/user_targets/user_profiles self-scoped, and
-    # the get_target_jobs RPC is SECURITY INVOKER with an authenticated EXECUTE
-    # grant, so RLS still governs inside it). Api-key callers (user_id None,
-    # the operator view below) get the service-role client — they have no JWT
-    # to bind. The client choice mirrors get_current_user_id_optional.
+    # #88: the caller rides the RLS user client (jobs/scores/targets are
+    # SELECT-true; user_jobs/user_targets/user_profiles self-scoped, and the
+    # get_target_jobs RPC is SECURITY INVOKER with an authenticated EXECUTE
+    # grant, so RLS still governs inside it).
     supabase: AsyncClient = Depends(get_async_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> dict[str, Any]:
     exclude_terms = _parse_location_list(exclude_locations)
     only_terms = _parse_location_list(only_locations)
@@ -2695,32 +2570,19 @@ async def list_jobs(
     if cached is not None:
         return cached
 
-    # JWT callers see only postings from their ACTIVE memberships — pausing
-    # a target removes its jobs from the list (Group D decision, 2026-07-30;
-    # the link itself and all authz/dedup surfaces stay any-status). The
-    # api-key path (cron/poller) bypasses scoping — it operates on the
-    # whole table by design (e.g. backfill, rescore-all, cost rollup).
-    user_target_ids: set[str] | None = None
-    if user_id is not None:
-        user_target_ids = await _active_target_ids(supabase, user_id)
-        if not user_target_ids:
-            empty: dict[str, Any] = {
-                "postings": [],
-                "next_cursor": None,
-                "total": 0,
-                "applied_min_score": min_score,
-            }
-            job_list_cache.set(cache_key, empty)
-            return empty
-        if target_id and target_id not in user_target_ids:
-            empty = {
-                "postings": [],
-                "next_cursor": None,
-                "total": 0,
-                "applied_min_score": min_score,
-            }
-            job_list_cache.set(cache_key, empty)
-            return empty
+    # Callers see only postings from their ACTIVE memberships — pausing a
+    # target removes its jobs from the list (Group D decision, 2026-07-30;
+    # the link itself and all authz/dedup surfaces stay any-status).
+    user_target_ids = await _active_target_ids(supabase, user_id)
+    if not user_target_ids or (target_id and target_id not in user_target_ids):
+        empty: dict[str, Any] = {
+            "postings": [],
+            "next_cursor": None,
+            "total": 0,
+            "applied_min_score": min_score,
+        }
+        job_list_cache.set(cache_key, empty)
+        return empty
 
     # When no chip is set, fall back to the user's stored threshold —
     # historically ``user_profiles.job_score_threshold`` only gated SMS
@@ -2734,31 +2596,29 @@ async def list_jobs(
     # must keep showing new intake — trimming it there is the harm the
     # exemption exists to prevent.
     explicit_floor = min_score is not None and min_score > 0
-    if min_score is None and user_id is not None:
+    if min_score is None:
         min_score = await _default_min_score_for_user(supabase, user_id)
 
     # Target view: sort/paginate by target-specific scores
     if target_id:
         # Per-pairing axis weights override the displayed score for this
         # user's target view. Per-pairing preferences (#60) filter/re-rank
-        # that view at read time. Both are JWT-only — api-key callers get raw
-        # scores + no preference filtering (no user identity to scope by) — and
-        # both are read from the SAME user_targets row, so this is one round-trip.
+        # that view at read time. Both are read from the SAME user_targets
+        # row, so this is one round-trip.
         axis_weights: AxisWeights | None = None
         preferences: TargetPreferences | None = None
-        if user_id is not None:
-            ut = await _get_user_target_async(supabase, user_id, target_id)
-            if ut is not None:
-                axis_weights = ut.axis_weights
-                preferences = preferences_from_user_target(ut)
-                # Fold the preference score cutoff into the effective floor.
-                # Take the MAX of any explicit/profile-default min_score and
-                # the cutoff so the stricter bar wins, and so a user who set
-                # min_score=0 to "see everything" still can't drop below a
-                # cutoff they configured. Pushed server-side via min_score —
-                # this is a filter over the shared cached score, not a re-grade.
-                cutoff = preferences.pref_score_cutoff
-                min_score = cutoff if min_score is None else max(min_score, cutoff)
+        ut = await _get_user_target_async(supabase, user_id, target_id)
+        if ut is not None:
+            axis_weights = ut.axis_weights
+            preferences = preferences_from_user_target(ut)
+            # Fold the preference score cutoff into the effective floor.
+            # Take the MAX of any explicit/profile-default min_score and
+            # the cutoff so the stricter bar wins, and so a user who set
+            # min_score=0 to "see everything" still can't drop below a
+            # cutoff they configured. Pushed server-side via min_score —
+            # this is a filter over the shared cached score, not a re-grade.
+            cutoff = preferences.pref_score_cutoff
+            min_score = cutoff if min_score is None else max(min_score, cutoff)
         result = await _list_jobs_for_target(
             supabase,
             explicit_floor=explicit_floor,
@@ -2784,50 +2644,22 @@ async def list_jobs(
         job_list_cache.set(cache_key, result)
         return result
 
-    # Untargeted list — for JWT callers, return the union of jobs scored
-    # against any of the user's active targets (deduplicated). For api-key
-    # callers (cron/poller) we keep the old "table scan" path: they need
-    # to operate on the whole table by design (rescore-all, backfill).
-    if user_target_ids is not None:
-        # Build target_id -> AxisWeights map for any pairings that have
-        # custom weights set. Missing entries fall through to raw score.
-        weights_by_target: dict[str, AxisWeights] = {}
-        # Per-target pref_include_unknown_salary (wired 2026-07-31) — rides
-        # the same user_targets read as the weights.
-        include_unknown_salary_by_target: dict[str, bool] = {}
-        for ut in await _list_user_targets_async(supabase, user_id):  # type: ignore[arg-type]
-            if ut.axis_weights is not None:
-                weights_by_target[ut.target_id] = ut.axis_weights
-            include_unknown_salary_by_target[ut.target_id] = ut.pref_include_unknown_salary
-        result = await _list_jobs_across_user_targets(
-            supabase,
-            explicit_floor=explicit_floor,
-            user_target_ids=user_target_ids,
-            page_size=page_size,
-            sort=sort,
-            ascending=ascending,
-            min_score=min_score,
-            status=status,
-            company=company,
-            search=search,
-            exclude_terms=exclude_terms,
-            only_terms=only_terms,
-            cursor=cursor_data,
-            weights_by_target=weights_by_target or None,
-            user_id=user_id,
-            logistics=logistics,
-            include_unknown_salary_by_target=include_unknown_salary_by_target,
-        )
-        # No display post-step: both list paths already return THE score —
-        # the RPC selects it, the two-query overlay sets it from _display (#665).
-        result["applied_min_score"] = min_score
-        job_list_cache.set(cache_key, result)
-        return result
-
-    # Operator path (api-key, no JWT): full table view, no target scoping.
-    operator_result = await _list_jobs_operator(
+    # Untargeted list: the union of jobs scored against any of the caller's
+    # active targets (deduplicated).
+    # Build target_id -> AxisWeights map for any pairings that have
+    # custom weights set. Missing entries fall through to raw score.
+    weights_by_target: dict[str, AxisWeights] = {}
+    # Per-target pref_include_unknown_salary (wired 2026-07-31) — rides
+    # the same user_targets read as the weights.
+    include_unknown_salary_by_target: dict[str, bool] = {}
+    for ut in await _list_user_targets_async(supabase, user_id):
+        if ut.axis_weights is not None:
+            weights_by_target[ut.target_id] = ut.axis_weights
+        include_unknown_salary_by_target[ut.target_id] = ut.pref_include_unknown_salary
+    result = await _list_jobs_across_user_targets(
         supabase,
-        cursor_data=cursor_data,
+        explicit_floor=explicit_floor,
+        user_target_ids=user_target_ids,
         page_size=page_size,
         sort=sort,
         ascending=ascending,
@@ -2837,9 +2669,17 @@ async def list_jobs(
         search=search,
         exclude_terms=exclude_terms,
         only_terms=only_terms,
+        cursor=cursor_data,
+        weights_by_target=weights_by_target or None,
+        user_id=user_id,
+        logistics=logistics,
+        include_unknown_salary_by_target=include_unknown_salary_by_target,
     )
-    job_list_cache.set(cache_key, operator_result)
-    return operator_result
+    # No display post-step: both list paths already return THE score —
+    # the RPC selects it, the two-query overlay sets it from _display (#665).
+    result["applied_min_score"] = min_score
+    job_list_cache.set(cache_key, result)
+    return result
 
 
 _JOB_STATUSES = (
@@ -2860,7 +2700,7 @@ async def _pipeline_counts_python(
     *,
     target_ids: set[str],
     min_score: int | None,
-    user_id: str | None,
+    user_id: str,
 ) -> dict[str, int]:
     """Fallback used when the ``pipeline_counts`` RPC is unavailable
     (e.g. mid-deploy before the migration lands). Mirrors the JWT list
@@ -2894,21 +2734,18 @@ async def _pipeline_counts_python(
         ).execute()
         live_ids = [cast(str, r["id"]) for r in cast(list[dict[str, Any]], live_resp.data or [])]
         # Resolve per-user status for the chunk; jobs with no user_jobs
-        # row — and every job when there's no user identity — count as
-        # 'new' (#75 "absent = new" rule).
-        status_map: dict[str, str] = {}
-        if user_id is not None:
-            uj_resp = (
-                await supabase.table("user_jobs")
-                .select("job_posting_id,status")
-                .eq("user_id", user_id)
-                .in_("job_posting_id", chunk)
-                .execute()
-            )
-            status_map = {
-                cast(str, r["job_posting_id"]): cast(str, r["status"])
-                for r in cast(list[dict[str, Any]], uj_resp.data or [])
-            }
+        # row count as 'new' (#75 "absent = new" rule).
+        uj_resp = (
+            await supabase.table("user_jobs")
+            .select("job_posting_id,status")
+            .eq("user_id", user_id)
+            .in_("job_posting_id", chunk)
+            .execute()
+        )
+        status_map: dict[str, str] = {
+            cast(str, r["job_posting_id"]): cast(str, r["status"])
+            for r in cast(list[dict[str, Any]], uj_resp.data or [])
+        }
         for jid in live_ids:
             st = status_map.get(jid, "new")
             counts[st] = counts.get(st, 0) + 1
@@ -2920,7 +2757,7 @@ async def _pipeline_counts_grouped(
     *,
     target_ids: set[str],
     min_score: int | None,
-    user_id: str | None,
+    user_id: str,
 ) -> dict[str, int]:
     """Single grouped count via the ``pipeline_counts`` RPC; falls back
     to the client-side chunked variant if the RPC isn't deployed yet.
@@ -3017,7 +2854,7 @@ async def validate_url(
 async def add_manual_job(
     request: Request,
     body: ManualJobRequest,
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
     supabase: AsyncClient = Depends(get_async_service_supabase),
 ) -> ManualJobResponse:
     """Add a job posting by URL. Extracts metadata via cascade.
@@ -3148,14 +2985,10 @@ async def add_manual_job(
     # active targets. Scoping to the caller's targets is a privacy boundary: an
     # unscoped fan-out would write scores under every user's active target,
     # surfacing one user's pasted URL in every other user's /jobs list via the
-    # scores→user_targets join. Operator/api-key callers (user_id None) keep the
-    # global fan-out for cron/admin back-compat. Shared with the from-url target
-    # flow via materialize_and_score_job (upsert + score + global + force-include),
-    # all on the async service client injected above.
-    if user_id is not None:
-        active_targets = await _active_targets_for_user_async(supabase, user_id)
-    else:
-        active_targets = await _all_active_targets_async(supabase)
+    # scores→user_targets join. Shared with the from-url target flow via
+    # materialize_and_score_job (upsert + score + global + force-include), all
+    # on the async service client injected above.
+    active_targets = await _active_targets_for_user_async(supabase, user_id)
     try:
         posting_id = await materialize_and_score_job(
             supabase,
@@ -3215,27 +3048,6 @@ async def _active_targets_for_user_async(supabase: AsyncClient, user_id: str) ->
         return []
     resp = await supabase.table("targets").select("*").in_("id", target_ids).execute()
     return [_parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
-
-
-async def _all_active_targets_async(supabase: AsyncClient) -> list[JobTarget]:
-    """Async inline of ``crud.get_active`` — the derived ``app_active OR
-    EXISTS(active membership)`` pipeline predicate, two indexed reads deduped in
-    Python (the operator/api-key manual-add fan-out, #57 PR-G2e-4). Mirrors
-    ``targets._active_targets``."""
-    floor_resp = await supabase.table("targets").select("*").eq("app_active", True).execute()
-    member_ids_resp = await (
-        supabase.table("user_targets").select("target_id").eq("is_active", True).execute()
-    )
-    member_ids = {
-        cast(str, r["target_id"]) for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
-    }
-    rows = cast(list[dict[str, Any]], floor_resp.data or [])
-    seen = {cast(str, r["id"]) for r in rows}
-    missing = sorted(member_ids - seen)
-    if missing:
-        member_resp = await supabase.table("targets").select("*").in_("id", missing).execute()
-        rows.extend(cast(list[dict[str, Any]], member_resp.data or []))
-    return [_parse_target(r) for r in rows]
 
 
 async def _user_set_scores_included_async(

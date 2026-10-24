@@ -23,6 +23,13 @@ passed. So `PATCH /targets/{id}` refuses everyone and the operator hard-delete
 never runs. Each router now says so at the top. Removing those branches, or
 re-gating them like the six, is a separate decision.
 
+**2026-10-24 follow-up — removed.** The owner chose deletion. The routes now
+take `get_current_user_id`, the optional dependency is gone, and mypy's
+`warn_unreachable` found the dead branches. Gone with them: the operator `/jobs`
+table scan, `PATCH /targets/{id}` (now 405), the operator hard delete, and the
+api-key create/attach path in from-posting. `enforce_llm_budget` also takes a
+required user now, so no request can skip the spend check by having no user.
+
 ## 2026-09-18 — The SDK is a drift surface; OpenRouter Claude calls get a raw Messages transport (#1067)
 
 anthropic 1.0 removed the sampling kwargs (#1065) and swapped httpx for httpx2
