@@ -24,14 +24,14 @@ résumé tailoring. Live at wyrdfold.com (Vercel FE + Railway API + hosted Supab
     `apps/wyrdfold/node_modules/next/dist/docs/` and heed deprecation notices.
     (This folds in Next's auto-generated agent rules; generation is disabled via
     `agentRules: false` in `next.config.mjs`.)
-- `apps/wyrdfold-api` — FastAPI (Python 3.11, uv workspace). Poller, scoring, LLM
-  pipeline (`app/services/`), routers.
+- `apps/wyrdfold-api` — FastAPI (Python 3.14 in CI and the prod image, `requires-python >=3.11`;
+  uv workspace). Poller, scoring, LLM pipeline (`app/services/`), routers.
 - `apps/wyrdfold-e2e` — Playwright. `supabase/migrations/` — Postgres schema (manual
   apply; see rules).
 
 ## Key commands
 
-- API tests: `cd apps/wyrdfold-api && uv run pytest -q` (+ `ruff check`, `mypy app`).
+- API tests: `cd apps/wyrdfold-api && uv run pytest -q` (+ `ruff check`, `ruff format --check`, `mypy app`).
   Integration tests need `pytestmark = pytest.mark.integration` (run `-m integration`).
 - FE: `nx test wyrdfold` (jest — run before any FE PR; `nx build` only typechecks),
   `nx lint wyrdfold`. Local FE dev on port 3200; local Supabase on 54321/54322.

@@ -113,7 +113,7 @@ jobs:
 
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
           cache: pnpm
@@ -168,7 +168,7 @@ jobs:
 
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
           cache: pnpm
@@ -233,7 +233,7 @@ jobs:
       # public dev defaults, the test user is created per-run, and the
       # whole stack dies with the runner.
       - name: Install uv (for the wyrdfold-api server)
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -267,8 +267,12 @@ jobs:
           sudo dpkg -i /tmp/supabase.deb
           supabase --version
 
+      # Same stack start as the rls-integration job — see the comment there for
+      # why the images come from ghcr.io and which services are skipped.
       - name: Start Supabase stack
-        run: supabase start
+        env:
+          SUPABASE_INTERNAL_IMAGE_REGISTRY: ghcr.io
+        run: supabase start -x studio,postgres-meta,logflare,vector,imgproxy
 
       # NEXT_PUBLIC_* are inlined into the client bundle at BUILD time, so
       # this export must land before "Build wyrdfold" below.
@@ -343,7 +347,7 @@ jobs:
 
       - name: Upload traces on failure
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: playwright-report
           path: apps/wyrdfold-e2e/test-output/
@@ -365,7 +369,7 @@ jobs:
 
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
           cache: pnpm
@@ -388,7 +392,7 @@ jobs:
 
       - name: Upload Lighthouse reports on failure
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lighthouse-report
           path: .lighthouseci/
@@ -415,7 +419,7 @@ jobs:
           python-version: '3.14'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -470,10 +474,13 @@ jobs:
           fi
           pandoc --version
 
+      # `ruff format --check` keeps layout drift out of develop, so reformatting
+      # never rides along in a feature diff (36 files had drifted before it ran).
       - name: Lint, typecheck, test
         working-directory: apps/wyrdfold-api
         run: |
           uv run --package wyrdfold-api ruff check .
+          uv run --package wyrdfold-api ruff format --check .
           uv run --package wyrdfold-api mypy app/
           uv run --package wyrdfold-api pytest -v
 
@@ -501,7 +508,7 @@ jobs:
           python-version: '3.14'
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -534,10 +541,19 @@ jobs:
 
       # ubuntu-latest preinstalls Docker. `supabase start` boots the local stack
       # (Postgres + PostgREST + GoTrue + Storage) and applies every migration,
-      # so the suite exercises real RLS against the current schema. config.toml
-      # already disables the heavy unused services (imgproxy/edge-runtime/pooler).
+      # so the suite exercises real RLS against the current schema.
+      #
+      # The images come from ghcr.io instead of the CLI's default,
+      # public.ecr.aws. ECR caps anonymous downloads per source IP, and GitHub's
+      # shared runner IPs keep hitting that cap ("toomanyrequests: Data limit
+      # exceeded" — 7 of the 14 most recent failed CI runs); Supabase publishes
+      # the same tags to ghcr.io. `-x` skips the services no test uses — the
+      # dashboard (studio + postgres-meta), the logs pipeline (logflare +
+      # vector) and image resizing (imgproxy): 5 of the 12 images.
       - name: Start Supabase stack
-        run: supabase start
+        env:
+          SUPABASE_INTERNAL_IMAGE_REGISTRY: ghcr.io
+        run: supabase start -x studio,postgres-meta,logflare,vector,imgproxy
 
       # Guard against a false green: if the stack weren't reachable the conftest
       # would SKIP the whole suite (pytest still exits 0). Confirm REST answers
@@ -593,8 +609,9 @@ jobs:
       # `os,library` covers Debian packages from the slim base AND the
       # Python deps resolved into /app/.venv by the builder stage.
       # `ignore-unfixed` keeps the gate firing only on actionable
-      # findings. `.trivyignore` documents the accepted-risk transitive
-      # build-tool CVEs with expiry dates.
+      # findings. Image scans also run Trivy's secret scanner by default;
+      # `.trivyignore.yaml` holds every accepted finding, each with a reason
+      # and an expiry date (YAML so an entry can be scoped to paths).
       #
       # The scanner image is pinned by digest (not just the mutable 0.69.1
       # tag): it runs with the host docker socket mounted, so a re-tagged or
@@ -606,11 +623,11 @@ jobs:
         run: |
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD/.trivyignore:/.trivyignore:ro" \
+            -v "$PWD/.trivyignore.yaml:/.trivyignore.yaml:ro" \
             aquasec/trivy:0.69.1@sha256:1c78ed1ef824ab8bb05b04359d186e4c1229d0b3e67005faacb54a7d71974f73 image \
               --severity HIGH,CRITICAL \
               --vuln-type os,library \
               --ignore-unfixed \
-              --ignorefile /.trivyignore \
+              --ignorefile /.trivyignore.yaml \
               --exit-code 1 \
               wyrdfold-api:ci

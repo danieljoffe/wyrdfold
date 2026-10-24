@@ -220,8 +220,7 @@ def test_step_vocabulary_matches_the_wizard(client_factory):
     from app.models.user_profile import OnboardingStep
 
     wizard = (
-        Path(__file__).resolve().parents[2]
-        / "wyrdfold/src/app/onboarding/OnboardingWizard.tsx"
+        Path(__file__).resolve().parents[2] / "wyrdfold/src/app/onboarding/OnboardingWizard.tsx"
     )
     assert wizard.is_file(), f"wizard not found at {wizard} — fix this path, don't skip"
 

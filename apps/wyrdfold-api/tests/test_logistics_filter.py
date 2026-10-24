@@ -26,9 +26,7 @@ def _row(**logistics: object) -> dict[str, object]:
     }
 
 
-def _p(
-    logistics: dict[str, object] | None, *, is_remote: bool | None = None
-) -> dict[str, object]:
+def _p(logistics: dict[str, object] | None, *, is_remote: bool | None = None) -> dict[str, object]:
     """A minimal posting row carrying only LLM logistics (no structured
     salary columns) — exercises the fallback path.
 
@@ -342,7 +340,9 @@ def test_ca_matches_rows_stored_as_canada() -> None:
 
 def test_de_matches_rows_stored_as_germany() -> None:
     f = _LogisticsFilter(country="DE")
-    assert _logistics_passes({"id": "j", "country": "Germany", "logistics_filters": None}, f) is True
+    assert (
+        _logistics_passes({"id": "j", "country": "Germany", "logistics_filters": None}, f) is True
+    )
 
 
 def test_a_genuine_mismatch_is_still_rejected() -> None:

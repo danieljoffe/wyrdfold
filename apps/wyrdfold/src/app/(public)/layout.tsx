@@ -109,19 +109,22 @@ export default function PublicLayout({ children }: { children: ReactNode }) {
       </div>
       <header className='border-b border-border'>
         <div className='mx-auto flex w-full max-w-6xl items-center justify-between px-4 py-4 md:px-6 md:py-5'>
-          <Link
-            href='/'
-            aria-label='WyrdFold home'
-            className='flex items-center gap-2 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 focus-visible:ring-offset-surface'
-          >
-            <WyrdfoldWordmark aria-hidden className='h-6 w-auto' />
-            <span
-              className='ml-1 inline-flex items-center rounded-full border border-brand-300/40 bg-brand-300/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-brand-950 dark:text-brand-300'
-              aria-label='Private beta'
+          <div className='flex items-center gap-2'>
+            <Link
+              href='/'
+              aria-label='WyrdFold home'
+              className='flex items-center gap-2 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 focus-visible:ring-offset-surface'
             >
+              <WyrdfoldWordmark aria-hidden className='h-6 w-auto' />
+            </Link>
+            {/* Beside the link, not inside it: the link is named only by its
+                aria-label, so visible words inside it would be missing from
+                that name (WCAG 2.5.3 Label in Name — axe's
+                label-content-name-mismatch failed the landing page for it). */}
+            <span className='ml-1 inline-flex items-center rounded-full border border-brand-300/40 bg-brand-300/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-brand-950 dark:text-brand-300'>
               Beta
             </span>
-          </Link>
+          </div>
           <div className='flex items-center gap-3 sm:gap-4'>
             <Link
               href='/search'

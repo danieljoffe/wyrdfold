@@ -114,6 +114,7 @@ def _mark_still_live(source_id: str, *, now: float) -> None:
             del _STILL_LIVE_UNTIL[key]
     _STILL_LIVE_UNTIL[source_id] = now + hours * 3600.0
 
+
 RedetectAction = Literal["still_live", "repoint", "collision", "not_found"]
 
 

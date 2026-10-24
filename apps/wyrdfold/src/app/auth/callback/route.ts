@@ -51,6 +51,69 @@ function bounceToLogin(origin: string, reason: string): NextResponse {
   return NextResponse.redirect(url);
 }
 
+// What Sentry may learn from Supabase's error redirect. Every value in the
+// URL is whatever the link's author put there, so only known codes are sent
+// (anything else becomes `other`) and the free-text `error_description`
+// never is. `error` is an OAuth 2.0 code (RFC 6749 §4.1.2.1)…
+const OAUTH_ERRORS: ReadonlySet<string> = new Set([
+  'access_denied',
+  'invalid_request',
+  'invalid_scope',
+  'server_error',
+  'temporarily_unavailable',
+  'unauthorized_client',
+  'unsupported_response_type',
+]);
+
+// …and `error_code` is Supabase's own: the codes from auth-js's ErrorCode
+// list (lib/error-codes.ts, not exported) that an email link or an OAuth
+// callback can fail with. A code missing here is reported as `other`.
+const LINK_ERROR_CODES: ReadonlySet<string> = new Set([
+  'bad_code_verifier',
+  'bad_oauth_callback',
+  'bad_oauth_state',
+  'email_address_invalid',
+  'email_address_not_authorized',
+  'email_not_confirmed',
+  'email_provider_disabled',
+  'flow_state_expired',
+  'flow_state_not_found',
+  'invite_not_found',
+  'otp_disabled',
+  'otp_expired',
+  'over_email_send_rate_limit',
+  'over_request_rate_limit',
+  'provider_disabled',
+  'request_timeout',
+  'session_expired',
+  'session_not_found',
+  'signup_disabled',
+  'unexpected_failure',
+  'user_banned',
+  'user_not_found',
+  'validation_failed',
+]);
+
+// The params this route reads. Names are written by the link's author too,
+// so any other name is reported as `other`.
+const CALLBACK_PARAMS: ReadonlySet<string> = new Set([
+  'code',
+  'error',
+  'error_code',
+  'error_description',
+  'next',
+  'token_hash',
+  'type',
+]);
+
+function knownCode(
+  allowed: ReadonlySet<string>,
+  value: string | null
+): string | null {
+  if (value === null) return null;
+  return allowed.has(value) ? value : 'other';
+}
+
 /**
  * Handles the auth callback from Supabase. Two flows arrive here:
  *
@@ -82,7 +145,7 @@ export async function GET(request: Request) {
   const tokenHash = searchParams.get('token_hash');
   const otpType = asOtpType(searchParams.get('type'));
   const errorParam = searchParams.get('error');
-  const errorDescription = searchParams.get('error_description');
+  const errorCode = searchParams.get('error_code');
 
   const cookieStore = await cookies();
   const cookieNext = cookieStore.get(NEXT_COOKIE)?.value;
@@ -96,7 +159,10 @@ export async function GET(request: Request) {
   if (errorParam) {
     Sentry.captureMessage('auth/callback: supabase returned error', {
       level: 'warning',
-      extra: { errorParam, errorDescription },
+      extra: {
+        error: knownCode(OAUTH_ERRORS, errorParam),
+        errorCode: knownCode(LINK_ERROR_CODES, errorCode),
+      },
     });
     return bounceToLogin(origin, errorParam);
   }
@@ -136,13 +202,23 @@ export async function GET(request: Request) {
       return bounceToLogin(origin, error.code ?? 'exchange_failed');
     }
   } else {
-    // Neither flow's params present. Most common cause: Supabase
-    // silently substituted site_url for an unallow-listed redirect, so
-    // the link landed at /auth/callback (or wherever site_url points)
-    // without the params Supabase would have appended.
+    // Neither flow could run: no code, and no token_hash with a recognised
+    // type. Most common cause: Supabase silently substituted site_url for
+    // an unallow-listed redirect, so the link landed at /auth/callback (or
+    // wherever site_url points) without the params Supabase would have
+    // appended. Param NAMES only: a token_hash with a missing or unknown
+    // type lands here too, and its value is a live credential.
     Sentry.captureMessage('auth/callback: no code or token_hash', {
       level: 'warning',
-      extra: { search: url.search },
+      extra: {
+        params: [
+          ...new Set(
+            [...searchParams.keys()].map(name =>
+              CALLBACK_PARAMS.has(name) ? name : 'other'
+            )
+          ),
+        ].sort(),
+      },
     });
     return bounceToLogin(origin, 'missing_code');
   }

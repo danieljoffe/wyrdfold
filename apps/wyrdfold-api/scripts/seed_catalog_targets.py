@@ -89,8 +89,7 @@ async def _seed_one(supabase: Client, llm: Any, label: str, *, execute: bool) ->
         links = _user_link_count(supabase, existing.id)
         if links > 0:
             logger.warning(
-                "  SKIP %r — resolves to %s with %d user link(s); "
-                "never adopt a user's row",
+                "  SKIP %r — resolves to %s with %d user link(s); never adopt a user's row",
                 label,
                 existing.id[:8],
                 links,
@@ -110,9 +109,7 @@ async def _seed_one(supabase: Client, llm: Any, label: str, *, execute: bool) ->
     # app_active false, zero memberships — for the whole duration of an LLM
     # call. Any cleanup sweep running in that window would delete a catalog
     # target mid-creation.
-    target = existing or crud.create(
-        supabase, payload=TargetCreate(label=label), app_active=True
-    )
+    target = existing or crud.create(supabase, payload=TargetCreate(label=label), app_active=True)
 
     if target.role_family is None or not (target.search_keywords or []):
         derived, result = await derive_profile_from_label(llm, label=label)

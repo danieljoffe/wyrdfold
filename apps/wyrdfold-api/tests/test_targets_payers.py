@@ -152,9 +152,12 @@ class TestBlockReasonNamesTheRealCause:
             disabled_users=frozenset({"u"}),
         )
         assert gate.user_block_reason("u") == "llm_disabled"
-        assert _gate(
-            over_budget_users=frozenset({"u"}), idle_users=frozenset({"u"})
-        ).user_block_reason("u") == "idle"
+        assert (
+            _gate(
+                over_budget_users=frozenset({"u"}), idle_users=frozenset({"u"})
+            ).user_block_reason("u")
+            == "idle"
+        )
 
     def test_target_level_causes(self, monkeypatch) -> None:
         monkeypatch.setattr(live_settings, "grade_catalog_targets", False)

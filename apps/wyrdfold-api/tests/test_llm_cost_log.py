@@ -640,9 +640,7 @@ def test_a_window_larger_than_the_row_cap_is_summed_in_full() -> None:
 def test_the_operator_breakdown_also_pages() -> None:
     """``spend_by_purpose_all`` has no RPC behind it, so its read is the
     PRIMARY path — it was truncating on every call, not just on failure."""
-    sb, rec = _fake_client(
-        [{"purpose": "phase1_triage", "cost_usd": 0.001} for _ in range(1500)]
-    )
+    sb, rec = _fake_client([{"purpose": "phase1_triage", "cost_usd": 0.001} for _ in range(1500)])
 
     result = cost_log.spend_by_purpose_all(sb, since=datetime.now(UTC) - timedelta(days=30))
 

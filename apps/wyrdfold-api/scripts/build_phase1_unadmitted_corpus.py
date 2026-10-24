@@ -126,7 +126,9 @@ _PAGE = 1000
 _IN_CHUNK = 100
 
 
-def _load_sources(sb: Any, rng: random.Random, per_provider: dict[str, int]) -> list[dict[str, Any]]:
+def _load_sources(
+    sb: Any, rng: random.Random, per_provider: dict[str, int]
+) -> list[dict[str, Any]]:
     """Sample enabled sources, stratified by provider."""
     rows: list[dict[str, Any]] = []
     start = 0
@@ -449,7 +451,9 @@ def _build_fixture(
                     # Computed HERE from the live target and stored as DATA: the
                     # configuration needed to recompute it is deliberately not
                     # committed (see _target_payload).
-                    "stratum": "own_gate" if _title_matches_any_target(title, [t]) else "cross_gate",
+                    "stratum": "own_gate"
+                    if _title_matches_any_target(title, [t])
+                    else "cross_gate",
                     "provider": row["provider"],
                 }
             )
@@ -494,7 +498,9 @@ async def main_async(args: argparse.Namespace) -> None:
     logger.info(
         "Active targets (%d): %s",
         len(active_targets),
-        ", ".join(f"{t.label}{'' if t.app_active else ' [membership-only]'}" for t in active_targets),
+        ", ".join(
+            f"{t.label}{'' if t.app_active else ' [membership-only]'}" for t in active_targets
+        ),
     )
 
     per_provider = dict(_DEFAULT_SOURCES_PER_PROVIDER)

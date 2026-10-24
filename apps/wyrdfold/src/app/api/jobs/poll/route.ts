@@ -19,10 +19,10 @@ function constantTimeEqual(a: string, b: string): boolean {
  * `CRON_SECRET` as a Bearer token.
  *
  * It is NOT user-facing: nothing in the app calls it from a user action
- * (verified — no `/api/jobs/poll` references in the frontend). The
- * per-user "refresh now" surface is the separately authenticated,
- * ownership-checked `/api/targets/[id]/poll-jobs` route, which forwards the
- * user's JWT and polls only that target's sources.
+ * (verified — no `/api/jobs/poll` references in the frontend). There is no
+ * per-user "refresh now" route either: the `/api/targets/[id]/poll-jobs`
+ * proxy was removed as dead, and the API's `/targets/{id}/poll-jobs` is
+ * operator-only (a user JWT plus the operator key).
  *
  * Previously this route also accepted any authenticated user session and
  * then forwarded with the shared `WYRDFOLD_API_KEY`, letting any logged-in

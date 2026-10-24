@@ -682,9 +682,7 @@ def _company_rows(companies: list[str]) -> tuple[list[dict[str, Any]], list[dict
     return ts_rows, jobs_rows
 
 
-async def _company_page(
-    sb: MagicMock, *, cursor: dict[str, Any], page_size: int
-) -> dict[str, Any]:
+async def _company_page(sb: MagicMock, *, cursor: dict[str, Any], page_size: int) -> dict[str, Any]:
     return await _list_jobs_for_target_two_query(
         sb,
         target_id="t-1",
@@ -823,13 +821,29 @@ async def test_both_rpcs_refuse_the_posted_at_sort() -> None:
     sb = _rpc_supabase([], {})
     with pytest.raises(RuntimeError):
         await _list_jobs_for_target_rpc(
-            sb, target_id="t-1", page_size=2, sort="posted_at", ascending=False,
-            min_score=None, status=None, company=None, search=None,
-            exclude_terms=[], only_terms=[], cursor={},
+            sb,
+            target_id="t-1",
+            page_size=2,
+            sort="posted_at",
+            ascending=False,
+            min_score=None,
+            status=None,
+            company=None,
+            search=None,
+            exclude_terms=[],
+            only_terms=[],
+            cursor={},
         )
     with pytest.raises(RuntimeError):
         await _list_jobs_across_user_targets_rpc(
-            sb, user_target_ids={"t-1"}, page_size=2, sort="posted_at",
-            ascending=False, min_score=None, status=None, company=None,
-            search=None, cursor={},
+            sb,
+            user_target_ids={"t-1"},
+            page_size=2,
+            sort="posted_at",
+            ascending=False,
+            min_score=None,
+            status=None,
+            company=None,
+            search=None,
+            cursor={},
         )

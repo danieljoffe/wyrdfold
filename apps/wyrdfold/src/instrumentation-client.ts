@@ -1,5 +1,6 @@
 import * as Sentry from '@sentry/nextjs';
 import { sentryEnabled } from '@/lib/sentry.config';
+import { scrubBreadcrumb, scrubEvent } from '@/lib/sentry.scrub';
 import { publicEnv } from '@/lib/public.env';
 import { isProduction } from '@/utils/helpers';
 
@@ -9,16 +10,19 @@ if (sentryEnabled) {
     environment: publicEnv.NEXT_PUBLIC_NODE_ENV,
     tracesSampleRate: isProduction() ? 0.1 : 1.0,
     sampleRate: 1.0,
+    // The default, stated so nobody flips it: no IPs, cookies or bodies.
+    // scrubEvent below removes what the SDK attaches even so.
+    sendDefaultPii: false,
     // OFF (#29 H-r2-5): no Sentry.logger / consoleLoggingIntegration usage,
-    // and the Logs stream (unlike masked replay) ships unscrubbed — see the
-    // rationale in lib/sentry.config.ts.
+    // and the Logs stream bypasses scrubEvent, so it would ship unscrubbed —
+    // see the rationale in lib/sentry.config.ts.
     enableLogs: false,
 
-    // Heavy integrations are deferred below to avoid blocking LCP
+    // Heavy integrations are deferred below to avoid blocking LCP.
+    // Session Replay stays off: its DOM recording stores each page's full URL,
+    // query string included, and unlike errors and transactions those
+    // recording events can't be scrubbed.
     integrations: [],
-
-    replaysSessionSampleRate: isProduction() ? 0.1 : 0,
-    replaysOnErrorSampleRate: 1.0,
 
     ignoreErrors: [
       /extensions\//i,
@@ -39,8 +43,10 @@ if (sentryEnabled) {
           'page.referrer': document.referrer || 'direct',
         };
       }
-      return event;
+      return scrubEvent(event);
     },
+    beforeSendTransaction: scrubEvent,
+    beforeBreadcrumb: scrubBreadcrumb,
 
     debug: false,
   });
@@ -48,15 +54,6 @@ if (sentryEnabled) {
   if (typeof window !== 'undefined') {
     const loadDeferredIntegrations = () => {
       Sentry.addIntegration(Sentry.browserTracingIntegration());
-      // maskAllText: true is critical for WyrdFold — resume content,
-      // job descriptions, and tailoring prompts contain PII and secrets
-      // that must not leak into Sentry replay payloads.
-      Sentry.addIntegration(
-        Sentry.replayIntegration({
-          maskAllText: true,
-          blockAllMedia: true,
-        })
-      );
     };
 
     if ('requestIdleCallback' in window) {

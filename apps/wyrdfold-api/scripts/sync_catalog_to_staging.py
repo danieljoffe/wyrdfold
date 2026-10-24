@@ -427,9 +427,7 @@ def main(argv: list[str] | None = None) -> int:
     except SyncError as exc:
         print(f"sync: {exc}", file=sys.stderr)
         return 2
-    print(
-        f"sync: reading {src} -> writing {dst}  (limit {limit}, mode=additive)"
-    )
+    print(f"sync: reading {src} -> writing {dst}  (limit {limit}, mode=additive)")
 
     jobs = psql_json(
         read_url,

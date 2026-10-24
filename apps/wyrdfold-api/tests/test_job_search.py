@@ -494,9 +494,7 @@ async def test_blank_q_browses_without_a_title_clause() -> None:
     assert [r.id for r in results] == ["n1"]
     assert has_more is False
     qb = supabase.table.return_value
-    title_clauses = [
-        c.args[0] for c in qb.or_.call_args_list if "title.ilike" in str(c.args[0])
-    ]
+    title_clauses = [c.args[0] for c in qb.or_.call_args_list if "title.ilike" in str(c.args[0])]
     assert title_clauses == []
 
 

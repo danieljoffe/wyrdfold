@@ -181,9 +181,7 @@ def _seeded() -> _FakeSupabase:
         # Carries stripe_customer_id because the deletion path READS it before
         # deleting this row (#889). Without it the cancel-before-delete tests
         # would pass by returning early, proving nothing.
-        "user_profiles": [
-            {"id": _PROFILE_ID, "user_id": _UID, "stripe_customer_id": "cus_seeded"}
-        ],
+        "user_profiles": [{"id": _PROFILE_ID, "user_id": _UID, "stripe_customer_id": "cus_seeded"}],
         # Keyed by the auth uid since R3 §2 (#557) — an ordinary user_id table.
         "notifications_sent": [
             {"user_id": _UID},

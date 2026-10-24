@@ -288,7 +288,7 @@ def test_per_request_url_chatter_is_not_logged(
 
     # The exact record httpx emits, with PII in the query string.
     logging.getLogger(client).info(
-        'HTTP Request: GET https://db/rest/v1/waitlist_signups'
+        "HTTP Request: GET https://db/rest/v1/waitlist_signups"
         '?email=eq.jane%40example.com "HTTP/1.1 200 OK"'
     )
     out = capsys.readouterr().out

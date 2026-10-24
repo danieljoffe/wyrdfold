@@ -1,0 +1,16 @@
+# Trivy ignore list — explicit, expiring acceptances of known findings.
+# Each entry says why it is safe and when it must be re-evaluated, so it gets
+# looked at again instead of rotting. YAML (not the plain .trivyignore format)
+# because only YAML can scope an entry to specific paths.
+
+secrets:
+  # Not a credential. From 1.15 the Anthropic SDK documents its agents-beta
+  # `execution_identity` option with the literal text
+  # `{"type": "service_account"}`, which is the marker Trivy's Google
+  # service-account rule looks for. Scoped to the SDK's own folder and to this
+  # one rule, so a real key anywhere else in the image still fails the scan.
+  - id: gcp-service-account
+    paths:
+      - '/app/.venv/lib/python3.*/site-packages/anthropic/**'
+    expired_at: 2027-04-23
+    statement: Anthropic SDK docstrings, not key material (checked 2026-10-23, anthropic 1.15.0)

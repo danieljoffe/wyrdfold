@@ -105,6 +105,24 @@ describe('auth/callback GET', () => {
         `${ORIGIN}/login?auth_error=missing_code`
       );
     });
+
+    it('reports only param names to Sentry, never the token_hash', async () => {
+      await GET(
+        makeRequest(
+          'token_hash=SECRET-TOKEN-HASH&type=bogus&PLANTED-jane%40example.com=1'
+        )
+      );
+
+      expect(mockCaptureMessage).toHaveBeenCalledTimes(1);
+      const [, options] = mockCaptureMessage.mock.calls[0];
+      // Names the route doesn't read are caller-written too: `other`.
+      expect(options.extra).toEqual({
+        params: ['other', 'token_hash', 'type'],
+      });
+      const sent = JSON.stringify(mockCaptureMessage.mock.calls);
+      expect(sent).not.toContain('SECRET-TOKEN-HASH');
+      expect(sent).not.toContain('PLANTED');
+    });
   });
 
   describe('PKCE code flow (same-browser magic-link sign-in)', () => {
@@ -157,6 +175,42 @@ describe('auth/callback GET', () => {
       expect(res.headers.get('location')).toBe(
         `${ORIGIN}/login?auth_error=otp_expired`
       );
+    });
+
+    it('sends Sentry known error codes only, never the URL text', async () => {
+      // Anyone can write these params, so a credential, an email or a
+      // résumé fragment would otherwise reach Sentry verbatim.
+      const res = await GET(
+        makeRequest(
+          'error=PLANTED-jane%40example.com&error_code=PLANTED-TOKEN' +
+            '&error_description=PLANTED-RESUME-TEXT'
+        )
+      );
+
+      const [, options] = mockCaptureMessage.mock.calls[0];
+      expect(options.extra).toEqual({ error: 'other', errorCode: 'other' });
+      expect(JSON.stringify(mockCaptureMessage.mock.calls)).not.toContain(
+        'PLANTED'
+      );
+      // The redirect still tells the user what Supabase said.
+      expect(res.headers.get('location')).toBe(
+        `${ORIGIN}/login?auth_error=PLANTED-jane%40example.com`
+      );
+    });
+
+    it('passes known codes through and never the description', async () => {
+      await GET(
+        makeRequest(
+          'error=access_denied&error_code=otp_expired' +
+            '&error_description=Email+link+is+invalid+or+has+expired'
+        )
+      );
+
+      const [, options] = mockCaptureMessage.mock.calls[0];
+      expect(options.extra).toEqual({
+        error: 'access_denied',
+        errorCode: 'otp_expired',
+      });
     });
 
     it('bounces with missing_code when neither code nor token_hash is present', async () => {

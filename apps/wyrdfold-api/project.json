@@ -37,7 +37,7 @@
         "{workspaceRoot}/uv.lock"
       ],
       "options": {
-        "command": "uv run --package wyrdfold-api ruff check .",
+        "command": "uv run --package wyrdfold-api ruff check . && uv run --package wyrdfold-api ruff format --check .",
         "cwd": "apps/wyrdfold-api"
       }
     },

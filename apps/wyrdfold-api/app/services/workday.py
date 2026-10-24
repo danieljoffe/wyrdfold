@@ -31,6 +31,7 @@ class KnownPosting:
     # matched nothing and silently skipped no postings at all.
     posted_at_stored: str | None
 
+
 logger = logging.getLogger(__name__)
 
 MAX_JOBS = 200
@@ -341,9 +342,7 @@ async def fetch_workday_jobs(
     )
 
     jobs: list[StandardJob] = []
-    for list_item, detail_result, was_wanted in zip(
-        shallow, detail_results, wanted, strict=True
-    ):
+    for list_item, detail_result, was_wanted in zip(shallow, detail_results, wanted, strict=True):
         if not was_wanted:
             # Held unchanged: return it so the stale-archive pass counts it as
             # seen, flagged so the poller leaves the stored row alone.
