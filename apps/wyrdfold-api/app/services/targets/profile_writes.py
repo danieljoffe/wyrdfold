@@ -93,8 +93,8 @@ def apply_profile_patch_rpc(
 ) -> tuple[Outcome, int | None]:
     """Write ``scoring_profile`` + version bump through the #191 patch RPC.
 
-    Sync form for the poller/learner/feedback + operator ``delete_reference_jd``
-    paths (they hold the sync service client). Interactive ``async def`` router
+    Sync form for the poller/learner/feedback paths (they hold the sync service
+    client). Interactive ``async def`` router
     handlers on the pooled async client use :func:`apply_profile_patch_rpc_async`.
     """
     return _call(

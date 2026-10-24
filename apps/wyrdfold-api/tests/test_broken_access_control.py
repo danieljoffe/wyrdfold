@@ -20,7 +20,6 @@ from app.dependencies import (
     get_async_service_supabase,
     get_async_user_supabase,
     get_current_user_id,
-    get_current_user_id_optional,
     verify_api_key_or_jwt,
 )
 
@@ -172,7 +171,7 @@ def test_target_status_unowned_is_404(monkeypatch: pytest.MonkeyPatch) -> None:
         {
             get_async_service_supabase: lambda: MagicMock(),
             verify_api_key_or_jwt: lambda: "jwt",
-            get_current_user_id_optional: lambda: "user-a",
+            get_current_user_id: lambda: "user-a",
         }
     )
     try:
@@ -185,15 +184,12 @@ def test_target_status_unowned_is_404(monkeypatch: pytest.MonkeyPatch) -> None:
     target_get.assert_not_called()
 
 
-def test_target_status_operator_bypasses(monkeypatch: pytest.MonkeyPatch) -> None:
-    """api-key/operator path (user_id None) bypasses ownership."""
+def test_target_status_owner_gets_the_live_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A caller linked to the target gets its live job count."""
 
     from app.routers import targets as targets_mod
 
-    def _user_target_ids(*_a: Any, **_kw: Any) -> set[str]:
-        raise AssertionError("ownership check should be skipped for operators")
-
-    monkeypatch.setattr(targets_mod, "_user_target_ids", _user_target_ids)
+    monkeypatch.setattr(targets_mod, "_user_target_ids", AsyncMock(return_value={"any-target"}))
 
     target = MagicMock()
     target.activation_status = "ready"
@@ -213,8 +209,8 @@ def test_target_status_operator_bypasses(monkeypatch: pytest.MonkeyPatch) -> Non
     tc = _client_with_overrides(
         {
             get_async_service_supabase: lambda: supabase,
-            verify_api_key_or_jwt: lambda: None,
-            get_current_user_id_optional: lambda: None,
+            verify_api_key_or_jwt: lambda: "jwt",
+            get_current_user_id: lambda: "user-a",
         }
     )
     try:
@@ -257,7 +253,7 @@ def test_get_target_unowned_is_404(monkeypatch: pytest.MonkeyPatch) -> None:
         {
             get_async_service_supabase: lambda: MagicMock(),
             verify_api_key_or_jwt: lambda: "jwt",
-            get_current_user_id_optional: lambda: "user-a",
+            get_current_user_id: lambda: "user-a",
         }
     )
     try:
@@ -287,7 +283,7 @@ def test_reference_jds_unowned_is_404(monkeypatch: pytest.MonkeyPatch) -> None:
         {
             get_async_service_supabase: lambda: MagicMock(),
             verify_api_key_or_jwt: lambda: "jwt",
-            get_current_user_id_optional: lambda: "user-a",
+            get_current_user_id: lambda: "user-a",
         }
     )
     try:
@@ -328,7 +324,7 @@ def test_reference_jds_strips_contributor_user_id(
         {
             get_async_service_supabase: lambda: MagicMock(),
             verify_api_key_or_jwt: lambda: "jwt",
-            get_current_user_id_optional: lambda: "user-a",
+            get_current_user_id: lambda: "user-a",
         }
     )
     try:

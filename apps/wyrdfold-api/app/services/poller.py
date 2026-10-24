@@ -1186,7 +1186,7 @@ async def _active_targets(supabase: AsyncClient) -> list[JobTarget]:
     callers): the derived ``app_active OR EXISTS(active membership)`` pipeline
     predicate — two indexed reads deduped in Python (see the crud docstring for
     the dropped-trigger history). Routed through the poll seam so it rides the
-    pooled async client; mirror of ``routers.targets._active_targets``.
+    pooled async client.
     """
     floor_resp = await poll_db_read(
         supabase,

@@ -230,6 +230,7 @@ async def test_floor_drops_low_graded_but_keeps_low_pending(
     postings = {jid: {"id": jid, "title": jid} for jid in ("g90", "g30", "p20")}
     result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
+        user_id="user-1",
         target_id="t-1",
         page_size=10,
         sort="score",
@@ -270,6 +271,7 @@ async def test_pending_sorts_below_graded_and_is_flagged(monkeypatch: pytest.Mon
     postings = {jid: {"id": jid, "title": jid} for jid in ("g50", "p80", "g70")}
     result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
+        user_id="user-1",
         target_id="t-1",
         page_size=10,
         sort="score",
@@ -319,6 +321,7 @@ async def test_cross_target_dedup_prefers_graded_over_pending(
     postings = {"j": {"id": "j", "title": "j"}}
     result = await _list_jobs_across_user_targets(
         two_query_supabase(scores, postings),
+        user_id="user-1",
         user_target_ids={"t-1", "t-2"},
         page_size=10,
         sort="score",
@@ -413,6 +416,7 @@ async def test_select_shaped_graded_rows_sort_by_score_not_recency(
     postings = {jid: {"id": jid, "title": jid} for jid in ("new45", "old78", "new68")}
     result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
+        user_id="user-1",
         target_id="t-1",
         page_size=10,
         sort="score",
@@ -454,6 +458,7 @@ async def test_ascending_score_sort_returns_rows(monkeypatch: pytest.MonkeyPatch
     postings = {jid: {"id": jid, "title": jid} for jid in ("a78", "b45")}
     result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
+        user_id="user-1",
         target_id="t-1",
         page_size=10,
         sort="score",
@@ -527,6 +532,7 @@ async def test_live_view_applies_jobs_inner_join() -> None:
     sb.table.return_value = rec
     await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         page_size=10,
         sort="score",
@@ -572,6 +578,7 @@ async def test_archived_view_keeps_archived_jobs() -> None:
     sb.table.return_value = rec
     await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         page_size=10,
         sort="score",
@@ -627,6 +634,7 @@ async def test_filtered_path_keeps_graded_first_and_score_order(
     }
     result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
+        user_id="user-1",
         target_id="t-1",
         page_size=10,
         sort="score",
@@ -727,15 +735,30 @@ async def test_embedded_columns_eliminate_gate_and_recency_roundtrips(
         async def execute(self) -> FakeResponse:
             return FakeResponse([{"id": "t-1", "role_family": "engineering"}])
 
+    class _EmptyRec:
+        """The caller's own rows (``user_jobs``, removals): none here."""
+
+        def __getattr__(self, name: str):
+            def _f(*_a: object, **_k: object) -> _EmptyRec:
+                return self
+
+            return _f
+
+        async def execute(self) -> FakeResponse:
+            return FakeResponse([])
+
     sb = MagicMock()
     sb.table.side_effect = lambda name: {
         "scores": _ScoresRec(),
         "jobs": _JobsRec(),
         "targets": _TargetsRec(),
+        "user_jobs": _EmptyRec(),
+        "user_target_job_removals": _EmptyRec(),
     }[name]
 
     result = await _list_jobs_across_user_targets(
         sb,
+        user_id="user-1",
         user_target_ids={"t-1"},
         page_size=10,
         sort="score",
@@ -800,6 +823,7 @@ async def test_explicit_floor_caps_the_pending_tail(monkeypatch: pytest.MonkeyPa
     }
     result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
+        user_id="user-1",
         target_id="t-1",
         page_size=100,
         sort="score",
@@ -830,6 +854,7 @@ async def test_the_prod_shape_no_graded_row_clears_the_bar(
     }
     result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
+        user_id="user-1",
         target_id="t-1",
         page_size=100,
         sort="score",
@@ -859,6 +884,7 @@ async def test_the_profile_default_floor_does_not_cap(monkeypatch: pytest.Monkey
     }
     result = await _list_jobs_for_target_two_query(
         two_query_supabase(scores, postings),
+        user_id="user-1",
         target_id="t-1",
         page_size=100,
         sort="score",

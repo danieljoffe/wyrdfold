@@ -4,7 +4,7 @@ See ``docs/plan-wyrdfold-deployment-modes.md``. The data model is moving to a
 single invariant — every per-user row has a **non-null** owner — so rows created
 by the system itself (the cron poller, batch grader, and other api-key callers)
 need a real owner rather than the legacy ``user_id IS NULL`` single-tenant marker
-that ``get_current_user_id_optional`` threads through the service layer today.
+that the service layer still accepts from in-process callers.
 
 ``SYSTEM_USER_ID`` is that owner: a **reserved ``auth.users`` row** with this
 fixed id, seeded by migration ``20260701130000_seed_system_principal.sql`` so it

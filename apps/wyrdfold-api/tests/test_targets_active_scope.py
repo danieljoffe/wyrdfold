@@ -3,8 +3,7 @@
 `crud.get_active` returns the global union of every user's active
 targets (the shared `targets.is_active` flag is OR'd across users). The
 route must NOT hand that to a JWT caller — it would leak every other
-user's roles + scoring profiles. JWT → the caller's own active targets;
-api-key/operator → the instance-wide view.
+user's roles + scoring profiles. The caller gets their own active targets.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from app.dependencies import (
     get_async_service_supabase,
-    get_current_user_id_optional,
+    get_current_user_id,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -40,16 +39,16 @@ def _target(tid: str, label: str) -> JobTarget:
 def test_jwt_caller_gets_only_their_active_targets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # #57 slice 3: the handler inlines the crud reads as async helpers.
-    global_spy = AsyncMock(return_value=[_target("t-other", "Someone Else's Role")])
+    # #57 slice 3: the handler inlines the crud reads as async helpers. There
+    # is no instance-wide read in the router any more, so the per-user one is
+    # the only source.
     per_user_spy = AsyncMock(return_value=[_target("t-mine", "My Role")])
-    monkeypatch.setattr(router_mod, "_active_targets", global_spy)
     monkeypatch.setattr(router_mod, "_active_targets_for_user", per_user_spy)
 
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "jwt"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: "user-1"
+    app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     try:
         resp = TestClient(app).get("/targets/active")
     finally:
@@ -59,28 +58,4 @@ def test_jwt_caller_gets_only_their_active_targets(
     labels = [t["label"] for t in resp.json()["targets"]]
     assert labels == ["My Role"]
     per_user_spy.assert_called_once()
-    # The global, cross-user query must never run for a JWT caller.
-    global_spy.assert_not_called()
-
-
-def test_api_key_caller_gets_instance_wide_view(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    global_spy = AsyncMock(return_value=[_target("t-1", "Role A"), _target("t-2", "Role B")])
-    per_user_spy = AsyncMock()
-    monkeypatch.setattr(router_mod, "_active_targets", global_spy)
-    monkeypatch.setattr(router_mod, "_active_targets_for_user", per_user_spy)
-
-    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
-    app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
-    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "api-key"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    try:
-        resp = TestClient(app).get("/targets/active")
-    finally:
-        app.dependency_overrides.clear()
-
-    assert resp.status_code == 200
-    assert len(resp.json()["targets"]) == 2
-    global_spy.assert_called_once()
-    per_user_spy.assert_not_called()
+    assert per_user_spy.call_args.args[1] == "user-1"

@@ -16,7 +16,6 @@ from app.dependencies import (
     enforce_llm_budget,
     get_async_supabase_for_caller,
     get_current_user_id,
-    get_current_user_id_optional,
     refresh_jwks_cache,
     try_decode_jwt_sub_cache_only,
     verify_api_key,
@@ -361,8 +360,8 @@ async def test_get_current_user_id_returns_jwt_sub():
 
 
 async def test_get_current_user_id_rejects_api_key_only():
-    """get_current_user_id is JWT-required — api-key callers must use
-    get_current_user_id_optional or a cron-only auth dep instead.
+    """get_current_user_id is JWT-required — api-key callers must use the
+    operator gate (``verify_api_key``) instead.
     """
     req = _make_request()
     with pytest.raises(HTTPException) as exc:
@@ -377,34 +376,6 @@ async def test_get_current_user_id_rejects_unauthenticated():
     assert exc.value.status_code == 401
 
 
-async def test_get_current_user_id_optional_returns_jwt_sub():
-    req = _make_request({"authorization": f"Bearer {_mint()}"})
-    assert await get_current_user_id_optional(req, key=None, s=_settings()) == USER_SUB
-
-
-async def test_get_current_user_id_optional_returns_none_for_api_key():
-    """API-key callers (cron/poller/batch) get None — services map None to
-    the legacy NULL-user_id rows, preserving single-tenant behavior.
-    """
-    req = _make_request()
-    assert await get_current_user_id_optional(req, key="testkey", s=_settings()) is None
-
-
-async def test_get_current_user_id_optional_rejects_unauthenticated():
-    req = _make_request()
-    with pytest.raises(HTTPException) as exc:
-        await get_current_user_id_optional(req, key=None, s=_settings())
-    assert exc.value.status_code == 401
-
-
-async def test_get_current_user_id_optional_prefers_jwt_over_api_key():
-    """If both a valid JWT and a valid API key are present, prefer the JWT
-    so the request runs under the user's identity, not the cron path.
-    """
-    req = _make_request({"authorization": f"Bearer {_mint()}"})
-    assert await get_current_user_id_optional(req, key="testkey", s=_settings()) == USER_SUB
-
-
 def _budget_settings(daily: float = 5.0, hourly: float = 1.0, monthly: float = 5.0) -> Settings:
     return Settings(
         wyrdfold_api_key="testkey",
@@ -415,21 +386,15 @@ def _budget_settings(daily: float = 5.0, hourly: float = 1.0, monthly: float = 5
     )
 
 
-async def test_enforce_llm_budget_apikey_caller_bypasses(monkeypatch):
-    """API-key callers (user_id=None) skip the budget check entirely — no
-    supabase round-trip, no spend lookup. System paths are trusted.
+def test_enforce_llm_budget_requires_a_user():
+    """No caller skips the spend check. The gate takes its user from the
+    JWT-required dependency, so a request without one is refused (401) rather
+    than let through unmetered — it used to return early on ``user_id=None``.
     """
-    from app.services.llm import budget as budget_mod
+    import inspect
 
-    called = False
-
-    async def _spy(*a, **kw):
-        nonlocal called
-        called = True
-
-    monkeypatch.setattr(budget_mod, "check_user_budget_async", _spy)
-    await enforce_llm_budget(user_id=None, supabase=MagicMock(), s=_budget_settings())
-    assert called is False
+    param = inspect.signature(enforce_llm_budget).parameters["user_id"]
+    assert param.default.dependency is get_current_user_id
 
 
 async def test_enforce_llm_budget_jwt_user_invokes_check(monkeypatch):

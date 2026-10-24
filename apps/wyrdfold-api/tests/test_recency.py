@@ -430,6 +430,7 @@ async def test_target_two_query_orders_by_recency_when_enabled(
 
     result = await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         cursor={},
         page_size=10,
@@ -487,6 +488,7 @@ async def test_across_targets_orders_by_recency_when_enabled(
 
     result = await _list_jobs_across_user_targets(
         sb,
+        user_id="user-1",
         user_target_ids={"t-1", "t-2"},
         cursor={},
         page_size=10,
@@ -550,6 +552,7 @@ async def test_two_query_sorts_by_weighted_display_not_raw(
 
     result = await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         cursor={},
         page_size=10,
