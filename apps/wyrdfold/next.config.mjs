@@ -1,7 +1,5 @@
 //@ts-check
 
-import { composePlugins, withNx } from '@nx/next';
-
 const isTest = process.env.NODE_ENV === 'test';
 // CI provider conventions vary: GitHub Actions sets CI=true, Vercel sets CI=1.
 // Truthy check handles both. Also explicitly include VERCEL for clarity.
@@ -20,11 +18,11 @@ const supabaseHost = (() => {
   }
 })();
 
-/**
- * @type {import('@nx/next/plugins/with-nx').WithNxOptions}
- **/
+// A plain Next config: Nx 24 removed `withNx`/`composePlugins` (inert stubs
+// now). With `nx: {}` their only effect here was a webpack callback, which
+// Turbopack never runs — the resolved config and routes are otherwise identical.
+/** @type {import('next').NextConfig} */
 const nextConfig = {
-  nx: {},
   // shared-ui ships ESM-only (dist/lib/*.js). Transpile it so both the Next
   // build and next/jest transform it — node_modules is otherwise left
   // untransformed, which breaks jest with "Cannot use import statement".
@@ -161,20 +159,16 @@ const nextConfig = {
   productionBrowserSourceMaps: false,
 };
 
-const plugins = [withNx];
-
 // The build-config helper lives at the `/config` subpath since @sentry/nextjs
 // 10.75; the root export is deprecated and stops working in v11.
 const { withSentryConfig } = await import('@sentry/nextjs/config');
-
-const nextConfigWithPlugins = composePlugins(...plugins)(nextConfig);
 
 // Skip Sentry config in CI/test to keep build deterministic and avoid
 // uploading source maps during PR checks.
 const finalConfig =
   isCI || isTest
-    ? nextConfigWithPlugins
-    : withSentryConfig(nextConfigWithPlugins, {
+    ? nextConfig
+    : withSentryConfig(nextConfig, {
         org: 'testing-b1',
         project: 'wyrdfold',
 
