@@ -17,8 +17,8 @@ import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 import type { UserTarget } from '../types';
 
-export const THRESHOLD_MIN = 0;
-export const THRESHOLD_MAX = 100;
+const THRESHOLD_MIN = 0;
+const THRESHOLD_MAX = 100;
 
 interface NotificationThresholdsEditorProps {
   targetId: string;

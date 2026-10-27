@@ -1063,21 +1063,3 @@ def count_user_reference_jds(supabase: Client, *, target_id: str, user_id: str) 
         .execute()
     )
     return resp.count or 0
-
-
-def delete_reference_jd(
-    supabase: Client, ref_jd_id: str, *, target_id: str, user_id: str | None = None
-) -> bool:
-    # target_id constrains the delete to the target the route already
-    # ownership-checked — without it, any ref_jd_id across any target
-    # would be deletable (IDOR, audit #24 F1).
-    query = supabase.table(REF_JDS_TABLE).delete().eq("id", ref_jd_id).eq("target_id", target_id)
-    # A regular JWT caller may only remove their OWN contribution (#5
-    # refinement: "remove-your-own + re-merge", never hard-delete others').
-    # No app code calls this sync form any more (the route uses the router's
-    # async inline, which always passes the caller); ``user_id=None`` matches
-    # any contributor and is left for its tests.
-    if user_id is not None:
-        query = query.eq("user_id", user_id)
-    resp = query.execute()
-    return bool(resp.data)

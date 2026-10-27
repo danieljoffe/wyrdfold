@@ -37,7 +37,7 @@ export const LLM_TIMEOUT_MS = 120_000;
 const _AUTH_RETRIES = 1;
 const _AUTH_RETRY_BACKOFF_MS = 100;
 
-export const getAccessToken = cache(async (): Promise<string | null> => {
+const getAccessToken = cache(async (): Promise<string | null> => {
   // WHY THIS RETRIES (red team, 2026-08-08): this helper used to collapse every
   // failure into `null`, and `null` means 401 to all three callers below. That
   // conflated two very different things — "this token is not valid" and "the

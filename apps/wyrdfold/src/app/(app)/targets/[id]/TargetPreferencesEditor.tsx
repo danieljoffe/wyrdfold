@@ -19,7 +19,7 @@ import { extractApiError } from '@/lib/extractApiError';
 import { useToast } from '@/state/Toast/ToastProvider';
 
 // Mirrors the API's SeniorityLevel ladder (app/models/targets.py), low→high.
-export const SENIORITY_LEVELS = [
+const SENIORITY_LEVELS = [
   'ic',
   'senior',
   'staff',
@@ -66,7 +66,7 @@ export const DEFAULT_PREFERENCES: TargetPreferences = {
   pref_include_unknown_salary: true,
 };
 
-export const SCORE_MIN = 0;
+const SCORE_MIN = 0;
 // Job scores are hard-clamped to 0-100 at the write site
 // (api services/scoring.py: `max(0, min(100, ...))`), so a cutoff above
 // 100 could only ever hide every job — and nothing told the user that.
@@ -83,7 +83,7 @@ export function parseList(raw: string): string[] | null {
   return items.length ? items : null;
 }
 
-export function listToInput(value: string[] | null): string {
+function listToInput(value: string[] | null): string {
   return value ? value.join(', ') : '';
 }
 

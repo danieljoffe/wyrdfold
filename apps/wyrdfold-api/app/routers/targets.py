@@ -299,9 +299,10 @@ async def _count_user_reference_jds_async(
 async def _delete_reference_jd_async(
     supabase: AsyncClient, ref_jd_id: str, *, target_id: str, user_id: str
 ) -> bool:
-    """Async inline of ``crud.delete_reference_jd``. ``target_id`` scopes the
-    delete to the already-ownership-checked target (IDOR guard, audit #24 F1);
-    ``user_id`` further constrains it to the caller's OWN contribution."""
+    """Remove one reference JD. ``target_id`` scopes the delete to the
+    already-ownership-checked target (IDOR guard, audit #24 F1); ``user_id``
+    further constrains it to the caller's OWN contribution (#5: remove your
+    own, never hard-delete others')."""
     resp = await (
         supabase.table(crud.REF_JDS_TABLE)
         .delete()

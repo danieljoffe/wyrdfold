@@ -17,7 +17,7 @@ import { fitScoreVariant } from '@/lib/fitScore';
  * caller-supplied tooltip, so on a target card a sighted user read "Fit score
  * 82" and a screen-reader user heard "Match score 82" off the same element.
  */
-export type ScoreKind = 'fit' | 'match';
+type ScoreKind = 'fit' | 'match';
 
 const SCORE_NOUN: Record<ScoreKind, string> = {
   fit: 'Fit score',

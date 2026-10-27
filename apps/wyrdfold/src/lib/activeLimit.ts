@@ -12,7 +12,7 @@
  * complicate every one of its callers for one case.
  */
 
-export interface ActiveTargetChoice {
+interface ActiveTargetChoice {
   id: string;
   label: string;
 }

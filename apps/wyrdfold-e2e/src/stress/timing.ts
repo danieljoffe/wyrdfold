@@ -17,7 +17,7 @@ import type { Page, Request } from '@playwright/test';
 
 export const FLAG_MS = 300;
 
-export interface NetTrace {
+interface NetTrace {
   url: string;
   method: string;
   status: number;
@@ -44,10 +44,6 @@ const LEDGER_DIR =
   process.env['STRESS_LEDGER_DIR'] ??
   path.join(process.cwd(), 'stress-results');
 const LEDGER = path.join(LEDGER_DIR, 'ledger.jsonl');
-
-export function ledgerPath(): string {
-  return LEDGER;
-}
 
 export function resetLedger(): void {
   fs.mkdirSync(LEDGER_DIR, { recursive: true });

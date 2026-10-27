@@ -97,13 +97,13 @@ export interface SkillsCostInsights {
   avg_cost_per_resume: number | null;
 }
 
-export interface NearMissTitle {
+interface NearMissTitle {
   title: string;
   confidence: number;
   last_judged_at: string;
 }
 
-export interface TargetNearMisses {
+interface TargetNearMisses {
   target_id: string;
   label: string;
   titles: NearMissTitle[];

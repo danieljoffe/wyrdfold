@@ -24,33 +24,48 @@ from app.dependencies import (
     get_llm_client,
     verify_api_key_or_jwt,
 )
+from app.routers.targets import _delete_reference_jd_async
 from app.services.llm.mock import MockLLMClient
 from app.services.targets import crud
 
 # ---------------------------------------------------------------------------
-# F1 — crud.delete_reference_jd is scoped to the target
+# F1 — the reference-JD delete is scoped to the target and the contributor
 # ---------------------------------------------------------------------------
 
 
-def test_delete_reference_jd_constrains_on_target_id() -> None:
+def _delete_chain(data: list[dict[str, Any]]) -> tuple[MagicMock, MagicMock]:
     supabase = MagicMock()
     delete_chain = supabase.table.return_value.delete.return_value
-    delete_chain.eq.return_value.eq.return_value.execute.return_value.data = [{"id": "ref-1"}]
+    delete_chain.eq.return_value.eq.return_value.eq.return_value.execute = AsyncMock(
+        return_value=MagicMock(data=data)
+    )
+    return supabase, delete_chain
 
-    assert crud.delete_reference_jd(supabase, "ref-1", target_id="tgt-1") is True
+
+async def test_delete_reference_jd_constrains_on_target_and_contributor() -> None:
+    supabase, delete_chain = _delete_chain([{"id": "ref-1"}])
+
+    assert (
+        await _delete_reference_jd_async(supabase, "ref-1", target_id="tgt-1", user_id="u-1")
+        is True
+    )
 
     supabase.table.assert_called_once_with(crud.REF_JDS_TABLE)
     delete_chain.eq.assert_called_once_with("id", "ref-1")
     delete_chain.eq.return_value.eq.assert_called_once_with("target_id", "tgt-1")
+    delete_chain.eq.return_value.eq.return_value.eq.assert_called_once_with("user_id", "u-1")
 
 
-def test_delete_reference_jd_returns_false_when_not_in_target() -> None:
+async def test_delete_reference_jd_returns_false_when_not_in_target() -> None:
     """A ref_jd_id belonging to a different target matches no row."""
-    supabase = MagicMock()
-    delete_chain = supabase.table.return_value.delete.return_value
-    delete_chain.eq.return_value.eq.return_value.execute.return_value.data = []
+    supabase, _ = _delete_chain([])
 
-    assert crud.delete_reference_jd(supabase, "ref-other-target", target_id="tgt-1") is False
+    assert (
+        await _delete_reference_jd_async(
+            supabase, "ref-other-target", target_id="tgt-1", user_id="u-1"
+        )
+        is False
+    )
 
 
 # ---------------------------------------------------------------------------

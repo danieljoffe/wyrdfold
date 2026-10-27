@@ -30,7 +30,7 @@ export function formatStatus(status: string): string {
   return status.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
-export type ScoringStatus = 'stage1' | 'stage2' | 'complete';
+type ScoringStatus = 'stage1' | 'stage2' | 'complete';
 
 // Sentinel UUID for jobs added via POST /jobs/manual.
 // Mirrors `MANUAL_SOURCE_ID` in apps/wyrdfold-api/app/services/extract.py.
@@ -314,7 +314,7 @@ export function isFlaggedDraft(
  *  - `idle`    — nothing in flight. With a record that means "settled"; with
  *    a null record it's the "Generate" empty state.
  */
-export type TailorRunStatus = 'running' | 'error' | 'idle';
+type TailorRunStatus = 'running' | 'error' | 'idle';
 
 /** Response shape of `GET /api/jobs/tailor/by-job/{id}` (and its cover-letter
  *  sibling). Replaced the bare `TailoredResumeRecord | null` those routes used
@@ -322,12 +322,6 @@ export type TailorRunStatus = 'running' | 'error' | 'idle';
  *  here yet, keep polling" from "nothing here, and nothing coming". */
 export interface TailoredDocumentState {
   record: TailoredResumeRecord | null;
-  status: TailorRunStatus;
-  message?: string | null;
-}
-
-/** 202 body from POST /api/jobs/tailor/resume | /cover-letter. */
-export interface TailorStatusResponse {
   status: TailorRunStatus;
   message?: string | null;
 }

@@ -22,19 +22,11 @@ const config: KnipConfig = {
         'caniuse-lite',
         // ts-node is referenced in tsconfig.json "ts-node" block
         'ts-node',
-        // @swc/cli is the SWC compiler driver referenced via apps/*/.swcrc
-        '@swc/cli',
         // @eslint/js is required by @nx/eslint-plugin flat config presets
         '@eslint/js',
         // eslint-plugin-react-hooks is loaded transitively by @nx/eslint-plugin
         // flat config presets — not imported directly anywhere in our configs
         'eslint-plugin-react-hooks',
-        // ts-jest is required by @nx/jest/preset transform config
-        'ts-jest',
-        // babel-jest is the Jest transformer fallback used by next/jest
-        'babel-jest',
-        // jest-util is a transitive Jest internal pulled in by next/jest
-        'jest-util',
         // eslint-config-next + these plugins are required by name by the
         // @nx/eslint-plugin flat/react-typescript preset, not imported directly.
         'eslint-config-next',
@@ -81,7 +73,14 @@ const config: KnipConfig = {
       // Playwright spec entry points: ``.spec.ts`` files and
       // ``auth.setup.ts`` (referenced by the ``setup`` project's
       // ``testMatch`` regex in playwright.config.ts).
-      entry: ['src/**/*.spec.ts', 'src/**/*.setup.ts'],
+      // Also the stress sweep's ``globalSetup``, which
+      // playwright.stress.config.ts loads via ``require.resolve`` — a string
+      // knip cannot follow.
+      entry: [
+        'src/**/*.spec.ts',
+        'src/**/*.setup.ts',
+        'src/stress/global-setup.ts',
+      ],
       project: ['src/**/*.ts'],
     },
   },
