@@ -72,7 +72,7 @@ async def get_async_supabase_for_caller(
     request: Request,
     s: Settings = Depends(get_settings),
 ) -> AsyncClient:
-    """Per-request RLS-enforced user client for a JWT caller (dual-auth routers).
+    """Per-request RLS-enforced user client for a JWT caller.
 
     Scopes queries by ``auth.uid() = user_id`` at Postgres (not just in Python).
     JWT-only: since #192 the user-data gate rejects shared API keys, so this dep

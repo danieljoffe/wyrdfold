@@ -1553,9 +1553,8 @@ async def get_target(
 ) -> JobTarget:
     # Targets are shared, service-role-read (no RLS backstop). Without this
     # guard any authenticated user could read any target's full JD text and
-    # scoring profile by id (audit #29 round 3 / M3). Operators (api-key,
-    # user_id None) bypass; non-owners get 404 so they can't enumerate
-    # target existence.
+    # scoring profile by id (audit #29 round 3 / M3). Non-owners get 404 so
+    # they can't enumerate target existence.
     await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
     target = await _target_get(supabase, target_id)
     if target is None:
@@ -1999,7 +1998,7 @@ async def get_target_status(
     """Return activation status and job count for a target."""
     # Without this, any authenticated user could read any target's
     # activation status + scored-job count by id (audit #29 round 3 / M2).
-    # Operators (user_id None) bypass; non-owners get 404.
+    # Non-owners get 404.
     await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
     target = await _target_get(supabase, target_id)
     if target is None:
@@ -2560,7 +2559,7 @@ async def list_reference_jds(
     # Reference JDs are read via the service-role client with no RLS
     # backstop. Without this guard any authenticated user could read any
     # target's full reference-JD text by id (audit #29 round 3 / M3).
-    # Operators (user_id None) bypass; non-owners get 404.
+    # Non-owners get 404.
     await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
     ref_jds = await _list_reference_jds_async(supabase, target_id)
     # Strip the contributor ``user_id``: the contribution graph is meant to

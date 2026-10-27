@@ -1163,9 +1163,8 @@ async def approve_tailored_resume(
     # Resume approval also advances the linked job posting to resume_ready;
     # cover letters don't drive job status.
     # Per-user pipeline state lives in user_jobs (#75 C3): no longer touch
-    # the global jobs.status. Api-key callers (user_id None) have no per-user
-    # pipeline, so they skip the mirror; cover letters don't drive job status.
-    if row.document_type == "resume" and row.job_posting_id and user_id:
+    # the global jobs.status.
+    if row.document_type == "resume" and row.job_posting_id:
         await _upsert_user_job(
             supabase,
             user_id=user_id,

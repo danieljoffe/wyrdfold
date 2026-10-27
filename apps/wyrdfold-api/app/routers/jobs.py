@@ -2794,7 +2794,7 @@ async def _pipeline_counts_grouped(
 
 @router.get("/pipeline-counts")
 async def pipeline_counts(
-    # #88 dual-auth: get_current_user_id is JWT-required, so every caller that
+    # #88: get_current_user_id is JWT-required, so every caller that
     # reaches the body carries a JWT and rides the RLS user client (the
     # pipeline_counts RPC is SECURITY INVOKER; user_jobs/user_targets/
     # user_profiles are self-scoped, scores/jobs SELECT-true).
@@ -3426,7 +3426,7 @@ async def _upsert_user_job_async(
 async def get_job(
     posting_id: str,
     user_id: str = Depends(get_current_user_id),
-    # #88 dual-auth: JWT-required endpoint, so callers ride the RLS user
+    # #88: JWT-required endpoint, so callers ride the RLS user
     # client (ownership probe reads jobs/user_targets/scores — SELECT-true or
     # self-scoped; the status overlay reads the caller's own user_jobs row).
     supabase: AsyncClient = Depends(get_async_supabase_for_caller),
