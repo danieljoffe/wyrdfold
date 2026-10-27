@@ -427,64 +427,6 @@ async def test_get_target_scores_uses_rpc_body() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_list_jobs_without_target_returns_global_view(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Global view queries jobs directly with global scores."""
-    from fastapi.testclient import TestClient
-
-    from app.dependencies import (
-        get_async_service_supabase,
-        get_async_supabase_for_caller,
-        get_current_user_id_optional,
-        verify_api_key_or_jwt,
-    )
-    from app.main import app
-
-    def _fluent_mock(data: list[dict]) -> MagicMock:
-        m = MagicMock()
-        # /jobs is async now (#57 slice 3) — the handler awaits .execute().
-        m.execute = AsyncMock(return_value=MagicMock(data=data, count=len(data)))
-        for method in ("select", "eq", "neq", "gte", "in_", "is_", "ilike", "order", "range"):
-            getattr(m, method).return_value = m
-        m.not_ = m  # `.not_.is_(...)` negation is an attribute access (#60 non-US gate)
-        return m
-
-    jp_mock = _fluent_mock(
-        [
-            {
-                "id": "job-1",
-                "score": 50,
-                "score_breakdown": None,
-                "title": "Engineer",
-                "company_name": "Acme",
-                "created_at": "2026-01-01T00:00:00Z",
-            }
-        ]
-    )
-
-    supabase = MagicMock()
-    supabase.table.return_value = jp_mock
-
-    app.dependency_overrides[get_async_service_supabase] = lambda: supabase
-    # api-key caller (user_id None): dual-auth resolves the caller client to
-    # the (async) service-role client, so mirror the seeded fake.
-    app.dependency_overrides[get_async_supabase_for_caller] = lambda: supabase
-    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: None
-
-    try:
-        tc = TestClient(app)
-        resp = tc.get("/jobs")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert len(data["postings"]) == 1
-        # Global view preserves the global score
-        assert data["postings"][0]["score"] == 50
-    finally:
-        app.dependency_overrides.clear()
-
-
 def test_list_jobs_with_target_overlays_target_score(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -493,7 +435,7 @@ def test_list_jobs_with_target_overlays_target_score(
     from app.dependencies import (
         get_async_service_supabase,
         get_async_supabase_for_caller,
-        get_current_user_id_optional,
+        get_current_user_id,
         verify_api_key_or_jwt,
     )
     from app.main import app
@@ -543,19 +485,29 @@ def test_list_jobs_with_target_overlays_target_score(
         ]
     )
 
+    # The caller's own rows (user_jobs statuses, per-target removals): none.
+    empty_mock = _fluent_mock([])
     supabase = MagicMock()
-    supabase.table.side_effect = lambda name: ts_mock if name == "scores" else jp_mock
+    supabase.table.side_effect = lambda name: {"scores": ts_mock, "jobs": jp_mock}.get(
+        name, empty_mock
+    )
     # The per-target score sort tries the cross-target RPC first; a non-list
     # payload makes it fall back to the two-query path (ts_mock + jp_mock),
     # exactly as before — the await just needs an awaitable .execute().
     supabase.rpc.return_value.execute = AsyncMock(return_value=MagicMock(data=None))
 
+    from app.routers import jobs as jobs_router
+
+    # A caller following target-1, with no stored score floor and no
+    # per-pairing weights or preferences.
+    monkeypatch.setattr(jobs_router, "_active_target_ids", AsyncMock(return_value={"target-1"}))
+    monkeypatch.setattr(jobs_router, "_default_min_score_for_user", AsyncMock(return_value=None))
+    monkeypatch.setattr(jobs_router, "_get_user_target_async", AsyncMock(return_value=None))
+
     app.dependency_overrides[get_async_service_supabase] = lambda: supabase
-    # api-key caller (user_id None): dual-auth resolves the caller client to
-    # the (async) service-role client, so mirror the seeded fake.
     app.dependency_overrides[get_async_supabase_for_caller] = lambda: supabase
-    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    app.dependency_overrides[verify_api_key_or_jwt] = lambda: "jwt"
+    app.dependency_overrides[get_current_user_id] = lambda: "user-1"
 
     try:
         tc = TestClient(app)

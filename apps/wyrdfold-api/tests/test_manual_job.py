@@ -95,14 +95,12 @@ class TestManualJobEndpoint:
     @pytest.fixture(autouse=True)
     def _no_active_target(self, monkeypatch):
         """Prevent target scoring from firing in manual-job tests: the caller's
-        active-target reads are now async router inlines, so neutralize both the
-        user-scoped and the operator (global) fan-out to resolve to none."""
+        active-target read is an async router inline, so resolve it to none."""
         from app.routers import jobs as jobs_router
 
         monkeypatch.setattr(
             jobs_router, "_active_targets_for_user_async", AsyncMock(return_value=[])
         )
-        monkeypatch.setattr(jobs_router, "_all_active_targets_async", AsyncMock(return_value=[]))
 
     @pytest.mark.asyncio
     async def test_happy_path_jsonld(self, monkeypatch):
@@ -115,7 +113,7 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="https://example.com/jobs/123")
         result = await add_manual_job(
-            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
+            request=MagicMock(), body=body, user_id="user-1", supabase=mock_supabase
         )
 
         assert result.success is True
@@ -214,7 +212,7 @@ class TestManualJobEndpoint:
             company_name="Override Corp",
         )
         result = await add_manual_job(
-            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
+            request=MagicMock(), body=body, user_id="user-1", supabase=mock_supabase
         )
 
         assert result.success is True
@@ -233,7 +231,9 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="not-a-url")
         with pytest.raises(HTTPException) as exc_info:
-            await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=MagicMock())
+            await add_manual_job(
+                request=MagicMock(), body=body, user_id="user-1", supabase=MagicMock()
+            )
         assert exc_info.value.status_code == 400
         assert "Malformed" in exc_info.value.detail
 
@@ -246,7 +246,9 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="https://www.ziprecruiter.com/jobs/123")
         with pytest.raises(HTTPException) as exc_info:
-            await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=MagicMock())
+            await add_manual_job(
+                request=MagicMock(), body=body, user_id="user-1", supabase=MagicMock()
+            )
         assert exc_info.value.status_code == 400
         assert "Banned" in exc_info.value.detail
 
@@ -260,7 +262,7 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="https://example.com/opaque-page")
         result = await add_manual_job(
-            request=MagicMock(), body=body, user_id=None, supabase=_async_service_client()
+            request=MagicMock(), body=body, user_id="user-1", supabase=_async_service_client()
         )
 
         assert result.success is False
@@ -283,7 +285,7 @@ class TestManualJobEndpoint:
             company_name="Some Company",
         )
         result = await add_manual_job(
-            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
+            request=MagicMock(), body=body, user_id="user-1", supabase=mock_supabase
         )
 
         assert result.success is True
@@ -308,7 +310,9 @@ class TestManualJobEndpoint:
         from app.routers.jobs import add_manual_job
 
         body = ManualJobRequest(url=url)
-        await add_manual_job(request=MagicMock(), body=body, user_id=None, supabase=mock_supabase)
+        await add_manual_job(
+            request=MagicMock(), body=body, user_id="user-1", supabase=mock_supabase
+        )
 
         upsert_call = mock_supabase.table.return_value.upsert.call_args
         row = upsert_call[0][0]
@@ -326,7 +330,7 @@ class TestManualJobEndpoint:
         body = ManualJobRequest(url="https://example.com/jobs/123")
         with pytest.raises(HTTPException) as exc_info:
             await add_manual_job(
-                request=MagicMock(), body=body, user_id=None, supabase=_async_service_client()
+                request=MagicMock(), body=body, user_id="user-1", supabase=_async_service_client()
             )
         assert exc_info.value.status_code == 400
         assert "fetch" in exc_info.value.detail.lower()
@@ -343,7 +347,7 @@ class TestManualJobEndpoint:
         body = ManualJobRequest(url="https://legit.com/jobs/123")
         with pytest.raises(HTTPException) as exc_info:
             await add_manual_job(
-                request=MagicMock(), body=body, user_id=None, supabase=_async_service_client()
+                request=MagicMock(), body=body, user_id="user-1", supabase=_async_service_client()
             )
         assert exc_info.value.status_code == 400
         assert "banned" in exc_info.value.detail.lower()
@@ -361,7 +365,7 @@ class TestManualJobEndpoint:
 
         body = ManualJobRequest(url="https://example.com/jobs/123")
         result = await add_manual_job(
-            request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
+            request=MagicMock(), body=body, user_id="user-1", supabase=mock_supabase
         )
 
         assert result.success is True
@@ -408,7 +412,7 @@ class TestManualJobEndpoint:
         body = ManualJobRequest(url="https://example.com/jobs/123")
         with pytest.raises(HTTPException) as exc_info:
             await add_manual_job(
-                request=MagicMock(), body=body, user_id=None, supabase=mock_supabase
+                request=MagicMock(), body=body, user_id="user-1", supabase=mock_supabase
             )
 
         assert exc_info.value.status_code == 502

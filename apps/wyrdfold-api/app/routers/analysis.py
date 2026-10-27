@@ -26,7 +26,7 @@ from app.dependencies import (
     enforce_llm_budget,
     get_async_service_supabase,
     get_async_supabase_for_caller,
-    get_current_user_id_optional,
+    get_current_user_id,
     get_llm_client,
     get_settings,
     verify_api_key_or_jwt,
@@ -170,15 +170,14 @@ async def _resolve_state(
     *,
     supabase: AsyncClient,
     caller_supabase: AsyncClient,
-    user_id: str | None,
+    user_id: str,
 ) -> tuple[OptimizedDoc | None, JobAnalysisRecord | None]:
     """Shared POST/GET preamble: ownership gate → optimized doc → cache read.
 
     * **Ownership** — the analysis WRITE re-ranks the shared ``(job, target)``
-      scores row, so a JWT caller must be linked to ``target_id`` (audit #24
-      F2). 404 not 403 so non-owners can't enumerate target existence. api-key
-      callers (``user_id`` None) are operators and bypass, matching the targets
-      router. Raises ``HTTPException(404)``.
+      scores row, so the caller must be linked to ``target_id`` (audit #24
+      F2). 404 not 403 so non-owners can't enumerate target existence.
+      Raises ``HTTPException(404)``.
     * **Optimized doc** — needed for the cache key. ``None`` → the caller has no
       experience profile yet.
     * **Cache** — keyed on ``(job, target, optimized version)``. Stays on the
@@ -187,7 +186,7 @@ async def _resolve_state(
     Returns ``(optimized, cached)``: ``optimized is None`` → no-profile;
     ``cached is not None`` → a persisted analysis exists.
     """
-    if user_id is not None and target_id not in await _user_target_ids(caller_supabase, user_id):
+    if target_id not in await _user_target_ids(caller_supabase, user_id):
         raise HTTPException(status_code=404, detail="Target not found.")
 
     current_optimized = await _optimized_latest(caller_supabase, user_id)
@@ -214,11 +213,10 @@ async def create_analysis(
     target_id: str = Query(..., description="Target the user is viewing the job under"),
     supabase: AsyncClient = Depends(get_async_service_supabase),
     # #6 R2 / #88 dual-client split:
-    # * `caller_supabase` (JWT → RLS user client, api-key → service-role)
-    #   carries every read a JWT caller is entitled to make directly — the
-    #   ownership gate (user_targets, self-scoped), the optimized doc
-    #   (experience_optimized_docs, self-scoped), the target + job posting
-    #   (SELECT-true shared catalog).
+    # * `caller_supabase` (the RLS user client) carries every read the caller
+    #   is entitled to make directly — the ownership gate (user_targets,
+    #   self-scoped), the optimized doc (experience_optimized_docs,
+    #   self-scoped), the target + job posting (SELECT-true shared catalog).
     # * `supabase` (service-role) keeps the COST-BEARING plumbing: the
     #   analyses cache read + upsert and the llm_costs write/count.
     #   `analyses`/`llm_costs` have no INSERT policy for `authenticated` by
@@ -227,7 +225,7 @@ async def create_analysis(
     #   budget — the failure mode must stay impossible, not just tested.
     caller_supabase: AsyncClient = Depends(get_async_supabase_for_caller),
     llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
     s: Settings = Depends(get_settings),
 ) -> JobAnalysisRecord | JSONResponse:
     optimized_doc, cached = await _resolve_state(
@@ -288,15 +286,14 @@ async def create_analysis(
         # OTHER concurrent kicks, whose cost rows won't exist until their LLM
         # calls return ~26s from now — without it a burst could all pass a gate
         # that only sees persisted rows and blow past the cap.
-        if user_id is not None:
-            other_in_flight = max(0, run_registry.running_count_for_user(user_id) - 1)
-            await _check_daily_count(
-                supabase,
-                user_id=user_id,
-                purpose=DEFAULT_PURPOSE,
-                limit=s.analysis_daily_limit,
-                in_flight=other_in_flight,
-            )
+        other_in_flight = max(0, run_registry.running_count_for_user(user_id) - 1)
+        await _check_daily_count(
+            supabase,
+            user_id=user_id,
+            purpose=DEFAULT_PURPOSE,
+            limit=s.analysis_daily_limit,
+            in_flight=other_in_flight,
+        )
 
         # Fetch target (existence + LLM context) and the JD in-line so 404/422
         # surface as real HTTP status on the POST, not as a silent task failure.
@@ -354,7 +351,7 @@ async def get_analysis(
     target_id: str = Query(..., description="Target the user is viewing the job under"),
     supabase: AsyncClient = Depends(get_async_service_supabase),
     caller_supabase: AsyncClient = Depends(get_async_supabase_for_caller),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> JobAnalysisRecord | JSONResponse:
     """Poll the state of a (possibly backgrounded) analysis (#459).
 
@@ -399,7 +396,7 @@ async def _run_analysis_task(
     llm: LLMClient,
     job_id: str,
     target_id: str,
-    user_id: str | None,
+    user_id: str,
     optimized_doc: OptimizedDoc,
     target_context: str,
     description_html: str,

@@ -28,9 +28,8 @@ polling: the structural gap gate (422) and contact resolution (400) — the
 frontend has dedicated recovery UI for both. A 202 only means the LLM work
 was accepted.
 
-The blocking path survives for callers with no ``job_posting_id`` (operator /
-api-key drives against a bare JD): that id IS the poll surface, so there is
-nothing to poll without it.
+The blocking path survives for callers with no ``job_posting_id`` (a bare JD):
+that id IS the poll surface, so there is nothing to poll without it.
 
 422 responses carry the LintFailureResponse shape — but as of #656 a
 generation lint failure is no longer one of them: the document (resume OR
@@ -119,11 +118,6 @@ from app.services.tailor.reuse import (
 
 _log = logging.getLogger(__name__)
 
-# Since #192 every route here needs a user JWT, so over HTTP
-# ``get_current_user_id_optional`` returns that user's id and the
-# ``user_id is None`` branches below, which comments call the operator /
-# api-key / cron path, are unreachable; only in-process callers and tests
-# take them.
 router = APIRouter(
     prefix="/tailor",
     tags=["tailor"],
@@ -247,33 +241,35 @@ async def _fetch_postings_by_ids(supabase: AsyncClient, ids: list[str]) -> list[
 
 
 async def _resolve_target_for_posting(
-    supabase: AsyncClient, *, user_id: str | None, job_posting_id: str
+    supabase: AsyncClient, *, user_id: str, job_posting_id: str
 ) -> str | None:
     """Resolve which target a posting belongs to, via ``scores``.
 
     ``jobs.target_id`` is a vestigial column the poller never writes —
     the job ↔ target link lives in ``scores`` (same resolution as
-    ``routers/jobs.py``). JWT callers are scoped to their own targets via
-    ``user_targets`` and get their best-scoring one when several match;
-    API-key (operator) callers resolve across all targets.
+    ``routers/jobs.py``). The caller is scoped to their own targets via
+    ``user_targets`` and gets their best-scoring one when several match.
     """
-    target_ids: list[str] | None = None
-    if user_id is not None:
-        ut_resp = await (
-            supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
-        )
-        target_ids = [
-            cast(dict[str, Any], r)["target_id"]
-            for r in (ut_resp.data or [])
-            if isinstance(r, dict) and r.get("target_id")
-        ]
-        if not target_ids:
-            return None
+    ut_resp = await (
+        supabase.table("user_targets").select("target_id").eq("user_id", user_id).execute()
+    )
+    target_ids = [
+        cast(dict[str, Any], r)["target_id"]
+        for r in (ut_resp.data or [])
+        if isinstance(r, dict) and r.get("target_id")
+    ]
+    if not target_ids:
+        return None
 
-    score_query = supabase.table("scores").select("target_id").eq("job_posting_id", job_posting_id)
-    if target_ids is not None:
-        score_query = score_query.in_("target_id", target_ids)
-    resp = await score_query.order("score", desc=True).limit(1).execute()
+    resp = await (
+        supabase.table("scores")
+        .select("target_id")
+        .eq("job_posting_id", job_posting_id)
+        .in_("target_id", target_ids)
+        .order("score", desc=True)
+        .limit(1)
+        .execute()
+    )
     rows = resp.data or []
     if not rows:
         return None
@@ -480,7 +476,7 @@ async def create_tailored_resume(
 
     if body.job_posting_id is None:
         # No posting → no poll surface (``by-job/{id}`` is keyed on it), so the
-        # operator/api-key JD-only path keeps blocking for the full pipeline.
+        # JD-only path keeps blocking for the full pipeline.
         prefs_row = await _preferences_get(supabase, user_id=user_id)
         contact = await resolve_contact(supabase, user_id, body.contact)
         result = await _run_resume_pipeline(
@@ -578,7 +574,7 @@ def _resume_response(result: PipelineResult) -> TailorResponse:
 
     A lint failure is no longer a 422 (#656): the draft is persisted flagged,
     so it comes back as a normal record whose ``lint_violations`` say why it
-    needs attention. Keeping one success shape means the operator path and the
+    needs attention. Keeping one success shape means the blocking path and the
     poll surface describe a flagged draft identically.
     """
     if isinstance(result, PipelineLintFailure):
@@ -1167,9 +1163,8 @@ async def approve_tailored_resume(
     # Resume approval also advances the linked job posting to resume_ready;
     # cover letters don't drive job status.
     # Per-user pipeline state lives in user_jobs (#75 C3): no longer touch
-    # the global jobs.status. Api-key callers (user_id None) have no per-user
-    # pipeline, so they skip the mirror; cover letters don't drive job status.
-    if row.document_type == "resume" and row.job_posting_id and user_id:
+    # the global jobs.status.
+    if row.document_type == "resume" and row.job_posting_id:
         await _upsert_user_job(
             supabase,
             user_id=user_id,
@@ -1265,7 +1260,7 @@ async def _fetch_user_resume_style(
 
 
 async def _resolve_render_style(
-    supabase: AsyncClient, row: TailoredResumeRecord, user_id: str | None
+    supabase: AsyncClient, row: TailoredResumeRecord, user_id: str
 ) -> ResumeStyleSettings | None:
     """Effective docx style for a download: per-record override, else the
     user's profile default, else None (today's unstyled pandoc render).
@@ -1275,9 +1270,7 @@ async def _resolve_render_style(
             return ResumeStyleSettings.model_validate(row.style_settings)
         except ValidationError:
             pass
-    if user_id is not None:
-        return await _fetch_user_resume_style(supabase, user_id)
-    return None
+    return await _fetch_user_resume_style(supabase, user_id)
 
 
 @router.get("/resumes/{resume_id}/download")

@@ -232,9 +232,8 @@ async def get(
 
     ``user_id=None`` matches the legacy single-tenant rows (api-key
     cron/poller paths), mirroring the convention used by
-    ``list_recent`` and the upsert paths. Routes that accept JWT
-    callers thread ``get_current_user_id_optional`` through; pass that
-    same value here.
+    ``list_recent`` and the upsert paths. Routes pass the caller's
+    ``get_current_user_id``.
 
     Returns ``None`` both when the row doesn't exist AND when it
     exists but belongs to another user — same response so we don't

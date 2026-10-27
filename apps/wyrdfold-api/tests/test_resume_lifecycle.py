@@ -731,38 +731,6 @@ class TestApproveResume:
         assert upsert_payload["status"] == "resume_ready"
 
     @pytest.mark.asyncio
-    async def test_approve_skips_user_jobs_for_api_key(self) -> None:
-        """api-key callers (user_id None) have no per-user pipeline, so they
-        write neither user_jobs nor the (now-untouched) global jobs.status."""
-        from app.routers import tailor as tailor_router
-
-        supabase = MagicMock()
-        supabase.table.return_value.upsert.return_value.execute = AsyncMock(
-            return_value=MagicMock(data=[])
-        )
-        record = _make_record()
-        approved_record = _make_record(approved_at=_NOW)
-
-        with (
-            patch(
-                "app.services.tailor.persistence.get", new_callable=AsyncMock, return_value=record
-            ),
-            patch(
-                "app.services.tailor.persistence.approve",
-                new_callable=AsyncMock,
-                return_value=approved_record,
-            ),
-        ):
-            await tailor_router.approve_tailored_resume(
-                resume_id="rec-1",
-                supabase=supabase,
-                user_id=None,
-            )
-
-        tables = [c.args[0] for c in supabase.table.call_args_list]
-        assert "jobs" not in tables
-        assert "user_jobs" not in tables
-
     @pytest.mark.asyncio
     async def test_unapprove_writes_user_jobs(self) -> None:
         """#75 C3: unapproving a resume with a JWT user_id writes the

@@ -121,6 +121,7 @@ async def test_target_two_query_restores_score_desc_order() -> None:
 
     result = await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         cursor={},
         page_size=10,
@@ -169,6 +170,7 @@ async def test_two_query_emits_axis_scores_for_graded_rows() -> None:
 
     result = await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         cursor={},
         page_size=10,
@@ -233,6 +235,7 @@ async def test_across_user_targets_restores_score_desc_order(
 
     result = await _list_jobs_across_user_targets(
         sb,
+        user_id="user-1",
         user_target_ids={"t-1", "t-2"},
         cursor={},
         page_size=10,
@@ -325,6 +328,7 @@ async def test_target_two_query_location_filter_paginates_post_filter_set() -> N
 
     result = await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         cursor={},
         page_size=10,
@@ -386,6 +390,7 @@ async def test_rpc_keyset_emits_cursor_and_trims_extra_row() -> None:
     sb = _rpc_supabase(rows, captured)
     result = await _list_jobs_for_target_rpc(
         sb,
+        user_id="user-1",
         target_id="t-1",
         page_size=2,
         sort="created_at",
@@ -414,6 +419,7 @@ async def test_rpc_keyset_last_page_has_no_cursor() -> None:
     sb = _rpc_supabase(rows, {})
     result = await _list_jobs_for_target_rpc(
         sb,
+        user_id="user-1",
         target_id="t-1",
         page_size=2,
         sort="created_at",
@@ -434,6 +440,7 @@ async def test_rpc_keyset_consumes_incoming_cursor() -> None:
     sb = _rpc_supabase([], captured)
     await _list_jobs_for_target_rpc(
         sb,
+        user_id="user-1",
         target_id="t-1",
         page_size=2,
         sort="created_at",
@@ -459,6 +466,7 @@ async def test_rpc_skips_score_sort_and_floored_queries() -> None:
         with pytest.raises(RuntimeError):
             await _list_jobs_for_target_rpc(
                 sb,
+                user_id="user-1",
                 target_id="t-1",
                 page_size=2,
                 ascending=False,
@@ -490,6 +498,7 @@ async def test_two_query_offset_cursor_advances_when_more_rows() -> None:
     sb = _supabase_with({"scores": _Resp(ts_rows, count=3), "jobs": _Resp(postings)})
     result = await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         page_size=2,
         sort="title",
@@ -507,6 +516,7 @@ async def test_two_query_offset_cursor_advances_when_more_rows() -> None:
     # Following that cursor yields the last row and no further cursor.
     result2 = await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         page_size=2,
         sort="title",
@@ -633,6 +643,7 @@ async def test_two_query_pending_sorts_by_recency_not_keyword_score(
 
     result = await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         cursor={},
         page_size=10,
@@ -685,6 +696,7 @@ def _company_rows(companies: list[str]) -> tuple[list[dict[str, Any]], list[dict
 async def _company_page(sb: MagicMock, *, cursor: dict[str, Any], page_size: int) -> dict[str, Any]:
     return await _list_jobs_for_target_two_query(
         sb,
+        user_id="user-1",
         target_id="t-1",
         cursor=cursor,
         page_size=page_size,
@@ -775,6 +787,7 @@ async def test_created_at_keyset_cursor_reads_the_renamed_column() -> None:
     sb = _rpc_supabase(rows, captured)
     page1 = await _list_jobs_for_target_rpc(
         sb,
+        user_id="user-1",
         target_id="t-1",
         page_size=2,
         sort="created_at",
@@ -793,6 +806,7 @@ async def test_created_at_keyset_cursor_reads_the_renamed_column() -> None:
     # And it must reach the RPC as a real keyset bound, not NULL.
     await _list_jobs_for_target_rpc(
         sb,
+        user_id="user-1",
         target_id="t-1",
         page_size=2,
         sort="created_at",
@@ -822,6 +836,7 @@ async def test_both_rpcs_refuse_the_posted_at_sort() -> None:
     with pytest.raises(RuntimeError):
         await _list_jobs_for_target_rpc(
             sb,
+            user_id="user-1",
             target_id="t-1",
             page_size=2,
             sort="posted_at",
@@ -837,6 +852,7 @@ async def test_both_rpcs_refuse_the_posted_at_sort() -> None:
     with pytest.raises(RuntimeError):
         await _list_jobs_across_user_targets_rpc(
             sb,
+            user_id="user-1",
             user_target_ids={"t-1"},
             page_size=2,
             sort="posted_at",

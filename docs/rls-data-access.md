@@ -7,10 +7,10 @@ needs a design decision, not a cleanup PR.
 
 Two clients exist (`app/dependencies.py`):
 
-| Client                                                   | Dependency                                                                                                        | RLS                     |
-| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ----------------------- |
-| **User client** — per-request, bound to the caller's JWT | `get_user_supabase` (JWT-only) / `get_supabase_for_caller` (dual-auth: JWT → user client, api-key → service-role) | enforced (`auth.uid()`) |
-| **Service-role** — singleton, bypasses RLS               | `get_supabase`                                                                                                    | bypassed                |
+| Client                                                   | Dependency                                                                                           | RLS                     |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- | ----------------------- |
+| **User client** — per-request, bound to the caller's JWT | `get_user_supabase` / `get_supabase_for_caller` (both JWT-only since #192; the latter was dual-auth) | enforced (`auth.uid()`) |
+| **Service-role** — singleton, bypasses RLS               | `get_supabase`                                                                                       | bypassed                |
 
 ## Migrated — runs on the RLS user client
 
@@ -39,11 +39,13 @@ Two clients exist (`app/dependencies.py`):
 | **`reference_jds.user_id`** (nullable uuid, FK `ON DELETE SET NULL`)                                                                                                       | Shared-catalog content with **optional attribution** — NULL means "seeded/unattributed" and is load-bearing: the #29 erasure flow anonymizes (keeps the shared JD, drops the link), and the SET NULL FK automates + backstops exactly that. Deliberately NOT NOT-NULL/CASCADE (decision on #6, 2026-07-02, migration `20260702150000`).                                                                                                                                                                                                                                                                                                                                                                                                              |
 | **Background pipeline** (poller, scheduler, batch, learner internals)                                                                                                      | No request context — these run from cron/queue with the service key, charging work to the activating user via explicit `user_id` params.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
-## Dual-auth (JWT → RLS, api-key → service-role): done (#88)
+## Jobs reads on the RLS user client: done (#88)
 
 `jobs.py` list/read surfaces (`GET /jobs`, `/pipeline-counts`, `GET /{id}`)
-now run on `get_supabase_for_caller`: JWT callers ride the RLS user client,
-api-key callers (the operator view) keep service-role. What the flip
+run on `get_supabase_for_caller`, which rides the caller's RLS user client.
+These routes are JWT-only: #88 originally gave api-key callers a service-role
+"operator view", but #192 closed the router to api keys and the dead operator
+branches were deleted on 2026-10-24 (#1142). What the flip
 verified (2026-07-02, live stack + byte-identical before/after responses):
 
 - `get_target_jobs` and `pipeline_counts` are **SECURITY INVOKER** with an

@@ -398,6 +398,18 @@ def cast_str(v: str | None) -> str:
 # Router integration (via TestClient)
 # ---------------------------------------------------------------------------
 
+_USER = "user-1"
+
+
+@pytest.fixture(autouse=True)
+def _caller_follows_tgt_1(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Router tests here run as a signed-in caller who follows ``tgt-1``, under
+    the daily analysis cap. The ownership gate and the cap read
+    ``user_targets`` / ``llm_costs``, which the fakes don't model; the cap
+    itself is pinned by ``test_check_daily_count_counts_in_flight_runs``."""
+    monkeypatch.setattr(analysis_router, "_user_target_ids", AsyncMock(return_value={"tgt-1"}))
+    monkeypatch.setattr(analysis_router, "_check_daily_count", AsyncMock())
+
 
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> Any:
@@ -434,9 +446,9 @@ async def test_router_cache_hit_skips_llm(
     app.dependency_overrides[get_async_service_supabase] = lambda: supabase
     app.dependency_overrides[get_llm_client] = lambda: llm
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    # api-key caller (user_id None): dual-auth resolves the caller client
-    # to the same service-role client, so mirror the seeded fake.
+    app.dependency_overrides[get_current_user_id] = lambda: _USER
+    app.dependency_overrides[enforce_llm_budget] = lambda: None
+    # One fake serves both the service and the caller client.
     app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[
         get_async_service_supabase
     ]
@@ -465,13 +477,14 @@ def _analysis_client(
     *,
     supabase: Any,
     llm: Any = None,
-    user_id: str | None = None,
+    user_id: str = "user-1",
     caller: Any = None,
 ) -> Iterator[Any]:
     """A TestClient with the analysis router's deps overridden.
 
-    Defaults ``caller`` to ``supabase`` (the api-key path resolves the caller
-    client to the same service-role client). Clears overrides on exit.
+    Defaults ``caller`` to ``supabase`` so one fake serves both clients, and
+    skips the budget gate (pinned in ``test_dependencies``). Clears overrides
+    on exit.
     """
     from fastapi.testclient import TestClient
 
@@ -485,7 +498,8 @@ def _analysis_client(
     )
     app.dependency_overrides[get_llm_client] = lambda: llm if llm is not None else MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: user_id
+    app.dependency_overrides[get_current_user_id] = lambda: user_id
+    app.dependency_overrides[enforce_llm_budget] = lambda: None
     try:
         yield TestClient(app)
     finally:
@@ -781,7 +795,8 @@ async def test_end_to_end_kick_poll_persists_via_real_async_task(
     app.dependency_overrides[get_async_supabase_for_caller] = lambda: supabase
     app.dependency_overrides[get_llm_client] = lambda: llm
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    app.dependency_overrides[get_current_user_id] = lambda: _USER
+    app.dependency_overrides[enforce_llm_budget] = lambda: None
     try:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
@@ -848,9 +863,9 @@ async def test_router_missing_optimized_doc_returns_404(
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    # api-key caller (user_id None): dual-auth resolves the caller client
-    # to the same service-role client, so mirror the seeded fake.
+    app.dependency_overrides[get_current_user_id] = lambda: _USER
+    app.dependency_overrides[enforce_llm_budget] = lambda: None
+    # One fake serves both the service and the caller client.
     app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[
         get_async_service_supabase
     ]
@@ -893,9 +908,9 @@ async def test_router_empty_description_returns_422(
     app.dependency_overrides[get_async_service_supabase] = lambda: supabase
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    # api-key caller (user_id None): dual-auth resolves the caller client
-    # to the same service-role client, so mirror the seeded fake.
+    app.dependency_overrides[get_current_user_id] = lambda: _USER
+    app.dependency_overrides[enforce_llm_budget] = lambda: None
+    # One fake serves both the service and the caller client.
     app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[
         get_async_service_supabase
     ]
@@ -930,9 +945,9 @@ async def test_router_missing_job_posting_returns_404(
     app.dependency_overrides[get_async_service_supabase] = lambda: supabase
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    # api-key caller (user_id None): dual-auth resolves the caller client
-    # to the same service-role client, so mirror the seeded fake.
+    app.dependency_overrides[get_current_user_id] = lambda: _USER
+    app.dependency_overrides[enforce_llm_budget] = lambda: None
+    # One fake serves both the service and the caller client.
     app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[
         get_async_service_supabase
     ]
@@ -949,12 +964,15 @@ async def test_router_missing_job_posting_returns_404(
 async def test_router_missing_target_returns_404(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unknown target_id returns 404, not a silent LLM call."""
+    """A followed target whose row is gone returns 404, not a silent LLM call."""
     monkeypatch.setattr(persistence_mod, "get_cached", AsyncMock(return_value=None))
     monkeypatch.setattr(
         analysis_router, "_optimized_latest", AsyncMock(return_value=_optimized_doc())
     )
-    monkeypatch.setattr(analysis_router, "_target_get", AsyncMock(return_value=None))
+    # Past the ownership gate, so the 404 comes from the missing row itself.
+    monkeypatch.setattr(analysis_router, "_user_target_ids", AsyncMock(return_value={"missing"}))
+    target_get = AsyncMock(return_value=None)
+    monkeypatch.setattr(analysis_router, "_target_get", target_get)
 
     from fastapi.testclient import TestClient
 
@@ -963,9 +981,9 @@ async def test_router_missing_target_returns_404(
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: None
-    # api-key caller (user_id None): dual-auth resolves the caller client
-    # to the same service-role client, so mirror the seeded fake.
+    app.dependency_overrides[get_current_user_id] = lambda: _USER
+    app.dependency_overrides[enforce_llm_budget] = lambda: None
+    # One fake serves both the service and the caller client.
     app.dependency_overrides[get_async_supabase_for_caller] = app.dependency_overrides[
         get_async_service_supabase
     ]
@@ -975,6 +993,7 @@ async def test_router_missing_target_returns_404(
         resp = tc.post("/analysis/job-1?target_id=missing")
         assert resp.status_code == 404
         assert "target" in resp.json()["detail"].lower()
+        target_get.assert_awaited_once()
     finally:
         app.dependency_overrides.clear()
 
@@ -1008,7 +1027,8 @@ async def test_router_blend_writes_score_via_service_rpc(
     app.dependency_overrides[get_async_supabase_for_caller] = lambda: caller
     app.dependency_overrides[get_llm_client] = lambda: MockLLMClient()
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: None
+    app.dependency_overrides[get_current_user_id] = lambda: _USER
+    app.dependency_overrides[enforce_llm_budget] = lambda: None
 
     try:
         resp = TestClient(app).post("/analysis/job-1?target_id=tgt-1")
@@ -1028,9 +1048,10 @@ async def test_router_blend_writes_score_via_service_rpc(
 
 # Need these imports for dependency overrides
 from app.dependencies import (
+    enforce_llm_budget,
     get_async_service_supabase,
     get_async_supabase_for_caller,
-    get_current_user_id_optional,
+    get_current_user_id,
     get_llm_client,
     verify_api_key_or_jwt,
 )

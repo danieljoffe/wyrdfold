@@ -87,7 +87,7 @@ def test_manual_job_ssrf_rejection_is_generic(monkeypatch) -> None:  # type: ign
     from app.dependencies import (
         get_async_service_supabase,
         get_async_supabase_for_caller,
-        get_current_user_id_optional,
+        get_current_user_id,
         verify_api_key_or_jwt,
     )
 
@@ -96,7 +96,7 @@ def test_manual_job_ssrf_rejection_is_generic(monkeypatch) -> None:  # type: ign
     # SSRF check (not a 503 for an unconfigured client) is what rejects the URL.
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_async_supabase_for_caller] = lambda: MagicMock()
-    app.dependency_overrides[get_current_user_id_optional] = lambda: "user-a"
+    app.dependency_overrides[get_current_user_id] = lambda: "user-a"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-a"
     try:
         client = TestClient(app, raise_server_exceptions=False)
