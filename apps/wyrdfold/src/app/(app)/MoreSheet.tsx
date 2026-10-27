@@ -9,7 +9,7 @@ import { cn } from '@/lib/cn';
 import { useFocusTrap } from '@/hooks/useFocusTrap';
 import DarkModeToggle from '@/components/Nav/DarkModeToggle';
 
-export interface MoreSheetItem {
+interface MoreSheetItem {
   id: string;
   label: string;
   href: string;

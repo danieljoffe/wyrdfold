@@ -2,10 +2,9 @@
 
 Each reference JD records the user who added it (``user_id``) so the shared
 profile merge can de-bias by contributor, and so the "remove your own
-contribution" delete is scoped to the caller. These exercise the crud the
-route calls against real Postgres: attribution is persisted, a non-contributor
-cannot delete someone else's JD, the contributor can, and the operator
-(``user_id`` None, api-key path) may remove any.
+contribution" delete is scoped to the caller. These exercise the writes the
+route makes against real Postgres: attribution is persisted, a non-contributor
+cannot delete someone else's JD, and the contributor can.
 """
 
 from __future__ import annotations
@@ -14,9 +13,10 @@ import uuid
 from collections.abc import Iterator
 
 import pytest
-from supabase import Client
+from supabase import AsyncClient, Client
 
 from app.models.targets import ScoringProfile
+from app.routers.targets import _delete_reference_jd_async
 from app.services.targets import crud
 
 pytestmark = pytest.mark.integration
@@ -58,36 +58,50 @@ def test_add_records_contributor(
     assert [j.user_id for j in crud.list_reference_jds(service_client, target_id)] == [uid_a]
 
 
-def test_remove_own_is_scoped_to_contributor(
-    service_client: Client, target_id: str, two_seeded_users: tuple[str, str]
+async def test_remove_own_is_scoped_to_contributor(
+    service_client: Client,
+    async_service_client: AsyncClient,
+    target_id: str,
+    two_seeded_users: tuple[str, str],
 ) -> None:
     uid_a, uid_b = two_seeded_users
     ref_a = _add(service_client, target_id, uid_a)
 
     # B cannot delete A's contribution: no row matches -> False, JD persists.
     assert (
-        crud.delete_reference_jd(service_client, ref_a.id, target_id=target_id, user_id=uid_b)
+        await _delete_reference_jd_async(
+            async_service_client, ref_a.id, target_id=target_id, user_id=uid_b
+        )
         is False
     )
     assert len(crud.list_reference_jds(service_client, target_id)) == 1
 
     # A can delete their own.
     assert (
-        crud.delete_reference_jd(service_client, ref_a.id, target_id=target_id, user_id=uid_a)
+        await _delete_reference_jd_async(
+            async_service_client, ref_a.id, target_id=target_id, user_id=uid_a
+        )
         is True
     )
     assert crud.list_reference_jds(service_client, target_id) == []
 
 
-def test_operator_can_remove_any_contribution(
-    service_client: Client, target_id: str, two_seeded_users: tuple[str, str]
+async def test_remove_is_scoped_to_target(
+    service_client: Client,
+    async_service_client: AsyncClient,
+    target_id: str,
+    two_seeded_users: tuple[str, str],
 ) -> None:
+    """Audit #24 F1: a JD id from another target matches no row, even for its
+    own contributor, so the route's target-ownership check can't be sidestepped."""
     uid_a, _ = two_seeded_users
     ref_a = _add(service_client, target_id, uid_a)
-    # Operator path (user_id None) is unscoped -> removes any contributor's JD,
-    # matching the route's ownership guard, which also lets operators bypass.
+
+    other = str(uuid.uuid4())
     assert (
-        crud.delete_reference_jd(service_client, ref_a.id, target_id=target_id, user_id=None)
-        is True
+        await _delete_reference_jd_async(
+            async_service_client, ref_a.id, target_id=other, user_id=uid_a
+        )
+        is False
     )
-    assert crud.list_reference_jds(service_client, target_id) == []
+    assert len(crud.list_reference_jds(service_client, target_id)) == 1
