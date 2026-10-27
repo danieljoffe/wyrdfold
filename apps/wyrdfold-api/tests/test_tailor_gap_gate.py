@@ -6,9 +6,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.dependencies import (
+    enforce_llm_budget,
     get_async_service_supabase,
     get_current_user_id,
-    get_current_user_id_optional,
     verify_api_key_or_jwt,
 )
 from app.main import app
@@ -104,9 +104,9 @@ class TestGapGateResume:
     def _overrides(self):
         app.dependency_overrides[verify_api_key_or_jwt] = lambda: "test"
         app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
-        app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
-        app.dependency_overrides[get_current_user_id_optional] = lambda: None
         app.dependency_overrides[get_current_user_id] = lambda: "test-user"
+        # The budget gate has its own tests; these pin the gap gate.
+        app.dependency_overrides[enforce_llm_budget] = lambda: None
         yield
         app.dependency_overrides.clear()
 

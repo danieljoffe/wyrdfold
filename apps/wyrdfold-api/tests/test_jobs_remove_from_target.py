@@ -197,11 +197,6 @@ class TestRemovedPairs:
         assert pairs == {(_T1, _JOB)}
         assert (_T2, _JOB) not in pairs
 
-    async def test_anonymous_callers_have_no_removals(self) -> None:
-        sb = MagicMock()
-        assert await _removed_pairs(sb, user_id=None, target_ids=[_T1]) == set()
-        sb.table.assert_not_called()
-
     async def test_no_targets_short_circuits(self) -> None:
         sb = MagicMock()
         assert await _removed_pairs(sb, user_id=_USER, target_ids=[]) == set()

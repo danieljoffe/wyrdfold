@@ -25,7 +25,6 @@ from app.dependencies import (
     get_async_service_supabase,
     get_async_user_supabase,
     get_current_user_id,
-    get_current_user_id_optional,
     get_llm_client,
     verify_api_key,
     verify_api_key_or_jwt,
@@ -129,13 +128,6 @@ from app.services.validate import assert_safe_host, validate_job_url
 
 logger = logging.getLogger(__name__)
 
-# Since #192 every route here needs a user JWT, so over HTTP
-# ``get_current_user_id_optional`` returns that user's id and the
-# ``user_id is None`` branches below, which comments call the operator /
-# api-key / cron path, are unreachable; only in-process callers and tests
-# take them.
-# In effect PATCH /{target_id} refuses every caller and DELETE /{target_id}
-# never takes its operator hard-delete.
 router = APIRouter(
     prefix="/targets",
     tags=["targets"],
@@ -149,30 +141,6 @@ router = APIRouter(
 # ``target_scoring.bulk_title_score_for_target`` (keyset-paged bulk upsert +
 # per-page global-score recompute) — the batch shape ``bulk_score_for_target``
 # uses. It replaced a per-row-upsert N+1 over an unordered OFFSET scan here.
-
-
-def _require_operator(user_id: str | None) -> None:
-    """Reject a signed-in end user from a shared-catalog mutation.
-
-    Targets are a shared row (many users co-follow one target via the global
-    ``find_matching_target`` label dedup), so a direct field edit here would
-    rewrite the scoring rubric / label every co-follower depends on. Those
-    edits are operator-only: ``user_id is None`` passes and a real subject (a
-    JWT end user) is refused. Since #192 no HTTP caller arrives with ``None``
-    (see the note above ``router``), so over HTTP this refuses everyone. End
-    users shape only their own view (axis weights, preferences on
-    ``user_targets``) and contribute to the shared profile solely through the
-    bounded #191 path (reference JDs, learner review). See SEC-2 (#366).
-    """
-    if user_id is not None:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Targets are a shared catalog and can't be edited directly. "
-                "Tune your own view via axis weights and preferences, or "
-                "contribute a reference JD."
-            ),
-        )
 
 
 # ── Async inlines of shared crud reads (#57 slice 3) ─────────────────────────
@@ -204,18 +172,15 @@ async def _user_target_ids(supabase: AsyncClient, user_id: str) -> set[str]:
 
 
 async def _require_user_owns_target_async(
-    supabase: AsyncClient, *, user_id: str | None, target_id: str
+    supabase: AsyncClient, *, user_id: str, target_id: str
 ) -> None:
     """404 a caller who isn't linked to ``target_id``.
 
     Targets are shared rows keyed only by the ``user_targets`` junction, and
     the service-role client has no RLS backstop, so without this any signed-in
     user could act on any target. A 404 (not 403) keeps target existence
-    unenumerable. ``user_id`` None skips the check, but since #192 no HTTP
-    caller arrives with ``None`` (see the note above ``router``).
+    unenumerable.
     """
-    if user_id is None:
-        return
     if target_id not in await _user_target_ids(supabase, user_id):
         raise HTTPException(status_code=404, detail="Target not found")
 
@@ -279,33 +244,6 @@ async def _active_targets_for_user(supabase: AsyncClient, user_id: str) -> list[
     return [crud._parse_target(cast(dict[str, Any], r)) for r in (resp.data or [])]
 
 
-async def _active_targets(supabase: AsyncClient) -> list[JobTarget]:
-    """Async inline of ``crud.get_active`` — the derived ``app_active OR
-    EXISTS(active membership)`` pipeline predicate, two indexed reads deduped in
-    Python (see the crud docstring for the dropped-trigger history)."""
-    floor_resp = (
-        await supabase.table(crud.TARGETS_TABLE).select("*").eq("app_active", True).execute()
-    )
-    member_ids_resp = (
-        await supabase.table(crud.USER_TARGETS_TABLE)
-        .select("target_id")
-        .eq("is_active", True)
-        .execute()
-    )
-    member_ids = {
-        cast(str, r["target_id"]) for r in cast(list[dict[str, Any]], member_ids_resp.data or [])
-    }
-    rows = cast(list[dict[str, Any]], floor_resp.data or [])
-    seen = {cast(str, r["id"]) for r in rows}
-    missing = sorted(member_ids - seen)
-    if missing:
-        member_resp = (
-            await supabase.table(crud.TARGETS_TABLE).select("*").in_("id", missing).execute()
-        )
-        rows.extend(cast(list[dict[str, Any]], member_resp.data or []))
-    return [crud._parse_target(r) for r in rows]
-
-
 async def _list_reference_jds_async(
     supabase: AsyncClient, target_id: str
 ) -> list[TargetReferenceJD]:
@@ -327,7 +265,7 @@ async def _add_reference_jd_async(
     jd_text: str,
     jd_url: str | None,
     extracted_profile: ScoringProfile,
-    user_id: str | None = None,
+    user_id: str,
 ) -> TargetReferenceJD:
     """Async inline of ``crud.add_reference_jd``."""
     row = {
@@ -359,18 +297,19 @@ async def _count_user_reference_jds_async(
 
 
 async def _delete_reference_jd_async(
-    supabase: AsyncClient, ref_jd_id: str, *, target_id: str, user_id: str | None = None
+    supabase: AsyncClient, ref_jd_id: str, *, target_id: str, user_id: str
 ) -> bool:
-    """Async inline of ``crud.delete_reference_jd`` (crud stays sync for its
-    poller/learner callers). ``target_id`` scopes the delete to the already-
-    ownership-checked target (IDOR guard, audit #24 F1); a non-None ``user_id``
-    further constrains it to the caller's OWN contribution (regular JWT path)."""
-    query = (
-        supabase.table(crud.REF_JDS_TABLE).delete().eq("id", ref_jd_id).eq("target_id", target_id)
+    """Async inline of ``crud.delete_reference_jd``. ``target_id`` scopes the
+    delete to the already-ownership-checked target (IDOR guard, audit #24 F1);
+    ``user_id`` further constrains it to the caller's OWN contribution."""
+    resp = await (
+        supabase.table(crud.REF_JDS_TABLE)
+        .delete()
+        .eq("id", ref_jd_id)
+        .eq("target_id", target_id)
+        .eq("user_id", user_id)
+        .execute()
     )
-    if user_id is not None:
-        query = query.eq("user_id", user_id)
-    resp = await query.execute()
     return bool(resp.data)
 
 
@@ -596,12 +535,6 @@ async def _unlink_user_from_target_async(
         .eq("target_id", target_id)
         .execute()
     )
-    return bool(resp.data)
-
-
-async def _delete_target_async(supabase: AsyncClient, target_id: str) -> bool:
-    """Async inline of ``crud.delete`` — operator-only hard delete."""
-    resp = await supabase.table(crud.TARGETS_TABLE).delete().eq("id", target_id).execute()
     return bool(resp.data)
 
 
@@ -1065,20 +998,6 @@ def _invalid_swap_error(e: APIError) -> HTTPException | None:
     )
 
 
-async def _set_app_active_async(supabase: AsyncClient, target_id: str) -> JobTarget | None:
-    """Async inline of ``crud.set_app_active`` — raise the instance-sponsorship
-    floor (``app_active = True``) for api-key/system callers with no user identity
-    to link. crud stays sync for its seed-script/operator callers (#57 PR-G2e-5)."""
-    resp = await (
-        supabase.table(crud.TARGETS_TABLE)
-        .update({"app_active": True, "updated_at": datetime.now(UTC).isoformat()})
-        .eq("id", target_id)
-        .execute()
-    )
-    rows = cast(list[dict[str, Any]], resp.data or [])
-    return crud._parse_target(rows[0]) if rows else None
-
-
 async def _activate_pipeline(
     supabase: AsyncClient, llm: LLMClient, target: JobTarget, user_id: str
 ) -> None:
@@ -1522,7 +1441,7 @@ async def suggest_from_query(
 @router.get("/active", response_model=TargetsListResponse)
 async def get_active_targets(
     supabase: AsyncClient = Depends(get_async_service_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> TargetsListResponse:
     """Active targets for the caller.
 
@@ -1530,16 +1449,10 @@ async def get_active_targets(
     ``crud.get_active`` returns every PIPELINE-ACTIVE target (the
     instance's ``app_active`` floor OR any user's active membership,
     derived at read time), which would leak every other user's roles +
-    scoring profiles to any authenticated caller. api-key /
-    operator callers (user_id is None) keep the instance-wide view for
-    tooling. Mirrors the scoping the rest of the targets router applies.
+    scoring profiles to any authenticated caller. Mirrors the scoping the
+    rest of the targets router applies.
     """
-    targets = (
-        await _active_targets_for_user(supabase, user_id)
-        if user_id is not None
-        else await _active_targets(supabase)
-    )
-    return TargetsListResponse(targets=targets)
+    return TargetsListResponse(targets=await _active_targets_for_user(supabase, user_id))
 
 
 async def _llm_for_background_refresh(supabase: AsyncClient, user_id: str) -> "LLMClient | None":
@@ -1636,13 +1549,12 @@ async def search_targets(
 async def get_target(
     target_id: str,
     supabase: AsyncClient = Depends(get_async_service_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> JobTarget:
     # Targets are shared, service-role-read (no RLS backstop). Without this
     # guard any authenticated user could read any target's full JD text and
-    # scoring profile by id (audit #29 round 3 / M3). Operators (api-key,
-    # user_id None) bypass; non-owners get 404 so they can't enumerate
-    # target existence.
+    # scoring profile by id (audit #29 round 3 / M3). Non-owners get 404 so
+    # they can't enumerate target existence.
     await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
     target = await _target_get(supabase, target_id)
     if target is None:
@@ -1675,24 +1587,6 @@ async def get_my_user_target(
         # data integrity issue, surface as a 404 not a 500.
         raise HTTPException(status_code=404, detail="Target not found")
     return UserTargetWithTarget(user_target=ut, target=target)
-
-
-@router.patch("/{target_id}", response_model=JobTarget)
-async def update_target(
-    target_id: str,
-    body: TargetUpdate,
-    supabase: AsyncClient = Depends(get_async_service_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
-) -> JobTarget:
-    # Shared-catalog write → operator-only (SEC-2, #366). End users can't edit
-    # the shared scoring profile / label; they tune their own view via
-    # axis-weights / preferences and contribute via the bounded #191 path.
-    # Since #192 this refuses every HTTP caller (see ``_require_operator``).
-    _require_operator(user_id)
-    target = await _update_target_async(supabase, target_id, body)
-    if target is None:
-        raise HTTPException(status_code=404, detail="Target not found")
-    return target
 
 
 # Async: the target read + the active-cap link run natively on the pooled async
@@ -2099,12 +1993,12 @@ async def poll_jobs_for_target(
 async def get_target_status(
     target_id: str,
     supabase: AsyncClient = Depends(get_async_service_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> TargetStatusResponse:
     """Return activation status and job count for a target."""
     # Without this, any authenticated user could read any target's
     # activation status + scored-job count by id (audit #29 round 3 / M2).
-    # Operators (user_id None) bypass; non-owners get 404.
+    # Non-owners get 404.
     await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
     target = await _target_get(supabase, target_id)
     if target is None:
@@ -2149,7 +2043,7 @@ async def get_target_funnel(
 async def delete_target(
     target_id: str,
     supabase: AsyncClient = Depends(get_async_service_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> DeleteResponse:
     await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
     # Targets are a SHARED catalog — find_matching_target dedups by normalized
@@ -2158,8 +2052,7 @@ async def delete_target(
     # deleting the shared row cascades away every co-follower's user_targets /
     # scores / feedback / analyses / learning (all those FKs are ON DELETE
     # CASCADE), which is exactly what account-erasure is documented never to do.
-    # Operators (api-key path, user_id is None) keep the hard delete. Mirrors the
-    # audit-#29 H1 fix that turned the jobs "delete" into a per-user unlink for
+    # Mirrors the audit-#29 H1 fix that turned the jobs "delete" into a per-user unlink for
     # the same shared-row reason.
     #
     # ...but once the LAST follower leaves, nobody can reach the row again: this
@@ -2169,15 +2062,10 @@ async def delete_target(
     # 20260731090000 dropped when ``is_active`` became ``app_active`` — the
     # comment here claimed otherwise for a week and the orphans piled up (#667).
     # Reap explicitly instead of relying on a trigger that no longer exists.
-    if user_id is not None:
-        unlinked = await _unlink_user_from_target_async(supabase, user_id, target_id)
-        if not unlinked:
-            raise HTTPException(status_code=404, detail="Target not found")
-        await _reap_orphaned_target_async(supabase, target_id)
-        return DeleteResponse(deleted=True)
-    deleted = await _delete_target_async(supabase, target_id)
-    if not deleted:
+    unlinked = await _unlink_user_from_target_async(supabase, user_id, target_id)
+    if not unlinked:
         raise HTTPException(status_code=404, detail="Target not found")
+    await _reap_orphaned_target_async(supabase, target_id)
     return DeleteResponse(deleted=True)
 
 
@@ -2194,7 +2082,7 @@ async def create_target_from_posting(
     posting_id: str,
     supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> JobTarget:
     """Create a target from an existing job posting.
 
@@ -2219,15 +2107,13 @@ async def create_target_from_posting(
     # A signed-in caller lands on an ACTIVE target, so refuse at the cap
     # BEFORE any LLM call is billed (#1071; the #865 shape). Advisory only:
     # the atomic create-and-link below is what enforces under a race.
-    active_limit: int | None = None
-    if user_id is not None:
-        active_limit = await _effective_active_target_cap_async(supabase, user_id)
-        current = await _count_active_for_user_async(supabase, user_id)
-        if current >= active_limit:
-            raise _active_limit_error(
-                crud.ActiveTargetLimitError(current, active_limit),
-                await _active_target_choices(supabase, user_id),
-            )
+    active_limit = await _effective_active_target_cap_async(supabase, user_id)
+    current = await _count_active_for_user_async(supabase, user_id)
+    if current >= active_limit:
+        raise _active_limit_error(
+            crud.ActiveTargetLimitError(current, active_limit),
+            await _active_target_choices(supabase, user_id),
+        )
 
     # Canonicalize BEFORE matching or creating (#1071). The label becomes
     # ``targets.normalized_label``, the UNIQUE catalog key, so the employer-
@@ -2250,29 +2136,19 @@ async def create_target_from_posting(
         # caller is all a match needs (mirrors ``from_url``).
         return await _attach_caller_to_target(supabase, user_id=user_id, target=matched)
 
-    if user_id is None:
-        # api-key (cron) caller: no membership to write, so the instance floor
-        # (``app_active``) is raised instead and the target still enters the
-        # pipeline. Find-or-create on the exact key; a row that already
-        # existed is shared and is never derived over.
-        target, was_created = await _find_or_create_target_async(
-            supabase, payload=TargetCreate(label=label)
+    # Create, link ACTIVE and enforce the cap in ONE transaction: a cap
+    # rejection leaves no target row behind, and a concurrent create of the
+    # same exact key comes back as ``was_created=False``.
+    try:
+        target, _link, was_created = await from_input.create_and_link(
+            supabase,
+            user_id=user_id,
+            payload=TargetCreate(label=label),
+            is_active=True,
+            active_limit=active_limit,
         )
-        target = await _set_app_active_async(supabase, target.id) or target
-    else:
-        # Create, link ACTIVE and enforce the cap in ONE transaction: a cap
-        # rejection leaves no target row behind, and a concurrent create of
-        # the same exact key comes back as ``was_created=False``.
-        try:
-            target, _link, was_created = await from_input.create_and_link(
-                supabase,
-                user_id=user_id,
-                payload=TargetCreate(label=label),
-                is_active=True,
-                active_limit=active_limit,
-            )
-        except crud.ActiveTargetLimitError as e:
-            raise _active_limit_error(e, await _active_target_choices(supabase, user_id)) from e
+    except crud.ActiveTargetLimitError as e:
+        raise _active_limit_error(e, await _active_target_choices(supabase, user_id)) from e
 
     if not was_created:
         # A concurrent request won the exact key. The row is shared (and
@@ -2302,8 +2178,7 @@ async def create_target_from_posting(
             jd_url=absolute_url,
             extracted_profile=derived.scoring_profile,
             # The seed JD belongs to the person who created the target, so
-            # contributor de-bias and account cleanup see the right owner;
-            # an api-key caller stays an unattributed (operator) contribution.
+            # contributor de-bias and account cleanup see the right owner.
             user_id=user_id,
         )
         updated = await _update_target_async(
@@ -2338,7 +2213,7 @@ async def create_target_from_posting(
 
 
 async def _attach_caller_to_target(
-    supabase: AsyncClient, *, user_id: str | None, target: JobTarget
+    supabase: AsyncClient, *, user_id: str, target: JobTarget
 ) -> JobTarget:
     """Make a from-posting target the caller's and return the row as it now is.
 
@@ -2346,13 +2221,8 @@ async def _attach_caller_to_target(
     in mind" path lands on a target that scores immediately), subject to the
     active-target cap. Without the membership the catalog row exists but never
     shows up in ``/targets/mine``: the wizard used to finish with "All set!"
-    onto an empty dashboard. An api-key (cron) caller has no user identity to
-    link, so the instance floor (``app_active``) is raised instead and the
-    target still enters the pipeline.
+    onto an empty dashboard.
     """
-    if user_id is None:
-        activated = await _set_app_active_async(supabase, target.id)
-        return activated or target
     try:
         await _link_user_to_target_async(
             supabase, user_id=user_id, target_id=target.id, is_active=True
@@ -2478,7 +2348,7 @@ async def add_reference_jd(
     body: ReferenceJDAdd,
     supabase: AsyncClient = Depends(get_async_service_supabase),
     llm: LLMClient = Depends(get_llm_client),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> JobTarget:
     """Add a reference JD, derive a scoring profile via LLM, and merge.
 
@@ -2502,21 +2372,19 @@ async def add_reference_jd(
     # Cap reference-JD contributions per user per target (#47): bounds a single
     # (possibly rogue) contributor's footprint on the shared profile, on top of
     # the per-contributor merge de-bias + downvote suppression. Checked before
-    # the LLM derive so an over-cap add costs nothing. Operator/api-key callers
-    # (user_id None) are exempt. Soft cap — see config.
-    if user_id is not None:
-        contributed = await _count_user_reference_jds_async(
-            supabase, target_id=target_id, user_id=user_id
+    # the LLM derive so an over-cap add costs nothing. Soft cap — see config.
+    contributed = await _count_user_reference_jds_async(
+        supabase, target_id=target_id, user_id=user_id
+    )
+    if contributed >= settings.reference_jd_max_per_user_per_target:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "You've reached the limit of "
+                f"{settings.reference_jd_max_per_user_per_target} reference "
+                "JDs for this target. Remove one before adding another."
+            ),
         )
-        if contributed >= settings.reference_jd_max_per_user_per_target:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "You've reached the limit of "
-                    f"{settings.reference_jd_max_per_user_per_target} reference "
-                    "JDs for this target. Remove one before adding another."
-                ),
-            )
 
     # Validate JD URL if provided (#496)
     if body.jd_url:
@@ -2577,30 +2445,6 @@ async def add_reference_jd(
         extracted_profile=derived.scoring_profile,
         user_id=user_id,
     )
-
-    # Operator path (api-key caller): no follower identity to RPC-gate on —
-    # trusted direct write, the documented #191 exception (same convention
-    # as the operator/cron service-role paths in docs/rls-data-access.md).
-    # Example title pools come from the LATEST JD only — these are concrete
-    # examples not weighted aggregates, and merging across JDs would dilute
-    # the few-shot signal. The latest JD overwrites; pools stay coherent.
-    if user_id is None:
-        all_ref_jds = await _list_reference_jds_async(supabase, target_id)
-        composite = merge_reference_jds(all_ref_jds)
-        updated = await _update_target_async(
-            supabase,
-            target_id,
-            TargetUpdate(
-                scoring_profile=composite,
-                search_keywords=derived.search_keywords,
-                example_promising_titles=derived.example_promising_titles,
-                example_unpromising_titles=derived.example_unpromising_titles,
-                profile_version=target.profile_version + 1,
-            ),
-        )
-        if updated is None:
-            raise HTTPException(status_code=500, detail="Failed to update target profile")
-        return updated
 
     # #191 slice 1b — user contributions to the SHARED profile are bounded
     # and RPC-gated. Project the merged profile's impact over the target's
@@ -2673,6 +2517,9 @@ async def add_reference_jd(
             # learning-log panel (apply lifts the quarantine).
             return current
 
+        # Example title pools come from the LATEST JD only — they're concrete
+        # examples, not weighted aggregates, and merging across JDs would
+        # dilute the few-shot signal. The latest JD overwrites them.
         outcome, _new_version = await apply_profile_merge_rpc_async(
             supabase,
             user_id=user_id,
@@ -2707,12 +2554,12 @@ async def add_reference_jd(
 async def list_reference_jds(
     target_id: str,
     supabase: AsyncClient = Depends(get_async_service_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> ReferenceJDsListResponse:
     # Reference JDs are read via the service-role client with no RLS
     # backstop. Without this guard any authenticated user could read any
     # target's full reference-JD text by id (audit #29 round 3 / M3).
-    # Operators (user_id None) bypass; non-owners get 404.
+    # Non-owners get 404.
     await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
     ref_jds = await _list_reference_jds_async(supabase, target_id)
     # Strip the contributor ``user_id``: the contribution graph is meant to
@@ -2735,7 +2582,7 @@ async def delete_reference_jd(
     target_id: str,
     ref_jd_id: str,
     supabase: AsyncClient = Depends(get_async_service_supabase),
-    user_id: str | None = Depends(get_current_user_id_optional),
+    user_id: str = Depends(get_current_user_id),
 ) -> JobTarget:
     """Delete a reference JD and re-merge the remaining profiles."""
     await _require_user_owns_target_async(supabase, user_id=user_id, target_id=target_id)
@@ -2743,31 +2590,13 @@ async def delete_reference_jd(
     if target is None:
         raise HTTPException(status_code=404, detail="Target not found")
 
-    # A regular caller may only remove their OWN contribution; operators
-    # (user_id None) may remove any. A non-owner's delete matches no rows and
-    # returns 404 — without enumerating who contributed it.
+    # A caller may only remove their OWN contribution. A non-owner's delete
+    # matches no rows and returns 404 — without enumerating who contributed it.
     deleted = await _delete_reference_jd_async(
         supabase, ref_jd_id, target_id=target_id, user_id=user_id
     )
     if not deleted:
         raise HTTPException(status_code=404, detail="Reference JD not found")
-
-    # Operator path (api-key caller): no follower identity to RPC-gate on —
-    # trusted direct write, the documented #191 exception.
-    if user_id is None:
-        remaining = await _list_reference_jds_async(supabase, target_id)
-        composite = merge_reference_jds(remaining) if remaining else ScoringProfile()
-        updated = await _update_target_async(
-            supabase,
-            target_id,
-            TargetUpdate(
-                scoring_profile=composite,
-                profile_version=target.profile_version + 1,
-            ),
-        )
-        if updated is None:
-            raise HTTPException(status_code=404, detail="Target not found")
-        return updated
 
     # #191: removal-direction re-merge — RPC-gated (in-DB follower re-check +
     # version guard), deliberately NOT capped: removing your own contribution

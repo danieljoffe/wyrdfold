@@ -136,10 +136,6 @@ def h(monkeypatch: pytest.MonkeyPatch) -> Harness:
             raise h.create_error
         return _target(label=payload.label), object(), h.was_created
 
-    async def find_or_create(supabase: Any, payload: Any) -> tuple[JobTarget, bool]:
-        h.events.append(("find_or_create", payload.label))
-        return _target(label=payload.label), h.was_created
-
     async def link(
         supabase: Any, *, user_id: str, target_id: str, is_active: bool = True, **_: Any
     ) -> None:
@@ -152,10 +148,6 @@ def h(monkeypatch: pytest.MonkeyPatch) -> Harness:
 
     async def choices(supabase: Any, user_id: str) -> list[dict[str, str]]:
         return []
-
-    async def app_active(supabase: Any, target_id: str) -> JobTarget:
-        h.events.append(("app_active", target_id))
-        return _target(id=target_id)
 
     async def derive(llm: Any, *, jd_text: str, supabase: Any) -> tuple[DerivedTarget, LLMResult]:
         h.events.append(("derive", len(jd_text)))
@@ -181,18 +173,16 @@ def h(monkeypatch: pytest.MonkeyPatch) -> Harness:
     monkeypatch.setattr(cost_log, "record_async", record)
     monkeypatch.setattr(router, "find_matching_target", match)
     monkeypatch.setattr(from_input, "create_and_link", create_and_link)
-    monkeypatch.setattr(router, "_find_or_create_target_async", find_or_create)
     monkeypatch.setattr(router, "_link_user_to_target_async", link)
     monkeypatch.setattr(router, "_target_get", get)
     monkeypatch.setattr(router, "_active_target_choices", choices)
-    monkeypatch.setattr(router, "_set_app_active_async", app_active)
     monkeypatch.setattr(router, "derive_profile_from_jd", derive)
     monkeypatch.setattr(router, "_add_reference_jd_async", add_ref)
     monkeypatch.setattr(router, "_update_target_async", update)
     return h
 
 
-async def _call(user_id: str | None = "u-1") -> JobTarget:
+async def _call(user_id: str = "u-1") -> JobTarget:
     return await router.create_target_from_posting(
         "p-1", supabase=object(), llm=object(), user_id=user_id
     )
@@ -277,17 +267,6 @@ async def test_losing_the_exact_key_race_is_treated_as_a_match(h: Harness) -> No
     assert _profile_writes(h) == []
 
 
-@pytest.mark.asyncio
-async def test_api_key_race_loser_is_not_derived_over_either(h: Harness) -> None:
-    h.was_created = False
-
-    await _call(user_id=None)
-
-    assert h.named("find_or_create") == [CANONICAL]
-    assert h.named("app_active") == ["t-new"]
-    assert h.named("derive") == []
-
-
 # ---- Active-target cap ------------------------------------------------------
 
 
@@ -319,18 +298,6 @@ async def test_cap_rejection_at_the_atomic_write_is_a_409_with_no_derivation(h: 
     assert exc.value.detail["limit"] == 3
     assert h.named("derive") == []
     assert h.named("reference_jd") == []
-
-
-@pytest.mark.asyncio
-async def test_api_key_caller_skips_the_cap_and_raises_app_active(h: Harness) -> None:
-    await _call(user_id=None)
-
-    assert h.named("cap") == []
-    assert h.named("link") == []
-    assert h.named("create_and_link") == []
-    assert h.named("find_or_create") == [CANONICAL]
-    assert h.named("app_active") == ["t-new"]
-    assert from_input.NORMALIZE_TITLE_PURPOSE in h.named("cost_log")
 
 
 # ---- Ordering ---------------------------------------------------------------

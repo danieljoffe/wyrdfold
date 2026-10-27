@@ -17,6 +17,9 @@ from supabase import AsyncClient, Client
 
 from app.routers.jobs import _list_jobs_for_target_two_query, _LogisticsFilter
 
+# A caller with no user_jobs rows or removals: every seeded job reads as 'new'.
+_CALLER = str(uuid.uuid4())
+
 pytestmark = pytest.mark.integration
 
 
@@ -91,6 +94,7 @@ def seeded_logistics(service_client: Client) -> Iterator[tuple[str, dict[str, st
 async def _ids(client: AsyncClient, target_id: str, f: _LogisticsFilter) -> set[str]:
     result = await _list_jobs_for_target_two_query(
         client,
+        user_id=_CALLER,
         target_id=target_id,
         page_size=50,
         sort="score",
@@ -163,6 +167,7 @@ async def test_no_filter_returns_all_with_logistics_overlaid(
     target_id, _ = seeded_logistics
     result = await _list_jobs_for_target_two_query(
         async_service_client,
+        user_id=_CALLER,
         target_id=target_id,
         page_size=50,
         sort="score",
@@ -195,6 +200,7 @@ async def test_rpc_fast_path_also_returns_logistics(
     target_id, _ = seeded_logistics
     result = await _list_jobs_for_target_rpc(
         async_service_client,
+        user_id=_CALLER,
         target_id=target_id,
         page_size=50,
         sort="created_at",

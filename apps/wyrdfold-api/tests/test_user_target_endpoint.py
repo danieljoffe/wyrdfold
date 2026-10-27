@@ -18,7 +18,6 @@ from fastapi.testclient import TestClient
 from app.dependencies import (
     get_async_service_supabase,
     get_current_user_id,
-    get_current_user_id_optional,
     get_llm_client,
     verify_api_key_or_jwt,
 )
@@ -64,7 +63,7 @@ def client() -> TestClient:
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     # GET /targets/{id} now resolves the caller via the optional dep and
     # ownership-checks it (#29 round 3 / M3), so the fixture must supply it.
-    app.dependency_overrides[get_current_user_id_optional] = lambda: "user-1"
+    app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-1"
     app.dependency_overrides[get_llm_client] = lambda: MagicMock()
     yield TestClient(app)
@@ -228,7 +227,7 @@ def client_real_llm_dep() -> TestClient:
     """
     app.dependency_overrides[get_async_service_supabase] = lambda: MagicMock()
     app.dependency_overrides[get_current_user_id] = lambda: "user-1"
-    app.dependency_overrides[get_current_user_id_optional] = lambda: "user-1"
+    app.dependency_overrides[get_current_user_id] = lambda: "user-1"
     app.dependency_overrides[verify_api_key_or_jwt] = lambda: "user-1"
     yield TestClient(app)
     app.dependency_overrides.clear()
