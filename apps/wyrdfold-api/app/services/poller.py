@@ -2685,6 +2685,8 @@ async def _poll_one_source(
             "last_polled_at": datetime.now(UTC).isoformat(),
             "job_count": len(jobs),
             "consecutive_failures": 0,
+            # A clean poll ends any disable/recover cycle: the board works.
+            "auto_disables": 0,
             # A clean poll clears the stored failure cause so last_error
             # reflects only live problems (queryable signal, not history).
             "last_error": None,
@@ -2819,8 +2821,13 @@ _SOURCE_LAST_ERROR_MAX_LEN = 500
 # What the pre-disable re-detection tells the backoff to do. See
 # _redetect_before_disabling for each value.
 RedetectVerdict = Literal["repointed", "suppress", "disable", "retire_duplicate", "retire_dead"]
-# Mirrors the sources_retired_reason_check constraint (20260930000000).
-SourceRetireReason = Literal["dead_board", "duplicate"]
+# Mirrors the sources_retired_reason_check constraint (20261028000000).
+SourceRetireReason = Literal["dead_board", "duplicate", "recovery_exhausted"]
+# The fetch statuses that say THIS board rejects THIS request, so a board that
+# keeps answering one of them through every recovery round is not coming back
+# on its own. Deliberately not "any 4xx": 408/429 are transient, and 401/403
+# can be systemic (an ATS blocking our egress) rather than about the board.
+_PARKABLE_STATUSES = frozenset({400, 404, 410, 422})
 
 # #962: re-detection outcomes accumulated across a cycle. Per-event log lines
 # exist (RE-POINTED / still-live / collision), but spotting drift -- a new ATS
@@ -2880,6 +2887,14 @@ async def _record_source_failure(
     Auto-recovery never revives a retired row, which is what stops a dead
     board cycling off-and-on (and alerting) forever. ``status`` is the HTTP
     status of the failed fetch, None when there was no HTTP answer.
+
+    A board that is dead but can never be PROVEN dead would still cycle, so
+    a disable whose ``status`` is in ``_PARKABLE_STATUSES`` bumps
+    ``auto_disables``, and such a disable that comes after
+    ``source_park_after_failed_recoveries`` of them retires the row as
+    ``recovery_exhausted`` instead. Any other disable (5xx, timeouts, 429,
+    no HTTP answer) neither parks nor counts: those are the ATS-outage case
+    recovery must keep retrying, and they must not spend the parking budget.
     """
     threshold = settings.source_failure_disable_threshold
     if threshold <= 0:
@@ -2921,6 +2936,12 @@ async def _record_source_failure(
                 retire_reason = "dead_board"
             disabling = verdict != "suppress"
         if disabling:
+            if status in _PARKABLE_STATUSES:
+                prior_disables = int(source.get("auto_disables") or 0)
+                park_after = settings.source_park_after_failed_recoveries
+                if retire_reason is None and park_after > 0 and prior_disables >= park_after:
+                    retire_reason = "recovery_exhausted"
+                updates["auto_disables"] = prior_disables + 1
             updates["enabled"] = False
             updates["disabled_at"] = now_iso
             if retire_reason is not None:
@@ -3077,6 +3098,7 @@ async def _redetect_before_disabling(
         # The failure is resolved, so clear the whole failure state — same
         # shape a clean poll writes.
         "consecutive_failures": 0,
+        "auto_disables": 0,
         "last_error": None,
         "last_error_at": None,
         # Rotate to the back of the most-overdue-first queue: this source just

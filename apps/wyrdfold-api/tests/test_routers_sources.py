@@ -125,7 +125,7 @@ def test_sources_toggle_on_clears_a_retirement(client_factory):
     assert r.status_code == 200
     assert r.json()["enabled"] is True
     sb.table.return_value.update.assert_called_with(
-        {"enabled": True, "retired_at": None, "retired_reason": None}
+        {"enabled": True, "retired_at": None, "retired_reason": None, "auto_disables": 0}
     )
 
 
