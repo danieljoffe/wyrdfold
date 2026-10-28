@@ -90,6 +90,9 @@ async def _set_source_enabled(supabase: AsyncClient, *, board_token: str, enable
         # be reported against a stale verdict.
         payload["retired_at"] = None
         payload["retired_reason"] = None
+        # A fresh start: without this a source parked as recovery_exhausted
+        # would be parked again by its very next failure streak.
+        payload["auto_disables"] = 0
     await supabase.table("sources").update(payload).eq("board_token", board_token).execute()
 
 

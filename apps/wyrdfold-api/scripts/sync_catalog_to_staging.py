@@ -266,6 +266,9 @@ _INERT_SOURCE_STATE: dict[str, Any] = {
     # polling history; staging never polls these rows, so it inherits none.
     "retired_at": None,
     "retired_reason": None,
+    # Disable/recover rounds since the last clean poll (20261028000000) --
+    # production's polling history again.
+    "auto_disables": 0,
     # Denormalised counter the poller maintains. Production's value describes
     # production's catalog, not the subset copied here, so it would be wrong
     # either way; 0 is at least CONSISTENT with last_polled_at being NULL —
