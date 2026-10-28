@@ -32,7 +32,8 @@ T = TypeVar("T")
 
 # Transient transport-level failures we'll retry. ``HTTPStatusError`` is
 # deliberately excluded — those are protocol-level rejections (e.g. 4xx
-# constraint violations) that retrying won't help.
+# constraint violations) that retrying won't help. The one HTTP-level answer
+# that IS transient, a gateway 5xx, is matched by ``is_gateway_error``.
 _TRANSIENT_HTTP: tuple[type[Exception], ...] = (
     httpx.RemoteProtocolError,
     httpx.ReadError,
@@ -55,6 +56,39 @@ def is_statement_timeout(exc: BaseException) -> bool:
     return isinstance(exc, APIError) and getattr(exc, "code", None) == _STATEMENT_TIMEOUT_CODE
 
 
+# postgrest-py's fallback when an error body is not JSON: it sets ``code`` to
+# the HTTP status and this fixed message. PostgREST itself always answers in
+# JSON, so a non-JSON 5xx came from the gateway in front of it (Cloudflare /
+# Supabase's proxy: a bare "Internal server error." or an HTML 502 page) — the
+# request never got a database verdict. Sentry PYTHON-FASTAPI-66 / -5T: a poll
+# mark-polled and a scores upsert each lost to one such blip, with no retry,
+# because only transport exceptions counted as transient.
+_NON_JSON_ERROR_MESSAGE = "JSON could not be generated"
+
+
+def is_gateway_error(exc: BaseException) -> bool:
+    """True when *exc* is a 5xx whose body was not PostgREST's JSON.
+
+    Retryable like a dropped connection. A real database error (constraint,
+    57014, permission) arrives as JSON and is never matched; neither is a 4xx.
+    """
+    if not isinstance(exc, APIError) or getattr(exc, "message", None) != _NON_JSON_ERROR_MESSAGE:
+        return False
+    try:
+        status = int(getattr(exc, "code", None) or 0)
+    except (TypeError, ValueError):
+        return False
+    return 500 <= status <= 599
+
+
+def _is_retryable(exc: Exception, *, retry_statement_timeout: bool) -> bool:
+    return (
+        isinstance(exc, _TRANSIENT_HTTP)
+        or is_gateway_error(exc)
+        or (retry_statement_timeout and is_statement_timeout(exc))
+    )
+
+
 def _backoff_delay(attempt: int, base: float, cap: float) -> float:
     raw = base * (2**attempt)
     jitter: float = random.uniform(0, 0.15)  # noqa: S311 — non-cryptographic jitter
@@ -72,7 +106,8 @@ def execute_with_retry_sync(
 ) -> T:
     """Synchronous retry wrapper — call from inside an ``asyncio.to_thread``
     or any sync context. Retries on transient httpx failures with
-    exponential backoff + jitter.
+    exponential backoff + jitter, and on a gateway 5xx that never reached
+    PostgREST (see ``is_gateway_error``).
 
     ``retry_statement_timeout=True`` additionally retries Postgres 57014,
     same opt-in contract as the async wrapper (see ``is_statement_timeout``).
@@ -82,10 +117,7 @@ def execute_with_retry_sync(
         try:
             return fn()
         except Exception as exc:
-            retryable = isinstance(exc, _TRANSIENT_HTTP) or (
-                retry_statement_timeout and is_statement_timeout(exc)
-            )
-            if not retryable:
+            if not _is_retryable(exc, retry_statement_timeout=retry_statement_timeout):
                 raise
             last_exc = exc
             if attempt == retries:
@@ -138,10 +170,7 @@ async def execute_with_retry(
         try:
             return await fn()
         except Exception as exc:
-            retryable = isinstance(exc, _TRANSIENT_HTTP) or (
-                retry_statement_timeout and is_statement_timeout(exc)
-            )
-            if not retryable:
+            if not _is_retryable(exc, retry_statement_timeout=retry_statement_timeout):
                 raise
             last_exc = exc
             if attempt == retries:
