@@ -921,16 +921,14 @@ def _park_after_three(monkeypatch: pytest.MonkeyPatch) -> None:
         pytest.param(0, 422, None, id="first-disable"),
         pytest.param(2, 422, None, id="two-rounds-is-not-three"),
         pytest.param(3, 422, "recovery_exhausted", id="workday-422-parks"),
-        pytest.param(7, 403, "recovery_exhausted", id="any-4xx-parks"),
-        # The outage case recovery exists for: never parked, however long.
-        pytest.param(3, 503, None, id="5xx-never-parks"),
-        pytest.param(9, None, None, id="no-http-answer-never-parks"),
+        pytest.param(7, 410, "recovery_exhausted", id="410-parks"),
+        pytest.param(3, 400, "recovery_exhausted", id="400-parks"),
         # Proof still wins and keeps its own reason.
         pytest.param(3, 404, "dead_board", id="proof-keeps-dead-board"),
     ],
 )
 async def test_the_disable_after_three_recovery_rounds_retires(
-    fleet: _BoardFleet, prior: int, status: int | None, reason: str | None
+    fleet: _BoardFleet, prior: int, status: int, reason: str | None
 ) -> None:
     payload, _table = await _record(
         {**_ACME, "auto_disables": prior}, status=status, error=f"acme {status}"
@@ -938,9 +936,65 @@ async def test_the_disable_after_three_recovery_rounds_retires(
 
     assert payload is not None
     assert payload["enabled"] is False
-    assert payload["auto_disables"] == prior + 1, "every disable is counted"
+    assert payload["auto_disables"] == prior + 1, "a rejection round is counted"
     assert payload.get("retired_reason") == reason
     assert ("retired_at" in payload) is (reason is not None)
+
+
+@pytest.mark.usefixtures("_park_after_three")
+@pytest.mark.parametrize(
+    "status",
+    [
+        pytest.param(503, id="5xx"),
+        pytest.param(None, id="no-http-answer"),
+        pytest.param(429, id="429-rate-limited"),
+        pytest.param(408, id="408-timeout"),
+        pytest.param(403, id="403-maybe-blocked"),
+        pytest.param(401, id="401"),
+    ],
+)
+async def test_an_outage_shaped_disable_neither_parks_nor_counts(
+    fleet: _BoardFleet, status: int | None
+) -> None:
+    """The outage case recovery exists for: never parked however long it
+    lasts, and it does not spend the parking budget either."""
+    payload, _table = await _record(
+        {**_ACME, "auto_disables": 9}, status=status, error=f"acme {status}"
+    )
+
+    assert payload is not None
+    assert payload["enabled"] is False
+    assert payload["disabled_at"] is not None, "still recoverable"
+    assert "retired_at" not in payload
+    assert "auto_disables" not in payload, "the counter is left where it was"
+
+
+@pytest.mark.usefixtures("_park_after_three")
+async def test_outage_rounds_then_one_rejection_does_not_park(fleet: _BoardFleet) -> None:
+    """ChatGPT review on #1159: three outage rounds followed by a single 422
+    must not retire the board -- only rejection rounds count."""
+    row: dict[str, Any] = {**_ACME, "auto_disables": 0}
+    for status in (503, None, 429, 422):
+        payload, _table = await _record(row, status=status, error=f"acme {status}")
+        assert payload is not None
+        assert "retired_at" not in payload, f"parked on {status}"
+        row = {**row, "auto_disables": payload.get("auto_disables", row["auto_disables"])}
+
+    assert row["auto_disables"] == 1
+
+
+@pytest.mark.usefixtures("_park_after_three")
+async def test_three_rejection_rounds_then_a_fourth_parks(fleet: _BoardFleet) -> None:
+    """The same walk with rejections throughout: the fourth disable parks."""
+    row: dict[str, Any] = {**_ACME, "auto_disables": 0}
+    reasons = []
+    for _ in range(4):
+        payload, _table = await _record(row, status=422, error="acme 422")
+        assert payload is not None
+        reasons.append(payload.get("retired_reason"))
+        row = {**row, "auto_disables": payload["auto_disables"]}
+
+    assert reasons == [None, None, None, "recovery_exhausted"]
 
 
 @pytest.mark.usefixtures("_park_after_three")

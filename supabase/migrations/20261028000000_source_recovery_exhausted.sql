@@ -8,10 +8,12 @@
 -- failures (alert), re-enabled 24h later, disabled again (alert) -- ~25 boards
 -- and ~5 Sentry events a day in prod on 2026-10-28.
 --
--- `auto_disables` counts the times the poller auto-disabled a source since its
--- last clean poll. Once a source has been through three recovery rounds and
--- fails again, the poller retires it with reason 'recovery_exhausted' instead
--- of disabling it, and auto-recovery stops reviving it. A clean poll, an ATS
+-- `auto_disables` counts the times the poller auto-disabled a source on a
+-- board-specific rejection (HTTP 400/404/410/422) since its last clean poll.
+-- Once a source has been through three such recovery rounds and is rejected
+-- again, the poller retires it with reason 'recovery_exhausted' instead of
+-- disabling it, and auto-recovery stops reviving it. Outage-shaped disables
+-- (5xx, timeouts, 429, 401/403) neither count nor park. A clean poll, an ATS
 -- re-point, or an operator re-enable resets the counter.
 --
 -- Reversible per row: an operator enabling the source clears the retirement
@@ -48,5 +50,5 @@ ALTER TABLE "public"."sources"
             AND "retired_reason" IN ('dead_board', 'duplicate', 'recovery_exhausted'))
     );
 
-COMMENT ON COLUMN "public"."sources"."auto_disables" IS 'Times the poller auto-disabled this source since its last clean poll. Reset by a clean poll, an ATS re-point, or an operator re-enable. Past source_park_after_failed_recoveries the next disable retires the source (recovery_exhausted).';
+COMMENT ON COLUMN "public"."sources"."auto_disables" IS 'Times the poller auto-disabled this source on a board-specific rejection (HTTP 400/404/410/422) since its last clean poll. Reset by a clean poll, an ATS re-point, or an operator re-enable. Past source_park_after_failed_recoveries the next disable retires the source (recovery_exhausted).';
 COMMENT ON COLUMN "public"."sources"."retired_reason" IS 'Why the source was retired: dead_board, duplicate, or recovery_exhausted (failed again after the configured number of auto-recovery rounds). NULL exactly when retired_at is NULL.';
