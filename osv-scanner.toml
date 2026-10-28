@@ -107,3 +107,24 @@ production path, and nothing we ship runs a shared HTTP cache built on it —
 the exploit needs a multi-user server cache, which a developer CLI is not.
 Drop this the moment a patched release lands.
 """
+
+[[IgnoredVulns]]
+id = "GHSA-gcqx-w48m-w2h4"
+ignoreUntil = 2027-01-27
+reason = """
+deepmerge mergeObject() prototype poisoning of the returned object.
+
+NO FIXED VERSION EXISTS: OSV's range is >=4.2.0 <=4.3.1 and 4.3.1 is the
+latest release (npm last published 2023-03; checked 2026-10-27).
+
+The only PRODUCTION path (resend -> its optional peer @react-email/render ->
+html-to-text -> deepmerge) was REMOVED, not suppressed: pnpm-workspace.yaml
+overrides `'resend>@react-email/render': '-'`. resend loads that peer only for
+`react:` emails and we send `html:` (app/api/email/target-paused/route.ts);
+`pnpm why deepmerge --prod` is now empty.
+
+Unreachable here: what remains is jest-config (jest 30, devDependencies only),
+which deep-merges this repo's own committed jest config files. Exploiting it
+needs attacker-controlled merge sources, i.e. a malicious commit to our test
+config. Drop this the moment a patched release lands.
+"""

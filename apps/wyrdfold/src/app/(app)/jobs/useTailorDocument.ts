@@ -3,11 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { extractApiError } from '@/lib/extractApiError';
 import { promptForMissingContactName } from './promptForMissingContactName';
-import type {
-  TailoredDocumentState,
-  TailoredResumeRecord,
-  TailorRunStatus,
-} from './types';
+import type { TailoredDocumentState, TailoredResumeRecord } from './types';
 
 /**
  * Client half of the non-blocking tailor flow (#656).
@@ -39,7 +35,7 @@ const MAX_POLLS = 96; // ~4 minutes
 const delay = (ms: number) =>
   new Promise<void>(resolve => setTimeout(resolve, ms));
 
-export type TailorKind = 'resume' | 'cover_letter';
+type TailorKind = 'resume' | 'cover_letter';
 
 interface UseTailorDocumentOptions {
   jobPostingId: string;
@@ -314,5 +310,3 @@ export function useTailorDocument({
     setRecord: setRecordState,
   };
 }
-
-export type { TailorRunStatus };

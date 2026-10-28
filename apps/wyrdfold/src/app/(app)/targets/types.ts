@@ -3,17 +3,17 @@ export interface CategoryProfile {
   weight: number; // category multiplier
 }
 
-export interface SeniorityProfile {
+interface SeniorityProfile {
   level: string | null;
   signals: string[];
 }
 
-export interface DomainProfile {
+interface DomainProfile {
   signals: string[];
   weight: number;
 }
 
-export interface NegativeProfile {
+interface NegativeProfile {
   keywords: string[];
   weight: number;
 }
@@ -208,7 +208,7 @@ export interface MatchedSuggestion {
 
 /** The caller's active-target headroom, served with the suggestions so the
  * OFFER can fit the plan (#864). Mirrors the API's `TargetAllowance`. */
-export interface TargetAllowance {
+interface TargetAllowance {
   cap: number;
   active: number;
   remaining: number;
@@ -222,7 +222,7 @@ export interface MatchedSuggestions {
 
 /** Seniority bands the lateral-suggestion miner returns. Mirrors the API's
  * `SeniorityHint` enum (services/targets/lateral_discovery.py). */
-export type SeniorityHint =
+type SeniorityHint =
   'ic' | 'senior' | 'staff' | 'manager' | 'director' | 'vp' | 'c_level';
 
 /** One adjacent ("lateral") target the user is competitive for, mined from
@@ -270,7 +270,7 @@ export interface ProfilePatchDiff {
 }
 
 /** How much a patch would move the target's existing scores (#5 P4). */
-export interface RescoreProjection {
+interface RescoreProjection {
   jobs_considered: number;
   jobs_moved: number;
   moved_fraction: number; // 0-1
