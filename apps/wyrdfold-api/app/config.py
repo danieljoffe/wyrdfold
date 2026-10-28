@@ -869,6 +869,14 @@ class Settings(BaseSettings):
     # ingestion forever. The sweep runs from the poll cycle. 0 disables
     # recovery (sources stay disabled until an operator intervenes).
     source_recovery_after_hours: int = Field(default=24, ge=0, le=8760)
+    # Some dead boards can never be PROVEN dead (a Workday site whose careers
+    # page 500s answers every fetch with 422; a Greenhouse 404 whose
+    # re-detection is inconclusive), so recovery revived them forever, each
+    # round another Sentry alert. A source that fails again after this many
+    # recovery rounds is retired as ``recovery_exhausted`` -- but only on an
+    # HTTP 4xx, so an ATS outage (5xx, timeouts) still recovers however long
+    # it lasts. 0 disables parking.
+    source_park_after_failed_recoveries: int = Field(default=3, ge=0, le=100)
     # Health check (runs from the scheduler/poll cycle). Fires a Sentry
     # alert when ingestion looks dead — the symptom that went unnoticed.
     # Off-switch is the threshold being 0.

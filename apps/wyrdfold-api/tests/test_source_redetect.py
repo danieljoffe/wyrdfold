@@ -899,6 +899,128 @@ async def test_retirement_alerts_under_one_grouped_sentry_issue(
     assert "Acme" in message and "src-1" in message, "per-source detail rides in the message"
 
 
+# ---- parking a board recovery cannot revive ---------------------------------
+#
+# Dead boards that can never be PROVEN dead (a 422, or a 404 whose re-detection
+# is inconclusive) cycled disable -> recover -> disable forever, one Sentry
+# event per round. After ``source_park_after_failed_recoveries`` recovery
+# rounds the next disable retires the row as ``recovery_exhausted``.
+
+
+@pytest.fixture
+def _park_after_three(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import poller
+
+    monkeypatch.setattr(poller.settings, "source_park_after_failed_recoveries", 3)
+
+
+@pytest.mark.usefixtures("_park_after_three")
+@pytest.mark.parametrize(
+    ("prior", "status", "reason"),
+    [
+        pytest.param(0, 422, None, id="first-disable"),
+        pytest.param(2, 422, None, id="two-rounds-is-not-three"),
+        pytest.param(3, 422, "recovery_exhausted", id="workday-422-parks"),
+        pytest.param(7, 403, "recovery_exhausted", id="any-4xx-parks"),
+        # The outage case recovery exists for: never parked, however long.
+        pytest.param(3, 503, None, id="5xx-never-parks"),
+        pytest.param(9, None, None, id="no-http-answer-never-parks"),
+        # Proof still wins and keeps its own reason.
+        pytest.param(3, 404, "dead_board", id="proof-keeps-dead-board"),
+    ],
+)
+async def test_the_disable_after_three_recovery_rounds_retires(
+    fleet: _BoardFleet, prior: int, status: int | None, reason: str | None
+) -> None:
+    payload, _table = await _record(
+        {**_ACME, "auto_disables": prior}, status=status, error=f"acme {status}"
+    )
+
+    assert payload is not None
+    assert payload["enabled"] is False
+    assert payload["auto_disables"] == prior + 1, "every disable is counted"
+    assert payload.get("retired_reason") == reason
+    assert ("retired_at" in payload) is (reason is not None)
+
+
+@pytest.mark.usefixtures("_park_after_three")
+async def test_an_inconclusive_404_parks_once_its_rounds_are_spent(
+    mock_http_client: MagicMock,
+) -> None:
+    """The Greenhouse half of the prod loop (Netflix, Shopify, ...): a 404 the
+    re-detection could not confirm is never proof, so only the rounds park it."""
+    mock_http_client.get = AsyncMock(side_effect=RuntimeError("boom"))
+    mock_http_client.post = AsyncMock(side_effect=RuntimeError("boom"))
+
+    payload, _table = await _record({**_ACME, "auto_disables": 3}, status=404)
+
+    assert payload is not None
+    assert payload["retired_reason"] == "recovery_exhausted"
+
+
+async def test_parking_switched_off_only_disables(
+    fleet: _BoardFleet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services import poller
+
+    monkeypatch.setattr(poller.settings, "source_park_after_failed_recoveries", 0)
+
+    payload, _table = await _record({**_ACME, "auto_disables": 50}, status=422)
+
+    assert payload is not None
+    assert payload["enabled"] is False
+    assert "retired_at" not in payload
+    assert payload["auto_disables"] == 51
+
+
+@pytest.mark.usefixtures("_park_after_three")
+async def test_a_suppressed_disable_is_not_a_round(fleet: _BoardFleet) -> None:
+    """A still-live board is not disabled, so it has not used up a round."""
+    fleet.add("workday", "tricon|tricon", jobs=29)
+
+    payload, _table = await _record({**_TRICON, "auto_disables": 3}, status=422)
+
+    assert payload is not None
+    assert "enabled" not in payload
+    assert "auto_disables" not in payload
+    assert "retired_at" not in payload
+
+
+async def test_a_repoint_resets_the_rounds(fleet: _BoardFleet) -> None:
+    """A re-pointed row is a different board: its old rounds do not count."""
+    fleet.add("ashby", "acme", jobs=7)
+
+    payload, _table = await _record({**_ACME, "auto_disables": 3})
+
+    assert payload is not None
+    assert payload["board_token"] == "acme" and payload["provider"] == "ashby"
+    assert payload["auto_disables"] == 0
+
+
+@pytest.mark.usefixtures("_park_after_three")
+async def test_parking_alerts_under_its_own_grouped_sentry_issue(
+    fleet: _BoardFleet, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sentry_sdk
+
+    from app.services import poller
+
+    monkeypatch.setattr(poller.settings, "sentry_dsn", "https://x@sentry/1")
+    sent: list[tuple[str, str | None, list[str] | None]] = []
+    monkeypatch.setattr(
+        sentry_sdk,
+        "capture_message",
+        lambda msg, level=None, fingerprint=None: sent.append((msg, level, fingerprint)),
+    )
+
+    await _record({**_ACME, "auto_disables": 3}, status=422)
+
+    assert len(sent) == 1
+    _message, level, fingerprint = sent[0]
+    assert fingerprint == ["source-retired", "recovery_exhausted"]
+    assert level == "warning"
+
+
 # ---- ambiguous probes are never proof (ChatGPT review on #1113) -------------
 #
 # The probers swallow 429s, 5xx, transport errors and unreadable bodies and

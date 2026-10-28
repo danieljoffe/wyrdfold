@@ -239,6 +239,44 @@ async def test_reaching_the_threshold_disables_the_source(
     assert payload["disabled_at"]
 
 
+# ---- a board that never comes back parks itself -----------------------------
+
+
+@pytest.mark.parametrize(("prior_disables", "parked"), [(2, False), (3, True)])
+async def test_a_workday_422_loop_parks_after_three_recovery_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_http_client: MagicMock,
+    prior_disables: int,
+    parked: bool,
+) -> None:
+    """The prod loop end to end: a Workday board whose every fetch is a 422
+    (its careers site itself 500s). Re-detection cannot prove it dead -- a 422
+    is never proof -- so it used to be disabled, recovered a day later,
+    and disabled again, forever. Once it has been through
+    ``source_park_after_failed_recoveries`` (3) recovery rounds, the next
+    disable retires it instead, and auto-recovery leaves retired rows alone."""
+    from app.services import poller as poller_mod
+
+    monkeypatch.setattr(live_settings, "source_park_after_failed_recoveries", 3)
+    monkeypatch.setattr(live_settings, "source_redetect_on_disable_enabled", True)
+    _wire(mock_http_client, "post", _resp(422))
+    mock_http_client.get = AsyncMock(return_value=_resp(500))
+    supabase, sources_table = _poll_supabase(_EXISTING)
+
+    threshold = live_settings.source_failure_disable_threshold
+    row = {**_WORKDAY, "consecutive_failures": threshold - 1, "auto_disables": prior_disables}
+    await poller_mod._poll_one_source(row, supabase, active_targets=[])
+
+    payload = _sources_update_payload(sources_table)
+    assert payload["enabled"] is False
+    assert payload["auto_disables"] == prior_disables + 1
+    if parked:
+        assert payload["retired_reason"] == "recovery_exhausted"
+        assert payload["retired_at"] == payload["disabled_at"]
+    else:
+        assert "retired_at" not in payload, "rounds remain: still recoverable"
+
+
 # ---- CONTROL: a 200 with zero postings is a real, empty board ---------------
 
 
@@ -263,7 +301,7 @@ async def test_empty_board_is_not_a_failure_and_resets_the_counter(
     # this test is only about the failure accounting.
     supabase, sources_table = _poll_supabase([])
 
-    row = {**source, "consecutive_failures": 7}
+    row = {**source, "consecutive_failures": 7, "auto_disables": 3}
     summary = await poller_mod._poll_one_source(row, supabase, active_targets=[])
 
     # PRECONDITIONS — the poll ran to completion on the success path.
@@ -275,6 +313,7 @@ async def test_empty_board_is_not_a_failure_and_resets_the_counter(
     assert "last_polled_at" in payload, "this must be the mark-polled write"
     assert payload["job_count"] == 0
     assert payload["consecutive_failures"] == 0, "an empty board is not a failure"
+    assert payload["auto_disables"] == 0, "a working board ends any disable/recover cycle"
     assert payload["last_error"] is None
     assert "enabled" not in payload, "an empty board must never be auto-disabled"
 
