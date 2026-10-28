@@ -234,3 +234,124 @@ def test_sync_statement_timeout_retried_only_when_opted_in() -> None:
     opted = _Counter(fail_times=1, exc=_statement_timeout())
     assert execute_with_retry_sync(opted, label="t", retry_statement_timeout=True) == "ok"
     assert opted.calls == 2
+
+
+# ---------------------------------------------------------------------------
+# Gateway 5xx with a non-JSON body (Sentry PYTHON-FASTAPI-66 / -5T)
+# ---------------------------------------------------------------------------
+#
+# These drive the REAL postgrest client over a mock transport, so the APIError
+# under test is the one postgrest actually builds from such a response — not a
+# hand-made imitation that would keep passing if postgrest changed its shape.
+
+_GATEWAY_TEXT = httpx.Response(500, content=b"Internal server error.")
+_GATEWAY_HTML = httpx.Response(
+    502,
+    content=b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n</html>\r\n",
+    headers={"content-type": "text/html"},
+)
+# A genuine PostgREST/database error: JSON body, SQLSTATE code.
+_POSTGREST_JSON_500 = httpx.Response(
+    500, json={"code": "XX000", "message": "internal error", "details": None, "hint": None}
+)
+_CLOUDFLARE_413 = httpx.Response(413, content=b"<html>413 Request Entity Too Large</html>")
+_OK = httpx.Response(201, json=[{"id": "row-1"}])
+
+
+def _scripted(responses: list[httpx.Response]) -> tuple[list[int], httpx.MockTransport]:
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        r = responses[min(len(calls), len(responses)) - 1]
+        return httpx.Response(r.status_code, content=r.content, headers=r.headers)
+
+    return calls, httpx.MockTransport(handler)
+
+
+def _async_upsert(transport: httpx.MockTransport) -> Any:
+    from postgrest import AsyncPostgrestClient
+
+    client = AsyncPostgrestClient(
+        "http://pg.test",
+        http_client=httpx.AsyncClient(transport=transport, base_url="http://pg.test"),
+    )
+    return client.from_("sources").upsert({"id": "row-1"}).execute
+
+
+def _sync_update(transport: httpx.MockTransport) -> Any:
+    from postgrest import SyncPostgrestClient
+
+    client = SyncPostgrestClient(
+        "http://pg.test", http_client=httpx.Client(transport=transport, base_url="http://pg.test")
+    )
+    return client.from_("sources").update({"enabled": True}).eq("id", "row-1").execute
+
+
+async def _apierror_from(response: httpx.Response) -> Exception:
+    _, transport = _scripted([response])
+    with pytest.raises(Exception) as info:
+        await _async_upsert(transport)()
+    return info.value
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (_GATEWAY_TEXT, True),
+        (_GATEWAY_HTML, True),
+        (_POSTGREST_JSON_500, False),
+        (_CLOUDFLARE_413, False),
+    ],
+    ids=["500-text", "502-html", "postgrest-json-500", "413-html"],
+)
+async def test_is_gateway_error_predicate(response: httpx.Response, expected: bool) -> None:
+    from app.services.supabase_retry import is_gateway_error
+
+    exc = await _apierror_from(response)
+    assert type(exc).__name__ == "APIError"
+    assert is_gateway_error(exc) is expected
+
+
+def test_is_gateway_error_ignores_other_exceptions() -> None:
+    from postgrest.exceptions import APIError
+
+    from app.services.supabase_retry import is_gateway_error
+
+    assert is_gateway_error(RuntimeError("JSON could not be generated")) is False
+    assert is_gateway_error(APIError({"message": "statement timeout", "code": "57014"})) is False
+    # Same message but a code that isn't an HTTP status at all.
+    assert (
+        is_gateway_error(APIError({"message": "JSON could not be generated", "code": "x"})) is False
+    )
+
+
+async def test_async_retries_a_gateway_5xx_then_succeeds() -> None:
+    calls, transport = _scripted([_GATEWAY_TEXT, _GATEWAY_HTML, _OK])
+    resp = await execute_with_retry(_async_upsert(transport), label="t")
+    assert resp.data == [{"id": "row-1"}]
+    assert len(calls) == 3
+
+
+async def test_async_gateway_5xx_exhausts_and_reraises() -> None:
+    calls, transport = _scripted([_GATEWAY_TEXT])
+    with pytest.raises(Exception, match="JSON could not be generated"):
+        await execute_with_retry(_async_upsert(transport), label="t", retries=2)
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize(
+    "response", [_POSTGREST_JSON_500, _CLOUDFLARE_413], ids=["postgrest-json-500", "413-html"]
+)
+async def test_async_does_not_retry_database_or_client_errors(response: httpx.Response) -> None:
+    calls, transport = _scripted([response, _OK])
+    with pytest.raises(Exception):
+        await execute_with_retry(_async_upsert(transport), label="t")
+    assert len(calls) == 1
+
+
+def test_sync_retries_a_gateway_5xx_then_succeeds() -> None:
+    calls, transport = _scripted([_GATEWAY_HTML, _OK])
+    resp = execute_with_retry_sync(_sync_update(transport), label="t")
+    assert resp.data == [{"id": "row-1"}]
+    assert len(calls) == 2
