@@ -40,7 +40,7 @@
     "not kaios > 0"
   ],
   "dependencies": {
-    "@sentry/nextjs": "10.75.2",
+    "@sentry/nextjs": "11.10.0",
     "@supabase/supabase-js": "2.118.0",
     "caniuse-lite": "1.0.30001819",
     "clsx": "^2.1.1",
